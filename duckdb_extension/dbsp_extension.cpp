@@ -1,5 +1,5 @@
 // DBSP DuckDB Extension - Real-Time Incremental Materialized Views
-// Version 2.0 - With automatic CDC, SQL parsing, and native DuckDB types
+// Version 3.0 - With cascading views and persistence
 //
 // Usage:
 //   LOAD 'dbsp';
@@ -11,8 +11,8 @@
 //   SELECT * FROM dbsp_create_view('high_value', 'SELECT * FROM orders WHERE amount > 100');
 //   SELECT * FROM dbsp_create_view('totals', 'SELECT customer_id, SUM(amount) FROM orders GROUP BY customer_id');
 //
-//   -- Or use simple syntax
-//   SELECT * FROM dbsp_create_view('filtered', 'orders', 'filter', 'amount > 100');
+//   -- Cascading views (views on views)
+//   SELECT * FROM dbsp_create_view('vip_totals', 'SELECT * FROM totals WHERE SUM > 1000');
 //
 //   -- Notify changes (or use dbsp_sync to auto-detect)
 //   SELECT * FROM dbsp_notify_insert('orders', 1, 'Alice', 250.00);
@@ -20,6 +20,16 @@
 //
 //   -- Query views
 //   SELECT * FROM dbsp_query('high_value');
+//
+//   -- Persistence
+//   SELECT * FROM dbsp_save();           -- Save to DuckDB table
+//   SELECT * FROM dbsp_save('file.json'); -- Save to JSON file
+//   SELECT * FROM dbsp_load();           -- Load from DuckDB table
+//   SELECT * FROM dbsp_load('file.json'); -- Load from JSON file
+//
+//   -- View dependencies
+//   SELECT * FROM dbsp_deps('view_name');
+//   SELECT dbsp_drop_cascade('view_name'); -- Drop view and dependents
 
 #define DUCKDB_EXTENSION_MAIN
 
@@ -454,8 +464,184 @@ void DropScalar(DataChunk &args, ExpressionState &state, Vector &result) {
     UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t name) {
         auto &manager = dbsp_native::get_cdc_manager();
         bool ok = manager.drop_view(name.GetString());
-        return StringVector::AddString(result, ok ? "Dropped" : "Not found");
+        return StringVector::AddString(result, ok ? "Dropped" : manager.last_error());
     });
+}
+
+// ============================================================================
+// dbsp_drop_cascade - Drop a view and all dependent views
+// ============================================================================
+
+void DropCascadeScalar(DataChunk &args, ExpressionState &state, Vector &result) {
+    UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t name) {
+        auto &manager = dbsp_native::get_cdc_manager();
+        auto deps = manager.get_dependents(name.GetString());
+        bool ok = manager.drop_view_cascade(name.GetString());
+        string msg = ok ? "Dropped " + name.GetString() : "Not found";
+        if (ok && !deps.empty()) {
+            msg += " (and " + std::to_string(deps.size()) + " dependent views)";
+        }
+        return StringVector::AddString(result, msg);
+    });
+}
+
+// ============================================================================
+// dbsp_save - Save views to storage
+// Usage: SELECT * FROM dbsp_save();           -- Save to DuckDB table
+//        SELECT * FROM dbsp_save('file.json'); -- Save to JSON file
+// ============================================================================
+
+struct SaveBindData : public TableFunctionData {
+    string filepath;
+    bool to_file = false;
+    bool done = false;
+};
+
+unique_ptr<FunctionData> SaveBind(ClientContext &context, TableFunctionBindInput &input,
+                                  vector<LogicalType> &return_types, vector<string> &names) {
+    auto data = make_uniq<SaveBindData>();
+
+    if (!input.inputs.empty()) {
+        data->filepath = input.inputs[0].GetValue<string>();
+        data->to_file = true;
+    }
+
+    return_types.push_back(LogicalType::VARCHAR);
+    names.push_back("result");
+    return std::move(data);
+}
+
+void SaveFunc(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+    auto &data = input.bind_data->CastNoConst<SaveBindData>();
+    if (data.done) return;
+
+    auto &manager = dbsp_native::get_cdc_manager();
+    bool ok;
+    string msg;
+
+    if (data.to_file) {
+        ok = manager.save_to_file(data.filepath);
+        msg = ok ? "Saved to file: " + data.filepath : "Error: " + manager.last_error();
+    } else {
+        ok = manager.save_to_table(context);
+        msg = ok ? "Saved to DuckDB table: _dbsp_views" : "Error: " + manager.last_error();
+    }
+
+    output.SetCardinality(1);
+    output.SetValue(0, 0, Value(msg));
+    data.done = true;
+}
+
+// ============================================================================
+// dbsp_load - Load views from storage
+// Usage: SELECT * FROM dbsp_load();           -- Load from DuckDB table
+//        SELECT * FROM dbsp_load('file.json'); -- Load from JSON file
+// ============================================================================
+
+struct LoadBindData : public TableFunctionData {
+    string filepath;
+    bool from_file = false;
+    bool done = false;
+};
+
+unique_ptr<FunctionData> LoadBind(ClientContext &context, TableFunctionBindInput &input,
+                                  vector<LogicalType> &return_types, vector<string> &names) {
+    auto data = make_uniq<LoadBindData>();
+
+    if (!input.inputs.empty()) {
+        data->filepath = input.inputs[0].GetValue<string>();
+        data->from_file = true;
+    }
+
+    return_types.push_back(LogicalType::VARCHAR);
+    names.push_back("result");
+    return std::move(data);
+}
+
+void LoadFunc(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+    auto &data = input.bind_data->CastNoConst<LoadBindData>();
+    if (data.done) return;
+
+    auto &manager = dbsp_native::get_cdc_manager();
+    bool ok;
+    string msg;
+
+    if (data.from_file) {
+        ok = manager.load_from_file(context, data.filepath);
+        msg = ok ? "Loaded from file: " + data.filepath : "Error: " + manager.last_error();
+    } else {
+        ok = manager.load_from_table(context);
+        msg = ok ? "Loaded from DuckDB table" : "Error: " + manager.last_error();
+    }
+
+    // Count loaded views
+    auto views = manager.list_views();
+    if (ok) {
+        msg += " (" + std::to_string(views.size()) + " views)";
+    }
+
+    output.SetCardinality(1);
+    output.SetValue(0, 0, Value(msg));
+    data.done = true;
+}
+
+// ============================================================================
+// dbsp_deps - Show view dependencies
+// Usage: SELECT * FROM dbsp_deps('view_name');
+// ============================================================================
+
+struct DepsBindData : public TableFunctionData {
+    string view_name;
+    vector<std::pair<string, string>> deps;  // (name, type: "depends_on" or "depended_by")
+    idx_t current = 0;
+};
+
+unique_ptr<FunctionData> DepsBind(ClientContext &context, TableFunctionBindInput &input,
+                                  vector<LogicalType> &return_types, vector<string> &names) {
+    auto data = make_uniq<DepsBindData>();
+
+    if (input.inputs.empty()) {
+        throw InvalidInputException("dbsp_deps(view_name)");
+    }
+
+    data->view_name = input.inputs[0].GetValue<string>();
+
+    auto &manager = dbsp_native::get_cdc_manager();
+
+    // Get dependencies (what this view depends on)
+    auto deps = manager.get_view_dependencies(data->view_name);
+    for (const auto &dep : deps) {
+        data->deps.push_back({dep, "depends_on"});
+    }
+
+    // Get dependents (what depends on this view)
+    auto dependents = manager.get_dependents(data->view_name);
+    for (const auto &dep : dependents) {
+        data->deps.push_back({dep, "depended_by"});
+    }
+
+    return_types.push_back(LogicalType::VARCHAR);
+    names.push_back("name");
+    return_types.push_back(LogicalType::VARCHAR);
+    names.push_back("relationship");
+
+    return std::move(data);
+}
+
+void DepsFunc(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+    auto &data = input.bind_data->CastNoConst<DepsBindData>();
+
+    idx_t count = 0;
+    while (data.current < data.deps.size() && count < STANDARD_VECTOR_SIZE) {
+        const auto &[name, rel] = data.deps[data.current];
+
+        output.SetValue(0, count, Value(name));
+        output.SetValue(1, count, Value(rel));
+
+        data.current++;
+        count++;
+    }
+    output.SetCardinality(count);
 }
 
 // ============================================================================
@@ -502,6 +688,24 @@ static void LoadInternal(DatabaseInstance &instance) {
     // dbsp_drop
     ScalarFunction drop_fn("dbsp_drop", {LogicalType::VARCHAR}, LogicalType::VARCHAR, DropScalar);
     ExtensionUtil::RegisterFunction(instance, drop_fn);
+
+    // dbsp_drop_cascade
+    ScalarFunction drop_cascade_fn("dbsp_drop_cascade", {LogicalType::VARCHAR}, LogicalType::VARCHAR, DropCascadeScalar);
+    ExtensionUtil::RegisterFunction(instance, drop_cascade_fn);
+
+    // dbsp_save
+    TableFunction save_fn("dbsp_save", {}, SaveFunc, SaveBind);
+    save_fn.varargs = LogicalType::VARCHAR;
+    ExtensionUtil::RegisterFunction(instance, save_fn);
+
+    // dbsp_load
+    TableFunction load_fn("dbsp_load", {}, LoadFunc, LoadBind);
+    load_fn.varargs = LogicalType::VARCHAR;
+    ExtensionUtil::RegisterFunction(instance, load_fn);
+
+    // dbsp_deps
+    TableFunction deps_fn("dbsp_deps", {LogicalType::VARCHAR}, DepsFunc, DepsBind);
+    ExtensionUtil::RegisterFunction(instance, deps_fn);
 }
 
 void DbspExtension::Load(DuckDB &db) {
@@ -513,7 +717,7 @@ std::string DbspExtension::Name() {
 }
 
 std::string DbspExtension::Version() const {
-    return "2.0.0";
+    return "3.0.0";
 }
 
 } // namespace duckdb
@@ -525,6 +729,6 @@ DUCKDB_EXTENSION_API void dbsp_init(duckdb::DatabaseInstance &db) {
 }
 
 DUCKDB_EXTENSION_API const char *dbsp_version() {
-    return "2.0.0";
+    return "3.0.0";
 }
 }
