@@ -38,6 +38,17 @@ if(BUILD_TESTS)
     )
     FetchContent_MakeAvailable(Catch2)
 
+    # Unit tests
+    add_executable(unit_tests
+        test/catch2_main.cpp
+        test/unit/test_zset.cpp
+    )
+    target_link_libraries(unit_tests PRIVATE dbsp_headers Catch2::Catch2)
+    target_include_directories(unit_tests PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
+    enable_testing()
+    add_test(NAME unit_tests COMMAND unit_tests)
+
     # Existing unit tests (will port to Catch2 later)
     add_executable(dbsp_tests_old test/test_zset.cpp)
     target_link_libraries(dbsp_tests_old PRIVATE dbsp_headers)
