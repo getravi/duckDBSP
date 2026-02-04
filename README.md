@@ -1,0 +1,232 @@
+# DBSP for DuckDB
+
+Real-time incrementally maintained materialized views for DuckDB, based on [Database Stream Processing (DBSP)](https://www.feldera.com/blog/what-is-dbsp) theory.
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![DuckDB](https://img.shields.io/badge/DuckDB-v1.0+-blue.svg)](https://duckdb.org/)
+
+## Overview
+
+Traditional materialized views recompute entirely when underlying data changes. DBSP-powered views update **incrementally** in O(delta) time - only processing the changes, not the entire dataset.
+
+```
+Traditional:  INSERT 1 row → Recompute 1M rows → O(n)
+DBSP:         INSERT 1 row → Update affected aggregates → O(delta)
+```
+
+### Key Features
+
+- **Incremental Updates**: Views update in O(delta) time, not O(n)
+- **SQL Syntax**: Define views using familiar SQL
+- **Cascading Views**: Views can reference other views
+- **Automatic CDC**: Change Data Capture with sync detection
+- **Persistence**: Save/restore views across sessions
+- **Zero Dependencies**: Pure C++ header-only core library
+
+## Quick Start
+
+```sql
+-- Load the extension
+LOAD 'dbsp';
+
+-- Create a table and track it for CDC
+CREATE TABLE orders (id INT, customer VARCHAR, amount DECIMAL);
+SELECT * FROM dbsp_track('orders');
+
+-- Create an incrementally maintained view
+SELECT * FROM dbsp_create_view('customer_totals',
+    'SELECT customer, SUM(amount) FROM orders GROUP BY customer');
+
+-- Insert data (views update automatically)
+INSERT INTO orders VALUES (1, 'Alice', 100), (2, 'Bob', 200), (3, 'Alice', 150);
+SELECT * FROM dbsp_sync('orders');
+
+-- Query the view (instant - no recomputation)
+SELECT * FROM dbsp_query('customer_totals');
+-- Returns: Alice: 250, Bob: 200
+
+-- Insert more data
+INSERT INTO orders VALUES (4, 'Alice', 50);
+SELECT * FROM dbsp_sync('orders');
+
+-- View is already updated!
+SELECT * FROM dbsp_query('customer_totals');
+-- Returns: Alice: 300, Bob: 200
+```
+
+## Installation
+
+### Building from Source
+
+```bash
+cd duckdb_extension
+./build.sh
+```
+
+This will:
+1. Download DuckDB source (if not present)
+2. Build the DBSP extension
+3. Output `dbsp.duckdb_extension`
+
+### Loading the Extension
+
+```sql
+LOAD '/path/to/dbsp.duckdb_extension';
+```
+
+## Documentation
+
+- [API Reference](docs/API.md) - Complete function reference
+- [Theory](docs/THEORY.md) - DBSP mathematical foundations
+- [Examples](examples/) - Usage examples
+- [Architecture](docs/ARCHITECTURE.md) - Internal design
+
+## SQL Functions
+
+### Table Tracking
+
+| Function | Description |
+|----------|-------------|
+| `dbsp_track(table)` | Track a table for change detection |
+| `dbsp_sync(table)` | Sync tracked table with DuckDB |
+| `dbsp_sync()` | Sync all tracked tables |
+| `dbsp_tables()` | List all tracked tables |
+
+### View Management
+
+| Function | Description |
+|----------|-------------|
+| `dbsp_create_view(name, sql)` | Create view with SQL syntax |
+| `dbsp_query(view)` | Query a materialized view |
+| `dbsp_views()` | List all views with stats |
+| `dbsp_drop(view)` | Drop a view |
+| `dbsp_drop_cascade(view)` | Drop view and dependents |
+| `dbsp_deps(view)` | Show view dependencies |
+
+### Persistence
+
+| Function | Description |
+|----------|-------------|
+| `dbsp_save()` | Save views to DuckDB table |
+| `dbsp_save(file)` | Save views to JSON file |
+| `dbsp_load()` | Load views from DuckDB table |
+| `dbsp_load(file)` | Load views from JSON file |
+
+### Manual CDC
+
+| Function | Description |
+|----------|-------------|
+| `dbsp_notify_insert(table, ...)` | Notify of row insertion |
+| `dbsp_notify_delete(table, ...)` | Notify of row deletion |
+
+## Supported SQL Features
+
+### Currently Supported
+
+- `SELECT * FROM table`
+- `SELECT columns FROM table`
+- `SELECT ... WHERE condition`
+- `SELECT ... GROUP BY column`
+- `SELECT DISTINCT ...`
+- `SELECT ... FROM t1 JOIN t2 ON ...`
+- Aggregate functions: `SUM`, `COUNT`, `AVG`
+- Comparison operators: `=`, `>`, `<`, `>=`, `<=`, `!=`
+- Cascading views (views on views)
+
+### Planned
+
+- `HAVING` clause
+- `ORDER BY` / `LIMIT`
+- Window functions
+- `UNION` / `INTERSECT`
+- Subqueries
+- `MIN` / `MAX` aggregates
+
+## How It Works
+
+DBSP (Database Stream Processing) treats database operations as streams of changes:
+
+1. **Z-Sets**: Data represented as `element → weight` mappings
+   - Weight +1 = insertion
+   - Weight -1 = deletion
+   - Weight 0 = no change
+
+2. **Incremental Operators**: Each SQL operator has an incremental version
+   - Filter^Δ: Only process changed rows matching predicate
+   - Join^Δ: `Δa × b + a × Δb` (bilinear formula)
+   - Aggregate^Δ: Update running totals with deltas
+
+3. **Change Propagation**: Changes flow through the view graph
+   ```
+   orders (Δ) → filter_view (Δ) → aggregate_view (Δ)
+   ```
+
+For the mathematical foundations, see [Theory](docs/THEORY.md).
+
+## Performance
+
+| Operation | Traditional View | DBSP View |
+|-----------|-----------------|-----------|
+| Initial creation | O(n) | O(n) |
+| Single row insert | O(n) | O(1)* |
+| Batch insert (k rows) | O(n) | O(k)* |
+| Query | O(1) | O(1) |
+
+*Plus O(affected groups) for aggregations
+
+## Project Structure
+
+```
+duckDBSP/
+├── include/                    # Core DBSP library (header-only)
+│   ├── dbsp_zset.hpp          # Z-set data structure
+│   ├── dbsp_stream.hpp        # Stream operators
+│   ├── dbsp_circuit.hpp       # Dataflow graph
+│   └── dbsp_materialized_view.hpp
+├── duckdb_extension/          # DuckDB extension
+│   ├── dbsp_extension.cpp     # Extension entry point
+│   ├── dbsp_duckdb_types.hpp  # Native DuckDB type integration
+│   ├── dbsp_sql_parser.hpp    # SQL parsing
+│   ├── dbsp_cdc.hpp           # CDC manager
+│   └── build.sh               # Build script
+├── src/                       # Standalone demos
+│   └── dbsp_cli.cpp           # Interactive CLI
+├── test/                      # Unit tests
+├── docs/                      # Documentation
+└── examples/                  # Usage examples
+```
+
+## Contributing
+
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+### Development Setup
+
+```bash
+# Clone the repository
+git clone https://github.com/yourusername/duckDBSP.git
+cd duckDBSP
+
+# Build the core library tests
+mkdir build && cd build
+cmake ..
+make
+
+# Run tests
+./dbsp_tests
+```
+
+## References
+
+- [DBSP: Automatic Incremental View Maintenance](https://www.vldb.org/pvldb/vol16/p1601-budiu.pdf) - VLDB 2023
+- [Feldera: Continuous Analytics](https://www.feldera.com/)
+- [Database Stream Processing Theory (Lean Formalization)](https://github.com/tchajed/database-stream-processing-theory)
+
+## License
+
+MIT License - see [LICENSE](LICENSE) for details.
+
+## Acknowledgments
+
+- The DBSP theory was developed by Mihai Budiu, Tej Chajed, Frank McSherry, Leonid Ryzhyk, and Val Tannen
+- DuckDB team for the excellent embeddable database
