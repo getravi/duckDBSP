@@ -23,6 +23,10 @@ if(BUILD_STANDALONE_DEMO)
     target_link_libraries(dbsp_demo PRIVATE dbsp_headers)
 endif()
 
+# Interactive CLI (no external dependencies)
+add_executable(dbsp src/dbsp_cli.cpp)
+target_link_libraries(dbsp PRIVATE dbsp_headers)
+
 # Tests
 if(BUILD_TESTS)
     add_executable(dbsp_tests test/test_zset.cpp)
