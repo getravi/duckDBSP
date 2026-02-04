@@ -1,0 +1,21 @@
+# Build output
+build/
+cmake-build-*/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Compiled objects
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+
+# External dependencies (cloned for reference)
+dbsp-theory/
