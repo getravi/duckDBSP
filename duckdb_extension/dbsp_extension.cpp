@@ -1,10 +1,25 @@
 // DBSP DuckDB Extension - Real-Time Incremental Materialized Views
+// Version 2.0 - With automatic CDC, SQL parsing, and native DuckDB types
 //
 // Usage:
 //   LOAD 'dbsp';
-//   SELECT * FROM dbsp_create_view('view_name', 'table', 'filter', '2 > 100');
-//   SELECT * FROM dbsp_insert('table', 1, 100, 250);
-//   SELECT * FROM dbsp_query('view_name');
+//
+//   -- Track a table for CDC (auto-detects schema)
+//   SELECT * FROM dbsp_track('orders');
+//
+//   -- Create view with SQL syntax
+//   SELECT * FROM dbsp_create_view('high_value', 'SELECT * FROM orders WHERE amount > 100');
+//   SELECT * FROM dbsp_create_view('totals', 'SELECT customer_id, SUM(amount) FROM orders GROUP BY customer_id');
+//
+//   -- Or use simple syntax
+//   SELECT * FROM dbsp_create_view('filtered', 'orders', 'filter', 'amount > 100');
+//
+//   -- Notify changes (or use dbsp_sync to auto-detect)
+//   SELECT * FROM dbsp_notify_insert('orders', 1, 'Alice', 250.00);
+//   SELECT * FROM dbsp_sync('orders');  -- Sync with actual table
+//
+//   -- Query views
+//   SELECT * FROM dbsp_query('high_value');
 
 #define DUCKDB_EXTENSION_MAIN
 
@@ -17,26 +32,66 @@
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
-#include "../include/dbsp_materialized_view.hpp"
-
-#include <mutex>
+#include "dbsp_cdc.hpp"
 
 namespace duckdb {
 
-// Global DBSP state
-static dbsp::MaterializedViewManager g_views;
-static std::mutex g_mutex;
+// ============================================================================
+// dbsp_track - Track a table for automatic CDC
+// Usage: SELECT * FROM dbsp_track('table_name');
+// ============================================================================
+
+struct TrackBindData : public TableFunctionData {
+    string table_name;
+    string result;
+    bool done = false;
+};
+
+unique_ptr<FunctionData> TrackBind(ClientContext &context, TableFunctionBindInput &input,
+                                   vector<LogicalType> &return_types, vector<string> &names) {
+    auto data = make_uniq<TrackBindData>();
+
+    if (input.inputs.empty()) {
+        throw InvalidInputException("dbsp_track(table_name)");
+    }
+
+    data->table_name = input.inputs[0].GetValue<string>();
+
+    return_types.push_back(LogicalType::VARCHAR);
+    names.push_back("result");
+    return std::move(data);
+}
+
+void TrackFunc(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+    auto &data = input.bind_data->CastNoConst<TrackBindData>();
+    if (data.done) return;
+
+    auto &manager = dbsp_native::get_cdc_manager();
+    bool ok = manager.track_table(context, data.table_name);
+
+    output.SetCardinality(1);
+    if (ok) {
+        auto schema = manager.get_table_schema(data.table_name);
+        string cols = schema ? std::to_string(schema->columns.size()) + " columns" : "";
+        output.SetValue(0, 0, Value("Tracking table: " + data.table_name + " (" + cols + ")"));
+    } else {
+        output.SetValue(0, 0, Value("Failed to track: " + data.table_name));
+    }
+    data.done = true;
+}
 
 // ============================================================================
 // dbsp_create_view - Create a materialized view
-// Usage: SELECT * FROM dbsp_create_view('name', 'table', 'type', 'spec');
-//   Types: 'filter', 'aggregate', 'distinct'
-//   Spec for filter: 'col_idx op value' e.g., '2 > 100'
-//   Spec for aggregate: 'group_col agg_type value_col' e.g., '1 SUM 2'
+// Usage (SQL): SELECT * FROM dbsp_create_view('name', 'SELECT ... FROM ...');
+// Usage (simple): SELECT * FROM dbsp_create_view('name', 'table', 'type', 'spec');
 // ============================================================================
 
 struct CreateViewBindData : public TableFunctionData {
-    string result;
+    string view_name;
+    string sql_or_table;
+    string view_type;
+    string spec;
+    bool is_sql_mode = false;
     bool done = false;
 };
 
@@ -44,98 +99,23 @@ unique_ptr<FunctionData> CreateViewBind(ClientContext &context, TableFunctionBin
                                         vector<LogicalType> &return_types, vector<string> &names) {
     auto data = make_uniq<CreateViewBindData>();
 
-    if (input.inputs.size() < 4) {
-        throw InvalidInputException("dbsp_create_view(name, table, type, spec)");
+    if (input.inputs.size() < 2) {
+        throw InvalidInputException("dbsp_create_view(name, sql) or dbsp_create_view(name, table, type, spec)");
     }
 
-    string view_name = input.inputs[0].GetValue<string>();
-    string table_name = input.inputs[1].GetValue<string>();
-    string view_type = StringUtil::Lower(input.inputs[2].GetValue<string>());
-    string spec = input.inputs[3].GetValue<string>();
+    data->view_name = input.inputs[0].GetValue<string>();
+    data->sql_or_table = input.inputs[1].GetValue<string>();
 
-    std::lock_guard<std::mutex> lock(g_mutex);
-
-    if (view_type == "filter") {
-        // Parse spec: "col_idx op value"
-        auto parts = StringUtil::Split(spec, ' ');
-        if (parts.size() < 3) {
-            throw InvalidInputException("Filter spec: 'col_idx op value'");
-        }
-
-        int col_idx = std::stoi(parts[0]);
-        string op = parts[1];
-        string val_str = parts[2];
-
-        // Parse value
-        int64_t val_int = 0;
-        bool is_int = true;
-        try {
-            val_int = std::stoll(val_str);
-        } catch (...) {
-            is_int = false;
-        }
-
-        auto pred = [col_idx, op, val_int, val_str, is_int](const dbsp::Row &row) -> bool {
-            if (col_idx >= (int)row.columns.size()) return false;
-            const auto &col = row.columns[col_idx];
-
-            if (is_int && std::holds_alternative<int64_t>(col)) {
-                int64_t lhs = std::get<int64_t>(col);
-                if (op == "=") return lhs == val_int;
-                if (op == ">") return lhs > val_int;
-                if (op == "<") return lhs < val_int;
-                if (op == ">=") return lhs >= val_int;
-                if (op == "<=") return lhs <= val_int;
-                if (op == "!=" || op == "<>") return lhs != val_int;
-            }
-            if (std::holds_alternative<std::string>(col)) {
-                const auto &lhs = std::get<std::string>(col);
-                if (op == "=") return lhs == val_str;
-                if (op == "!=") return lhs != val_str;
-            }
-            return false;
-        };
-
-        g_views.register_view(std::make_unique<dbsp::FilteredView>(view_name, table_name, pred));
-        data->result = "Created filter view: " + view_name;
-
-    } else if (view_type == "aggregate") {
-        // Parse spec: "group_col agg_type value_col"
-        auto parts = StringUtil::Split(spec, ' ');
-        if (parts.size() < 3) {
-            throw InvalidInputException("Aggregate spec: 'group_col AGG value_col'");
-        }
-
-        int group_col = std::stoi(parts[0]);
-        string agg = StringUtil::Upper(parts[1]);
-        int value_col = std::stoi(parts[2]);
-
-        dbsp::AggregateView::AggType agg_type = dbsp::AggregateView::AggType::SUM;
-        if (agg == "COUNT") agg_type = dbsp::AggregateView::AggType::COUNT;
-        else if (agg == "AVG") agg_type = dbsp::AggregateView::AggType::AVG;
-
-        auto key_fn = [group_col](const dbsp::Row &r) -> dbsp::Row {
-            dbsp::Row k;
-            if (group_col < (int)r.columns.size()) k.columns.push_back(r.columns[group_col]);
-            return k;
-        };
-        auto val_fn = [value_col](const dbsp::Row &r) -> int64_t {
-            if (value_col < (int)r.columns.size()) {
-                if (auto *p = std::get_if<int64_t>(&r.columns[value_col])) return *p;
-                if (auto *p = std::get_if<double>(&r.columns[value_col])) return (int64_t)*p;
-            }
-            return 0;
-        };
-
-        g_views.register_view(std::make_unique<dbsp::AggregateView>(view_name, table_name, key_fn, val_fn, agg_type));
-        data->result = "Created aggregate view: " + view_name;
-
-    } else if (view_type == "distinct") {
-        g_views.register_view(std::make_unique<dbsp::DistinctView>(view_name, table_name));
-        data->result = "Created distinct view: " + view_name;
-
+    // Detect mode: if second arg starts with SELECT, it's SQL mode
+    string upper = StringUtil::Upper(StringUtil::Trim(data->sql_or_table));
+    if (upper.rfind("SELECT", 0) == 0) {
+        data->is_sql_mode = true;
+    } else if (input.inputs.size() >= 4) {
+        data->view_type = input.inputs[2].GetValue<string>();
+        data->spec = input.inputs[3].GetValue<string>();
+        data->is_sql_mode = false;
     } else {
-        throw InvalidInputException("Unknown view type: " + view_type);
+        throw InvalidInputException("Use SQL syntax: dbsp_create_view('name', 'SELECT ...')");
     }
 
     return_types.push_back(LogicalType::VARCHAR);
@@ -146,53 +126,80 @@ unique_ptr<FunctionData> CreateViewBind(ClientContext &context, TableFunctionBin
 void CreateViewFunc(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
     auto &data = input.bind_data->CastNoConst<CreateViewBindData>();
     if (data.done) return;
+
+    auto &manager = dbsp_native::get_cdc_manager();
+    string result;
+
+    if (data.is_sql_mode) {
+        // SQL mode - use the parser
+        bool ok = manager.create_view(context, data.view_name, data.sql_or_table);
+        if (ok) {
+            auto info = manager.get_view_info(data.view_name);
+            result = "Created view: " + data.view_name + " (sources: ";
+            for (size_t i = 0; i < info.source_tables.size(); i++) {
+                if (i > 0) result += ", ";
+                result += info.source_tables[i];
+            }
+            result += ")";
+        } else {
+            result = "Error: " + manager.last_error();
+        }
+    } else {
+        // Simple mode - construct SQL from parameters
+        string sql;
+        string table = data.sql_or_table;
+        string type = StringUtil::Lower(data.view_type);
+
+        if (type == "filter") {
+            // Parse spec: "column op value"
+            sql = "SELECT * FROM " + table + " WHERE " + data.spec;
+        } else if (type == "aggregate") {
+            // Parse spec: "group_col AGG value_col"
+            auto parts = StringUtil::Split(data.spec, ' ');
+            if (parts.size() >= 3) {
+                sql = "SELECT " + parts[0] + ", " + parts[1] + "(" + parts[2] + ") FROM " + table + " GROUP BY " + parts[0];
+            }
+        } else if (type == "distinct") {
+            sql = "SELECT DISTINCT * FROM " + table;
+        } else {
+            sql = "SELECT * FROM " + table;
+        }
+
+        bool ok = manager.create_view(context, data.view_name, sql);
+        result = ok ? "Created " + type + " view: " + data.view_name
+                    : "Error: " + manager.last_error();
+    }
+
     output.SetCardinality(1);
-    output.SetValue(0, 0, Value(data.result));
+    output.SetValue(0, 0, Value(result));
     data.done = true;
 }
 
 // ============================================================================
-// dbsp_insert / dbsp_delete - Modify data
-// Usage: SELECT * FROM dbsp_insert('table', val1, val2, ...);
+// dbsp_notify_insert / dbsp_notify_delete - Notify CDC of changes
+// Usage: SELECT * FROM dbsp_notify_insert('table', val1, val2, ...);
 // ============================================================================
 
-struct ModifyBindData : public TableFunctionData {
+struct NotifyBindData : public TableFunctionData {
     string table_name;
-    dbsp::Row row;
+    dbsp_native::DuckDBRow row;
     bool is_delete = false;
     bool done = false;
 };
 
-unique_ptr<FunctionData> ModifyBind(ClientContext &context, TableFunctionBindInput &input,
+unique_ptr<FunctionData> NotifyBind(ClientContext &context, TableFunctionBindInput &input,
                                     vector<LogicalType> &return_types, vector<string> &names) {
-    auto data = make_uniq<ModifyBindData>();
+    auto data = make_uniq<NotifyBindData>();
 
     if (input.inputs.size() < 2) {
-        throw InvalidInputException("dbsp_insert/delete(table, val1, val2, ...)");
+        throw InvalidInputException("dbsp_notify_insert/delete(table, val1, val2, ...)");
     }
 
     data->table_name = input.inputs[0].GetValue<string>();
 
+    // Convert values to DuckDBRow
     for (idx_t i = 1; i < input.inputs.size(); i++) {
-        auto &val = input.inputs[i];
-        switch (val.type().id()) {
-            case LogicalTypeId::BIGINT:
-            case LogicalTypeId::INTEGER:
-            case LogicalTypeId::SMALLINT:
-            case LogicalTypeId::TINYINT:
-                data->row.columns.push_back(val.GetValue<int64_t>());
-                break;
-            case LogicalTypeId::DOUBLE:
-            case LogicalTypeId::FLOAT:
-                data->row.columns.push_back(val.GetValue<double>());
-                break;
-            case LogicalTypeId::BOOLEAN:
-                data->row.columns.push_back(val.GetValue<bool>());
-                break;
-            default:
-                data->row.columns.push_back(val.ToString());
-                break;
-        }
+        data->row.columns.push_back(input.inputs[i]);
     }
 
     return_types.push_back(LogicalType::VARCHAR);
@@ -200,40 +207,85 @@ unique_ptr<FunctionData> ModifyBind(ClientContext &context, TableFunctionBindInp
     return std::move(data);
 }
 
-void InsertFunc(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
-    auto &data = input.bind_data->CastNoConst<ModifyBindData>();
+void NotifyInsertFunc(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+    auto &data = input.bind_data->CastNoConst<NotifyBindData>();
     if (data.done) return;
 
-    std::lock_guard<std::mutex> lock(g_mutex);
-    g_views.insert_row(data.table_name, data.row);
+    auto &manager = dbsp_native::get_cdc_manager();
+    manager.on_insert(data.table_name, data.row);
 
     output.SetCardinality(1);
-    output.SetValue(0, 0, Value("Inserted 1 row into " + data.table_name));
+    output.SetValue(0, 0, Value("Notified insert into " + data.table_name));
     data.done = true;
 }
 
-void DeleteFunc(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
-    auto &data = input.bind_data->CastNoConst<ModifyBindData>();
+void NotifyDeleteFunc(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+    auto &data = input.bind_data->CastNoConst<NotifyBindData>();
     if (data.done) return;
 
-    std::lock_guard<std::mutex> lock(g_mutex);
-    g_views.delete_row(data.table_name, data.row);
+    auto &manager = dbsp_native::get_cdc_manager();
+    manager.on_delete(data.table_name, data.row);
 
     output.SetCardinality(1);
-    output.SetValue(0, 0, Value("Deleted 1 row from " + data.table_name));
+    output.SetValue(0, 0, Value("Notified delete from " + data.table_name));
     data.done = true;
 }
 
 // ============================================================================
-// dbsp_query - Query a view
+// dbsp_sync - Sync tracked table with actual DuckDB table
+// Usage: SELECT * FROM dbsp_sync('table_name');
+//        SELECT * FROM dbsp_sync();  -- Sync all
+// ============================================================================
+
+struct SyncBindData : public TableFunctionData {
+    string table_name;
+    bool sync_all = false;
+    bool done = false;
+};
+
+unique_ptr<FunctionData> SyncBind(ClientContext &context, TableFunctionBindInput &input,
+                                  vector<LogicalType> &return_types, vector<string> &names) {
+    auto data = make_uniq<SyncBindData>();
+
+    if (input.inputs.empty()) {
+        data->sync_all = true;
+    } else {
+        data->table_name = input.inputs[0].GetValue<string>();
+    }
+
+    return_types.push_back(LogicalType::VARCHAR);
+    names.push_back("result");
+    return std::move(data);
+}
+
+void SyncFunc(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+    auto &data = input.bind_data->CastNoConst<SyncBindData>();
+    if (data.done) return;
+
+    auto &manager = dbsp_native::get_cdc_manager();
+
+    if (data.sync_all) {
+        manager.sync_all(context);
+        output.SetCardinality(1);
+        output.SetValue(0, 0, Value("Synced all tracked tables"));
+    } else {
+        bool ok = manager.sync_table(context, data.table_name);
+        output.SetCardinality(1);
+        output.SetValue(0, 0, Value(ok ? "Synced: " + data.table_name : "Failed to sync"));
+    }
+    data.done = true;
+}
+
+// ============================================================================
+// dbsp_query - Query a materialized view
 // Usage: SELECT * FROM dbsp_query('view_name');
 // ============================================================================
 
 struct QueryBindData : public TableFunctionData {
     string view_name;
-    vector<dbsp::Row> rows;
+    vector<dbsp_native::DuckDBRow> rows;
+    vector<LogicalType> types;
     idx_t current = 0;
-    idx_t num_cols = 0;
 };
 
 unique_ptr<FunctionData> QueryBind(ClientContext &context, TableFunctionBindInput &input,
@@ -246,37 +298,38 @@ unique_ptr<FunctionData> QueryBind(ClientContext &context, TableFunctionBindInpu
 
     data->view_name = input.inputs[0].GetValue<string>();
 
-    std::lock_guard<std::mutex> lock(g_mutex);
-    auto *view = g_views.get_view(data->view_name);
-    if (!view) {
+    auto &manager = dbsp_native::get_cdc_manager();
+    const auto *result = manager.query_view(data->view_name);
+    const auto *schema = manager.get_view_schema(data->view_name);
+
+    if (!result) {
         throw InvalidInputException("View not found: " + data->view_name);
     }
 
-    // Collect rows
-    const auto &zset = view->get_result();
-    for (const auto &[row, weight] : zset) {
+    // Collect rows with positive weight
+    for (const auto &[row, weight] : *result) {
         if (weight > 0) {
-            data->rows.push_back(row);
-            data->num_cols = std::max(data->num_cols, row.columns.size());
+            for (int64_t i = 0; i < weight; i++) {
+                data->rows.push_back(row);
+            }
         }
     }
 
-    // Determine column types from first row
-    if (!data->rows.empty()) {
+    // Build return schema
+    if (schema && !schema->columns.empty()) {
+        for (const auto &col : schema->columns) {
+            return_types.push_back(col.type);
+            names.push_back(col.name);
+        }
+        data->types = return_types;
+    } else if (!data->rows.empty()) {
+        // Infer from first row
         const auto &first = data->rows[0];
         for (size_t i = 0; i < first.columns.size(); i++) {
-            const auto &col = first.columns[i];
-            if (std::holds_alternative<int64_t>(col)) {
-                return_types.push_back(LogicalType::BIGINT);
-            } else if (std::holds_alternative<double>(col)) {
-                return_types.push_back(LogicalType::DOUBLE);
-            } else if (std::holds_alternative<bool>(col)) {
-                return_types.push_back(LogicalType::BOOLEAN);
-            } else {
-                return_types.push_back(LogicalType::VARCHAR);
-            }
+            return_types.push_back(first.columns[i].type());
             names.push_back("col" + std::to_string(i));
         }
+        data->types = return_types;
     } else {
         return_types.push_back(LogicalType::VARCHAR);
         names.push_back("result");
@@ -293,18 +346,7 @@ void QueryFunc(ClientContext &context, TableFunctionInput &input, DataChunk &out
         const auto &row = data.rows[data.current];
 
         for (idx_t col = 0; col < output.ColumnCount() && col < row.columns.size(); col++) {
-            const auto &val = row.columns[col];
-            Value dval;
-            if (std::holds_alternative<int64_t>(val)) {
-                dval = Value::BIGINT(std::get<int64_t>(val));
-            } else if (std::holds_alternative<double>(val)) {
-                dval = Value::DOUBLE(std::get<double>(val));
-            } else if (std::holds_alternative<bool>(val)) {
-                dval = Value::BOOLEAN(std::get<bool>(val));
-            } else {
-                dval = Value(std::get<std::string>(val));
-            }
-            output.SetValue(col, count, dval);
+            output.SetValue(col, count, row.columns[col]);
         }
 
         data.current++;
@@ -314,41 +356,89 @@ void QueryFunc(ClientContext &context, TableFunctionInput &input, DataChunk &out
 }
 
 // ============================================================================
-// dbsp_views - List views
+// dbsp_views - List all views
 // ============================================================================
 
-struct ListBindData : public TableFunctionData {
-    vector<string> names;
+struct ListViewsBindData : public TableFunctionData {
+    vector<dbsp_native::CDCManager::ViewInfo> views;
     idx_t current = 0;
 };
 
-unique_ptr<FunctionData> ListBind(ClientContext &context, TableFunctionBindInput &input,
-                                  vector<LogicalType> &return_types, vector<string> &names) {
-    auto data = make_uniq<ListBindData>();
+unique_ptr<FunctionData> ListViewsBind(ClientContext &context, TableFunctionBindInput &input,
+                                       vector<LogicalType> &return_types, vector<string> &names) {
+    auto data = make_uniq<ListViewsBindData>();
 
-    std::lock_guard<std::mutex> lock(g_mutex);
-    data->names = g_views.list_views();
+    auto &manager = dbsp_native::get_cdc_manager();
+    for (const auto &name : manager.list_views()) {
+        data->views.push_back(manager.get_view_info(name));
+    }
 
     return_types.push_back(LogicalType::VARCHAR);
     names.push_back("view_name");
+    return_types.push_back(LogicalType::VARCHAR);
+    names.push_back("sql");
     return_types.push_back(LogicalType::BIGINT);
     names.push_back("rows");
+    return_types.push_back(LogicalType::BIGINT);
+    names.push_back("version");
 
     return std::move(data);
 }
 
-void ListFunc(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
-    auto &data = input.bind_data->CastNoConst<ListBindData>();
+void ListViewsFunc(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+    auto &data = input.bind_data->CastNoConst<ListViewsBindData>();
 
     idx_t count = 0;
-    while (data.current < data.names.size() && count < STANDARD_VECTOR_SIZE) {
-        const auto &name = data.names[data.current];
+    while (data.current < data.views.size() && count < STANDARD_VECTOR_SIZE) {
+        const auto &view = data.views[data.current];
 
-        std::lock_guard<std::mutex> lock(g_mutex);
-        auto *view = g_views.get_view(name);
+        output.SetValue(0, count, Value(view.name));
+        output.SetValue(1, count, Value(view.sql));
+        output.SetValue(2, count, Value::BIGINT(view.row_count));
+        output.SetValue(3, count, Value::BIGINT(view.version));
 
-        output.SetValue(0, count, Value(name));
-        output.SetValue(1, count, Value::BIGINT(view ? view->row_count() : 0));
+        data.current++;
+        count++;
+    }
+    output.SetCardinality(count);
+}
+
+// ============================================================================
+// dbsp_tables - List tracked tables
+// ============================================================================
+
+struct ListTablesBindData : public TableFunctionData {
+    vector<string> tables;
+    idx_t current = 0;
+};
+
+unique_ptr<FunctionData> ListTablesBind(ClientContext &context, TableFunctionBindInput &input,
+                                        vector<LogicalType> &return_types, vector<string> &names) {
+    auto data = make_uniq<ListTablesBindData>();
+
+    auto &manager = dbsp_native::get_cdc_manager();
+    data->tables = manager.list_tracked_tables();
+
+    return_types.push_back(LogicalType::VARCHAR);
+    names.push_back("table_name");
+    return_types.push_back(LogicalType::BIGINT);
+    names.push_back("columns");
+
+    return std::move(data);
+}
+
+void ListTablesFunc(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+    auto &data = input.bind_data->CastNoConst<ListTablesBindData>();
+
+    auto &manager = dbsp_native::get_cdc_manager();
+
+    idx_t count = 0;
+    while (data.current < data.tables.size() && count < STANDARD_VECTOR_SIZE) {
+        const auto &table = data.tables[data.current];
+        const auto *schema = manager.get_table_schema(table);
+
+        output.SetValue(0, count, Value(table));
+        output.SetValue(1, count, Value::BIGINT(schema ? schema->columns.size() : 0));
 
         data.current++;
         count++;
@@ -362,8 +452,8 @@ void ListFunc(ClientContext &context, TableFunctionInput &input, DataChunk &outp
 
 void DropScalar(DataChunk &args, ExpressionState &state, Vector &result) {
     UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t name) {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        bool ok = g_views.remove_view(name.GetString());
+        auto &manager = dbsp_native::get_cdc_manager();
+        bool ok = manager.drop_view(name.GetString());
         return StringVector::AddString(result, ok ? "Dropped" : "Not found");
     });
 }
@@ -373,28 +463,41 @@ void DropScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 // ============================================================================
 
 static void LoadInternal(DatabaseInstance &instance) {
-    // dbsp_create_view
+    // dbsp_track
+    TableFunction track_fn("dbsp_track", {LogicalType::VARCHAR}, TrackFunc, TrackBind);
+    ExtensionUtil::RegisterFunction(instance, track_fn);
+
+    // dbsp_create_view (varargs for both SQL and simple mode)
     TableFunction create_fn("dbsp_create_view", {}, CreateViewFunc, CreateViewBind);
     create_fn.varargs = LogicalType::VARCHAR;
     ExtensionUtil::RegisterFunction(instance, create_fn);
 
-    // dbsp_insert
-    TableFunction insert_fn("dbsp_insert", {}, InsertFunc, ModifyBind);
-    insert_fn.varargs = LogicalType::ANY;
-    ExtensionUtil::RegisterFunction(instance, insert_fn);
+    // dbsp_notify_insert
+    TableFunction notify_insert_fn("dbsp_notify_insert", {}, NotifyInsertFunc, NotifyBind);
+    notify_insert_fn.varargs = LogicalType::ANY;
+    ExtensionUtil::RegisterFunction(instance, notify_insert_fn);
 
-    // dbsp_delete
-    TableFunction delete_fn("dbsp_delete", {}, DeleteFunc, ModifyBind);
-    delete_fn.varargs = LogicalType::ANY;
-    ExtensionUtil::RegisterFunction(instance, delete_fn);
+    // dbsp_notify_delete
+    TableFunction notify_delete_fn("dbsp_notify_delete", {}, NotifyDeleteFunc, NotifyBind);
+    notify_delete_fn.varargs = LogicalType::ANY;
+    ExtensionUtil::RegisterFunction(instance, notify_delete_fn);
+
+    // dbsp_sync
+    TableFunction sync_fn("dbsp_sync", {}, SyncFunc, SyncBind);
+    sync_fn.varargs = LogicalType::VARCHAR;
+    ExtensionUtil::RegisterFunction(instance, sync_fn);
 
     // dbsp_query
     TableFunction query_fn("dbsp_query", {LogicalType::VARCHAR}, QueryFunc, QueryBind);
     ExtensionUtil::RegisterFunction(instance, query_fn);
 
     // dbsp_views
-    TableFunction list_fn("dbsp_views", {}, ListFunc, ListBind);
-    ExtensionUtil::RegisterFunction(instance, list_fn);
+    TableFunction list_views_fn("dbsp_views", {}, ListViewsFunc, ListViewsBind);
+    ExtensionUtil::RegisterFunction(instance, list_views_fn);
+
+    // dbsp_tables
+    TableFunction list_tables_fn("dbsp_tables", {}, ListTablesFunc, ListTablesBind);
+    ExtensionUtil::RegisterFunction(instance, list_tables_fn);
 
     // dbsp_drop
     ScalarFunction drop_fn("dbsp_drop", {LogicalType::VARCHAR}, LogicalType::VARCHAR, DropScalar);
@@ -410,7 +513,7 @@ std::string DbspExtension::Name() {
 }
 
 std::string DbspExtension::Version() const {
-    return "0.1.0";
+    return "2.0.0";
 }
 
 } // namespace duckdb
@@ -422,6 +525,6 @@ DUCKDB_EXTENSION_API void dbsp_init(duckdb::DatabaseInstance &db) {
 }
 
 DUCKDB_EXTENSION_API const char *dbsp_version() {
-    return duckdb::DuckDB::LibraryVersion();
+    return "2.0.0";
 }
 }
