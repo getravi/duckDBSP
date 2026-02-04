@@ -29,8 +29,18 @@ target_link_libraries(dbsp PRIVATE dbsp_headers)
 
 # Tests
 if(BUILD_TESTS)
-    add_executable(dbsp_tests test/test_zset.cpp)
-    target_link_libraries(dbsp_tests PRIVATE dbsp_headers)
+    # Fetch Catch2 v3
+    include(FetchContent)
+    FetchContent_Declare(
+        Catch2
+        GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+        GIT_TAG v3.7.1
+    )
+    FetchContent_MakeAvailable(Catch2)
+
+    # Existing unit tests (will port to Catch2 later)
+    add_executable(dbsp_tests_old test/test_zset.cpp)
+    target_link_libraries(dbsp_tests_old PRIVATE dbsp_headers)
 endif()
 
 # Install headers
