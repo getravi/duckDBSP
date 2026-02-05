@@ -74,6 +74,37 @@ This will:
 LOAD '/path/to/dbsp.duckdb_extension';
 ```
 
+## Testing
+
+### Running Tests
+
+```bash
+# Build tests
+cd build
+cmake -DBUILD_TESTS=ON ..
+make
+
+# Run unit tests
+./unit_tests
+
+# Run integration tests (requires extension to be built)
+cd ../duckdb_extension && ./build.sh && cd ../build
+./integration_tests
+
+# Run benchmarks
+cmake -DBUILD_BENCHMARKS=ON ..
+make benchmarks
+./benchmarks
+```
+
+### Test Coverage
+
+- **Unit tests**: Core DBSP library, SQL parser, CDC manager
+- **Integration tests**: All extension functions, CDC, cascading views, persistence
+- **Benchmarks**: O(delta) performance validation
+
+See [docs/TESTING.md](docs/TESTING.md) for details.
+
 ## Documentation
 
 - [API Reference](docs/API.md) - Complete function reference
