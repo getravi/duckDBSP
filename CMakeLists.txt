@@ -44,6 +44,7 @@ if(BUILD_TESTS)
         test/unit/test_zset.cpp
         test/unit/test_sql_parser.cpp
         test/unit/test_cdc_manager.cpp
+        test/unit/test_security_validation.cpp
     )
     target_link_libraries(unit_tests PRIVATE dbsp_headers Catch2::Catch2)
     target_include_directories(unit_tests PRIVATE
@@ -62,6 +63,7 @@ if(BUILD_TESTS)
         test/integration/test_extension_cdc.cpp
         test/integration/test_cascading_views.cpp
         test/integration/test_persistence.cpp
+        test/integration/test_security.cpp
     )
     target_link_libraries(integration_tests PRIVATE
         dbsp_headers

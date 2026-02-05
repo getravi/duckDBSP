@@ -27,6 +27,63 @@
 
 namespace dbsp_native {
 
+// Security validation functions
+
+// Validate SQL identifier (table/view name) - only alphanumeric and underscore
+inline bool is_valid_identifier(const std::string& name) {
+    if (name.empty() || name.length() > 255) {
+        return false;
+    }
+    // First character must be letter or underscore
+    if (!std::isalpha(name[0]) && name[0] != '_') {
+        return false;
+    }
+    // Remaining characters must be alphanumeric or underscore
+    for (char c : name) {
+        if (!std::isalnum(c) && c != '_') {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Validate and canonicalize file path to prevent path traversal
+// Returns canonicalized path if valid, empty string if invalid
+inline std::string validate_filepath(const std::string& filepath) {
+    // Check for null bytes
+    if (filepath.find('\0') != std::string::npos) {
+        return "";
+    }
+
+    // Check for path traversal patterns
+    if (filepath.find("..") != std::string::npos) {
+        return "";
+    }
+
+    // Must not be absolute path starting with /
+    if (!filepath.empty() && filepath[0] == '/') {
+        return "";
+    }
+
+    // Must not start with ~ (home directory)
+    if (!filepath.empty() && filepath[0] == '~') {
+        return "";
+    }
+
+    // On Windows, check for drive letters and backslashes
+    #ifdef _WIN32
+    if (filepath.length() >= 2 && filepath[1] == ':') {
+        return "";  // Reject C:\ style paths
+    }
+    if (filepath.find('\\') != std::string::npos) {
+        return "";  // Reject backslashes
+    }
+    #endif
+
+    // Valid relative path
+    return filepath;
+}
+
 // View definition for persistence
 struct ViewDefinition {
     std::string name;
@@ -203,6 +260,12 @@ public:
     bool track_table(duckdb::ClientContext& context, const std::string& table_name) {
         std::lock_guard<std::mutex> lock(mutex_);
 
+        // Validate table name to prevent SQL injection
+        if (!is_valid_identifier(table_name)) {
+            last_error_ = "Invalid table name (must be alphanumeric/underscore only): " + table_name;
+            return false;
+        }
+
         if (tracked_tables_.count(table_name)) {
             return true;  // Already tracked
         }
@@ -234,6 +297,12 @@ public:
     bool create_view(duckdb::ClientContext& context, const std::string& view_name,
                      const std::string& sql) {
         std::lock_guard<std::mutex> lock(mutex_);
+
+        // Validate view name to prevent SQL injection
+        if (!is_valid_identifier(view_name)) {
+            last_error_ = "Invalid view name (must be alphanumeric/underscore only): " + view_name;
+            return false;
+        }
 
         // Check if view already exists
         if (views_.count(view_name)) {
@@ -441,6 +510,12 @@ public:
 
             // Insert view definitions
             for (const auto& [name, def] : view_definitions_) {
+                // Validate view name
+                if (!is_valid_identifier(name)) {
+                    last_error_ = "Invalid view name: " + name;
+                    return false;
+                }
+
                 // Join sources with comma
                 std::string sources;
                 for (size_t i = 0; i < def.source_tables.size(); i++) {
@@ -448,12 +523,14 @@ public:
                     sources += def.source_tables[i];
                 }
 
-                // Escape SQL string
+                // Escape SQL strings
+                std::string escaped_name = escape_string(name);
                 std::string escaped_sql = escape_string(def.sql);
+                std::string escaped_sources = escape_string(sources);
 
                 std::string insert_sql = "INSERT INTO " + storage_table +
-                    " VALUES ('" + name + "', '" + escaped_sql + "', '" +
-                    sources + "', " + std::to_string(def.created_at) + ")";
+                    " VALUES ('" + escaped_name + "', '" + escaped_sql + "', '" +
+                    escaped_sources + "', " + std::to_string(def.created_at) + ")";
 
                 result = context.Query(insert_sql, false);
                 if (result->HasError()) {
@@ -469,7 +546,13 @@ public:
             context.Query("DELETE FROM " + tables_table, false);
 
             for (const auto& [name, _] : tracked_tables_) {
-                context.Query("INSERT INTO " + tables_table + " VALUES ('" + name + "')", false);
+                // Validate table name
+                if (!is_valid_identifier(name)) {
+                    last_error_ = "Invalid table name: " + name;
+                    return false;
+                }
+                std::string escaped_name = escape_string(name);
+                context.Query("INSERT INTO " + tables_table + " VALUES ('" + escaped_name + "')", false);
             }
 
             return true;
@@ -554,9 +637,16 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
 
         try {
-            std::ofstream file(filepath);
+            // Validate filepath to prevent path traversal
+            std::string validated_path = validate_filepath(filepath);
+            if (validated_path.empty()) {
+                last_error_ = "Invalid file path (must be relative, no path traversal): " + filepath;
+                return false;
+            }
+
+            std::ofstream file(validated_path);
             if (!file.is_open()) {
-                last_error_ = "Could not open file: " + filepath;
+                last_error_ = "Could not open file: " + validated_path;
                 return false;
             }
 
@@ -608,9 +698,16 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
 
         try {
-            std::ifstream file(filepath);
+            // Validate filepath to prevent path traversal
+            std::string validated_path = validate_filepath(filepath);
+            if (validated_path.empty()) {
+                last_error_ = "Invalid file path (must be relative, no path traversal): " + filepath;
+                return false;
+            }
+
+            std::ifstream file(validated_path);
             if (!file.is_open()) {
-                last_error_ = "Could not open file: " + filepath;
+                last_error_ = "Could not open file: " + validated_path;
                 return false;
             }
 
