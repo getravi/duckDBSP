@@ -49,6 +49,23 @@ if(BUILD_TESTS)
     enable_testing()
     add_test(NAME unit_tests COMMAND unit_tests)
 
+    # Integration tests (requires DuckDB)
+    add_executable(integration_tests
+        test/catch2_main.cpp
+        test/integration/test_extension_basic.cpp
+    )
+    target_link_libraries(integration_tests PRIVATE
+        dbsp_headers
+        Catch2::Catch2
+    )
+    target_include_directories(integration_tests PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/duckdb_extension
+        ${CMAKE_SOURCE_DIR}/duckdb_extension/duckdb/src/include
+    )
+
+    add_test(NAME integration_tests COMMAND integration_tests)
+
     # Existing unit tests (will port to Catch2 later)
     add_executable(dbsp_tests_old test/test_zset.cpp)
     target_link_libraries(dbsp_tests_old PRIVATE dbsp_headers)
