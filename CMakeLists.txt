@@ -80,6 +80,25 @@ if(BUILD_TESTS)
     target_link_libraries(dbsp_tests_old PRIVATE dbsp_headers)
 endif()
 
+# Benchmarks
+option(BUILD_BENCHMARKS "Build benchmarks" OFF)
+
+if(BUILD_BENCHMARKS)
+    add_executable(benchmarks
+        test/catch2_main.cpp
+        test/benchmarks/bench_incremental.cpp
+    )
+    target_link_libraries(benchmarks PRIVATE
+        dbsp_headers
+        Catch2::Catch2
+    )
+    target_include_directories(benchmarks PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/duckdb_extension
+        ${CMAKE_SOURCE_DIR}/duckdb_extension/duckdb/src/include
+    )
+endif()
+
 # Install headers
 install(DIRECTORY include/ DESTINATION include/dbsp)
 
