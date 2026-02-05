@@ -53,6 +53,7 @@ if(BUILD_TESTS)
     add_executable(integration_tests
         test/catch2_main.cpp
         test/integration/test_extension_basic.cpp
+        test/integration/test_extension_cdc.cpp
     )
     target_link_libraries(integration_tests PRIVATE
         dbsp_headers
