@@ -55,6 +55,7 @@ if(BUILD_TESTS)
         test/integration/test_extension_basic.cpp
         test/integration/test_extension_cdc.cpp
         test/integration/test_cascading_views.cpp
+        test/integration/test_persistence.cpp
     )
     target_link_libraries(integration_tests PRIVATE
         dbsp_headers
