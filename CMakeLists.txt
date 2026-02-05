@@ -43,6 +43,7 @@ if(BUILD_TESTS)
         test/catch2_main.cpp
         test/unit/test_zset.cpp
         test/unit/test_sql_parser.cpp
+        test/unit/test_cdc_manager.cpp
     )
     target_link_libraries(unit_tests PRIVATE dbsp_headers Catch2::Catch2)
     target_include_directories(unit_tests PRIVATE
