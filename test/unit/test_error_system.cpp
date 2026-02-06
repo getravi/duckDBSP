@@ -32,3 +32,47 @@ TEST_CASE("ErrorInfo structure", "[errors]") {
         REQUIRE(info.error_position == 30);
     }
 }
+
+TEST_CASE("Error formatting - Basic", "[errors][format]") {
+    SECTION("Format error with code and message") {
+        ErrorInfo info;
+        info.code = ErrorCode::HAVING_NOT_SUPPORTED;
+        info.message = "HAVING clause detected";
+
+        std::string formatted = format_error(info);
+
+        REQUIRE(formatted.find("DBSP-E101") != std::string::npos);
+        REQUIRE(formatted.find("HAVING clause detected") != std::string::npos);
+        REQUIRE(formatted.find("Documentation:") != std::string::npos);
+    }
+}
+
+TEST_CASE("Error formatting - SQL highlighting", "[errors][format]") {
+    SECTION("Show SQL with position marker") {
+        ErrorInfo info;
+        info.code = ErrorCode::ORDER_BY_NOT_SUPPORTED;
+        info.message = "ORDER BY clause detected";
+        info.sql = "SELECT * FROM orders ORDER BY created_at";
+        info.error_position = 22; // Position of "ORDER"
+
+        std::string formatted = format_error(info);
+
+        REQUIRE(formatted.find("SQL:") != std::string::npos);
+        REQUIRE(formatted.find(info.sql) != std::string::npos);
+        REQUIRE(formatted.find("^") != std::string::npos);
+    }
+}
+
+TEST_CASE("Error formatting - Workaround", "[errors][format]") {
+    SECTION("Include workaround if provided") {
+        ErrorInfo info;
+        info.code = ErrorCode::LIMIT_NOT_SUPPORTED;
+        info.message = "LIMIT clause detected";
+        info.workaround = "Query view and apply LIMIT in outer query";
+
+        std::string formatted = format_error(info);
+
+        REQUIRE(formatted.find("Workaround:") != std::string::npos);
+        REQUIRE(formatted.find("Query view and apply LIMIT") != std::string::npos);
+    }
+}

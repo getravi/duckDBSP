@@ -58,4 +58,54 @@ struct ErrorInfo {
     std::string doc_link;          // Path to error documentation
 };
 
+// Format error code as DBSP-Exxx string
+inline std::string format_error_code(ErrorCode code) {
+    std::stringstream ss;
+    ss << "DBSP-E" << std::setfill('0') << std::setw(3)
+       << static_cast<int>(code);
+    return ss.str();
+}
+
+// Get documentation link for error code
+inline std::string get_doc_link(ErrorCode code) {
+    int category = static_cast<int>(code) / 100;
+    std::stringstream ss;
+    ss << "docs/errors/E" << category << "xx/"
+       << format_error_code(code) << ".md";
+    return ss.str();
+}
+
+// Format complete error message with SQL highlighting
+inline std::string format_error(const ErrorInfo& info) {
+    std::stringstream ss;
+
+    // Error code and message
+    ss << format_error_code(info.code) << ": " << info.message << "\n\n";
+
+    // Show SQL with position marker if available
+    if (!info.sql.empty()) {
+        ss << "SQL:\n" << info.sql << "\n";
+        if (info.error_position > 0 && info.error_position < info.sql.length()) {
+            ss << std::string(info.error_position, ' ') << "^\n";
+        }
+        ss << "\n";
+    }
+
+    // Context (view name, etc.)
+    if (!info.context.empty()) {
+        ss << "Context: " << info.context << "\n\n";
+    }
+
+    // Workaround
+    if (!info.workaround.empty()) {
+        ss << "Workaround:\n" << info.workaround << "\n\n";
+    }
+
+    // Documentation link
+    std::string doc_link = info.doc_link.empty() ? get_doc_link(info.code) : info.doc_link;
+    ss << "Documentation: " << doc_link << "\n";
+
+    return ss.str();
+}
+
 } // namespace dbsp_native
