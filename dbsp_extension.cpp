@@ -85,8 +85,14 @@ void TrackFunc(ClientContext &context, TableFunctionInput &input,
   bool ok = manager.track_table(context, data.table_name);
 
   if (!ok) {
-    throw InvalidInputException("Failed to track table '%s': %s",
-                                data.table_name, manager.last_error());
+    std::string formatted_error = manager.last_error();
+    // If last_error doesn't contain DBSP-E code, it's an old-style error
+    if (formatted_error.find("DBSP-E") == std::string::npos) {
+      // Wrap in generic format for consistency
+      formatted_error = "Failed to track table '" + data.table_name +
+                       "': " + formatted_error;
+    }
+    throw InvalidInputException(formatted_error);
   }
 
   output.SetCardinality(1);
@@ -160,8 +166,14 @@ void CreateViewFunc(ClientContext &context, TableFunctionInput &input,
     // SQL mode - use the parser
     bool ok = manager.create_view(context, data.view_name, data.sql_or_table);
     if (!ok) {
-      throw InvalidInputException("Failed to create view '%s': %s",
-                                  data.view_name, manager.last_error());
+      std::string formatted_error = manager.last_error();
+      // If last_error doesn't contain DBSP-E code, it's an old-style error
+      if (formatted_error.find("DBSP-E") == std::string::npos) {
+        // Wrap in generic format for consistency
+        formatted_error = "Failed to create view '" + data.view_name +
+                         "': " + formatted_error;
+      }
+      throw InvalidInputException(formatted_error);
     }
     auto info = manager.get_view_info(data.view_name);
     result = "Created view: " + data.view_name + " (sources: ";
@@ -195,8 +207,14 @@ void CreateViewFunc(ClientContext &context, TableFunctionInput &input,
 
     bool ok = manager.create_view(context, data.view_name, sql);
     if (!ok) {
-      throw InvalidInputException("Failed to create view '%s': %s",
-                                  data.view_name, manager.last_error());
+      std::string formatted_error = manager.last_error();
+      // If last_error doesn't contain DBSP-E code, it's an old-style error
+      if (formatted_error.find("DBSP-E") == std::string::npos) {
+        // Wrap in generic format for consistency
+        formatted_error = "Failed to create view '" + data.view_name +
+                         "': " + formatted_error;
+      }
+      throw InvalidInputException(formatted_error);
     }
     result = "Created " + type + " view: " + data.view_name;
   }
