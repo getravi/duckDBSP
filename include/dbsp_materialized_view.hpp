@@ -6,6 +6,7 @@
 #include "dbsp_circuit.hpp"
 #include "dbsp_stream.hpp"
 #include "dbsp_zset.hpp"
+#include "../dbsp_errors.hpp"
 
 #include <chrono>
 #include <functional>
@@ -18,6 +19,13 @@
 #include <vector>
 
 namespace dbsp {
+
+// Validation result for view updates
+struct ValidationResult {
+    bool success = true;
+    std::string error_message;
+    dbsp_native::ErrorCode error_code = dbsp_native::ErrorCode::VIEW_UPDATE_FAILED;
+};
 
 // Represents a row in a table (simplified for demonstration)
 // In a real implementation, this would integrate with DuckDB's Value/Vector types
@@ -101,6 +109,13 @@ public:
     // Get statistics
     virtual size_t row_count() const = 0;
     virtual uint64_t version() const = 0;
+
+    // Validate changes before applying (for ACID compliance)
+    virtual ValidationResult validate_changes(const RowZSet& changes) {
+        // Default: accept all changes
+        // Subclasses can override for type checking, constraint validation, etc.
+        return ValidationResult{true, "", dbsp_native::ErrorCode::VIEW_UPDATE_FAILED};
+    }
 
 protected:
     std::string name_;
