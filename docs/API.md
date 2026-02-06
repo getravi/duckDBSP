@@ -423,19 +423,59 @@ SELECT * FROM dbsp_notify_delete('orders', 1, 'Alice', 100.00);
 
 ## Error Handling
 
-All functions return error messages in the result when operations fail:
+duckDBSP uses a structured error code system (DBSP-Exxx) that provides:
+
+- **Error codes** in format `DBSP-E{category}{number}` (e.g., DBSP-E101)
+- **Clear descriptions** of what went wrong
+- **SQL highlighting** with position markers (^) showing exactly where the error occurred
+- **Workarounds** suggesting alternative approaches for unsupported features
+- **Documentation links** to detailed error explanations
+
+### Error Categories
+
+| Category | Description | Examples |
+|----------|-------------|----------|
+| **E1xx** | Parser errors (unsupported SQL) | E101 (HAVING), E102 (ORDER BY) |
+| **E2xx** | Validation errors (invalid input) | E201 (Invalid identifier) |
+| **E3xx** | Runtime errors (execution failures) | E301 (View update failed) |
+| **E4xx** | Resource errors (limits exceeded) | E401 (Too many views) |
+| **E5xx** | Persistence errors (I/O failures) | E501 (Load failed) |
+
+### Example Error
 
 ```sql
-SELECT * FROM dbsp_create_view('dup', 'SELECT * FROM orders');
-SELECT * FROM dbsp_create_view('dup', 'SELECT * FROM orders');
--- Returns: "Error: View already exists: dup"
+SELECT * FROM dbsp_create_view('high_orders',
+    'SELECT customer, SUM(amt) FROM orders GROUP BY customer HAVING SUM(amt) > 1000');
 
-SELECT dbsp_drop('totals');  -- When other views depend on it
--- Returns: "Cannot drop view: other views depend on it: vip_totals"
+-- Error:
+-- DBSP-E101: HAVING clause in GROUP BY
+--
+-- SQL:
+-- SELECT customer, SUM(amt) FROM orders GROUP BY customer HAVING SUM(amt) > 1000
+--                                                          ^
+--
+-- Workaround:
+-- Use a nested view: create a view with GROUP BY, then create another view
+-- with WHERE clause to filter the aggregated results. Tracked in TODO #3.
+--
+-- Documentation: docs/errors/E1xx/DBSP-E101.md
+```
 
+### Legacy Error Messages
+
+Some operations still return simple error strings:
+
+```sql
 SELECT * FROM dbsp_query('nonexistent');
 -- Throws: InvalidInputException("View not found: nonexistent")
 ```
+
+### Getting Help
+
+For complete error documentation and troubleshooting:
+- See [Error Handling Guide](ERROR_HANDLING.md)
+- Browse [Error Catalog](errors/README.md)
+- Check specific error docs in `docs/errors/E{category}xx/`
 
 ---
 

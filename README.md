@@ -150,6 +150,17 @@ See [docs/TESTING.md](docs/TESTING.md) for details.
 | `dbsp_notify_insert(table, ...)` | Notify of row insertion |
 | `dbsp_notify_delete(table, ...)` | Notify of row deletion |
 
+## Error Handling
+
+duckDBSP uses a structured error code system (DBSP-Exxx) with helpful error messages:
+
+- **Clear descriptions** of what went wrong
+- **SQL highlighting** showing exactly where the error occurred
+- **Workarounds** for unsupported features
+- **Documentation links** for detailed guidance
+
+See [Error Handling Guide](docs/ERROR_HANDLING.md) for details.
+
 ## Supported SQL Features
 
 ### Currently Supported
