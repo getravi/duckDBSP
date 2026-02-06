@@ -1082,14 +1082,17 @@ void LoadInternal(ExtensionLoader &loader) {
 extern "C" {
 // Entry point for C++ ABI extensions - DuckDB expects <name>_duckdb_cpp_init
 DUCKDB_EXTENSION_API void dbsp_duckdb_cpp_init(duckdb::DatabaseInstance &db) {
-  // TODO: Register parser extension for CREATE/DROP/REFRESH MATERIALIZED VIEW
-  // Need to find the correct API for registering parser extensions
-  // auto parser_ext = dbsp_native::CreateMaterializedViewParserExtension();
-  // db.GetConfig().parser_extensions.push_back(parser_ext);
+  // TODO: Fix extension loading - LoadInternal causes "Missing DB manager" error
+  // This appears to be a timing issue where ExtensionLoader tries to access
+  // the database manager before it's fully initialized.
+  //
+  // For now, extension loads but functions are not registered.
+  // Need to either:
+  // 1. Use Extension base class with Load() method
+  // 2. Find correct timing for registration
+  // 3. Use different registration API
 
-  // Register table functions
-  duckdb::ExtensionLoader loader(db, "dbsp");
-  duckdb::LoadInternal(loader);
+  (void)db; // Suppress unused parameter warning
 }
 
 // Legacy entry point for compatibility
