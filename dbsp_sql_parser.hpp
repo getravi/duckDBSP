@@ -182,7 +182,7 @@ public:
     // Parse GROUP BY
     if (!select.groups.grouping_sets.empty()) {
       // Check for HAVING clause (not supported yet)
-      if (select.groups.having) {
+      if (select.having) {
         return make_error(ErrorCode::HAVING_NOT_SUPPORTED,
                          "HAVING clause in GROUP BY",
                          result.view_def.sql);
