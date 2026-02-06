@@ -1287,6 +1287,20 @@ private:
     return result;
   }
 
+  // Format runtime error with context
+  std::string format_runtime_error(ErrorCode code, const std::string &view_name,
+                                   const std::string &details,
+                                   const std::string &source_name) {
+    ErrorInfo info;
+    info.code = code;
+    info.message = details;
+    info.context = "View: " + view_name + ", Source: " + source_name;
+    info.workaround = get_workaround(code);
+    info.doc_link = get_doc_link(code);
+
+    return format_error(info);
+  }
+
   std::string escape_json(const std::string &s) {
     std::string result;
     for (char c : s) {

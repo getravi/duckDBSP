@@ -94,6 +94,14 @@ target_link_libraries(test_security catch2_main duckdb_static)
 target_compile_definitions(test_security PRIVATE DUCKDB_EXTENSION_MAIN)
 add_test(NAME security COMMAND test_security)
 
+add_executable(test_acid_compliance
+    integration/test_acid_compliance.cpp
+    ../dbsp_extension.cpp
+)
+target_link_libraries(test_acid_compliance catch2_main duckdb_static)
+target_compile_definitions(test_acid_compliance PRIVATE DUCKDB_EXTENSION_MAIN)
+add_test(NAME acid_compliance COMMAND test_acid_compliance)
+
 # Benchmarks
 add_executable(bench_incremental
     benchmarks/bench_incremental.cpp
@@ -106,7 +114,7 @@ add_test(NAME benchmark_incremental COMMAND bench_incremental)
 message(STATUS "")
 message(STATUS "DBSP Test Suite Configuration Complete")
 message(STATUS "  Unit tests: 7")
-message(STATUS "  Integration tests: 5")
+message(STATUS "  Integration tests: 6")
 message(STATUS "  Benchmarks: 1")
 message(STATUS "")
 message(STATUS "Run tests with: cd build_test && ctest --output-on-failure")
