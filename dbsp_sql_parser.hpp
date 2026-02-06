@@ -4,6 +4,7 @@
 #pragma once
 
 #include "dbsp_duckdb_types.hpp"
+#include "dbsp_errors.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
@@ -90,6 +91,7 @@ public:
   struct ParseResult {
     bool success = false;
     std::string error;
+    ErrorCode error_code = ErrorCode::HAVING_NOT_SUPPORTED; // Default, will be overwritten
     ParsedViewDef view_def;
   };
 

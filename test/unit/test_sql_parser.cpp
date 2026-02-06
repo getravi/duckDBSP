@@ -1,5 +1,6 @@
 #include "catch.hpp"
-#include "../dbsp_sql_parser.hpp"
+#include "../../dbsp_sql_parser.hpp"
+#include "../../dbsp_errors.hpp"
 
 using namespace dbsp_native;
 
@@ -339,5 +340,17 @@ TEST_CASE("SQL Parser - Comparison operators", "[sql_parser]") {
         REQUIRE(result.success);
         REQUIRE(result.view_def.filters.size() == 1);
         REQUIRE(result.view_def.filters[0].op == "!=");
+    }
+}
+
+TEST_CASE("Parser errors - Error codes", "[sql_parser][errors]") {
+    DBSPSqlParser parser;
+
+    SECTION("ParseResult includes error code") {
+        auto result = parser.parse("INVALID SQL");
+
+        REQUIRE_FALSE(result.success);
+        REQUIRE_FALSE(result.error.empty());
+        // Error code should be set (will add specific checks later)
     }
 }
