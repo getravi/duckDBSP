@@ -112,10 +112,18 @@ target_link_libraries(bench_incremental catch2_main duckdb_static)
 target_compile_definitions(bench_incremental PRIVATE DUCKDB_EXTENSION_MAIN)
 add_test(NAME benchmark_incremental COMMAND bench_incremental)
 
+add_executable(test_error_handling_e2e
+    integration/test_error_handling_e2e.cpp
+    ../dbsp_extension.cpp
+)
+target_link_libraries(test_error_handling_e2e catch2_main duckdb_static)
+target_compile_definitions(test_error_handling_e2e PRIVATE DUCKDB_EXTENSION_MAIN)
+add_test(NAME error_handling_e2e COMMAND test_error_handling_e2e)
+
 message(STATUS "")
 message(STATUS "DBSP Test Suite Configuration Complete")
 message(STATUS "  Unit tests: 8")
-message(STATUS "  Integration tests: 6")
+message(STATUS "  Integration tests: 7")
 message(STATUS "  Benchmarks: 1")
 message(STATUS "")
 message(STATUS "Run tests with: cd build_test && ctest --output-on-failure")
