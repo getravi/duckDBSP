@@ -184,6 +184,25 @@ public:
       return result;
     }
 
+    // Check for window functions in SELECT list
+    for (size_t i = 0; i < select.select_list.size(); i++) {
+      auto &expr = select.select_list[i];
+      if (expr->type == duckdb::ExpressionType::WINDOW_AGGREGATE ||
+          expr->type == duckdb::ExpressionType::WINDOW_RANK_DENSE ||
+          expr->type == duckdb::ExpressionType::WINDOW_RANK ||
+          expr->type == duckdb::ExpressionType::WINDOW_PERCENT_RANK ||
+          expr->type == duckdb::ExpressionType::WINDOW_ROW_NUMBER ||
+          expr->type == duckdb::ExpressionType::WINDOW_FIRST_VALUE ||
+          expr->type == duckdb::ExpressionType::WINDOW_LAST_VALUE ||
+          expr->type == duckdb::ExpressionType::WINDOW_NTILE ||
+          expr->type == duckdb::ExpressionType::WINDOW_LEAD ||
+          expr->type == duckdb::ExpressionType::WINDOW_LAG) {
+        return make_error(ErrorCode::WINDOW_FUNCTIONS_NOT_SUPPORTED,
+                         "Window function detected in SELECT list",
+                         result.view_def.sql);
+      }
+    }
+
     // Parse SELECT columns
     parse_select_list(select.select_list, result.view_def);
 

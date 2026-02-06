@@ -77,3 +77,27 @@ TEST_CASE("Parser errors - LIMIT clause", "[parser][errors][e103]") {
         REQUIRE(result.error_code == ErrorCode::LIMIT_NOT_SUPPORTED);
     }
 }
+
+TEST_CASE("Parser errors - Window functions", "[parser][errors][e104]") {
+    DBSPSqlParser parser;
+
+    SECTION("ROW_NUMBER window function") {
+        auto result = parser.parse(
+            "SELECT *, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary) FROM emp",
+            "ranked_emp");
+
+        REQUIRE_FALSE(result.success);
+        REQUIRE(result.error_code == ErrorCode::WINDOW_FUNCTIONS_NOT_SUPPORTED);
+        REQUIRE(result.error.find("DBSP-E104") != std::string::npos);
+        REQUIRE(result.error.find("Window") != std::string::npos);
+    }
+
+    SECTION("RANK window function") {
+        auto result = parser.parse(
+            "SELECT *, RANK() OVER (ORDER BY salary DESC) FROM emp",
+            "ranked_emp");
+
+        REQUIRE_FALSE(result.success);
+        REQUIRE(result.error_code == ErrorCode::WINDOW_FUNCTIONS_NOT_SUPPORTED);
+    }
+}
