@@ -123,12 +123,12 @@ inline ParserExtensionParseResult ParseCreateMaterializedView(const string &quer
     }
 
     result->view_name = query.substr(pos, as_pos - pos);
-    result->view_name = StringUtil::Trim(result->view_name);
+    StringUtil::Trim(result->view_name);
 
     // Extract SELECT query (everything after AS)
     pos = as_pos + 4; // Skip " AS "
     result->select_query = query.substr(pos);
-    result->select_query = StringUtil::Trim(result->select_query);
+    StringUtil::Trim(result->select_query);
 
     // Remove trailing semicolon if present
     if (!result->select_query.empty() && result->select_query.back() == ';') {
@@ -173,12 +173,12 @@ inline ParserExtensionParseResult ParseDropMaterializedView(const string &query)
     }
 
     result->view_name = query.substr(pos, end_pos - pos);
-    result->view_name = StringUtil::Trim(result->view_name);
+    StringUtil::Trim(result->view_name);
 
     // Remove trailing semicolon
     if (!result->view_name.empty() && result->view_name.back() == ';') {
         result->view_name.pop_back();
-        result->view_name = StringUtil::Trim(result->view_name);
+        StringUtil::Trim(result->view_name);
     }
 
     return ParserExtensionParseResult(std::move(result));
@@ -198,12 +198,12 @@ inline ParserExtensionParseResult ParseRefreshMaterializedView(const string &que
     while (pos < query.length() && std::isspace(query[pos])) pos++;
 
     result->view_name = query.substr(pos);
-    result->view_name = StringUtil::Trim(result->view_name);
+    StringUtil::Trim(result->view_name);
 
     // Remove trailing semicolon
     if (!result->view_name.empty() && result->view_name.back() == ';') {
         result->view_name.pop_back();
-        result->view_name = StringUtil::Trim(result->view_name);
+        StringUtil::Trim(result->view_name);
     }
 
     return ParserExtensionParseResult(std::move(result));

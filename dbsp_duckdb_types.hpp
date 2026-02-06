@@ -40,6 +40,29 @@ struct DuckDBRow {
     }
     return true;
   }
+
+  // Ordering operator for std::set compatibility
+  // Provides strict weak ordering with NULL < non-NULL
+  bool operator<(const DuckDBRow &other) const {
+    if (columns.size() != other.columns.size())
+      return columns.size() < other.columns.size();
+
+    for (size_t i = 0; i < columns.size(); i++) {
+      bool this_null = columns[i].IsNull();
+      bool other_null = other.columns[i].IsNull();
+
+      // NULL < non-NULL
+      if (this_null && !other_null) return true;
+      if (!this_null && other_null) return false;
+      if (this_null && other_null) continue; // Both NULL, check next column
+
+      // Both non-NULL: use DuckDB value comparison
+      if (columns[i] < other.columns[i]) return true;
+      if (other.columns[i] < columns[i]) return false;
+      // Equal, continue to next column
+    }
+    return false; // All columns equal
+  }
 };
 
 // Hash function for DuckDBRow - NULL-aware

@@ -940,7 +940,7 @@ ParserExtensionPlanResult MaterializedViewPlan(
   ParserExtensionPlanResult result;
 
   // Handle CREATE MATERIALIZED VIEW
-  if (auto *create_data = dynamic_cast<CreateMaterializedViewParseData *>(parse_data_p.get())) {
+  if (auto *create_data = dynamic_cast<::dbsp_native::CreateMaterializedViewParseData *>(parse_data_p.get())) {
     TableFunction func("create_materialized_view",
                       {LogicalType::VARCHAR, LogicalType::VARCHAR},
                       CreateMaterializedViewExecute, nullptr,
@@ -960,7 +960,7 @@ ParserExtensionPlanResult MaterializedViewPlan(
   }
 
   // Handle DROP MATERIALIZED VIEW
-  if (auto *drop_data = dynamic_cast<DropMaterializedViewParseData *>(parse_data_p.get())) {
+  if (auto *drop_data = dynamic_cast<::dbsp_native::DropMaterializedViewParseData *>(parse_data_p.get())) {
     TableFunction func("drop_materialized_view",
                       {LogicalType::VARCHAR, LogicalType::BOOLEAN},
                       DropMaterializedViewExecute, nullptr,
@@ -980,7 +980,7 @@ ParserExtensionPlanResult MaterializedViewPlan(
   }
 
   // Handle REFRESH MATERIALIZED VIEW
-  if (auto *refresh_data = dynamic_cast<RefreshMaterializedViewParseData *>(parse_data_p.get())) {
+  if (auto *refresh_data = dynamic_cast<::dbsp_native::RefreshMaterializedViewParseData *>(parse_data_p.get())) {
     TableFunction func("refresh_materialized_view",
                       {LogicalType::VARCHAR},
                       RefreshMaterializedViewExecute, nullptr,
@@ -1082,9 +1082,10 @@ void LoadInternal(ExtensionLoader &loader) {
 extern "C" {
 // Entry point for C++ ABI extensions - DuckDB expects <name>_duckdb_cpp_init
 DUCKDB_EXTENSION_API void dbsp_duckdb_cpp_init(duckdb::DatabaseInstance &db) {
-  // Register parser extension for CREATE/DROP/REFRESH MATERIALIZED VIEW
-  auto parser_ext = dbsp_native::CreateMaterializedViewParserExtension();
-  db.GetConfig().parser_extensions.push_back(parser_ext);
+  // TODO: Register parser extension for CREATE/DROP/REFRESH MATERIALIZED VIEW
+  // Need to find the correct API for registering parser extensions
+  // auto parser_ext = dbsp_native::CreateMaterializedViewParserExtension();
+  // db.GetConfig().parser_extensions.push_back(parser_ext);
 
   // Register table functions
   duckdb::ExtensionLoader loader(db, "dbsp");
