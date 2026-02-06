@@ -21,11 +21,20 @@ using Weight = int64_t;
 struct DuckDBRow {
   std::vector<duckdb::Value> columns;
 
+  // Default equality: NULL-aware for GROUP BY/DISTINCT semantics
+  // In GROUP BY and DISTINCT: NULL == NULL (same group)
   bool operator==(const DuckDBRow &other) const {
     if (columns.size() != other.columns.size())
       return false;
     for (size_t i = 0; i < columns.size(); i++) {
-      // Use DuckDB's value comparison
+      bool this_null = columns[i].IsNull();
+      bool other_null = other.columns[i].IsNull();
+
+      // For GROUP BY/DISTINCT: NULL == NULL
+      if (this_null && other_null) continue;
+      if (this_null || other_null) return false;
+
+      // Use DuckDB's value comparison for non-NULL
       if (columns[i] != other.columns[i])
         return false;
     }
@@ -33,15 +42,42 @@ struct DuckDBRow {
   }
 };
 
-// Hash function for DuckDBRow
+// Hash function for DuckDBRow - NULL-aware
 struct DuckDBRowHash {
+  static constexpr size_t NULL_HASH = 0x9e3779b97f4a7c15ULL;
+
   size_t operator()(const DuckDBRow &row) const noexcept {
     size_t hash = 0;
     for (const auto &col : row.columns) {
-      size_t col_hash = col.Hash();
+      size_t col_hash;
+      if (col.IsNull()) {
+        col_hash = NULL_HASH;  // Special hash for NULL
+      } else {
+        col_hash = col.Hash();
+      }
       hash ^= col_hash + 0x9e3779b9 + (hash << 6) + (hash >> 2);
     }
     return hash;
+  }
+};
+
+// JOIN-specific equality: NULL never matches NULL (SQL standard for JOINs)
+struct JoinRowEqual {
+  bool operator()(const DuckDBRow &a, const DuckDBRow &b) const {
+    if (a.columns.size() != b.columns.size())
+      return false;
+
+    for (size_t i = 0; i < a.columns.size(); i++) {
+      // In JOIN: NULL != NULL (no match)
+      if (a.columns[i].IsNull() || b.columns[i].IsNull()) {
+        return false;
+      }
+
+      if (a.columns[i] != b.columns[i]) {
+        return false;
+      }
+    }
+    return true;
   }
 };
 
@@ -247,6 +283,8 @@ protected:
 };
 
 // Filter view: SELECT * FROM table WHERE condition
+// NOTE: PredicateFn must implement three-valued logic (TRUE/FALSE/UNKNOWN)
+// where UNKNOWN (NULL comparisons) returns false (filtered out)
 class NativeFilterView : public NativeMaterializedView {
 public:
   using PredicateFn = std::function<bool(const DuckDBRow &)>;
@@ -356,30 +394,45 @@ public:
     if (table_name != source_table_)
       return;
 
-    // Group changes by key
+    // Group changes by key - NULL-aware
     std::unordered_map<DuckDBRow, int64_t, DuckDBRowHash> delta_sums;
     std::unordered_map<DuckDBRow, int64_t, DuckDBRowHash> delta_counts;
+    std::unordered_map<DuckDBRow, int64_t, DuckDBRowHash> delta_null_counts;
 
     for (const auto &[row, weight] : changes) {
       DuckDBRow key = key_fn_(row);
       duckdb::Value val = value_fn_(row);
 
-      int64_t int_val = 0;
-      if (val.type().IsNumeric()) {
-        int_val = val.GetValue<int64_t>();
-      }
+      // SQL Standard: NULL values are ignored in aggregates (except COUNT(*))
+      if (val.IsNull()) {
+        delta_null_counts[key] += weight;
+        // Don't update delta_sums or delta_counts for NULL values
+      } else {
+        int64_t int_val = 0;
+        if (val.type().IsNumeric()) {
+          int_val = val.GetValue<int64_t>();
+        }
 
-      delta_sums[key] += int_val * weight;
-      delta_counts[key] += weight;
+        delta_sums[key] += int_val * weight;
+        delta_counts[key] += weight;
+      }
     }
 
-    // Update aggregates
-    for (const auto &[key, delta_sum] : delta_sums) {
+    // Update aggregates - NULL-aware
+    std::set<DuckDBRow> all_keys;
+    for (const auto &[key, _] : delta_sums) all_keys.insert(key);
+    for (const auto &[key, _] : delta_counts) all_keys.insert(key);
+    for (const auto &[key, _] : delta_null_counts) all_keys.insert(key);
+
+    for (const auto &key : all_keys) {
       auto &state = agg_states_[key];
+
+      int64_t delta_sum = delta_sums[key];
       int64_t delta_count = delta_counts[key];
+      int64_t delta_null_count = delta_null_counts[key];
 
       // Remove old result
-      if (state.count > 0) {
+      if (state.count > 0 || state.null_count > 0) {
         DuckDBRow old_result = make_result_row(key, compute_agg(state));
         result_.insert(old_result, -1);
       }
@@ -387,9 +440,10 @@ public:
       // Update state
       state.sum += delta_sum;
       state.count += delta_count;
+      state.null_count += delta_null_count;
 
       // Add new result
-      if (state.count > 0) {
+      if (state.count > 0 || state.null_count > 0) {
         DuckDBRow new_result = make_result_row(key, compute_agg(state));
         result_.insert(new_result, 1);
       } else {
@@ -415,26 +469,39 @@ public:
 private:
   struct AggState {
     int64_t sum = 0;
-    int64_t count = 0;
+    int64_t count = 0;         // Non-NULL count (for COUNT(column))
+    int64_t null_count = 0;    // NULL count (for COUNT(*))
   };
 
-  int64_t compute_agg(const AggState &state) const {
+  duckdb::Value compute_agg(const AggState &state) const {
     switch (agg_type_) {
     case AggType::SUM:
-      return state.sum;
+      // SQL Standard: SUM of all NULLs returns NULL
+      if (state.count == 0) {
+        return duckdb::Value(duckdb::LogicalType::BIGINT);  // NULL value
+      }
+      return duckdb::Value::BIGINT(state.sum);
+
     case AggType::COUNT:
-      return state.count;
+      // COUNT(column) excludes NULLs, returns non-NULL count
+      return duckdb::Value::BIGINT(state.count);
+
     case AggType::AVG:
-      return state.count > 0 ? state.sum / state.count : 0;
+      // SQL Standard: AVG of all NULLs returns NULL
+      if (state.count == 0) {
+        return duckdb::Value(duckdb::LogicalType::BIGINT);  // NULL value
+      }
+      return duckdb::Value::BIGINT(state.sum / state.count);
+
     default:
-      return state.sum;
+      return duckdb::Value::BIGINT(state.sum);
     }
   }
 
-  DuckDBRow make_result_row(const DuckDBRow &key, int64_t agg_val) const {
+  DuckDBRow make_result_row(const DuckDBRow &key, const duckdb::Value &agg_val) const {
     DuckDBRow result;
     result.columns = key.columns;
-    result.columns.push_back(duckdb::Value::BIGINT(agg_val));
+    result.columns.push_back(agg_val);  // Can be NULL now
     return result;
   }
 
@@ -469,6 +536,12 @@ public:
       for (const auto &[row, weight] : changes) {
         duckdb::Value key = left_key_(row);
 
+        // SQL Standard: NULL never matches NULL in JOINs
+        if (key.IsNull()) {
+          // Don't index NULL keys, they never produce join results
+          continue;
+        }
+
         // Join with existing right rows
         auto it = right_indexed_.find(key);
         if (it != right_indexed_.end()) {
@@ -483,6 +556,12 @@ public:
     } else if (table_name == right_table_) {
       for (const auto &[row, weight] : changes) {
         duckdb::Value key = right_key_(row);
+
+        // SQL Standard: NULL never matches NULL in JOINs
+        if (key.IsNull()) {
+          // Don't index NULL keys, they never produce join results
+          continue;
+        }
 
         // Join with existing left rows
         auto it = left_indexed_.find(key);
@@ -538,7 +617,8 @@ private:
   DuckDBZSet result_;
 };
 
-// Distinct view
+// Distinct view - NULL-aware (SQL Standard: multiple NULLs -> single NULL)
+// Uses DuckDBRowHash and DuckDBRow::operator== which treat NULL == NULL
 class NativeDistinctView : public NativeMaterializedView {
 public:
   NativeDistinctView(const std::string &name, const std::string &sql,
