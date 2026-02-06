@@ -989,6 +989,27 @@ public:
     return dep_graph_.get_all_dependents(name);
   }
 
+  // Alias for get_dependents (used by parser extension)
+  std::vector<std::string> get_dependent_views(const std::string &name) {
+    return get_dependents(name);
+  }
+
+  // Check if view exists
+  bool view_exists(const std::string &view_name) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return views_.find(view_name) != views_.end();
+  }
+
+  // Get drop order for CASCADE (returns views in order to drop)
+  std::vector<std::string> get_drop_order(const std::string &view_name) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto dependents = dep_graph_.get_all_dependents(view_name);
+
+    // Return in reverse order (drop leaves first, then parents)
+    std::reverse(dependents.begin(), dependents.end());
+    return dependents;
+  }
+
   const std::string &last_error() const { return last_error_; }
 
 private:

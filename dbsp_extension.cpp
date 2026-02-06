@@ -44,6 +44,7 @@
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
 #include "dbsp_cdc.hpp"
+#include "dbsp_parser_extension.hpp"
 
 namespace duckdb {
 
@@ -761,6 +762,247 @@ void DepsFunc(ClientContext &context, TableFunctionInput &input,
 }
 
 // ============================================================================
+// Materialized View DDL - CREATE MATERIALIZED VIEW
+// ============================================================================
+
+struct CreateMaterializedViewData : public GlobalTableFunctionState {
+  string view_name;
+  string select_query;
+  bool done = false;
+};
+
+unique_ptr<GlobalTableFunctionState>
+CreateMaterializedViewInit(ClientContext &context,
+                           TableFunctionInitInput &input) {
+  auto result = make_uniq<CreateMaterializedViewData>();
+  return std::move(result);
+}
+
+void CreateMaterializedViewExecute(ClientContext &context,
+                                   TableFunctionInput &input,
+                                   DataChunk &output) {
+  auto &state = input.global_state->Cast<CreateMaterializedViewData>();
+
+  if (state.done) {
+    output.SetCardinality(0);
+    return;
+  }
+
+  auto &manager = dbsp_native::get_cdc_manager();
+  bool success = manager.create_view(context, state.view_name, state.select_query);
+
+  if (!success) {
+    string error = manager.last_error();
+    if (error.find("DBSP-E") == string::npos) {
+      error = "Failed to create materialized view '" + state.view_name + "': " + error;
+    }
+    throw InvalidInputException(error);
+  }
+
+  // Return success message
+  output.SetCardinality(1);
+  auto info = manager.get_view_info(state.view_name);
+  string sources = "";
+  for (size_t i = 0; i < info.source_tables.size(); i++) {
+    if (i > 0) sources += ", ";
+    sources += info.source_tables[i];
+  }
+
+  string message = "Created materialized view: " + state.view_name +
+                   " (sources: " + sources + ")";
+  output.SetValue(0, 0, Value(message));
+
+  state.done = true;
+}
+
+// ============================================================================
+// Materialized View DDL - DROP MATERIALIZED VIEW
+// ============================================================================
+
+struct DropMaterializedViewData : public GlobalTableFunctionState {
+  string view_name;
+  bool cascade = false;
+  bool done = false;
+};
+
+unique_ptr<GlobalTableFunctionState>
+DropMaterializedViewInit(ClientContext &context, TableFunctionInitInput &input) {
+  auto result = make_uniq<DropMaterializedViewData>();
+  return std::move(result);
+}
+
+void DropMaterializedViewExecute(ClientContext &context,
+                                 TableFunctionInput &input, DataChunk &output) {
+  auto &state = input.global_state->Cast<DropMaterializedViewData>();
+
+  if (state.done) {
+    output.SetCardinality(0);
+    return;
+  }
+
+  auto &manager = dbsp_native::get_cdc_manager();
+
+  // Check if view exists
+  if (!manager.view_exists(state.view_name)) {
+    // IF EXISTS was handled by parser, so this is an error
+    throw InvalidInputException("Materialized view does not exist: " + state.view_name);
+  }
+
+  // Check dependencies
+  auto dependents = manager.get_dependent_views(state.view_name);
+
+  if (!dependents.empty() && !state.cascade) {
+    // Build error message
+    string dep_list = "";
+    for (size_t i = 0; i < dependents.size() && i < 5; i++) {
+      if (i > 0) dep_list += ", ";
+      dep_list += dependents[i];
+    }
+    if (dependents.size() > 5) {
+      dep_list += "... and " + std::to_string(dependents.size() - 5) + " more";
+    }
+
+    throw InvalidInputException(
+      "Cannot drop materialized view '" + state.view_name +
+      "': other views depend on it (" + dep_list + ")\n" +
+      "Use DROP MATERIALIZED VIEW " + state.view_name + " CASCADE to drop with dependents");
+  }
+
+  // Drop the view (and dependents if cascade)
+  size_t dropped_count = 1;
+  if (state.cascade && !dependents.empty()) {
+    // Drop dependents first (in reverse topological order)
+    auto drop_order = manager.get_drop_order(state.view_name);
+    for (const auto &view : drop_order) {
+      manager.drop_view(view);
+      dropped_count++;
+    }
+  } else {
+    manager.drop_view(state.view_name);
+  }
+
+  // Return success message
+  output.SetCardinality(1);
+  string message = "Dropped materialized view: " + state.view_name;
+  if (dropped_count > 1) {
+    message += " (and " + std::to_string(dropped_count - 1) + " dependent views)";
+  }
+  output.SetValue(0, 0, Value(message));
+
+  state.done = true;
+}
+
+// ============================================================================
+// Materialized View DDL - REFRESH MATERIALIZED VIEW (no-op)
+// ============================================================================
+
+struct RefreshMaterializedViewData : public GlobalTableFunctionState {
+  string view_name;
+  bool done = false;
+};
+
+unique_ptr<GlobalTableFunctionState>
+RefreshMaterializedViewInit(ClientContext &context,
+                            TableFunctionInitInput &input) {
+  auto result = make_uniq<RefreshMaterializedViewData>();
+  return std::move(result);
+}
+
+void RefreshMaterializedViewExecute(ClientContext &context,
+                                    TableFunctionInput &input,
+                                    DataChunk &output) {
+  auto &state = input.global_state->Cast<RefreshMaterializedViewData>();
+
+  if (state.done) {
+    output.SetCardinality(0);
+    return;
+  }
+
+  // REFRESH is a no-op since views are automatically incremental
+  output.SetCardinality(1);
+  output.SetValue(0, 0,
+    Value("Materialized view '" + state.view_name +
+          "' is always up-to-date (automatic incremental refresh)"));
+
+  state.done = true;
+}
+
+// ============================================================================
+// Parser Extension Plan Function
+// ============================================================================
+
+namespace dbsp_native {
+
+ParserExtensionPlanResult MaterializedViewPlan(
+    ParserExtensionInfo *info, ClientContext &context,
+    unique_ptr<ParserExtensionParseData> parse_data_p) {
+
+  ParserExtensionPlanResult result;
+
+  // Handle CREATE MATERIALIZED VIEW
+  if (auto *create_data = dynamic_cast<CreateMaterializedViewParseData *>(parse_data_p.get())) {
+    TableFunction func("create_materialized_view",
+                      {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                      CreateMaterializedViewExecute, nullptr,
+                      CreateMaterializedViewInit);
+    func.name = "create_materialized_view";
+
+    auto state = make_uniq<CreateMaterializedViewData>();
+    state->view_name = create_data->view_name;
+    state->select_query = create_data->select_query;
+
+    result.function = func;
+    result.parameters.push_back(Value(create_data->view_name));
+    result.parameters.push_back(Value(create_data->select_query));
+    result.return_type = StatementReturnType::QUERY_RESULT;
+
+    return result;
+  }
+
+  // Handle DROP MATERIALIZED VIEW
+  if (auto *drop_data = dynamic_cast<DropMaterializedViewParseData *>(parse_data_p.get())) {
+    TableFunction func("drop_materialized_view",
+                      {LogicalType::VARCHAR, LogicalType::BOOLEAN},
+                      DropMaterializedViewExecute, nullptr,
+                      DropMaterializedViewInit);
+    func.name = "drop_materialized_view";
+
+    auto state = make_uniq<DropMaterializedViewData>();
+    state->view_name = drop_data->view_name;
+    state->cascade = drop_data->cascade;
+
+    result.function = func;
+    result.parameters.push_back(Value(drop_data->view_name));
+    result.parameters.push_back(Value(drop_data->cascade));
+    result.return_type = StatementReturnType::QUERY_RESULT;
+
+    return result;
+  }
+
+  // Handle REFRESH MATERIALIZED VIEW
+  if (auto *refresh_data = dynamic_cast<RefreshMaterializedViewParseData *>(parse_data_p.get())) {
+    TableFunction func("refresh_materialized_view",
+                      {LogicalType::VARCHAR},
+                      RefreshMaterializedViewExecute, nullptr,
+                      RefreshMaterializedViewInit);
+    func.name = "refresh_materialized_view";
+
+    auto state = make_uniq<RefreshMaterializedViewData>();
+    state->view_name = refresh_data->view_name;
+
+    result.function = func;
+    result.parameters.push_back(Value(refresh_data->view_name));
+    result.return_type = StatementReturnType::QUERY_RESULT;
+
+    return result;
+  }
+
+  throw InternalException("Unknown materialized view statement type");
+}
+
+} // namespace dbsp_native
+
+// ============================================================================
 // Extension Entry Point
 // ============================================================================
 
@@ -840,6 +1082,11 @@ void LoadInternal(ExtensionLoader &loader) {
 extern "C" {
 // Entry point for C++ ABI extensions - DuckDB expects <name>_duckdb_cpp_init
 DUCKDB_EXTENSION_API void dbsp_duckdb_cpp_init(duckdb::DatabaseInstance &db) {
+  // Register parser extension for CREATE/DROP/REFRESH MATERIALIZED VIEW
+  auto parser_ext = dbsp_native::CreateMaterializedViewParserExtension();
+  db.GetConfig().parser_extensions.push_back(parser_ext);
+
+  // Register table functions
   duckdb::ExtensionLoader loader(db, "dbsp");
   duckdb::LoadInternal(loader);
 }
