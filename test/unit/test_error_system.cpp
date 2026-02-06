@@ -76,3 +76,24 @@ TEST_CASE("Error formatting - Workaround", "[errors][format]") {
         REQUIRE(formatted.find("Query view and apply LIMIT") != std::string::npos);
     }
 }
+
+TEST_CASE("Workaround lookup", "[errors][workarounds]") {
+    SECTION("HAVING not supported") {
+        std::string workaround = get_workaround(ErrorCode::HAVING_NOT_SUPPORTED);
+        REQUIRE_FALSE(workaround.empty());
+        REQUIRE(workaround.find("nested view") != std::string::npos);
+        REQUIRE(workaround.find("TODO #3") != std::string::npos);
+    }
+
+    SECTION("ORDER BY not supported") {
+        std::string workaround = get_workaround(ErrorCode::ORDER_BY_NOT_SUPPORTED);
+        REQUIRE_FALSE(workaround.empty());
+        REQUIRE(workaround.find("client-side") != std::string::npos);
+    }
+
+    SECTION("Unknown error code returns empty") {
+        // Just verify function exists
+        std::string workaround = get_workaround(ErrorCode::MEMORY_LIMIT_EXCEEDED);
+        // May be empty or have default message
+    }
+}

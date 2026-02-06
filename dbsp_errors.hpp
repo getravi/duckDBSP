@@ -75,6 +75,62 @@ inline std::string get_doc_link(ErrorCode code) {
     return ss.str();
 }
 
+// Get workaround suggestion for error code
+inline std::string get_workaround(ErrorCode code) {
+    static const std::unordered_map<ErrorCode, std::string> workarounds = {
+        // Parser errors (E1xx)
+        {ErrorCode::HAVING_NOT_SUPPORTED,
+         "Use a nested view: create a view with GROUP BY, then create another "
+         "view with WHERE clause to filter the aggregated results. "
+         "Tracked in TODO #3."},
+        {ErrorCode::ORDER_BY_NOT_SUPPORTED,
+         "Query the view using dbsp_query() and sort results client-side. "
+         "ORDER BY support is tracked in TODO #4."},
+        {ErrorCode::LIMIT_NOT_SUPPORTED,
+         "Query the view and apply LIMIT in the outer query. "
+         "LIMIT support is tracked in TODO #4."},
+        {ErrorCode::WINDOW_FUNCTIONS_NOT_SUPPORTED,
+         "Window functions are not yet supported for incremental computation. "
+         "Tracked in TODO #8."},
+        {ErrorCode::SUBQUERY_NOT_SUPPORTED,
+         "Rewrite using JOINs or create intermediate views. "
+         "Subquery support is tracked in TODO #6."},
+        {ErrorCode::UNION_NOT_SUPPORTED,
+         "Create separate views and query them individually. "
+         "Set operations are tracked in TODO #7."},
+        {ErrorCode::INTERSECT_NOT_SUPPORTED,
+         "Use JOIN to find common rows between views. "
+         "Set operations are tracked in TODO #7."},
+        {ErrorCode::EXCEPT_NOT_SUPPORTED,
+         "Use LEFT JOIN with NULL check to find differences. "
+         "Set operations are tracked in TODO #7."},
+
+        // Validation errors (E2xx)
+        {ErrorCode::INVALID_IDENTIFIER,
+         "Use only alphanumeric characters and underscores. "
+         "Start with a letter or underscore."},
+        {ErrorCode::PATH_TRAVERSAL,
+         "Use relative paths without '..' or absolute paths. "
+         "Ensure paths don't contain null bytes or backslashes."},
+        {ErrorCode::CIRCULAR_DEPENDENCY,
+         "Review view dependencies to break the cycle. "
+         "A view cannot depend on itself directly or transitively."},
+        {ErrorCode::IDENTIFIER_TOO_LONG,
+         "Use shorter names (max 255 characters)."},
+
+        // Runtime errors (E3xx)
+        {ErrorCode::VIEW_UPDATE_FAILED,
+         "Check view definition and source data types for compatibility. "
+         "Ensure all source tables exist and have correct schema."},
+        {ErrorCode::TYPE_MISMATCH,
+         "Verify column types match between source and view definition. "
+         "Check aggregate function input types."},
+    };
+
+    auto it = workarounds.find(code);
+    return it != workarounds.end() ? it->second : "";
+}
+
 // Format complete error message with SQL highlighting
 inline std::string format_error(const ErrorInfo& info) {
     std::stringstream ss;
