@@ -1,4 +1,4 @@
-#include <catch2/catch_test_macros.hpp>
+#include "catch.hpp"
 #include "../test_helpers.hpp"
 
 using namespace dbsp_test;
@@ -37,11 +37,18 @@ TEST_CASE("dbsp_create_view creates filter view", "[integration][view]") {
     auto result = db.query(
         "SELECT * FROM dbsp_create_view('high_value', "
         "'SELECT * FROM orders WHERE amount > 100')");
+    if (result->HasError()) {
+        INFO("dbsp_create_view error: " << result->GetError());
+    }
     REQUIRE_FALSE(result->HasError());
 
     // Verify view is listed
     auto views = db.query("SELECT * FROM dbsp_views()");
+    if (views->HasError()) {
+        INFO("dbsp_views error: " << views->GetError());
+    }
     REQUIRE_FALSE(views->HasError());
+    INFO("Number of views: " << views->RowCount());
     REQUIRE(views->RowCount() >= 1);
 
     // Query the view
@@ -62,6 +69,9 @@ TEST_CASE("dbsp_create_view creates aggregate view", "[integration][view][aggreg
     auto result = db.query(
         "SELECT * FROM dbsp_create_view('totals', "
         "'SELECT customer, SUM(amount) FROM orders GROUP BY customer')");
+    if (result->HasError()) {
+        INFO("dbsp_create_view error: " << result->GetError());
+    }
     REQUIRE_FALSE(result->HasError());
 
     // Query the view

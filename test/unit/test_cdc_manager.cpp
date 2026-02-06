@@ -1,5 +1,5 @@
-#include <catch2/catch_test_macros.hpp>
-#include "../../duckdb_extension/dbsp_cdc.hpp"
+#include "catch.hpp"
+#include "../dbsp_cdc.hpp"
 
 using namespace dbsp_native;
 
@@ -60,11 +60,15 @@ TEST_CASE("DependencyGraph get dependents", "[cdc][deps]") {
     graph.add_dependency("v3", "v1");
     graph.add_dependency("v4", "v2");
 
-    auto deps = graph.get_dependents("v1");
+    // v1 has direct dependents v2 and v3
+    // v4 depends on v2, so v4 is a transitive dependent of v1
+    // get_all_dependents should return all 3
+    auto deps = graph.get_all_dependents("v1");
 
-    REQUIRE(deps.size() == 2);
+    REQUIRE(deps.size() == 3);
     REQUIRE(std::find(deps.begin(), deps.end(), "v2") != deps.end());
     REQUIRE(std::find(deps.begin(), deps.end(), "v3") != deps.end());
+    REQUIRE(std::find(deps.begin(), deps.end(), "v4") != deps.end());
 }
 
 TEST_CASE("DependencyGraph transitive dependents", "[cdc][deps]") {

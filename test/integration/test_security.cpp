@@ -1,4 +1,4 @@
-#include <catch2/catch_test_macros.hpp>
+#include "catch.hpp"
 #include "../test_helpers.hpp"
 
 using namespace dbsp_test;

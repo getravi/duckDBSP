@@ -1,9 +1,13 @@
 // Test utilities for DBSP tests
 #pragma once
 
-#include <catch2/catch_test_macros.hpp>
+#include "catch.hpp"
 #include "duckdb.hpp"
-#include "../duckdb_extension/dbsp_duckdb_types.hpp"
+#include "../dbsp_duckdb_types.hpp"
+#include "../dbsp_cdc.hpp"
+
+// Forward declaration for extension entry point
+extern "C" void dbsp_duckdb_cpp_init(duckdb::DatabaseInstance &db);
 
 namespace dbsp_test {
 
@@ -32,10 +36,10 @@ inline DuckDBZSet makeZSet(
 // Custom assertion for Z-sets
 inline void assertZSetEquals(const DuckDBZSet& actual,
                              const DuckDBZSet& expected) {
-    REQUIRE(actual.support_size() == expected.support_size());
+    REQUIRE(actual.size() == expected.size());
     for (const auto& [row, weight] : expected) {
         INFO("Checking row weight");
-        REQUIRE(actual[row] == weight);
+        REQUIRE(actual.get(row) == weight);
     }
 }
 
@@ -47,12 +51,14 @@ private:
 
 public:
     DuckDBTestHarness() : db_(nullptr), conn_(db_) {
-        // Load extension - update path as needed
-        const char* ext_path = "duckdb_extension/build/dbsp.duckdb_extension";
+        // Reset global CDC manager state between tests
+        dbsp_native::get_cdc_manager().reset();
+
+        // Register extension functions directly (compiled into test binary)
         try {
-            conn_.Query("LOAD '" + std::string(ext_path) + "'");
+            dbsp_duckdb_cpp_init(*db_.instance);
         } catch (const std::exception& e) {
-            // Extension not built yet - tests will skip
+            // Registration failed - tests will fail with descriptive errors
         }
     }
 
@@ -82,6 +88,9 @@ public:
     // Assert view has expected row count
     void assertViewRowCount(const std::string& view_name, size_t expected) {
         auto result = query("SELECT COUNT(*) FROM dbsp_query('" + view_name + "')");
+        if (result->HasError()) {
+            INFO("Query error: " << result->GetError());
+        }
         REQUIRE_FALSE(result->HasError());
         auto count = result->GetValue(0, 0).GetValue<int64_t>();
         REQUIRE(count == expected);
@@ -90,6 +99,9 @@ public:
     // Get all rows from view as vector
     std::vector<std::vector<Value>> getViewRows(const std::string& view_name) {
         auto result = query("SELECT * FROM dbsp_query('" + view_name + "')");
+        if (result->HasError()) {
+            INFO("Query error: " << result->GetError());
+        }
         REQUIRE_FALSE(result->HasError());
 
         std::vector<std::vector<Value>> rows;

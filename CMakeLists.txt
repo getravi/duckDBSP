@@ -1,114 +1,50 @@
 cmake_minimum_required(VERSION 3.14)
-project(dbsp_duckdb_extension VERSION 0.1.0 LANGUAGES CXX)
 
+project(dbsp_extension)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Options
-option(BUILD_TESTS "Build test programs" ON)
-option(BUILD_STANDALONE_DEMO "Build standalone demo" ON)
+set(TARGET_NAME dbsp)
+set(EXT_VERSION_DBSP "0.1.0")
 
-# Include directories
-include_directories(${CMAKE_SOURCE_DIR}/include)
+# DuckDB source directory (set via command line or default)
+set(DUCKDB_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/duckdb" CACHE PATH "Path to DuckDB source")
 
-# Header-only library (the DBSP implementation)
-add_library(dbsp_headers INTERFACE)
-target_include_directories(dbsp_headers INTERFACE ${CMAKE_SOURCE_DIR}/include)
-
-# Standalone demo executable
-if(BUILD_STANDALONE_DEMO)
-    add_executable(dbsp_demo src/dbsp_extension.cpp)
-    target_compile_definitions(dbsp_demo PRIVATE DBSP_STANDALONE_TEST)
-    target_link_libraries(dbsp_demo PRIVATE dbsp_headers)
+if(NOT EXISTS "${DUCKDB_SOURCE_DIR}/src/include/duckdb.hpp")
+    message(FATAL_ERROR "DuckDB source not found at ${DUCKDB_SOURCE_DIR}. Run build.sh to fetch it.")
 endif()
 
-# Interactive CLI (no external dependencies)
-add_executable(dbsp src/dbsp_cli.cpp)
-target_link_libraries(dbsp PRIVATE dbsp_headers)
+# Build DuckDB as a subdirectory
+set(BUILD_UNITTESTS OFF CACHE BOOL "" FORCE)
+set(BUILD_SHELL OFF CACHE BOOL "" FORCE)
+set(BUILD_EXTENSIONS "" CACHE STRING "" FORCE)
+add_subdirectory(${DUCKDB_SOURCE_DIR} duckdb EXCLUDE_FROM_ALL)
 
-# Tests
-if(BUILD_TESTS)
-    # Fetch Catch2 v3
-    include(FetchContent)
-    FetchContent_Declare(
-        Catch2
-        GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-        GIT_TAG v3.7.1
-    )
-    FetchContent_MakeAvailable(Catch2)
+# Extension source
+add_library(${TARGET_NAME}_loadable_extension SHARED
+    dbsp_extension.cpp
+)
 
-    # Unit tests
-    add_executable(unit_tests
-        test/catch2_main.cpp
-        test/unit/test_zset.cpp
-        test/unit/test_sql_parser.cpp
-        test/unit/test_cdc_manager.cpp
-        test/unit/test_security_validation.cpp
-    )
-    target_link_libraries(unit_tests PRIVATE dbsp_headers Catch2::Catch2)
-    target_include_directories(unit_tests PRIVATE
-        ${CMAKE_SOURCE_DIR}/include
-        ${CMAKE_SOURCE_DIR}/duckdb_extension
-        ${CMAKE_SOURCE_DIR}/duckdb_extension/duckdb/src/include
-    )
+target_compile_definitions(${TARGET_NAME}_loadable_extension PRIVATE
+    DUCKDB_EXTENSION_MAIN
+    EXT_VERSION_DBSP="${EXT_VERSION_DBSP}"
+)
 
-    enable_testing()
-    add_test(NAME unit_tests COMMAND unit_tests)
+target_include_directories(${TARGET_NAME}_loadable_extension PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${DUCKDB_SOURCE_DIR}/src/include
+)
 
-    # Integration tests (requires DuckDB)
-    add_executable(integration_tests
-        test/catch2_main.cpp
-        test/integration/test_extension_basic.cpp
-        test/integration/test_extension_cdc.cpp
-        test/integration/test_cascading_views.cpp
-        test/integration/test_persistence.cpp
-        test/integration/test_security.cpp
-    )
-    target_link_libraries(integration_tests PRIVATE
-        dbsp_headers
-        Catch2::Catch2
-    )
-    target_include_directories(integration_tests PRIVATE
-        ${CMAKE_SOURCE_DIR}/include
-        ${CMAKE_SOURCE_DIR}/duckdb_extension
-        ${CMAKE_SOURCE_DIR}/duckdb_extension/duckdb/src/include
-    )
+target_link_libraries(${TARGET_NAME}_loadable_extension duckdb_static)
 
-    add_test(NAME integration_tests COMMAND integration_tests)
+set_target_properties(${TARGET_NAME}_loadable_extension PROPERTIES
+    OUTPUT_NAME ${TARGET_NAME}
+    PREFIX ""
+    SUFFIX ".duckdb_extension"
+)
 
-    # Existing unit tests (will port to Catch2 later)
-    add_executable(dbsp_tests_old test/test_zset.cpp)
-    target_link_libraries(dbsp_tests_old PRIVATE dbsp_headers)
-endif()
-
-# Benchmarks
-option(BUILD_BENCHMARKS "Build benchmarks" OFF)
-
-if(BUILD_BENCHMARKS)
-    add_executable(benchmarks
-        test/catch2_main.cpp
-        test/benchmarks/bench_incremental.cpp
-    )
-    target_link_libraries(benchmarks PRIVATE
-        dbsp_headers
-        Catch2::Catch2
-    )
-    target_include_directories(benchmarks PRIVATE
-        ${CMAKE_SOURCE_DIR}/include
-        ${CMAKE_SOURCE_DIR}/duckdb_extension
-        ${CMAKE_SOURCE_DIR}/duckdb_extension/duckdb/src/include
-    )
-endif()
-
-# Install headers
-install(DIRECTORY include/ DESTINATION include/dbsp)
-
-# Print configuration summary
 message(STATUS "")
-message(STATUS "DBSP DuckDB Extension Configuration:")
-message(STATUS "  Version: ${PROJECT_VERSION}")
-message(STATUS "  C++ Standard: ${CMAKE_CXX_STANDARD}")
-message(STATUS "  Build Tests: ${BUILD_TESTS}")
-message(STATUS "  Build Standalone Demo: ${BUILD_STANDALONE_DEMO}")
+message(STATUS "DBSP DuckDB Extension v${EXT_VERSION_DBSP}")
+message(STATUS "  DuckDB: ${DUCKDB_SOURCE_DIR}")
 message(STATUS "")

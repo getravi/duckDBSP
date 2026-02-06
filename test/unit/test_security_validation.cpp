@@ -1,5 +1,5 @@
-#include <catch2/catch_test_macros.hpp>
-#include "../../duckdb_extension/dbsp_cdc.hpp"
+#include "catch.hpp"
+#include "../dbsp_cdc.hpp"
 
 using namespace dbsp_native;
 
@@ -77,7 +77,8 @@ TEST_CASE("validate_filepath prevents path traversal attacks", "[security][valid
     }
 
     SECTION("Reject null bytes") {
-        std::string with_null = "file\0.json";
+        // Properly construct string with embedded null byte
+        std::string with_null = std::string("file") + '\0' + std::string(".json");
         REQUIRE(validate_filepath(with_null) == "");
     }
 

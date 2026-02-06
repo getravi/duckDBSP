@@ -4,7 +4,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/build"
-DUCKDB_VERSION="v1.1.3"
+DUCKDB_VERSION="v1.4.0"
 
 echo "=== DBSP DuckDB Extension Build ==="
 echo ""
@@ -27,7 +27,11 @@ cmake .. \
 
 # Build
 echo "Building..."
-make -j$(nproc)
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    make -j$(sysctl -n hw.ncpu)
+else
+    make -j$(nproc)
+fi
 
 echo ""
 echo "=== Build Complete ==="

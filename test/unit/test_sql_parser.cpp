@@ -1,5 +1,5 @@
-#include <catch2/catch_test_macros.hpp>
-#include "../../duckdb_extension/dbsp_sql_parser.hpp"
+#include "catch.hpp"
+#include "../dbsp_sql_parser.hpp"
 
 using namespace dbsp_native;
 
