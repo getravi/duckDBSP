@@ -101,3 +101,36 @@ TEST_CASE("Parser errors - Window functions", "[parser][errors][e104]") {
         REQUIRE(result.error_code == ErrorCode::WINDOW_FUNCTIONS_NOT_SUPPORTED);
     }
 }
+
+TEST_CASE("Parser errors - Subqueries", "[parser][errors][e105]") {
+    DBSPSqlParser parser;
+
+    SECTION("Subquery in FROM clause") {
+        auto result = parser.parse(
+            "SELECT * FROM (SELECT id FROM orders WHERE amount > 100) AS high_orders",
+            "derived_table");
+
+        REQUIRE_FALSE(result.success);
+        REQUIRE(result.error_code == ErrorCode::SUBQUERY_NOT_SUPPORTED);
+        REQUIRE(result.error.find("DBSP-E105") != std::string::npos);
+        REQUIRE(result.error.find("Subquery") != std::string::npos);
+    }
+
+    SECTION("Subquery in WHERE with IN") {
+        auto result = parser.parse(
+            "SELECT * FROM orders WHERE customer_id IN (SELECT id FROM customers WHERE active = true)",
+            "filtered_orders");
+
+        REQUIRE_FALSE(result.success);
+        REQUIRE(result.error_code == ErrorCode::SUBQUERY_NOT_SUPPORTED);
+    }
+
+    SECTION("Subquery in WHERE with EXISTS") {
+        auto result = parser.parse(
+            "SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM customers WHERE id = orders.customer_id)",
+            "filtered_orders");
+
+        REQUIRE_FALSE(result.success);
+        REQUIRE(result.error_code == ErrorCode::SUBQUERY_NOT_SUPPORTED);
+    }
+}

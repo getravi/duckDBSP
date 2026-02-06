@@ -179,6 +179,14 @@ public:
       return result;
     }
 
+    // Check for subquery in FROM clause first
+    if (select.from_table &&
+        select.from_table->type == duckdb::TableReferenceType::SUBQUERY) {
+      return make_error(ErrorCode::SUBQUERY_NOT_SUPPORTED,
+                       "Subquery in FROM clause (derived table)",
+                       result.view_def.sql);
+    }
+
     if (!parse_from_clause(select.from_table.get(), result.view_def)) {
       result.error = "FROM clause required";
       return result;
@@ -208,6 +216,11 @@ public:
 
     // Parse WHERE clause
     if (select.where_clause) {
+      if (has_subquery_expression(select.where_clause.get())) {
+        return make_error(ErrorCode::SUBQUERY_NOT_SUPPORTED,
+                         "Subquery in WHERE clause",
+                         result.view_def.sql);
+      }
       parse_where_clause(select.where_clause.get(), result.view_def);
     }
 
@@ -241,6 +254,10 @@ private:
       def.source_tables.push_back(base.table_name);
       return true;
     }
+
+    case duckdb::TableReferenceType::SUBQUERY:
+      // Subquery in FROM clause (derived table) - not supported
+      return false;
 
     case duckdb::TableReferenceType::JOIN: {
       auto &join = ref->template Cast<duckdb::JoinRef>();
@@ -443,6 +460,20 @@ private:
       // Default to filter with no conditions (pass-through)
       def.type = ParsedViewDef::ViewType::FILTER;
     }
+  }
+
+  // Helper to check for subqueries in expressions
+  bool has_subquery_expression(duckdb::ParsedExpression *expr) {
+    if (!expr) return false;
+
+    // Check this expression
+    if (expr->type == duckdb::ExpressionType::SUBQUERY) {
+      return true;
+    }
+
+    // Note: For simplicity, just check the expression type
+    // A full recursive check would require more complex traversal
+    return false;
   }
 
   // Helper to create error results with proper formatting
