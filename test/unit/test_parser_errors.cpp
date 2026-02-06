@@ -134,3 +134,47 @@ TEST_CASE("Parser errors - Subqueries", "[parser][errors][e105]") {
         REQUIRE(result.error_code == ErrorCode::SUBQUERY_NOT_SUPPORTED);
     }
 }
+
+TEST_CASE("Parser errors - Set operations", "[parser][errors][e106][e107][e108]") {
+    DBSPSqlParser parser;
+
+    SECTION("UNION operation") {
+        auto result = parser.parse(
+            "SELECT * FROM orders UNION SELECT * FROM archived_orders",
+            "all_orders");
+
+        REQUIRE_FALSE(result.success);
+        REQUIRE(result.error_code == ErrorCode::UNION_NOT_SUPPORTED);
+        REQUIRE(result.error.find("DBSP-E106") != std::string::npos);
+        REQUIRE(result.error.find("UNION") != std::string::npos);
+    }
+
+    SECTION("UNION ALL operation") {
+        auto result = parser.parse(
+            "SELECT * FROM orders UNION ALL SELECT * FROM archived_orders",
+            "all_orders");
+
+        REQUIRE_FALSE(result.success);
+        REQUIRE(result.error_code == ErrorCode::UNION_NOT_SUPPORTED);
+    }
+
+    SECTION("INTERSECT operation") {
+        auto result = parser.parse(
+            "SELECT id FROM orders INTERSECT SELECT id FROM shipments",
+            "common_ids");
+
+        REQUIRE_FALSE(result.success);
+        REQUIRE(result.error_code == ErrorCode::INTERSECT_NOT_SUPPORTED);
+        REQUIRE(result.error.find("DBSP-E107") != std::string::npos);
+    }
+
+    SECTION("EXCEPT operation") {
+        auto result = parser.parse(
+            "SELECT id FROM orders EXCEPT SELECT id FROM cancelled_orders",
+            "active_orders");
+
+        REQUIRE_FALSE(result.success);
+        REQUIRE(result.error_code == ErrorCode::EXCEPT_NOT_SUPPORTED);
+        REQUIRE(result.error.find("DBSP-E108") != std::string::npos);
+    }
+}

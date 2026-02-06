@@ -15,6 +15,7 @@
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
@@ -145,6 +146,30 @@ public:
     result.view_def.view_name = view_name;
 
     auto *node = stmt.node.get();
+
+    // Check for set operations (UNION, INTERSECT, EXCEPT)
+    if (node->type == duckdb::QueryNodeType::SET_OPERATION_NODE) {
+      auto &set_op = node->template Cast<duckdb::SetOperationNode>();
+      switch (set_op.setop_type) {
+        case duckdb::SetOperationType::UNION:
+        case duckdb::SetOperationType::UNION_BY_NAME:
+          return make_error(ErrorCode::UNION_NOT_SUPPORTED,
+                           "UNION operation",
+                           result.view_def.sql);
+        case duckdb::SetOperationType::INTERSECT:
+          return make_error(ErrorCode::INTERSECT_NOT_SUPPORTED,
+                           "INTERSECT operation",
+                           result.view_def.sql);
+        case duckdb::SetOperationType::EXCEPT:
+          return make_error(ErrorCode::EXCEPT_NOT_SUPPORTED,
+                           "EXCEPT operation",
+                           result.view_def.sql);
+        default:
+          result.error = "Unsupported set operation";
+          return result;
+      }
+    }
+
     if (node->type != duckdb::QueryNodeType::SELECT_NODE) {
       result.error = "Complex queries not yet supported";
       return result;
