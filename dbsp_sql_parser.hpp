@@ -405,6 +405,25 @@ private:
       def.type = ParsedViewDef::ViewType::FILTER;
     }
   }
+
+  // Helper to create error results with proper formatting
+  ParseResult make_error(ErrorCode code, const std::string& detail,
+                        const std::string& sql, size_t pos = 0) {
+    ParseResult result;
+    result.success = false;
+    result.error_code = code;
+
+    ErrorInfo info;
+    info.code = code;
+    info.message = detail;
+    info.sql = sql;
+    info.error_position = pos;
+    info.workaround = get_workaround(code);
+    info.doc_link = get_doc_link(code);
+
+    result.error = format_error(info);
+    return result;
+  }
 };
 
 // View factory - creates DBSP views from parsed definitions
