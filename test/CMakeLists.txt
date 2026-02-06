@@ -48,6 +48,7 @@ add_dbsp_test(zset unit/test_zset.cpp)
 add_dbsp_test(cdc_manager unit/test_cdc_manager.cpp)
 add_dbsp_test(sql_parser unit/test_sql_parser.cpp)
 add_dbsp_test(security_validation unit/test_security_validation.cpp)
+add_dbsp_test(error_system unit/test_error_system.cpp)
 
 # Integration tests (require DuckDB)
 # Note: These tests need the extension functions, so we compile them with dbsp_extension.cpp
@@ -102,7 +103,7 @@ add_test(NAME benchmark_incremental COMMAND bench_incremental)
 
 message(STATUS "")
 message(STATUS "DBSP Test Suite Configuration Complete")
-message(STATUS "  Unit tests: 4")
+message(STATUS "  Unit tests: 5")
 message(STATUS "  Integration tests: 5")
 message(STATUS "  Benchmarks: 1")
 message(STATUS "")
