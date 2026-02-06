@@ -28,3 +28,52 @@ TEST_CASE("Parser errors - HAVING clause", "[parser][errors][e101]") {
         REQUIRE(result.success);
     }
 }
+
+TEST_CASE("Parser errors - ORDER BY clause", "[parser][errors][e102]") {
+    DBSPSqlParser parser;
+
+    SECTION("ORDER BY is detected and rejected") {
+        auto result = parser.parse(
+            "SELECT * FROM orders ORDER BY created_at DESC",
+            "sorted_orders");
+
+        REQUIRE_FALSE(result.success);
+        REQUIRE(result.error_code == ErrorCode::ORDER_BY_NOT_SUPPORTED);
+        REQUIRE(result.error.find("DBSP-E102") != std::string::npos);
+        REQUIRE(result.error.find("ORDER BY") != std::string::npos);
+        REQUIRE(result.error.find("client-side") != std::string::npos);
+    }
+
+    SECTION("Multiple ORDER BY columns") {
+        auto result = parser.parse(
+            "SELECT * FROM orders ORDER BY customer_id, created_at DESC",
+            "sorted_orders");
+
+        REQUIRE_FALSE(result.success);
+        REQUIRE(result.error_code == ErrorCode::ORDER_BY_NOT_SUPPORTED);
+    }
+}
+
+TEST_CASE("Parser errors - LIMIT clause", "[parser][errors][e103]") {
+    DBSPSqlParser parser;
+
+    SECTION("LIMIT is detected and rejected") {
+        auto result = parser.parse(
+            "SELECT * FROM orders LIMIT 100",
+            "limited_orders");
+
+        REQUIRE_FALSE(result.success);
+        REQUIRE(result.error_code == ErrorCode::LIMIT_NOT_SUPPORTED);
+        REQUIRE(result.error.find("DBSP-E103") != std::string::npos);
+        REQUIRE(result.error.find("LIMIT") != std::string::npos);
+    }
+
+    SECTION("LIMIT with OFFSET") {
+        auto result = parser.parse(
+            "SELECT * FROM orders LIMIT 100 OFFSET 50",
+            "limited_orders");
+
+        REQUIRE_FALSE(result.success);
+        REQUIRE(result.error_code == ErrorCode::LIMIT_NOT_SUPPORTED);
+    }
+}

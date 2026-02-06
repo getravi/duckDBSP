@@ -152,11 +152,24 @@ public:
 
     auto &select = node->template Cast<duckdb::SelectNode>();
 
-    // Check for DISTINCT
+    // Check for unsupported modifiers
     for (auto &modifier : select.modifiers) {
-      if (modifier->type == duckdb::ResultModifierType::DISTINCT_MODIFIER) {
-        result.view_def.is_distinct = true;
-        break;
+      switch (modifier->type) {
+        case duckdb::ResultModifierType::DISTINCT_MODIFIER:
+          result.view_def.is_distinct = true;
+          break;
+        case duckdb::ResultModifierType::ORDER_MODIFIER:
+          return make_error(ErrorCode::ORDER_BY_NOT_SUPPORTED,
+                           "ORDER BY clause detected",
+                           result.view_def.sql);
+        case duckdb::ResultModifierType::LIMIT_MODIFIER:
+        case duckdb::ResultModifierType::LIMIT_PERCENT_MODIFIER:
+          return make_error(ErrorCode::LIMIT_NOT_SUPPORTED,
+                           "LIMIT clause detected",
+                           result.view_def.sql);
+        default:
+          // Other modifiers not yet encountered
+          break;
       }
     }
 
