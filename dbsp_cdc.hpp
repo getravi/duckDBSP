@@ -35,22 +35,51 @@ namespace dbsp_native {
 
 // Security validation functions
 
-// Validate SQL identifier (table/view name) - only alphanumeric and underscore
-inline bool is_valid_identifier(const std::string &name) {
-  if (name.empty() || name.length() > 255) {
+// Enhanced identifier validation with detailed error codes
+inline bool validate_identifier(const std::string &name, std::string &error_msg,
+                               ErrorCode &error_code) {
+  error_msg.clear();
+  error_code = ErrorCode::INVALID_IDENTIFIER;
+
+  if (name.empty()) {
+    error_msg = "Identifier cannot be empty";
+    error_code = ErrorCode::INVALID_IDENTIFIER;
     return false;
   }
+
+  if (name.length() > 255) {
+    error_msg = "Identifier too long (max 255 characters): " + std::to_string(name.length());
+    error_code = ErrorCode::IDENTIFIER_TOO_LONG;
+    return false;
+  }
+
   // First character must be letter or underscore
   if (!std::isalpha(name[0]) && name[0] != '_') {
+    error_msg = "Identifier must start with letter or underscore: '" + name + "'";
+    error_code = ErrorCode::INVALID_IDENTIFIER;
     return false;
   }
+
   // Remaining characters must be alphanumeric or underscore
-  for (char c : name) {
+  for (size_t i = 0; i < name.length(); i++) {
+    char c = name[i];
     if (!std::isalnum(c) && c != '_') {
+      error_msg = "Identifier contains invalid character '" +
+                  std::string(1, c) + "' at position " + std::to_string(i) +
+                  ": '" + name + "'";
+      error_code = ErrorCode::INVALID_IDENTIFIER;
       return false;
     }
   }
+
   return true;
+}
+
+// Legacy function for backward compatibility
+inline bool is_valid_identifier(const std::string &name) {
+  std::string error_msg;
+  ErrorCode error_code;
+  return validate_identifier(name, error_msg, error_code);
 }
 
 // Validate and canonicalize file path to prevent path traversal
