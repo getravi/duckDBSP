@@ -1,5 +1,6 @@
 # Build output
 build/
+build_test/
 cmake-build-*/
 
 # IDE files
@@ -25,3 +26,6 @@ duckdb/
 
 # Test build artifacts
 test/build_test/
+
+# Work-in-progress files
+dbsp_recursive.hpp
