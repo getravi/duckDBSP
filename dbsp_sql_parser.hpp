@@ -84,6 +84,18 @@ struct ParsedViewDef {
 
   // Is DISTINCT present
   bool is_distinct = false;
+
+  // For HAVING clause (post-aggregation filter)
+  struct HavingFilter {
+    enum RefType { GROUP_COL, AGGREGATE_RESULT };
+    RefType ref_type = AGGREGATE_RESULT;
+    std::string column_name;    // Column name (for group cols)
+    std::string agg_function;   // Aggregate function name (for agg refs)
+    std::string agg_col_name;   // Column in aggregate (for agg refs like SUM(amount))
+    std::string op;             // =, >, <, >=, <=, !=
+    duckdb::Value value;
+  };
+  std::vector<HavingFilter> having_filters;
 };
 
 // SQL Parser for DBSP views
@@ -251,14 +263,12 @@ public:
 
     // Parse GROUP BY
     if (!select.groups.grouping_sets.empty()) {
-      // Check for HAVING clause (not supported yet)
-      if (select.having) {
-        return make_error(ErrorCode::HAVING_NOT_SUPPORTED,
-                         "HAVING clause in GROUP BY",
-                         result.view_def.sql);
-      }
-
       parse_group_by(select.groups, result.view_def);
+
+      // Parse HAVING clause (post-aggregation filter)
+      if (select.having) {
+        parse_having_clause(select.having.get(), result.view_def);
+      }
     }
 
     // Determine view type
@@ -447,6 +457,63 @@ private:
       for (auto idx : group_set) {
         def.group_by_columns.push_back(idx);
       }
+    }
+  }
+
+  void parse_having_clause(duckdb::ParsedExpression *expr, ParsedViewDef &def) {
+    if (!expr)
+      return;
+
+    switch (expr->type) {
+    case duckdb::ExpressionType::COMPARE_EQUAL:
+    case duckdb::ExpressionType::COMPARE_GREATERTHAN:
+    case duckdb::ExpressionType::COMPARE_LESSTHAN:
+    case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+    case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
+    case duckdb::ExpressionType::COMPARE_NOTEQUAL: {
+      auto &cmp = expr->template Cast<duckdb::ComparisonExpression>();
+      ParsedViewDef::HavingFilter filter;
+      filter.op = get_comparison_op(expr->type);
+
+      // Left side: could be aggregate function or group column
+      if (cmp.left->type == duckdb::ExpressionType::FUNCTION) {
+        auto &func = cmp.left->template Cast<duckdb::FunctionExpression>();
+        std::string func_name = duckdb::StringUtil::Upper(func.function_name);
+        if (func_name == "COUNT_STAR") func_name = "COUNT";
+
+        filter.ref_type = ParsedViewDef::HavingFilter::AGGREGATE_RESULT;
+        filter.agg_function = func_name;
+        if (!func.children.empty() &&
+            func.children[0]->type == duckdb::ExpressionType::COLUMN_REF) {
+          auto &col = func.children[0]->template Cast<duckdb::ColumnRefExpression>();
+          filter.agg_col_name = col.GetColumnName();
+        }
+      } else if (cmp.left->type == duckdb::ExpressionType::COLUMN_REF) {
+        auto &col = cmp.left->template Cast<duckdb::ColumnRefExpression>();
+        filter.ref_type = ParsedViewDef::HavingFilter::GROUP_COL;
+        filter.column_name = col.GetColumnName();
+      }
+
+      // Right side: constant value
+      if (cmp.right->type == duckdb::ExpressionType::VALUE_CONSTANT) {
+        auto &val = cmp.right->template Cast<duckdb::ConstantExpression>();
+        filter.value = val.value;
+      }
+
+      def.having_filters.push_back(filter);
+      break;
+    }
+
+    case duckdb::ExpressionType::CONJUNCTION_AND: {
+      auto &conj = expr->template Cast<duckdb::ConjunctionExpression>();
+      for (auto &child : conj.children) {
+        parse_having_clause(child.get(), def);
+      }
+      break;
+    }
+
+    default:
+      break;
     }
   }
 
@@ -745,9 +812,51 @@ private:
     else if (agg.function == "MAX")
       agg_type = NativeAggregateView::AggType::MAX;
 
+    // Build HAVING predicate if present
+    NativeAggregateView::HavingPredicate having_pred = nullptr;
+    if (!def.having_filters.empty()) {
+      // Capture the having filters for the lambda
+      auto having_filters = def.having_filters;
+      size_t num_group_cols = group_cols.size();
+      size_t agg_col_idx = num_group_cols; // Aggregate result is after group columns
+
+      // Resolve group column names to result row indices
+      std::vector<std::pair<size_t, ParsedViewDef::HavingFilter>> resolved_having;
+      for (const auto &hf : having_filters) {
+        size_t col_idx = agg_col_idx; // Default: aggregate column
+        if (hf.ref_type == ParsedViewDef::HavingFilter::GROUP_COL) {
+          // Find position of this group column in result row
+          for (size_t i = 0; i < def.group_by_names.size(); i++) {
+            if (duckdb::StringUtil::CIEquals(def.group_by_names[i], hf.column_name)) {
+              col_idx = i;
+              break;
+            }
+          }
+          // Also check project_column_names for non-group-by columns
+          for (size_t i = 0; i < def.project_column_names.size(); i++) {
+            if (duckdb::StringUtil::CIEquals(def.project_column_names[i], hf.column_name)) {
+              col_idx = i;
+              break;
+            }
+          }
+        }
+        resolved_having.push_back({col_idx, hf});
+      }
+
+      having_pred = [resolved_having](const DuckDBRow &result_row) -> bool {
+        for (const auto &[col_idx, filter] : resolved_having) {
+          if (col_idx >= result_row.columns.size()) return false;
+          const auto &col_val = result_row.columns[col_idx];
+          if (!compare_values(col_val, filter.op, filter.value)) return false;
+        }
+        return true;
+      };
+    }
+
     return std::make_unique<NativeAggregateView>(def.view_name, def.sql, table,
                                                  result_schema, key_fn,
-                                                 value_fn, agg_type);
+                                                 value_fn, agg_type,
+                                                 having_pred);
   }
 
   static std::unique_ptr<NativeMaterializedView> create_join_view(

@@ -19,3 +19,9 @@ cmake-build-*/
 
 # External dependencies (cloned for reference)
 dbsp-theory/
+
+# DuckDB source (auto-cloned by CMake for building)
+duckdb/
+
+# Test build artifacts
+test/build_test/

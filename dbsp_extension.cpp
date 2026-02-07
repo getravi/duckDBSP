@@ -41,6 +41,7 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
@@ -766,23 +767,29 @@ void DepsFunc(ClientContext &context, TableFunctionInput &input,
 // Materialized View DDL - CREATE MATERIALIZED VIEW
 // ============================================================================
 
-struct CreateMaterializedViewData : public GlobalTableFunctionState {
+struct CreateMaterializedViewData : public TableFunctionData {
   string view_name;
   string select_query;
   bool done = false;
 };
 
-unique_ptr<GlobalTableFunctionState>
-CreateMaterializedViewInit(ClientContext &context,
-                           TableFunctionInitInput &input) {
-  auto result = make_uniq<CreateMaterializedViewData>();
-  return std::move(result);
+unique_ptr<FunctionData>
+CreateMaterializedViewBind(ClientContext &context,
+                           TableFunctionBindInput &input,
+                           vector<LogicalType> &return_types,
+                           vector<string> &names) {
+  auto data = make_uniq<CreateMaterializedViewData>();
+  data->view_name = input.inputs[0].GetValue<string>();
+  data->select_query = input.inputs[1].GetValue<string>();
+  return_types.push_back(LogicalType::VARCHAR);
+  names.push_back("result");
+  return std::move(data);
 }
 
 void CreateMaterializedViewExecute(ClientContext &context,
                                    TableFunctionInput &input,
                                    DataChunk &output) {
-  auto &state = input.global_state->Cast<CreateMaterializedViewData>();
+  auto &state = input.bind_data->CastNoConst<CreateMaterializedViewData>();
 
   if (state.done) {
     output.SetCardinality(0);
@@ -820,21 +827,28 @@ void CreateMaterializedViewExecute(ClientContext &context,
 // Materialized View DDL - DROP MATERIALIZED VIEW
 // ============================================================================
 
-struct DropMaterializedViewData : public GlobalTableFunctionState {
+struct DropMaterializedViewData : public TableFunctionData {
   string view_name;
   bool cascade = false;
   bool done = false;
 };
 
-unique_ptr<GlobalTableFunctionState>
-DropMaterializedViewInit(ClientContext &context, TableFunctionInitInput &input) {
-  auto result = make_uniq<DropMaterializedViewData>();
-  return std::move(result);
+unique_ptr<FunctionData>
+DropMaterializedViewBind(ClientContext &context,
+                         TableFunctionBindInput &input,
+                         vector<LogicalType> &return_types,
+                         vector<string> &names) {
+  auto data = make_uniq<DropMaterializedViewData>();
+  data->view_name = input.inputs[0].GetValue<string>();
+  data->cascade = input.inputs[1].GetValue<bool>();
+  return_types.push_back(LogicalType::VARCHAR);
+  names.push_back("result");
+  return std::move(data);
 }
 
 void DropMaterializedViewExecute(ClientContext &context,
                                  TableFunctionInput &input, DataChunk &output) {
-  auto &state = input.global_state->Cast<DropMaterializedViewData>();
+  auto &state = input.bind_data->CastNoConst<DropMaterializedViewData>();
 
   if (state.done) {
     output.SetCardinality(0);
@@ -897,22 +911,27 @@ void DropMaterializedViewExecute(ClientContext &context,
 // Materialized View DDL - REFRESH MATERIALIZED VIEW (no-op)
 // ============================================================================
 
-struct RefreshMaterializedViewData : public GlobalTableFunctionState {
+struct RefreshMaterializedViewData : public TableFunctionData {
   string view_name;
   bool done = false;
 };
 
-unique_ptr<GlobalTableFunctionState>
-RefreshMaterializedViewInit(ClientContext &context,
-                            TableFunctionInitInput &input) {
-  auto result = make_uniq<RefreshMaterializedViewData>();
-  return std::move(result);
+unique_ptr<FunctionData>
+RefreshMaterializedViewBind(ClientContext &context,
+                            TableFunctionBindInput &input,
+                            vector<LogicalType> &return_types,
+                            vector<string> &names) {
+  auto data = make_uniq<RefreshMaterializedViewData>();
+  data->view_name = input.inputs[0].GetValue<string>();
+  return_types.push_back(LogicalType::VARCHAR);
+  names.push_back("result");
+  return std::move(data);
 }
 
 void RefreshMaterializedViewExecute(ClientContext &context,
                                     TableFunctionInput &input,
                                     DataChunk &output) {
-  auto &state = input.global_state->Cast<RefreshMaterializedViewData>();
+  auto &state = input.bind_data->CastNoConst<RefreshMaterializedViewData>();
 
   if (state.done) {
     output.SetCardinality(0);
@@ -927,6 +946,8 @@ void RefreshMaterializedViewExecute(ClientContext &context,
 
   state.done = true;
 }
+
+} // namespace duckdb
 
 // ============================================================================
 // Parser Extension Plan Function
@@ -944,13 +965,8 @@ ParserExtensionPlanResult MaterializedViewPlan(
   if (auto *create_data = dynamic_cast<::dbsp_native::CreateMaterializedViewParseData *>(parse_data_p.get())) {
     TableFunction func("create_materialized_view",
                       {LogicalType::VARCHAR, LogicalType::VARCHAR},
-                      CreateMaterializedViewExecute, nullptr,
-                      CreateMaterializedViewInit);
-    func.name = "create_materialized_view";
-
-    auto state = make_uniq<CreateMaterializedViewData>();
-    state->view_name = create_data->view_name;
-    state->select_query = create_data->select_query;
+                      CreateMaterializedViewExecute,
+                      CreateMaterializedViewBind);
 
     result.function = func;
     result.parameters.push_back(Value(create_data->view_name));
@@ -964,13 +980,8 @@ ParserExtensionPlanResult MaterializedViewPlan(
   if (auto *drop_data = dynamic_cast<::dbsp_native::DropMaterializedViewParseData *>(parse_data_p.get())) {
     TableFunction func("drop_materialized_view",
                       {LogicalType::VARCHAR, LogicalType::BOOLEAN},
-                      DropMaterializedViewExecute, nullptr,
-                      DropMaterializedViewInit);
-    func.name = "drop_materialized_view";
-
-    auto state = make_uniq<DropMaterializedViewData>();
-    state->view_name = drop_data->view_name;
-    state->cascade = drop_data->cascade;
+                      DropMaterializedViewExecute,
+                      DropMaterializedViewBind);
 
     result.function = func;
     result.parameters.push_back(Value(drop_data->view_name));
@@ -984,12 +995,8 @@ ParserExtensionPlanResult MaterializedViewPlan(
   if (auto *refresh_data = dynamic_cast<::dbsp_native::RefreshMaterializedViewParseData *>(parse_data_p.get())) {
     TableFunction func("refresh_materialized_view",
                       {LogicalType::VARCHAR},
-                      RefreshMaterializedViewExecute, nullptr,
-                      RefreshMaterializedViewInit);
-    func.name = "refresh_materialized_view";
-
-    auto state = make_uniq<RefreshMaterializedViewData>();
-    state->view_name = refresh_data->view_name;
+                      RefreshMaterializedViewExecute,
+                      RefreshMaterializedViewBind);
 
     result.function = func;
     result.parameters.push_back(Value(refresh_data->view_name));
@@ -1007,7 +1014,14 @@ ParserExtensionPlanResult MaterializedViewPlan(
 // Extension Entry Point
 // ============================================================================
 
+namespace duckdb {
+
 void LoadInternal(ExtensionLoader &loader) {
+
+  // Register parser extension for CREATE/DROP/REFRESH MATERIALIZED VIEW syntax
+  auto &db = loader.GetDatabaseInstance();
+  auto &config = DBConfig::GetConfig(db);
+  config.parser_extensions.push_back(::dbsp_native::CreateMaterializedViewParserExtension());
 
   // dbsp_track
   TableFunction track_fn("dbsp_track", {LogicalType::VARCHAR}, TrackFunc,

@@ -10,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -401,14 +402,17 @@ public:
 
   using KeyFn = std::function<DuckDBRow(const DuckDBRow &)>;
   using ValueFn = std::function<duckdb::Value(const DuckDBRow &)>;
+  using HavingPredicate = std::function<bool(const DuckDBRow &)>;
 
   NativeAggregateView(const std::string &name, const std::string &sql,
                       const std::string &source_table,
                       const TableSchema &result_schema, KeyFn key_fn,
-                      ValueFn value_fn, AggType agg_type)
+                      ValueFn value_fn, AggType agg_type,
+                      HavingPredicate having_predicate = nullptr)
       : NativeMaterializedView(name, sql), source_table_(source_table),
         schema_(result_schema), key_fn_(std::move(key_fn)),
-        value_fn_(std::move(value_fn)), agg_type_(agg_type) {
+        value_fn_(std::move(value_fn)), agg_type_(agg_type),
+        having_predicate_(std::move(having_predicate)) {
     schema_.table_name = name;
   }
 
@@ -421,6 +425,8 @@ public:
     std::unordered_map<DuckDBRow, int64_t, DuckDBRowHash> delta_sums;
     std::unordered_map<DuckDBRow, int64_t, DuckDBRowHash> delta_counts;
     std::unordered_map<DuckDBRow, int64_t, DuckDBRowHash> delta_null_counts;
+    // For MIN/MAX: track individual value changes per group
+    std::unordered_map<DuckDBRow, std::vector<std::pair<int64_t, int64_t>>, DuckDBRowHash> value_changes;
 
     for (const auto &[row, weight] : changes) {
       DuckDBRow key = key_fn_(row);
@@ -429,7 +435,6 @@ public:
       // SQL Standard: NULL values are ignored in aggregates (except COUNT(*))
       if (val.IsNull()) {
         delta_null_counts[key] += weight;
-        // Don't update delta_sums or delta_counts for NULL values
       } else {
         int64_t int_val = 0;
         if (val.type().IsNumeric()) {
@@ -438,6 +443,11 @@ public:
 
         delta_sums[key] += int_val * weight;
         delta_counts[key] += weight;
+
+        // Track individual values for MIN/MAX
+        if (agg_type_ == AggType::MIN || agg_type_ == AggType::MAX) {
+          value_changes[key].push_back({int_val, weight});
+        }
       }
     }
 
@@ -454,10 +464,12 @@ public:
       int64_t delta_count = delta_counts[key];
       int64_t delta_null_count = delta_null_counts[key];
 
-      // Remove old result
+      // Remove old result if it was in results (passes HAVING)
       if (state.count > 0 || state.null_count > 0) {
         DuckDBRow old_result = make_result_row(key, compute_agg(state));
-        result_.insert(old_result, -1);
+        if (!having_predicate_ || having_predicate_(old_result)) {
+          result_.insert(old_result, -1);
+        }
       }
 
       // Update state
@@ -465,10 +477,33 @@ public:
       state.count += delta_count;
       state.null_count += delta_null_count;
 
-      // Add new result
+      // Update MIN/MAX tracking
+      if (agg_type_ == AggType::MIN || agg_type_ == AggType::MAX) {
+        auto vc_it = value_changes.find(key);
+        if (vc_it != value_changes.end()) {
+          for (const auto &[val, w] : vc_it->second) {
+            if (w > 0) {
+              for (int64_t i = 0; i < w; i++) {
+                state.values.insert(val);
+              }
+            } else if (w < 0) {
+              for (int64_t i = 0; i < -w; i++) {
+                auto it = state.values.find(val);
+                if (it != state.values.end()) {
+                  state.values.erase(it);
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Add new result if count > 0 AND passes HAVING
       if (state.count > 0 || state.null_count > 0) {
         DuckDBRow new_result = make_result_row(key, compute_agg(state));
-        result_.insert(new_result, 1);
+        if (!having_predicate_ || having_predicate_(new_result)) {
+          result_.insert(new_result, 1);
+        }
       } else {
         agg_states_.erase(key);
       }
@@ -494,6 +529,7 @@ private:
     int64_t sum = 0;
     int64_t count = 0;         // Non-NULL count (for COUNT(column))
     int64_t null_count = 0;    // NULL count (for COUNT(*))
+    std::multiset<int64_t> values;  // For MIN/MAX: all individual values
   };
 
   duckdb::Value compute_agg(const AggState &state) const {
@@ -516,9 +552,19 @@ private:
       }
       return duckdb::Value::BIGINT(state.sum / state.count);
 
-    default:
-      return duckdb::Value::BIGINT(state.sum);
+    case AggType::MIN:
+      if (state.values.empty()) {
+        return duckdb::Value(duckdb::LogicalType::BIGINT);  // NULL if no values
+      }
+      return duckdb::Value::BIGINT(*state.values.begin());
+
+    case AggType::MAX:
+      if (state.values.empty()) {
+        return duckdb::Value(duckdb::LogicalType::BIGINT);  // NULL if no values
+      }
+      return duckdb::Value::BIGINT(*state.values.rbegin());
     }
+    return duckdb::Value::BIGINT(state.sum);
   }
 
   DuckDBRow make_result_row(const DuckDBRow &key, const duckdb::Value &agg_val) const {
@@ -533,6 +579,7 @@ private:
   KeyFn key_fn_;
   ValueFn value_fn_;
   AggType agg_type_;
+  HavingPredicate having_predicate_;
   std::unordered_map<DuckDBRow, AggState, DuckDBRowHash> agg_states_;
   DuckDBZSet result_;
 };

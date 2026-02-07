@@ -3,11 +3,12 @@
 
 #include "catch.hpp"
 #include "duckdb.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 #include "../dbsp_duckdb_types.hpp"
 #include "../dbsp_cdc.hpp"
 
-// Forward declaration for extension entry point
-extern "C" void dbsp_duckdb_cpp_init(duckdb::DatabaseInstance &db);
+// Forward declaration for extension entry point (extern "C" matches DUCKDB_CPP_EXTENSION_ENTRY)
+extern "C" DUCKDB_EXTENSION_API void dbsp_duckdb_cpp_init(duckdb::ExtensionLoader &loader);
 
 namespace dbsp_test {
 
@@ -56,7 +57,8 @@ public:
 
         // Register extension functions directly (compiled into test binary)
         try {
-            dbsp_duckdb_cpp_init(*db_.instance);
+            duckdb::ExtensionLoader loader(*db_.instance, "dbsp");
+            dbsp_duckdb_cpp_init(loader);
         } catch (const std::exception& e) {
             // Registration failed - tests will fail with descriptive errors
         }

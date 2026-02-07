@@ -343,6 +343,76 @@ TEST_CASE("SQL Parser - Comparison operators", "[sql_parser]") {
     }
 }
 
+TEST_CASE("SQL Parser - HAVING clause", "[sql_parser][having]") {
+    DBSPSqlParser parser;
+
+    SECTION("Simple HAVING with COUNT") {
+        auto result = parser.parse(
+            "SELECT dept, COUNT(id) FROM employees GROUP BY dept HAVING COUNT(id) > 10",
+            "large_depts"
+        );
+
+        REQUIRE(result.success);
+        REQUIRE(result.view_def.type == ParsedViewDef::ViewType::AGGREGATE);
+        REQUIRE(result.view_def.having_filters.size() == 1);
+        REQUIRE(result.view_def.having_filters[0].ref_type == ParsedViewDef::HavingFilter::AGGREGATE_RESULT);
+        REQUIRE(result.view_def.having_filters[0].agg_function == "COUNT");
+        REQUIRE(result.view_def.having_filters[0].op == ">");
+    }
+
+    SECTION("HAVING with SUM") {
+        auto result = parser.parse(
+            "SELECT category, SUM(price) FROM products GROUP BY category HAVING SUM(price) > 1000",
+            "expensive_categories"
+        );
+
+        REQUIRE(result.success);
+        REQUIRE(result.view_def.having_filters.size() == 1);
+        REQUIRE(result.view_def.having_filters[0].agg_function == "SUM");
+        REQUIRE(result.view_def.having_filters[0].op == ">");
+    }
+
+    SECTION("HAVING with group column reference") {
+        auto result = parser.parse(
+            "SELECT dept, COUNT(id) FROM employees GROUP BY dept HAVING dept = 'Sales'",
+            "sales_dept"
+        );
+
+        REQUIRE(result.success);
+        REQUIRE(result.view_def.having_filters.size() == 1);
+        REQUIRE(result.view_def.having_filters[0].ref_type == ParsedViewDef::HavingFilter::GROUP_COL);
+        REQUIRE(result.view_def.having_filters[0].column_name == "dept");
+        REQUIRE(result.view_def.having_filters[0].op == "=");
+    }
+
+    SECTION("HAVING with multiple conditions (AND)") {
+        auto result = parser.parse(
+            "SELECT customer_id, AVG(amount) FROM orders GROUP BY customer_id "
+            "HAVING AVG(amount) >= 100 AND COUNT(amount) > 5",
+            "good_customers"
+        );
+
+        REQUIRE(result.success);
+        REQUIRE(result.view_def.having_filters.size() == 2);
+        REQUIRE(result.view_def.having_filters[0].agg_function == "AVG");
+        REQUIRE(result.view_def.having_filters[0].op == ">=");
+        REQUIRE(result.view_def.having_filters[1].agg_function == "COUNT");
+        REQUIRE(result.view_def.having_filters[1].op == ">");
+    }
+
+    SECTION("HAVING with COUNT(*)") {
+        auto result = parser.parse(
+            "SELECT dept, COUNT(*) FROM employees GROUP BY dept HAVING COUNT(*) > 5",
+            "big_depts"
+        );
+
+        REQUIRE(result.success);
+        REQUIRE(result.view_def.having_filters.size() == 1);
+        REQUIRE(result.view_def.having_filters[0].agg_function == "COUNT");
+        REQUIRE(result.view_def.having_filters[0].op == ">");
+    }
+}
+
 TEST_CASE("Parser errors - Error codes", "[sql_parser][errors]") {
     DBSPSqlParser parser;
 
