@@ -2,15 +2,16 @@
 // Verifies O(log n) multiset-based MIN/MAX maintains correctness
 // under all mutation patterns (insert, delete, mixed)
 
-#include "../../dbsp_duckdb_types.hpp"
 #include "catch.hpp"
+#include "dbsp_duckdb_types.hpp"
 
 using namespace dbsp_native;
 using namespace duckdb;
 
 // Helper: Create a NativeAggregateView for MIN or MAX
-static std::unique_ptr<NativeAggregateView> make_minmax_view(
-    const std::string &name, NativeAggregateView::AggType agg_type) {
+static std::unique_ptr<NativeAggregateView>
+make_minmax_view(const std::string &name,
+                 NativeAggregateView::AggType agg_type) {
 
   TableSchema schema;
   schema.table_name = name;
@@ -25,12 +26,14 @@ static std::unique_ptr<NativeAggregateView> make_minmax_view(
   };
 
   // Value function: extract column 1 (value to aggregate)
-  auto value_fn = [](const DuckDBRow &row) -> Value {
-    return row.columns[1];
-  };
+  auto value_fn = [](const DuckDBRow &row) -> Value { return row.columns[1]; };
 
   return std::make_unique<NativeAggregateView>(
-      name, "SELECT group_key, " + std::string(agg_type == NativeAggregateView::AggType::MIN ? "MIN" : "MAX") + "(val) FROM t GROUP BY group_key",
+      name,
+      "SELECT group_key, " +
+          std::string(agg_type == NativeAggregateView::AggType::MIN ? "MIN"
+                                                                    : "MAX") +
+          "(val) FROM t GROUP BY group_key",
       "source_table", schema, key_fn, value_fn, agg_type);
 }
 
@@ -91,7 +94,8 @@ TEST_CASE("MIN: basic computation with initial data", "[unit][minmax]") {
   REQUIRE(get_agg_value(result, "B") == 50);
 }
 
-TEST_CASE("MIN: deletion of minimum value updates correctly", "[unit][minmax]") {
+TEST_CASE("MIN: deletion of minimum value updates correctly",
+          "[unit][minmax]") {
   auto view = make_minmax_view("min_del", NativeAggregateView::AggType::MIN);
 
   // Insert initial data: A has {5, 10, 15, 20}
@@ -233,7 +237,8 @@ TEST_CASE("MAX: basic computation with initial data", "[unit][minmax]") {
   REQUIRE(get_agg_value(view->get_result(), "A") == 20);
 }
 
-TEST_CASE("MAX: deletion of maximum value updates correctly", "[unit][minmax]") {
+TEST_CASE("MAX: deletion of maximum value updates correctly",
+          "[unit][minmax]") {
   auto view = make_minmax_view("max_del", NativeAggregateView::AggType::MAX);
 
   DuckDBZSet initial;
@@ -286,8 +291,10 @@ TEST_CASE("MAX: duplicate maximum values handled correctly", "[unit][minmax]") {
 // Multiple Groups Tests
 // ============================================================================
 
-TEST_CASE("MIN/MAX: multiple groups maintained independently", "[unit][minmax]") {
-  auto min_view = make_minmax_view("multi_min", NativeAggregateView::AggType::MIN);
+TEST_CASE("MIN/MAX: multiple groups maintained independently",
+          "[unit][minmax]") {
+  auto min_view =
+      make_minmax_view("multi_min", NativeAggregateView::AggType::MIN);
 
   DuckDBZSet initial;
   initial.insert(make_row("A", 10), 1);
@@ -371,8 +378,10 @@ TEST_CASE("MIN: NULL values are ignored", "[unit][minmax]") {
   REQUIRE(get_agg_value(view->get_result(), "A") == 10);
 }
 
-TEST_CASE("MIN: all NULLs still creates group with NULL result", "[unit][minmax]") {
-  auto view = make_minmax_view("min_allnull", NativeAggregateView::AggType::MIN);
+TEST_CASE("MIN: all NULLs still creates group with NULL result",
+          "[unit][minmax]") {
+  auto view =
+      make_minmax_view("min_allnull", NativeAggregateView::AggType::MIN);
 
   DuckDBZSet initial;
   initial.insert(make_null_row("A"), 1);
@@ -417,8 +426,10 @@ TEST_CASE("MIN: works with negative values", "[unit][minmax]") {
 // ============================================================================
 
 TEST_CASE("MIN equals MAX when single value", "[unit][minmax]") {
-  auto min_view = make_minmax_view("single_min", NativeAggregateView::AggType::MIN);
-  auto max_view = make_minmax_view("single_max", NativeAggregateView::AggType::MAX);
+  auto min_view =
+      make_minmax_view("single_min", NativeAggregateView::AggType::MIN);
+  auto max_view =
+      make_minmax_view("single_max", NativeAggregateView::AggType::MAX);
 
   DuckDBZSet initial;
   initial.insert(make_row("A", 42), 1);

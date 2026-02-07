@@ -126,7 +126,97 @@ public:
 };
 ```
 
-### 4. CDC Manager (`duckdb_extension/dbsp_cdc.hpp`)
+### 4. DBSPOptimizer (`include/dbsp_optimizer.hpp`)
+
+Circuit optimization passes for performance improvements.
+
+```cpp
+class DBSPOptimizer {
+    OptimizationStats stats_;
+
+public:
+    ParsedViewDef optimize(const ParsedViewDef& def);
+    
+    // Optimization passes
+    ParsedViewDef combine_filters(const ParsedViewDef& def);
+    ParsedViewDef pushdown_filters(const ParsedViewDef& def);
+    ParsedViewDef prune_projections(const ParsedViewDef& def);
+    
+    const OptimizationStats& stats() const { return stats_; }
+};
+```
+
+**Filter Pushdown**: Moves filters closer to data sources through JOIN operations.
+
+```
+Before:
+  JOIN(orders, customers) → FILTER(amount > 100)
+
+After:
+  JOIN(FILTER(orders, amount > 100), customers)
+  
+Benefit: Reduces rows entering the join, improving performance
+```
+
+**Projection Pruning**: Eliminates unused columns early in the pipeline.
+
+```
+Before:
+  SELECT a, b FROM (SELECT a, b, c, d FROM table)
+
+After:
+  SELECT a, b FROM (SELECT a, b FROM table)
+  
+Benefit: Reduces memory usage and data movement
+```
+
+**Implementation**: The optimizer runs before view creation, transforming `ParsedViewDef` to include:
+- `left_pushed_filters`: Filters applied to left JOIN input
+- `right_pushed_filters`: Filters applied to right JOIN input
+- `required_columns`: Minimal column set needed
+
+### 5. Recursive Query Engine (`include/dbsp_sql_parser.hpp` + `NativeRecursiveView`)
+
+Implements `WITH RECURSIVE` for transitive closures and fixed-point iteration.
+
+```cpp
+class NativeRecursiveView : public NativeMaterializedView {
+    std::unique_ptr<NativeMaterializedView> anchor_view_;
+    std::unique_ptr<NativeMaterializedView> recursive_view_;
+    DuckDBZSet fixed_point_;
+    
+public:
+    void apply_changes(const std::string& table_name, 
+                      const DuckDBZSet& changes) override;
+                      
+private:
+    void compute_fixed_point();
+    bool has_converged(const DuckDBZSet& delta);
+};
+```
+
+**Recursive Evaluation**:
+
+```
+1. Initialize: Evaluate anchor query (non-recursive part)
+   T₀ = SELECT src, dst FROM edges
+
+2. Iterate: Apply recursive query until convergence
+   T₁ = T₀ ∪ (SELECT e.src, r.dst FROM edges e JOIN T₀ r ON e.dst = r.src)
+   T₂ = T₁ ∪ (SELECT e.src, r.dst FROM edges e JOIN T₁ r ON e.dst = r.src)
+   ...
+   
+3. Fixed point: When Tₙ₊₁ = Tₙ (no new rows), return result
+```
+
+**Incremental Updates**: When base table changes:
+1. Compute Δ for anchor view
+2. Re-run fixed-point iteration with new delta
+3. Output changes to recursive view result
+
+**Safety**: Maximum iteration limit (default 1000) prevents infinite loops.
+
+### 6. CDC Manager (`duckdb_extension/dbsp_cdc.hpp`)
 
 Central coordinator for change tracking and propagation.
 
@@ -137,6 +227,7 @@ class CDCManager {
     std::unordered_map<std::string, NativeMaterializedView> views_;
     std::unordered_map<std::string, ViewDefinition> view_definitions_;
     DependencyGraph dep_graph_;
+    DBSPOptimizer optimizer_;  // NEW: Circuit optimizer
 
 public:
     // Table tracking
@@ -199,7 +290,8 @@ static void LoadInternal(DatabaseInstance &instance) {
 ### View Creation
 
 ```
-1. User: dbsp_create_view('totals', 'SELECT customer, SUM(amount) FROM orders GROUP BY customer')
+1. User: CREATE MATERIALIZED VIEW totals AS 
+         SELECT customer, SUM(amount) FROM orders GROUP BY customer
          │
 2. SQL Parser: Parse SQL, extract structure
          │
@@ -211,7 +303,15 @@ static void LoadInternal(DatabaseInstance &instance) {
      group_by: ["customer"]
    }
          │
-3. ViewFactory: Create appropriate view class
+3. DBSPOptimizer: Apply optimization passes
+         │
+         ▼
+   Optimized ParsedViewDef {
+     ...optimized structure...
+     required_columns: ["customer", "amount"]
+   }
+         │
+4. ViewFactory: Create appropriate view class
          │
          ▼
    NativeAggregateView {
@@ -220,9 +320,9 @@ static void LoadInternal(DatabaseInstance &instance) {
      agg_type: SUM
    }
          │
-4. CDC Manager: Register view, add dependencies
+5. CDC Manager: Register view, add dependencies
          │
-5. Initialize: Apply current table state to view
+6. Initialize: Apply current table state to view
 ```
 
 ### Change Propagation
@@ -275,14 +375,14 @@ State after:
 ## Threading Model
 
 - Single global CDCManager instance (singleton)
-- Mutex protects all state access
+- **Reader-writer locks** (`std::shared_mutex`) for concurrent queries
+- Readers (queries) can run in parallel
+- Writers (sync, create_view, drop) acquire exclusive locks
 - Lock held during:
-  - Table tracking
-  - View creation/deletion
-  - Change propagation
-  - Queries
-
-Future improvement: Reader-writer locks for concurrent queries.
+  - Table tracking (write)
+  - View creation/deletion (write)
+  - Change propagation (write)
+  - Queries (read - shared lock)
 
 ## Memory Model
 

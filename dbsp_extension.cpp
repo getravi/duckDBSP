@@ -35,20 +35,46 @@
 
 #define DUCKDB_EXTENSION_MAIN
 
-#include "duckdb.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
-#include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
 #include "dbsp_cdc.hpp"
+#include "dbsp_context_state.hpp"
 #include "dbsp_parser_extension.hpp"
+#include "duckdb/planner/extension_callback.hpp"
 
 namespace duckdb {
+
+static void RegisterExtensionFunction(DatabaseInstance &instance,
+                                      CreateFunctionInfo &info) {
+  Connection con(instance);
+  con.BeginTransaction();
+  auto &catalog = Catalog::GetSystemCatalog(*con.context);
+  info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+  catalog.CreateFunction(*con.context, info);
+  con.Commit();
+}
+
+static void RegisterExtensionFunction(DatabaseInstance &instance,
+                                      ScalarFunction &function) {
+  CreateScalarFunctionInfo info(function);
+  RegisterExtensionFunction(instance, info);
+}
+
+static void RegisterExtensionFunction(DatabaseInstance &instance,
+                                      TableFunction &function) {
+  CreateTableFunctionInfo info(function);
+  RegisterExtensionFunction(instance, info);
+}
 
 // ============================================================================
 // dbsp_track - Track a table for automatic CDC
@@ -92,8 +118,8 @@ void TrackFunc(ClientContext &context, TableFunctionInput &input,
     // If last_error doesn't contain DBSP-E code, it's an old-style error
     if (formatted_error.find("DBSP-E") == std::string::npos) {
       // Wrap in generic format for consistency
-      formatted_error = "Failed to track table '" + data.table_name +
-                       "': " + formatted_error;
+      formatted_error =
+          "Failed to track table '" + data.table_name + "': " + formatted_error;
     }
     throw InvalidInputException(formatted_error);
   }
@@ -174,7 +200,7 @@ void CreateViewFunc(ClientContext &context, TableFunctionInput &input,
       if (formatted_error.find("DBSP-E") == std::string::npos) {
         // Wrap in generic format for consistency
         formatted_error = "Failed to create view '" + data.view_name +
-                         "': " + formatted_error;
+                          "': " + formatted_error;
       }
       throw InvalidInputException(formatted_error);
     }
@@ -215,7 +241,7 @@ void CreateViewFunc(ClientContext &context, TableFunctionInput &input,
       if (formatted_error.find("DBSP-E") == std::string::npos) {
         // Wrap in generic format for consistency
         formatted_error = "Failed to create view '" + data.view_name +
-                         "': " + formatted_error;
+                          "': " + formatted_error;
       }
       throw InvalidInputException(formatted_error);
     }
@@ -613,12 +639,14 @@ void SaveFunc(ClientContext &context, TableFunctionInput &input,
 
   if (data.format == "json") {
     ok = manager.save_to_file(data.target);
-    msg = ok ? "Saved to file: " + data.target
-             : "Error: " + manager.last_error();
+    msg =
+        ok ? "Saved to file: " + data.target : "Error: " + manager.last_error();
   } else {
-    // Table mode - not supported from table functions due to DuckDB transaction restrictions
+    // Table mode - not supported from table functions due to DuckDB transaction
+    // restrictions
     ok = false;
-    msg = "Error: DuckDB table persistence not supported (use JSON files instead). Try: dbsp_save('view_name', 'file.json', 'json')";
+    msg = "Error: DuckDB table persistence not supported (use JSON files "
+          "instead). Try: dbsp_save('view_name', 'file.json', 'json')";
   }
 
   if (!ok) {
@@ -637,8 +665,8 @@ void SaveFunc(ClientContext &context, TableFunctionInput &input,
 // ============================================================================
 
 struct LoadBindData : public TableFunctionData {
-  string source;      // Table name or file path
-  string format;      // "table" or "json"
+  string source; // Table name or file path
+  string format; // "table" or "json"
   bool done = false;
 };
 
@@ -682,9 +710,11 @@ void LoadFunc(ClientContext &context, TableFunctionInput &input,
     msg = ok ? "Loaded from file: " + data.source
              : "Error: " + manager.last_error();
   } else {
-    // Table mode - not supported from table functions due to DuckDB transaction restrictions
+    // Table mode - not supported from table functions due to DuckDB transaction
+    // restrictions
     ok = false;
-    msg = "Error: DuckDB table persistence not supported (use JSON files instead). Try: dbsp_load('file.json', 'json')";
+    msg = "Error: DuckDB table persistence not supported (use JSON files "
+          "instead). Try: dbsp_load('file.json', 'json')";
   }
 
   if (!ok) {
@@ -773,11 +803,9 @@ struct CreateMaterializedViewData : public TableFunctionData {
   bool done = false;
 };
 
-unique_ptr<FunctionData>
-CreateMaterializedViewBind(ClientContext &context,
-                           TableFunctionBindInput &input,
-                           vector<LogicalType> &return_types,
-                           vector<string> &names) {
+unique_ptr<FunctionData> CreateMaterializedViewBind(
+    ClientContext &context, TableFunctionBindInput &input,
+    vector<LogicalType> &return_types, vector<string> &names) {
   auto data = make_uniq<CreateMaterializedViewData>();
   data->view_name = input.inputs[0].GetValue<string>();
   data->select_query = input.inputs[1].GetValue<string>();
@@ -797,12 +825,14 @@ void CreateMaterializedViewExecute(ClientContext &context,
   }
 
   auto &manager = dbsp_native::get_cdc_manager();
-  bool success = manager.create_view(context, state.view_name, state.select_query);
+  bool success =
+      manager.create_view(context, state.view_name, state.select_query);
 
   if (!success) {
     string error = manager.last_error();
     if (error.find("DBSP-E") == string::npos) {
-      error = "Failed to create materialized view '" + state.view_name + "': " + error;
+      error = "Failed to create materialized view '" + state.view_name +
+              "': " + error;
     }
     throw InvalidInputException(error);
   }
@@ -812,7 +842,8 @@ void CreateMaterializedViewExecute(ClientContext &context,
   auto info = manager.get_view_info(state.view_name);
   string sources = "";
   for (size_t i = 0; i < info.source_tables.size(); i++) {
-    if (i > 0) sources += ", ";
+    if (i > 0)
+      sources += ", ";
     sources += info.source_tables[i];
   }
 
@@ -834,8 +865,7 @@ struct DropMaterializedViewData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData>
-DropMaterializedViewBind(ClientContext &context,
-                         TableFunctionBindInput &input,
+DropMaterializedViewBind(ClientContext &context, TableFunctionBindInput &input,
                          vector<LogicalType> &return_types,
                          vector<string> &names) {
   auto data = make_uniq<DropMaterializedViewData>();
@@ -860,7 +890,8 @@ void DropMaterializedViewExecute(ClientContext &context,
   // Check if view exists
   if (!manager.view_exists(state.view_name)) {
     // IF EXISTS was handled by parser, so this is an error
-    throw InvalidInputException("Materialized view does not exist: " + state.view_name);
+    throw InvalidInputException("Materialized view does not exist: " +
+                                state.view_name);
   }
 
   // Check dependencies
@@ -870,7 +901,8 @@ void DropMaterializedViewExecute(ClientContext &context,
     // Build error message
     string dep_list = "";
     for (size_t i = 0; i < dependents.size() && i < 5; i++) {
-      if (i > 0) dep_list += ", ";
+      if (i > 0)
+        dep_list += ", ";
       dep_list += dependents[i];
     }
     if (dependents.size() > 5) {
@@ -878,9 +910,10 @@ void DropMaterializedViewExecute(ClientContext &context,
     }
 
     throw InvalidInputException(
-      "Cannot drop materialized view '" + state.view_name +
-      "': other views depend on it (" + dep_list + ")\n" +
-      "Use DROP MATERIALIZED VIEW " + state.view_name + " CASCADE to drop with dependents");
+        "Cannot drop materialized view '" + state.view_name +
+        "': other views depend on it (" + dep_list + ")\n" +
+        "Use DROP MATERIALIZED VIEW " + state.view_name +
+        " CASCADE to drop with dependents");
   }
 
   // Drop the view (and dependents if cascade)
@@ -900,7 +933,8 @@ void DropMaterializedViewExecute(ClientContext &context,
   output.SetCardinality(1);
   string message = "Dropped materialized view: " + state.view_name;
   if (dropped_count > 1) {
-    message += " (and " + std::to_string(dropped_count - 1) + " dependent views)";
+    message +=
+        " (and " + std::to_string(dropped_count - 1) + " dependent views)";
   }
   output.SetValue(0, 0, Value(message));
 
@@ -916,11 +950,9 @@ struct RefreshMaterializedViewData : public TableFunctionData {
   bool done = false;
 };
 
-unique_ptr<FunctionData>
-RefreshMaterializedViewBind(ClientContext &context,
-                            TableFunctionBindInput &input,
-                            vector<LogicalType> &return_types,
-                            vector<string> &names) {
+unique_ptr<FunctionData> RefreshMaterializedViewBind(
+    ClientContext &context, TableFunctionBindInput &input,
+    vector<LogicalType> &return_types, vector<string> &names) {
   auto data = make_uniq<RefreshMaterializedViewData>();
   data->view_name = input.inputs[0].GetValue<string>();
   return_types.push_back(LogicalType::VARCHAR);
@@ -940,9 +972,10 @@ void RefreshMaterializedViewExecute(ClientContext &context,
 
   // REFRESH is a no-op since views are automatically incremental
   output.SetCardinality(1);
-  output.SetValue(0, 0,
-    Value("Materialized view '" + state.view_name +
-          "' is always up-to-date (automatic incremental refresh)"));
+  output.SetValue(
+      0, 0,
+      Value("Materialized view '" + state.view_name +
+            "' is always up-to-date (automatic incremental refresh)"));
 
   state.done = true;
 }
@@ -955,18 +988,20 @@ void RefreshMaterializedViewExecute(ClientContext &context,
 
 namespace dbsp_native {
 
-ParserExtensionPlanResult MaterializedViewPlan(
-    ParserExtensionInfo *info, ClientContext &context,
-    unique_ptr<ParserExtensionParseData> parse_data_p) {
+ParserExtensionPlanResult
+MaterializedViewPlan(ParserExtensionInfo *info, ClientContext &context,
+                     unique_ptr<ParserExtensionParseData> parse_data_p) {
 
   ParserExtensionPlanResult result;
 
   // Handle CREATE MATERIALIZED VIEW
-  if (auto *create_data = dynamic_cast<::dbsp_native::CreateMaterializedViewParseData *>(parse_data_p.get())) {
+  if (auto *create_data =
+          dynamic_cast<::dbsp_native::CreateMaterializedViewParseData *>(
+              parse_data_p.get())) {
     TableFunction func("create_materialized_view",
-                      {LogicalType::VARCHAR, LogicalType::VARCHAR},
-                      CreateMaterializedViewExecute,
-                      CreateMaterializedViewBind);
+                       {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                       CreateMaterializedViewExecute,
+                       CreateMaterializedViewBind);
 
     result.function = func;
     result.parameters.push_back(Value(create_data->view_name));
@@ -977,11 +1012,12 @@ ParserExtensionPlanResult MaterializedViewPlan(
   }
 
   // Handle DROP MATERIALIZED VIEW
-  if (auto *drop_data = dynamic_cast<::dbsp_native::DropMaterializedViewParseData *>(parse_data_p.get())) {
+  if (auto *drop_data =
+          dynamic_cast<::dbsp_native::DropMaterializedViewParseData *>(
+              parse_data_p.get())) {
     TableFunction func("drop_materialized_view",
-                      {LogicalType::VARCHAR, LogicalType::BOOLEAN},
-                      DropMaterializedViewExecute,
-                      DropMaterializedViewBind);
+                       {LogicalType::VARCHAR, LogicalType::BOOLEAN},
+                       DropMaterializedViewExecute, DropMaterializedViewBind);
 
     result.function = func;
     result.parameters.push_back(Value(drop_data->view_name));
@@ -992,11 +1028,12 @@ ParserExtensionPlanResult MaterializedViewPlan(
   }
 
   // Handle REFRESH MATERIALIZED VIEW
-  if (auto *refresh_data = dynamic_cast<::dbsp_native::RefreshMaterializedViewParseData *>(parse_data_p.get())) {
-    TableFunction func("refresh_materialized_view",
-                      {LogicalType::VARCHAR},
-                      RefreshMaterializedViewExecute,
-                      RefreshMaterializedViewBind);
+  if (auto *refresh_data =
+          dynamic_cast<::dbsp_native::RefreshMaterializedViewParseData *>(
+              parse_data_p.get())) {
+    TableFunction func("refresh_materialized_view", {LogicalType::VARCHAR},
+                       RefreshMaterializedViewExecute,
+                       RefreshMaterializedViewBind);
 
     result.function = func;
     result.parameters.push_back(Value(refresh_data->view_name));
@@ -1010,98 +1047,169 @@ ParserExtensionPlanResult MaterializedViewPlan(
 
 } // namespace dbsp_native
 
+// Extensions
 // ============================================================================
-// Extension Entry Point
+
+// Extensions
 // ============================================================================
+
+using namespace duckdb;
+
+// Extension Callback & Loading
+// ============================================================================
+
+class DBSPExtensionCallback : public ExtensionCallback {
+public:
+  void OnConnectionOpened(ClientContext &context) override {
+    std::cerr << "DBSP: OnConnectionOpened called\n";
+    // Attach our context state for transaction hooking
+    auto &config = DBConfig::GetConfig(context);
+
+    // Register the context state to receive transaction events
+    context.registered_state->GetOrCreate<dbsp_native::DBSPContextState>(
+        "dbsp_cdc_state");
+
+    std::cerr << "DBSP: ContextState registered via registered_state\n";
+  }
+};
+
+static void LoadInternal(DatabaseInstance &instance) {
+  auto &config = DBConfig::GetConfig(instance);
+
+  // Register extension callback
+  config.extension_callbacks.push_back(make_uniq<DBSPExtensionCallback>());
+
+  // Register table functions
+  TableFunction track_func("dbsp_track", {LogicalType::VARCHAR}, TrackFunc,
+                           TrackBind);
+  RegisterExtensionFunction(instance, track_func);
+
+  TableFunction create_view_func("dbsp_create_view",
+                                 {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                                 CreateViewFunc, CreateViewBind);
+  // Optional args for simple mode
+  create_view_func.varargs = LogicalType::ANY;
+  RegisterExtensionFunction(instance, create_view_func);
+
+  // Create Materialized View DDL support
+  // Note: We cannot register actual SQL syntax here (ParserExtension needed for
+  // that) But we can expose the function so our parser extension can call it ?
+  // Or just rely on the table function
+
+  // Register Create Materialized View Table Function (internal)
+  TableFunction create_mv_func("dbsp_create_materialized_view",
+                               {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                               CreateMaterializedViewExecute,
+                               CreateMaterializedViewBind);
+  RegisterExtensionFunction(instance, create_mv_func);
+
+  TableFunction insert_func("dbsp_notify_insert",
+                            {LogicalType::VARCHAR},
+                            NotifyInsertFunc, NotifyBind);
+  insert_func.varargs = LogicalType::ANY; // For column values
+  RegisterExtensionFunction(instance, insert_func);
+
+  TableFunction delete_func("dbsp_notify_delete",
+                            {LogicalType::VARCHAR},
+                            NotifyDeleteFunc, NotifyBind);
+  delete_func.varargs = LogicalType::ANY; // For column values
+  RegisterExtensionFunction(instance, delete_func);
+
+  TableFunction sync_func("dbsp_sync", {}, SyncFunc, SyncBind);
+  sync_func.varargs = LogicalType::VARCHAR; // Optional table name
+  RegisterExtensionFunction(instance, sync_func);
+
+  TableFunction query_func("dbsp_query", {LogicalType::VARCHAR}, QueryFunc,
+                           QueryBind);
+  RegisterExtensionFunction(instance, query_func);
+
+  TableFunction list_views_func("dbsp_views", {}, ListViewsFunc, ListViewsBind);
+  RegisterExtensionFunction(instance, list_views_func);
+
+  TableFunction list_tables_func("dbsp_tables", {}, ListTablesFunc,
+                                 ListTablesBind);
+  RegisterExtensionFunction(instance, list_tables_func);
+
+  TableFunction deps_func("dbsp_deps", {LogicalType::VARCHAR}, DepsFunc,
+                          DepsBind);
+  RegisterExtensionFunction(instance, deps_func);
+
+  TableFunction save_func("dbsp_save", {}, SaveFunc, SaveBind);
+  save_func.varargs = LogicalType::VARCHAR;
+  RegisterExtensionFunction(instance, save_func);
+
+  TableFunction load_func("dbsp_load", {}, LoadFunc, LoadBind);
+  load_func.varargs = LogicalType::VARCHAR;
+  RegisterExtensionFunction(instance, load_func);
+
+  // Register scalar functions
+  CreateScalarFunctionInfo drop_func_info(
+      ScalarFunction("dbsp_drop_view", {LogicalType::VARCHAR},
+                     LogicalType::VARCHAR, DropScalar));
+  RegisterExtensionFunction(instance, drop_func_info);
+
+  // Alias: dbsp_drop (used by tests and shorter API)
+  CreateScalarFunctionInfo drop_alias_info(
+      ScalarFunction("dbsp_drop", {LogicalType::VARCHAR},
+                     LogicalType::VARCHAR, DropScalar));
+  RegisterExtensionFunction(instance, drop_alias_info);
+
+  CreateScalarFunctionInfo drop_cascade_func_info(
+      ScalarFunction("dbsp_drop_view_cascade", {LogicalType::VARCHAR},
+                     LogicalType::VARCHAR, DropCascadeScalar));
+  RegisterExtensionFunction(instance, drop_cascade_func_info);
+
+  // Alias: dbsp_drop_cascade (used by tests and shorter API)
+  CreateScalarFunctionInfo drop_cascade_alias_info(
+      ScalarFunction("dbsp_drop_cascade", {LogicalType::VARCHAR},
+                     LogicalType::VARCHAR, DropCascadeScalar));
+  RegisterExtensionFunction(instance, drop_cascade_alias_info);
+
+  // Initialize Parser Extension for SQL syntax support
+  auto &extension_manager = instance.GetExtensionManager();
+  // We need to register the parser extension
+  config.parser_extensions.push_back(
+      dbsp_native::CreateMaterializedViewParserExtension());
+}
+
+#ifndef EXT_VERSION_DBSP
+#define EXT_VERSION_DBSP "1.0.0"
+#endif
 
 namespace duckdb {
 
-void LoadInternal(ExtensionLoader &loader) {
+class DbspExtension : public Extension {
+public:
+  void Load(ExtensionLoader &loader) override;
+  std::string Name() override;
+  std::string Version() const override;
+};
 
-  // Register parser extension for CREATE/DROP/REFRESH MATERIALIZED VIEW syntax
-  auto &db = loader.GetDatabaseInstance();
-  auto &config = DBConfig::GetConfig(db);
-  config.parser_extensions.push_back(::dbsp_native::CreateMaterializedViewParserExtension());
-
-  // dbsp_track
-  TableFunction track_fn("dbsp_track", {LogicalType::VARCHAR}, TrackFunc,
-                         TrackBind);
-
-  loader.RegisterFunction(track_fn);
-
-  // dbsp_create_view (varargs for both SQL and simple mode)
-  TableFunction create_fn("dbsp_create_view", {}, CreateViewFunc,
-                          CreateViewBind);
-  create_fn.varargs = LogicalType::VARCHAR;
-  loader.RegisterFunction(create_fn);
-
-  // dbsp_notify_insert
-  TableFunction notify_insert_fn("dbsp_notify_insert", {}, NotifyInsertFunc,
-                                 NotifyBind);
-  notify_insert_fn.varargs = LogicalType::ANY;
-  loader.RegisterFunction(notify_insert_fn);
-
-  // dbsp_notify_delete
-  TableFunction notify_delete_fn("dbsp_notify_delete", {}, NotifyDeleteFunc,
-                                 NotifyBind);
-  notify_delete_fn.varargs = LogicalType::ANY;
-  loader.RegisterFunction(notify_delete_fn);
-
-  // dbsp_sync
-  TableFunction sync_fn("dbsp_sync", {}, SyncFunc, SyncBind);
-  sync_fn.varargs = LogicalType::VARCHAR;
-  loader.RegisterFunction(sync_fn);
-
-  // dbsp_query
-  TableFunction query_fn("dbsp_query", {LogicalType::VARCHAR}, QueryFunc,
-                         QueryBind);
-  loader.RegisterFunction(query_fn);
-
-  // dbsp_views
-  TableFunction list_views_fn("dbsp_views", {}, ListViewsFunc, ListViewsBind);
-  loader.RegisterFunction(list_views_fn);
-
-  // dbsp_tables
-  TableFunction list_tables_fn("dbsp_tables", {}, ListTablesFunc,
-                               ListTablesBind);
-  loader.RegisterFunction(list_tables_fn);
-
-  // dbsp_drop
-  ScalarFunction drop_fn("dbsp_drop", {LogicalType::VARCHAR},
-                         LogicalType::VARCHAR, DropScalar);
-  loader.RegisterFunction(drop_fn);
-
-  // dbsp_drop_cascade
-  ScalarFunction drop_cascade_fn("dbsp_drop_cascade", {LogicalType::VARCHAR},
-                                 LogicalType::VARCHAR, DropCascadeScalar);
-  loader.RegisterFunction(drop_cascade_fn);
-
-  // dbsp_save
-  TableFunction save_fn("dbsp_save", {}, SaveFunc, SaveBind);
-  save_fn.varargs = LogicalType::VARCHAR;
-  loader.RegisterFunction(save_fn);
-
-  // dbsp_load
-  TableFunction load_fn("dbsp_load", {}, LoadFunc, LoadBind);
-  load_fn.varargs = LogicalType::VARCHAR;
-  loader.RegisterFunction(load_fn);
-
-  // dbsp_deps
-  TableFunction deps_fn("dbsp_deps", {LogicalType::VARCHAR}, DepsFunc,
-                        DepsBind);
-  loader.RegisterFunction(deps_fn);
+void DbspExtension::Load(ExtensionLoader &loader) {
+  LoadInternal(loader.GetDatabaseInstance());
 }
+
+std::string DbspExtension::Name() { return "dbsp"; }
+
+std::string DbspExtension::Version() const { return EXT_VERSION_DBSP; }
 
 } // namespace duckdb
 
 extern "C" {
 
-DUCKDB_CPP_EXTENSION_ENTRY(dbsp, loader) {
-  duckdb::LoadInternal(loader);
+DUCKDB_EXTENSION_API void dbsp_init(duckdb::DatabaseInstance &db) {
+  duckdb::ExtensionLoader loader(db, "dbsp");
+  duckdb::DbspExtension extension;
+  extension.Load(loader);
+}
+
+DUCKDB_EXTENSION_API void
+dbsp_duckdb_cpp_init(duckdb::ExtensionLoader &loader) {
+  duckdb::DbspExtension extension;
+  extension.Load(loader);
 }
 
 DUCKDB_EXTENSION_API const char *dbsp_version() {
-  return "0.1.0";
+  return duckdb::DuckDB::LibraryVersion();
 }
-
 }

@@ -25,6 +25,8 @@ DBSP:         INSERT 1 row → Update affected aggregates → O(delta)
 
 ## Quick Start
 
+### Basic Example
+
 ```sql
 -- Load the extension
 LOAD 'dbsp';
@@ -33,16 +35,18 @@ LOAD 'dbsp';
 CREATE TABLE orders (id INT, customer VARCHAR, amount DECIMAL);
 SELECT * FROM dbsp_track('orders');
 
--- Create an incrementally maintained view
-SELECT * FROM dbsp_create_view('customer_totals',
-    'SELECT customer, SUM(amount) FROM orders GROUP BY customer');
+-- Create an incrementally maintained view (modern DDL syntax)
+CREATE MATERIALIZED VIEW customer_totals AS
+SELECT customer, SUM(amount) as total
+FROM orders
+GROUP BY customer;
 
 -- Insert data (views update automatically)
 INSERT INTO orders VALUES (1, 'Alice', 100), (2, 'Bob', 200), (3, 'Alice', 150);
 SELECT * FROM dbsp_sync('orders');
 
 -- Query the view (instant - no recomputation)
-SELECT * FROM dbsp_query('customer_totals');
+SELECT * FROM customer_totals;
 -- Returns: Alice: 250, Bob: 200
 
 -- Insert more data
@@ -50,9 +54,46 @@ INSERT INTO orders VALUES (4, 'Alice', 50);
 SELECT * FROM dbsp_sync('orders');
 
 -- View is already updated!
-SELECT * FROM dbsp_query('customer_totals');
+SELECT * FROM customer_totals;
 -- Returns: Alice: 300, Bob: 200
 ```
+
+**Alternative Syntax** (table functions):
+```sql
+-- Create view using table function API
+SELECT * FROM dbsp_create_view('customer_totals',
+    'SELECT customer, SUM(amount) FROM orders GROUP BY customer');
+    
+-- Query using table function
+SELECT * FROM dbsp_query('customer_totals');
+```
+
+### Advanced Examples
+
+**Filtering aggregates with HAVING:**
+```sql
+CREATE MATERIALIZED VIEW high_value_customers AS
+SELECT customer, SUM(amount) as total, COUNT(*) as order_count
+FROM orders
+GROUP BY customer
+HAVING SUM(amount) > 200;
+```
+
+**Recursive queries for graph traversal:**
+```sql
+CREATE TABLE edges (src INT, dst INT);
+SELECT * FROM dbsp_track('edges');
+
+CREATE MATERIALIZED VIEW reachable AS
+WITH RECURSIVE reach AS (
+    SELECT src, dst FROM edges
+    UNION
+    SELECT e.src, r.dst FROM edges e JOIN reach r ON e.dst = r.src
+)
+SELECT * FROM reach;
+```
+
+See [examples/](examples/) for more comprehensive demos.
 
 ## Installation
 
@@ -163,26 +204,44 @@ See [Error Handling Guide](docs/ERROR_HANDLING.md) for details.
 
 ## Supported SQL Features
 
-### Currently Supported
+### ✅ Currently Supported
 
-- `SELECT * FROM table`
-- `SELECT columns FROM table`
-- `SELECT ... WHERE condition`
+**DDL Syntax:**
+- `CREATE MATERIALIZED VIEW name AS SELECT ...`
+- `DROP MATERIALIZED VIEW name [CASCADE]`
+- `REFRESH MATERIALIZED VIEW name` (no-op with auto-refresh)
+
+**Query Operations:**
+- `SELECT * FROM table` / `SELECT columns FROM table`
+- `SELECT ... WHERE condition` with complex predicates
 - `SELECT ... GROUP BY column`
-- `SELECT DISTINCT ...`
-- `SELECT ... FROM t1 JOIN t2 ON ...`
-- Aggregate functions: `SUM`, `COUNT`, `AVG`
-- Comparison operators: `=`, `>`, `<`, `>=`, `<=`, `!=`
-- Cascading views (views on views)
+- `SELECT ... HAVING condition` - filter aggregated results
+- `SELECT DISTINCT ...` - incremental deduplication
+- `SELECT ... FROM t1 JOIN t2 ON ...` - bilinear incremental joins
+  - Multi-column equality joins
+  - Complex JOIN predicates (non-equi conditions)
+- `WITH RECURSIVE ...` - transitive closures and recursive queries
 
-### Planned
+**Aggregate Functions:**
+- `SUM`, `COUNT`, `AVG`, `MIN`, `MAX` - all with O(log n) incremental updates
 
-- `HAVING` clause
-- `ORDER BY` / `LIMIT`
-- Window functions
-- `UNION` / `INTERSECT`
-- Subqueries
-- `MIN` / `MAX` aggregates
+**Circuit Optimization:**
+- Automatic filter pushdown through JOINs
+- Projection pruning to minimize data movement
+- Operator fusion for reduced overhead
+
+**Advanced Features:**
+- Cascading views (views on views with dependency tracking)
+- NULL-aware operations (SQL semantics for GROUP BY, JOINs, aggregates)
+- Incremental recursive query evaluation
+
+### 📋 Planned (Phase 4+)
+
+- `ORDER BY` / `LIMIT` (anti-pattern - degrades to O(n), deferred)
+- Window functions (`ROW_NUMBER`, `RANK`, `LAG`, `LEAD`)
+- Set operations: `UNION`, `INTERSECT`, `EXCEPT`
+- Automatic CDC via transaction hooks
+- Subqueries and CTEs (non-recursive)
 
 ## How It Works
 

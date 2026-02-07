@@ -1,6 +1,6 @@
 #include "catch.hpp"
-#include "../../include/dbsp_zset.hpp"
-#include "../../include/dbsp_stream.hpp"
+#include "include/dbsp_zset.hpp"
+#include "include/dbsp_stream.hpp"
 
 using namespace dbsp;
 

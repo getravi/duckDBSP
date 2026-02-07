@@ -617,21 +617,31 @@ private:
 
 // Join view with incremental bilinear formula
 // Supports multi-column JOIN keys: ON a.x = b.x AND a.y = b.y
+// Also supports non-equi predicates via optional filter
 class NativeJoinView : public NativeMaterializedView {
 public:
   // Key function returns DuckDBRow to support composite keys
   using KeyFn = std::function<DuckDBRow(const DuckDBRow &)>;
   // Projection function for join result
   using ProjectFn = std::function<DuckDBRow(const DuckDBRow &)>;
+  // Filter predicate for non-equi conditions (applied after equi-join match)
+  using JoinPredicate =
+      std::function<bool(const DuckDBRow &left, const DuckDBRow &right)>;
+  // Filter predicate for input tables (pushed down filters)
+  using FilterFn = std::function<bool(const DuckDBRow &)>;
 
   NativeJoinView(const std::string &name, const std::string &sql,
                  const std::string &left_table, const std::string &right_table,
                  const TableSchema &result_schema, KeyFn left_key,
-                 KeyFn right_key, ProjectFn project = nullptr)
+                 KeyFn right_key, ProjectFn project = nullptr,
+                 JoinPredicate filter = nullptr, FilterFn left_filter = nullptr,
+                 FilterFn right_filter = nullptr)
       : NativeMaterializedView(name, sql), left_table_(left_table),
         right_table_(right_table), schema_(result_schema),
         left_key_(std::move(left_key)), right_key_(std::move(right_key)),
-        project_(std::move(project)) {
+        project_(std::move(project)), filter_(std::move(filter)),
+        left_filter_(std::move(left_filter)),
+        right_filter_(std::move(right_filter)) {
     schema_.table_name = name;
   }
 
@@ -640,6 +650,10 @@ public:
     delta_.clear();
     if (table_name == left_table_) {
       for (const auto &[row, weight] : changes) {
+        if (left_filter_ && !left_filter_(row)) {
+          continue;
+        }
+
         DuckDBRow key = left_key_(row);
 
         // SQL Standard: NULL never matches NULL in JOINs
@@ -661,6 +675,10 @@ public:
       }
     } else if (table_name == right_table_) {
       for (const auto &[row, weight] : changes) {
+        if (right_filter_ && !right_filter_(row)) {
+          continue;
+        }
+
         DuckDBRow key = right_key_(row);
 
         // SQL Standard: NULL never matches NULL in JOINs
@@ -710,6 +728,11 @@ private:
 
   void add_join_result(const DuckDBRow &left, const DuckDBRow &right,
                        Weight weight) {
+    // Apply non-equi filter predicate if present
+    if (filter_ && !filter_(left, right)) {
+      return; // Filter rejects this pair
+    }
+
     DuckDBRow joined;
     joined.columns.reserve(left.columns.size() + right.columns.size());
     for (const auto &col : left.columns) {
@@ -736,6 +759,9 @@ private:
   KeyFn left_key_;
   KeyFn right_key_;
   ProjectFn project_;
+  JoinPredicate filter_;
+  FilterFn left_filter_;
+  FilterFn right_filter_;
   // Use DuckDBRow as key for composite key support
   std::unordered_map<DuckDBRow, DuckDBZSet, DuckDBRowHash> left_indexed_;
   std::unordered_map<DuckDBRow, DuckDBZSet, DuckDBRowHash> right_indexed_;

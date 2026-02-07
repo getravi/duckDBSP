@@ -5,26 +5,28 @@
 #pragma once
 
 #include "dbsp_duckdb_types.hpp"
+#include "dbsp_optimizer.hpp"
 #include "dbsp_sql_parser.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/main/appender.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/parser/column_definition.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
-#include "duckdb/main/appender.hpp"
-#include "duckdb/parser/parsed_data/create_table_info.hpp"
-#include "duckdb/parser/column_definition.hpp"
 
 #include <algorithm>
 #include <fstream>
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -37,7 +39,7 @@ namespace dbsp_native {
 
 // Enhanced identifier validation with detailed error codes
 inline bool validate_identifier(const std::string &name, std::string &error_msg,
-                               ErrorCode &error_code) {
+                                ErrorCode &error_code) {
   error_msg.clear();
   error_code = ErrorCode::INVALID_IDENTIFIER;
 
@@ -48,14 +50,16 @@ inline bool validate_identifier(const std::string &name, std::string &error_msg,
   }
 
   if (name.length() > 255) {
-    error_msg = "Identifier too long (max 255 characters): " + std::to_string(name.length());
+    error_msg = "Identifier too long (max 255 characters): " +
+                std::to_string(name.length());
     error_code = ErrorCode::IDENTIFIER_TOO_LONG;
     return false;
   }
 
   // First character must be letter or underscore
   if (!std::isalpha(name[0]) && name[0] != '_') {
-    error_msg = "Identifier must start with letter or underscore: '" + name + "'";
+    error_msg =
+        "Identifier must start with letter or underscore: '" + name + "'";
     error_code = ErrorCode::INVALID_IDENTIFIER;
     return false;
   }
@@ -306,7 +310,7 @@ public:
 
   // Reset all state (for testing)
   void reset() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::shared_mutex> lock(mutex_);
     tracked_tables_.clear();
     views_.clear();
     table_schemas_.clear();
@@ -318,7 +322,7 @@ public:
   // Track a DuckDB table for CDC
   bool track_table(duckdb::ClientContext &context,
                    const std::string &table_name) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::shared_mutex> lock(mutex_);
 
     // Validate table name to prevent SQL injection
     if (!is_valid_identifier(table_name)) {
@@ -349,7 +353,7 @@ public:
 
   // Untrack a table
   void untrack_table(const std::string &table_name) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::shared_mutex> lock(mutex_);
     tracked_tables_.erase(table_name);
     table_schemas_.erase(table_name);
     dep_graph_.remove_node(table_name);
@@ -359,7 +363,7 @@ public:
   // Supports referencing other views (cascading views)
   bool create_view(duckdb::ClientContext &context, const std::string &view_name,
                    const std::string &sql) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::shared_mutex> lock(mutex_);
 
     // Validate view name to prevent SQL injection
     if (!is_valid_identifier(view_name)) {
@@ -375,49 +379,54 @@ public:
       return false;
     }
 
-#if 1  // SQL parser re-enabled for DuckDB 1.4.0
-        DBSPSqlParser parser;
-        auto result = parser.parse(sql, view_name);
+#if 1 // SQL parser re-enabled for DuckDB 1.4.0
+    DBSPSqlParser parser;
+    auto result = parser.parse(sql, view_name);
 
-        if (!result.success) {
-            last_error_ = result.error;
-            return false;
+    if (!result.success) {
+      last_error_ = result.error;
+      return false;
+    }
+
+    // optimizing parsed view definition
+    DBSPOptimizer optimizer;
+    result.view_def = optimizer.optimize(result.view_def);
+
+    // Resolve sources - can be tables or other views
+    std::vector<std::string> resolved_sources;
+    for (const auto &source : result.view_def.source_tables) {
+      // Check for cycles
+      if (dep_graph_.would_create_cycle(view_name, source)) {
+        last_error_ =
+            "Circular dependency detected: " + view_name + " -> " + source;
+        return false;
+      }
+
+      // Check if source is a view
+      if (views_.count(source)) {
+        // Source is another view - add to schema from view's result schema
+        table_schemas_[source] = views_[source]->result_schema();
+        resolved_sources.push_back(source);
+      } else if (tracked_tables_.count(source)) {
+        // Source is a tracked table
+        resolved_sources.push_back(source);
+      } else {
+        // Try to auto-track as a table
+        if (!track_table_internal(context, source)) {
+          last_error_ = "Could not find source: " + source;
+          return false;
         }
+        resolved_sources.push_back(source);
+      }
+    }
 
-        // Resolve sources - can be tables or other views
-        std::vector<std::string> resolved_sources;
-        for (const auto& source : result.view_def.source_tables) {
-            // Check for cycles
-            if (dep_graph_.would_create_cycle(view_name, source)) {
-                last_error_ = "Circular dependency detected: " + view_name + " -> " + source;
-                return false;
-            }
-
-            // Check if source is a view
-            if (views_.count(source)) {
-                // Source is another view - add to schema from view's result schema
-                table_schemas_[source] = views_[source]->result_schema();
-                resolved_sources.push_back(source);
-            } else if (tracked_tables_.count(source)) {
-                // Source is a tracked table
-                resolved_sources.push_back(source);
-            } else {
-                // Try to auto-track as a table
-                if (!track_table_internal(context, source)) {
-                    last_error_ = "Could not find source: " + source;
-                    return false;
-                }
-                resolved_sources.push_back(source);
-            }
-        }
-
-        // Create the view
-        auto view = ViewFactory::create_view(result.view_def, table_schemas_);
-        if (!view) {
-            last_error_ = "Could not create view from SQL";
-            return false;
-        }
-// Moved below
+    // Create the view
+    auto view = ViewFactory::create_view(result.view_def, table_schemas_);
+    if (!view) {
+      last_error_ = "Could not create view from SQL";
+      return false;
+    }
+    // Moved below
 
     // Add dependencies
     for (const auto &source : resolved_sources) {
@@ -450,12 +459,12 @@ public:
 
     views_[view_name] = std::move(view);
     return true;
-#endif  // SQL parser disabled - end of function
+#endif // SQL parser disabled - end of function
   }
 
   // Drop a view
   bool drop_view(const std::string &view_name) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::shared_mutex> lock(mutex_);
 
     // Check if other views depend on this one
     auto dependents = dep_graph_.get_all_dependents(view_name);
@@ -473,7 +482,7 @@ public:
 
   // Force drop a view and all dependents
   bool drop_view_cascade(const std::string &view_name) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::shared_mutex> lock(mutex_);
 
     auto dependents = dep_graph_.get_all_dependents(view_name);
 
@@ -494,7 +503,7 @@ public:
 
   // Record an INSERT
   void on_insert(const std::string &table_name, const DuckDBRow &row) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::shared_mutex> lock(mutex_);
 
     auto it = tracked_tables_.find(table_name);
     if (it == tracked_tables_.end())
@@ -506,7 +515,7 @@ public:
 
   // Record a DELETE
   void on_delete(const std::string &table_name, const DuckDBRow &row) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::shared_mutex> lock(mutex_);
 
     auto it = tracked_tables_.find(table_name);
     if (it == tracked_tables_.end())
@@ -519,7 +528,7 @@ public:
   // Record an UPDATE
   void on_update(const std::string &table_name, const DuckDBRow &old_row,
                  const DuckDBRow &new_row) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::shared_mutex> lock(mutex_);
 
     auto it = tracked_tables_.find(table_name);
     if (it == tracked_tables_.end())
@@ -532,7 +541,7 @@ public:
   // Batch insert
   void on_batch_insert(const std::string &table_name,
                        const std::vector<DuckDBRow> &rows) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::shared_mutex> lock(mutex_);
 
     auto it = tracked_tables_.find(table_name);
     if (it == tracked_tables_.end())
@@ -547,13 +556,13 @@ public:
   // Sync tracked table with actual DuckDB table
   bool sync_table(duckdb::ClientContext &context,
                   const std::string &table_name) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::shared_mutex> lock(mutex_);
     return sync_table_locked(context, table_name);
   }
 
   // Sync all tracked tables
   void sync_all(duckdb::ClientContext &context) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::shared_mutex> lock(mutex_);
     for (const auto &[name, _] : tracked_tables_) {
       sync_table_locked(context, name);
     }
@@ -566,14 +575,14 @@ public:
   // Save all view definitions to a DuckDB table
   bool save_to_table(duckdb::ClientContext &context,
                      const std::string &storage_table = "_dbsp_views") {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::shared_mutex> lock(mutex_);
     return save_to_table_internal(context, storage_table, view_definitions_);
   }
 
   bool save_view_to_table(duckdb::ClientContext &context,
                           const std::string &view_name,
                           const std::string &storage_table) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::shared_mutex> lock(mutex_);
     // Save just the specified view
     std::unordered_map<std::string, ViewDefinition> single_view;
     auto it = view_definitions_.find(view_name);
@@ -587,18 +596,23 @@ public:
   }
 
 private:
-  bool save_to_table_internal(duckdb::ClientContext &context,
-                              const std::string &storage_table,
-                              const std::unordered_map<std::string, ViewDefinition> &defs) {
+  bool save_to_table_internal(
+      duckdb::ClientContext &context, const std::string &storage_table,
+      const std::unordered_map<std::string, ViewDefinition> &defs) {
     try {
       auto &catalog = duckdb::Catalog::GetCatalog(context, INVALID_CATALOG);
       auto &schema_entry = catalog.GetSchema(context, DEFAULT_SCHEMA);
       auto catalog_txn = catalog.GetCatalogTransaction(context);
 
       // Table must exist - we can't create tables from within table functions
-      auto existing = schema_entry.GetEntry(catalog_txn, duckdb::CatalogType::TABLE_ENTRY, storage_table);
+      auto existing = schema_entry.GetEntry(
+          catalog_txn, duckdb::CatalogType::TABLE_ENTRY, storage_table);
       if (!existing) {
-        last_error_ = "Storage table '" + storage_table + "' does not exist. Create it first with: CREATE TABLE " + storage_table + " (name VARCHAR, sql VARCHAR, sources VARCHAR, created_at BIGINT)";
+        last_error_ =
+            "Storage table '" + storage_table +
+            "' does not exist. Create it first with: CREATE TABLE " +
+            storage_table +
+            " (name VARCHAR, sql VARCHAR, sources VARCHAR, created_at BIGINT)";
         return false;
       }
 
@@ -610,7 +624,8 @@ private:
       for (const auto &[name, def] : defs) {
         std::string sources;
         for (size_t i = 0; i < def.source_tables.size(); i++) {
-          if (i > 0) sources += ",";
+          if (i > 0)
+            sources += ",";
           sources += def.source_tables[i];
         }
 
@@ -633,11 +648,10 @@ private:
   }
 
 public:
-
   // Load view definitions from a DuckDB table and recreate views
   bool load_from_table(duckdb::ClientContext &context,
                        const std::string &storage_table = "_dbsp_views") {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::shared_mutex> lock(mutex_);
 
     try {
       auto &catalog = duckdb::Catalog::GetCatalog(context, INVALID_CATALOG);
@@ -645,7 +659,8 @@ public:
       auto catalog_txn = catalog.GetCatalogTransaction(context);
 
       // Check if storage table exists
-      auto table_ptr = schema_entry.GetEntry(catalog_txn, duckdb::CatalogType::TABLE_ENTRY, storage_table);
+      auto table_ptr = schema_entry.GetEntry(
+          catalog_txn, duckdb::CatalogType::TABLE_ENTRY, storage_table);
       if (!table_ptr) {
         // Table doesn't exist - nothing to load
         return true;
@@ -674,14 +689,16 @@ public:
       while (true) {
         chunk.Reset();
         data_table.Scan(transaction, chunk, scan_state);
-        if (chunk.size() == 0) break;
+        if (chunk.size() == 0)
+          break;
 
         for (idx_t row_idx = 0; row_idx < chunk.size(); row_idx++) {
           ViewDefinition def;
           def.name = chunk.GetValue(0, row_idx).GetValue<std::string>();
           def.sql = chunk.GetValue(1, row_idx).GetValue<std::string>();
 
-          std::string sources = chunk.GetValue(2, row_idx).GetValue<std::string>();
+          std::string sources =
+              chunk.GetValue(2, row_idx).GetValue<std::string>();
           if (!sources.empty()) {
             std::stringstream ss(sources);
             std::string source;
@@ -718,7 +735,7 @@ public:
 
   // Save to JSON file
   bool save_to_file(const std::string &filepath) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::shared_mutex> lock(mutex_);
 
     try {
       // Validate filepath to prevent path traversal
@@ -785,7 +802,7 @@ public:
   // Load from JSON file
   bool load_from_file(duckdb::ClientContext &context,
                       const std::string &filepath) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::shared_mutex> lock(mutex_);
 
     try {
       // Validate filepath to prevent path traversal
@@ -914,7 +931,7 @@ public:
   // ========================================================================
 
   const DuckDBZSet *query_view(const std::string &view_name) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     auto it = views_.find(view_name);
     if (it == views_.end())
       return nullptr;
@@ -922,7 +939,7 @@ public:
   }
 
   const TableSchema *get_view_schema(const std::string &view_name) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     auto it = views_.find(view_name);
     if (it == views_.end())
       return nullptr;
@@ -930,7 +947,7 @@ public:
   }
 
   std::vector<std::string> list_views() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     std::vector<std::string> names;
     for (const auto &[name, _] : views_) {
       names.push_back(name);
@@ -939,7 +956,7 @@ public:
   }
 
   std::vector<std::string> list_tracked_tables() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     std::vector<std::string> names;
     for (const auto &[name, _] : tracked_tables_) {
       names.push_back(name);
@@ -948,7 +965,7 @@ public:
   }
 
   const TableSchema *get_table_schema(const std::string &table_name) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     auto it = table_schemas_.find(table_name);
     return it != table_schemas_.end() ? &it->second : nullptr;
   }
@@ -963,7 +980,7 @@ public:
   };
 
   ViewInfo get_view_info(const std::string &view_name) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     ViewInfo info;
     auto it = views_.find(view_name);
     if (it != views_.end()) {
@@ -979,13 +996,13 @@ public:
 
   // Get view dependencies
   std::vector<std::string> get_view_dependencies(const std::string &view_name) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     return dep_graph_.get_dependencies(view_name);
   }
 
   // Get views that depend on this view/table
   std::vector<std::string> get_dependents(const std::string &name) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     return dep_graph_.get_all_dependents(name);
   }
 
@@ -996,13 +1013,13 @@ public:
 
   // Check if view exists
   bool view_exists(const std::string &view_name) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     return views_.find(view_name) != views_.end();
   }
 
   // Get drop order for CASCADE (returns views in order to drop)
   std::vector<std::string> get_drop_order(const std::string &view_name) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     auto dependents = dep_graph_.get_all_dependents(view_name);
 
     // Return in reverse order (drop leaves first, then parents)
@@ -1026,7 +1043,8 @@ private:
       auto &schema_entry = catalog.GetSchema(context, DEFAULT_SCHEMA);
       auto catalog_transaction = catalog.GetCatalogTransaction(context);
 
-      auto table_entry_ptr = schema_entry.GetEntry(catalog_transaction, duckdb::CatalogType::TABLE_ENTRY, table_name);
+      auto table_entry_ptr = schema_entry.GetEntry(
+          catalog_transaction, duckdb::CatalogType::TABLE_ENTRY, table_name);
       if (!table_entry_ptr) {
         return false;
       }
@@ -1058,7 +1076,7 @@ private:
         data_table.Scan(transaction, chunk, scan_state);
 
         if (chunk.size() == 0) {
-          break;  // No more data
+          break; // No more data
         }
 
         // Extract rows from chunk
@@ -1142,7 +1160,8 @@ private:
       auto &schema_entry = catalog.GetSchema(context, DEFAULT_SCHEMA);
       auto catalog_transaction = catalog.GetCatalogTransaction(context);
 
-      auto table_entry_ptr = schema_entry.GetEntry(catalog_transaction, duckdb::CatalogType::TABLE_ENTRY, table_name);
+      auto table_entry_ptr = schema_entry.GetEntry(
+          catalog_transaction, duckdb::CatalogType::TABLE_ENTRY, table_name);
       if (!table_entry_ptr) {
         return false;
       }
@@ -1174,7 +1193,7 @@ private:
         data_table.Scan(transaction, chunk, scan_state);
 
         if (chunk.size() == 0) {
-          break;  // No more data
+          break; // No more data
         }
 
         // Extract rows from chunk
@@ -1205,7 +1224,8 @@ private:
       auto &schema_entry = catalog.GetSchema(context, DEFAULT_SCHEMA);
       auto catalog_transaction = catalog.GetCatalogTransaction(context);
 
-      auto table_entry_ptr = schema_entry.GetEntry(catalog_transaction, duckdb::CatalogType::TABLE_ENTRY, table_name);
+      auto table_entry_ptr = schema_entry.GetEntry(
+          catalog_transaction, duckdb::CatalogType::TABLE_ENTRY, table_name);
       if (!table_entry_ptr) {
         return false;
       }
@@ -1318,7 +1338,8 @@ private:
           if (views_.count(src)) {
             it->second->apply_changes(src, views_[src]->get_result());
           } else if (tracked_tables_.count(src)) {
-            it->second->apply_changes(src, tracked_tables_[src]->current_state());
+            it->second->apply_changes(src,
+                                      tracked_tables_[src]->current_state());
           }
         }
       }
@@ -1421,7 +1442,7 @@ private:
     return s.size();
   }
 
-  mutable std::mutex mutex_;
+  mutable std::shared_mutex mutex_;
   std::unordered_map<std::string, std::unique_ptr<TrackedTable>>
       tracked_tables_;
   std::unordered_map<std::string, TableSchema> table_schemas_;

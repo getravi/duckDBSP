@@ -1,6 +1,6 @@
 #include "catch.hpp"
-#include "../../include/dbsp_materialized_view.hpp"
-#include "../../dbsp_duckdb_types.hpp"
+#include "include/dbsp_materialized_view.hpp"
+#include "dbsp_duckdb_types.hpp"
 
 using namespace dbsp;
 

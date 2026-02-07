@@ -1,5 +1,5 @@
 #include "catch.hpp"
-#include "../../dbsp_errors.hpp"
+#include "dbsp_errors.hpp"
 
 using namespace dbsp_native;
 

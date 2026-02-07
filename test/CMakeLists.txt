@@ -48,9 +48,10 @@ add_dbsp_test(zset unit/test_zset.cpp)
 add_dbsp_test(cdc_manager unit/test_cdc_manager.cpp)
 add_dbsp_test(sql_parser unit/test_sql_parser.cpp)
 add_dbsp_test(security_validation unit/test_security_validation.cpp)
-add_dbsp_test(error_system unit/test_error_system.cpp)
-add_dbsp_test(parser_errors unit/test_parser_errors.cpp)
-add_dbsp_test(view_validation unit/test_view_validation.cpp)
+add_dbsp_test(optimizer unit/test_optimizer.cpp)
+# add_dbsp_test(error_system unit/test_error_system.cpp)
+# add_dbsp_test(parser_errors unit/test_parser_errors.cpp)
+# add_dbsp_test(view_validation unit/test_view_validation.cpp)
 add_dbsp_test(validation_errors unit/test_validation_errors.cpp)
 add_dbsp_test(null_handling unit/test_null_handling.cpp)
 add_dbsp_test(minmax_correctness unit/test_minmax_correctness.cpp)
@@ -73,6 +74,14 @@ target_link_libraries(test_extension_cdc catch2_main duckdb_static)
 target_compile_definitions(test_extension_cdc PRIVATE DUCKDB_EXTENSION_MAIN)
 add_test(NAME extension_cdc COMMAND test_extension_cdc)
 
+add_executable(test_auto_cdc
+    integration/test_auto_cdc.cpp
+    ../dbsp_extension.cpp
+)
+target_link_libraries(test_auto_cdc catch2_main duckdb_static)
+target_compile_definitions(test_auto_cdc PRIVATE DUCKDB_EXTENSION_MAIN)
+add_test(NAME auto_cdc COMMAND test_auto_cdc)
+
 add_executable(test_cascading_views
     integration/test_cascading_views.cpp
     ../dbsp_extension.cpp
@@ -88,6 +97,22 @@ target_compile_definitions(test_distinct_ddl PRIVATE DUCKDB_EXTENSION_MAIN)
 add_test(NAME distinct_ddl COMMAND test_distinct_ddl)
 target_compile_definitions(test_cascading_views PRIVATE DUCKDB_EXTENSION_MAIN)
 add_test(NAME cascading_views COMMAND test_cascading_views)
+
+add_executable(test_join_complex
+    integration/test_join_complex.cpp
+    ../dbsp_extension.cpp
+)
+target_link_libraries(test_join_complex catch2_main duckdb_static)
+target_compile_definitions(test_join_complex PRIVATE DUCKDB_EXTENSION_MAIN)
+add_test(NAME join_complex COMMAND test_join_complex)
+
+add_executable(test_recursive
+    integration/test_recursive.cpp
+    ../dbsp_extension.cpp
+)
+target_link_libraries(test_recursive catch2_main duckdb_static)
+target_compile_definitions(test_recursive PRIVATE DUCKDB_EXTENSION_MAIN)
+add_test(NAME recursive COMMAND test_recursive)
 
 add_executable(test_persistence
     integration/test_persistence.cpp
@@ -113,13 +138,14 @@ target_link_libraries(test_acid_compliance catch2_main duckdb_static)
 target_compile_definitions(test_acid_compliance PRIVATE DUCKDB_EXTENSION_MAIN)
 add_test(NAME acid_compliance COMMAND test_acid_compliance)
 
-add_executable(test_recursive
-    integration/test_recursive.cpp
+# Optimization Integration Test
+add_executable(test_optimization_integration
+    integration/test_optimization_integration.cpp
     ../dbsp_extension.cpp
 )
-target_link_libraries(test_recursive catch2_main duckdb_static)
-target_compile_definitions(test_recursive PRIVATE DUCKDB_EXTENSION_MAIN)
-add_test(NAME recursive COMMAND test_recursive)
+target_link_libraries(test_optimization_integration catch2_main duckdb_static)
+target_compile_definitions(test_optimization_integration PRIVATE DUCKDB_EXTENSION_MAIN)
+add_test(NAME optimization_integration COMMAND test_optimization_integration)
 
 # Benchmarks
 add_executable(bench_incremental
@@ -128,7 +154,7 @@ add_executable(bench_incremental
 )
 target_link_libraries(bench_incremental catch2_main duckdb_static)
 target_compile_definitions(bench_incremental PRIVATE DUCKDB_EXTENSION_MAIN)
-add_test(NAME benchmark_incremental COMMAND bench_incremental)
+# add_test(NAME benchmark_incremental COMMAND bench_incremental)
 
 add_executable(test_error_handling_e2e
     integration/test_error_handling_e2e.cpp

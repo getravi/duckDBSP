@@ -93,6 +93,16 @@ struct ParsedViewDef {
     std::vector<std::pair<std::string, std::string>>
         column_pairs; // (left_col, right_col)
     std::vector<std::pair<size_t, size_t>> column_idx_pairs; // resolved indices
+
+    // Non-equi predicates: ON a.x = b.x AND a.y > b.z
+    struct NonEquiPredicate {
+      std::string left_col;
+      std::string right_col;
+      std::string op; // ">", "<", ">=", "<=", "!="
+      size_t left_idx = 0;
+      size_t right_idx = 0;
+    };
+    std::vector<NonEquiPredicate> non_equi_predicates;
   };
   std::optional<JoinInfo> join_info;
 
@@ -121,6 +131,19 @@ struct ParsedViewDef {
     duckdb::Value value;
   };
   std::vector<HavingFilter> having_filters;
+
+  // ========================================================================
+  // Optimizer metadata (populated by DBSPOptimizer)
+  // ========================================================================
+  bool optimized = false; // Whether optimization passes have been applied
+
+  // Pushed-down filters (for join queries)
+  std::vector<FilterInfo> left_pushed_filters; // Filters pushed to left source
+  std::vector<FilterInfo>
+      right_pushed_filters; // Filters pushed to right source
+
+  // Required columns (after projection pruning)
+  std::vector<std::string> required_columns;
 };
 
 // SQL Parser for DBSP views
@@ -410,10 +433,51 @@ private:
         auto &right_col =
             cmp.right->template Cast<duckdb::ColumnRefExpression>();
 
-        // Add column pair to the list
+        // Add column pair to the equi-join list
         info.column_pairs.push_back(
             {left_col.GetColumnName(), right_col.GetColumnName()});
       }
+    } else if (is_non_equi_comparison(expr->type)) {
+      // Handle non-equi predicates: >, <, >=, <=, !=
+      auto &cmp = expr->template Cast<duckdb::ComparisonExpression>();
+
+      if (cmp.left->type == duckdb::ExpressionType::COLUMN_REF &&
+          cmp.right->type == duckdb::ExpressionType::COLUMN_REF) {
+        auto &left_col = cmp.left->template Cast<duckdb::ColumnRefExpression>();
+        auto &right_col =
+            cmp.right->template Cast<duckdb::ColumnRefExpression>();
+
+        ParsedViewDef::JoinInfo::NonEquiPredicate pred;
+        pred.left_col = left_col.GetColumnName();
+        pred.right_col = right_col.GetColumnName();
+        pred.op = comparison_op_to_string(expr->type);
+        info.non_equi_predicates.push_back(pred);
+      }
+    }
+  }
+
+  static bool is_non_equi_comparison(duckdb::ExpressionType type) {
+    return type == duckdb::ExpressionType::COMPARE_GREATERTHAN ||
+           type == duckdb::ExpressionType::COMPARE_LESSTHAN ||
+           type == duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO ||
+           type == duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO ||
+           type == duckdb::ExpressionType::COMPARE_NOTEQUAL;
+  }
+
+  static std::string comparison_op_to_string(duckdb::ExpressionType type) {
+    switch (type) {
+    case duckdb::ExpressionType::COMPARE_GREATERTHAN:
+      return ">";
+    case duckdb::ExpressionType::COMPARE_LESSTHAN:
+      return "<";
+    case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+      return ">=";
+    case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
+      return "<=";
+    case duckdb::ExpressionType::COMPARE_NOTEQUAL:
+      return "!=";
+    default:
+      return "=";
     }
   }
 
@@ -433,8 +497,7 @@ private:
         def.project_columns.push_back(i);
         // Capture qualified reference (table name only if qualified)
         std::string table_name = col.IsQualified() ? col.GetTableName() : "";
-        def.project_column_refs.push_back(
-            {table_name, col.GetColumnName()});
+        def.project_column_refs.push_back({table_name, col.GetColumnName()});
         break;
       }
 
@@ -984,6 +1047,47 @@ private:
     auto left_schema_it = table_schemas.find(join.left_table);
     auto right_schema_it = table_schemas.find(join.right_table);
 
+    // Apply pushed-down filters if present
+    // Note: We need to wrap the source tables in filter views conceptually
+    // But since we are building the join view which takes table names, we might
+    // need to create intermediate filter views. However, the current
+    // NativeJoinView takes 'left_table' and 'right_table' strings. If we want
+    // to filter simply, we can't easily do it without creating intermediate
+    // views registered in the manager.
+    //
+    // ALTERNATIVE: Just include the pushed down filters in the JoinPredicate?
+    // No, that's not "push down". Push down means filtering BEFORE join (or
+    // during scan).
+    //
+    // If we can't create intermediate views easily here (because we don't have
+    // the manager), we might have to rely on the fact that NativeJoinView *can*
+    // take a filter. BUT that filter is applied *during* the join (or after
+    // matching). To truly push down, we want to filter the inputs.
+    //
+    // A true pushdown in this architecture (views on views) means creating a
+    // FilterView for the source, and then joining that FilterView. But
+    // create_join_view returns a unique_ptr, it doesn't register views. And it
+    // takes table names as strings.
+    //
+    // If we change the input table name to a new (intermediate) view name, we
+    // need to actually CREATE that intermediate view and register it. But we
+    // don't have the manager here.
+    //
+    // OPTION 2: Modify NativeJoinView to accept input-side filters?
+    // This is probably the cleanest "local" change without architectural
+    // refactoring. We can pass left_filter and right_filter to NativeJoinView.
+
+    // Let's check NativeJoinView again.
+    // It has `apply_changes(table_name, changes)`.
+    // It can filter changes from left_table before processing.
+
+    // So plan:
+    // 1. Modify NativeJoinView to accept left_predicate and right_predicate.
+    // 2. In apply_changes, if table == left_table, apply left_predicate to
+    // changes.
+    //
+    // This requires modifying dbsp_duckdb_types.hpp first.
+
     TableSchema left_schema, right_schema;
     if (left_schema_it != table_schemas.end()) {
       left_schema = left_schema_it->second;
@@ -1140,9 +1244,151 @@ private:
       }
     }
 
+    // Build filter lambda for non-equi predicates AND remaining filters
+    NativeJoinView::JoinPredicate filter = nullptr;
+    if (!join.non_equi_predicates.empty() || !def.filters.empty()) {
+      // Resolve column indices for non-equi predicates
+      struct ResolvedPredicate {
+        size_t left_idx;
+        size_t right_idx;
+        std::string op;
+      };
+
+      // 1. Join non-equi predicates
+      std::vector<ResolvedPredicate> resolved_preds;
+      for (const auto &pred : join.non_equi_predicates) {
+        ResolvedPredicate rp;
+        rp.left_idx = find_column_index(left_schema, pred.left_col);
+        rp.right_idx = find_column_index(right_schema, pred.right_col);
+        rp.op = pred.op;
+        resolved_preds.push_back(rp);
+      }
+
+      // 2. Remaining filters (post-join filters)
+      // These need to be mapped to left or right columns if possible
+      // Note: In a join view, we have access to left and right rows separately
+      // We need to resolve which side the filter applies to.
+      // If it's a simple column ref, find it in left or right schema.
+      // Note: We use the original column_name (which might be qualified)
+      struct ResolvedFilter {
+        bool is_left; // true = left, false = right
+        size_t col_idx;
+        std::string op;
+        duckdb::Value value;
+      };
+      std::vector<ResolvedFilter> resolved_filters;
+
+      for (const auto &f : def.filters) {
+        std::string col = f.column_name;
+        // Strip prefix if present
+        auto dot = col.find('.');
+        if (dot != std::string::npos)
+          col = col.substr(dot + 1);
+
+        bool found = false;
+        // Check left
+        size_t l_idx = find_column_index(left_schema, col);
+        if (duckdb::StringUtil::CIEquals(left_schema.columns[l_idx].name,
+                                         col)) {
+          resolved_filters.push_back({true, l_idx, f.op, f.value});
+          found = true;
+        } else {
+          // Check right
+          size_t r_idx = find_column_index(right_schema, col);
+          if (duckdb::StringUtil::CIEquals(right_schema.columns[r_idx].name,
+                                           col)) {
+            resolved_filters.push_back({false, r_idx, f.op, f.value});
+            found = true;
+          }
+        }
+
+        // If not found in either, we ignore it here (should error or handle
+        // otherwise) But for now, we assume valid SQL.
+      }
+
+      filter = [resolved_preds, resolved_filters](
+                   const DuckDBRow &left, const DuckDBRow &right) -> bool {
+        // Check non-equi predicates
+        for (const auto &pred : resolved_preds) {
+          if (pred.left_idx >= left.columns.size() ||
+              pred.right_idx >= right.columns.size()) {
+            return false;
+          }
+          const auto &left_val = left.columns[pred.left_idx];
+          const auto &right_val = right.columns[pred.right_idx];
+
+          if (left_val.IsNull() || right_val.IsNull()) {
+            return false;
+          }
+
+          if (!compare_values(left_val, pred.op, right_val)) {
+            return false;
+          }
+        }
+
+        // Check remaining filters
+        for (const auto &rf : resolved_filters) {
+          const auto &row = rf.is_left ? left : right;
+          if (rf.col_idx >= row.columns.size())
+            return false;
+
+          const auto &val = row.columns[rf.col_idx];
+          if (!compare_values(val, rf.op, rf.value))
+            return false;
+        }
+
+        return true;
+      };
+    }
+
+    // Build left pushed-down filter
+    NativeJoinView::FilterFn left_filter = nullptr;
+    if (!def.left_pushed_filters.empty()) {
+      std::vector<std::pair<size_t, ParsedViewDef::FilterInfo>>
+          resolved_filters;
+      for (const auto &filter : def.left_pushed_filters) {
+        size_t col_idx = find_column_index(left_schema, filter.column_name);
+        resolved_filters.push_back({col_idx, filter});
+      }
+
+      left_filter = [resolved_filters](const DuckDBRow &row) -> bool {
+        for (const auto &[col_idx, filter] : resolved_filters) {
+          if (col_idx >= row.columns.size())
+            return false;
+          const auto &col_val = row.columns[col_idx];
+          if (!compare_values(col_val, filter.op, filter.value))
+            return false;
+        }
+        return true;
+      };
+    }
+
+    // Build right pushed-down filter
+    NativeJoinView::FilterFn right_filter = nullptr;
+    if (!def.right_pushed_filters.empty()) {
+      std::vector<std::pair<size_t, ParsedViewDef::FilterInfo>>
+          resolved_filters;
+      for (const auto &filter : def.right_pushed_filters) {
+        size_t col_idx = find_column_index(right_schema, filter.column_name);
+        resolved_filters.push_back({col_idx, filter});
+      }
+
+      right_filter = [resolved_filters](const DuckDBRow &row) -> bool {
+        for (const auto &[col_idx, filter] : resolved_filters) {
+          if (col_idx >= row.columns.size())
+            return false;
+          const auto &col_val = row.columns[col_idx];
+          if (!compare_values(col_val, filter.op, filter.value))
+            return false;
+        }
+        return true;
+      };
+    }
+
     return std::make_unique<NativeJoinView>(
         def.view_name, def.sql, join.left_table, join.right_table,
-        result_schema, left_key, right_key, project);
+        result_schema, left_key, right_key, project, filter, left_filter,
+        right_filter);
   }
 
   static std::unique_ptr<NativeMaterializedView> create_distinct_view(
