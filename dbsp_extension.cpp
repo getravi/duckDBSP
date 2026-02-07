@@ -40,6 +40,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
@@ -1080,25 +1081,13 @@ void LoadInternal(ExtensionLoader &loader) {
 } // namespace duckdb
 
 extern "C" {
-// Entry point for C++ ABI extensions - DuckDB expects <name>_duckdb_cpp_init
-DUCKDB_EXTENSION_API void dbsp_duckdb_cpp_init(duckdb::DatabaseInstance &db) {
-  // TODO: Fix extension loading - LoadInternal causes "Missing DB manager" error
-  // This appears to be a timing issue where ExtensionLoader tries to access
-  // the database manager before it's fully initialized.
-  //
-  // For now, extension loads but functions are not registered.
-  // Need to either:
-  // 1. Use Extension base class with Load() method
-  // 2. Find correct timing for registration
-  // 3. Use different registration API
 
-  (void)db; // Suppress unused parameter warning
+DUCKDB_CPP_EXTENSION_ENTRY(dbsp, loader) {
+  duckdb::LoadInternal(loader);
 }
 
-// Legacy entry point for compatibility
-DUCKDB_EXTENSION_API void dbsp_init(duckdb::DatabaseInstance &db) {
-  dbsp_duckdb_cpp_init(db);
+DUCKDB_EXTENSION_API const char *dbsp_version() {
+  return "0.1.0";
 }
 
-DUCKDB_EXTENSION_API const char *dbsp_version() { return "0.1.0"; }
 }
