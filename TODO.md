@@ -302,113 +302,179 @@ GROUP BY customer_id;
 
 ---
 
-## 🔴 PHASE 2: SQL COMPLETENESS (Weeks 3-5, Target: Feb 24 - Mar 10)
+## 🔴 PHASE 2: CORE DBSP COMPLETENESS (Weeks 3-5, Target: Feb 24 - Mar 10)
 
-### P2.1: Add ORDER BY and LIMIT Support
-**Priority**: 🔴 HIGH (Essential for "top N" queries)
+> **⚠️ REVISED FOCUS**: Phase 2 now prioritizes **core DBSP theoretical features** over SQL syntax sugar, based on alignment with DBSP research papers and correctness requirements.
+
+### P2.1: DISTINCT SQL Integration ⭐ QUICK WIN
+**Priority**: 🔴 CRITICAL (Core DBSP feature, already implemented)
 **Status**: NOT STARTED
-**Effort**: 5-7 days
-**Target Completion**: Feb 24 - Mar 2
-**Depends On**: P1.2 (HAVING works first)
+**Effort**: 1-2 days
+**Target Completion**: Feb 21-22
+**Depends On**: None (independent)
 
-**Description**: Implement ORDER BY and LIMIT/OFFSET for sorted, paginated results
-Current: Error E102/E103 thrown
-Target: `SELECT * FROM view ORDER BY column DESC LIMIT 10 OFFSET 5`
+**Description**: Expose existing DISTINCT operator to SQL parser
+Current: `IncrementalDistinct` exists in C++ but `SELECT DISTINCT` throws error
+Target: `SELECT DISTINCT column FROM table` works correctly
 
-**Challenge**: Maintaining sorted order incrementally is architecturally complex
+**Background**: The incremental distinct operator (Δ-distinct) is a fundamental DBSP primitive covered in the relational algebra formalization. It's already correctly implemented in `dbsp_stream.hpp` but not accessible via SQL.
 
 **Example Queries to Support**:
 ```sql
-SELECT * FROM orders ORDER BY created_at DESC LIMIT 10;
+SELECT DISTINCT customer_id FROM orders;
 
-SELECT product, SUM(quantity) as qty FROM sales
-GROUP BY product
-ORDER BY qty DESC
-LIMIT 5;
+SELECT DISTINCT category, brand FROM products;
 
-SELECT * FROM employees
-ORDER BY salary DESC, name ASC
-LIMIT 10 OFFSET 20;
+-- Combined with other operations
+SELECT DISTINCT dept FROM employees WHERE salary > 50000;
 ```
 
 **Files to Modify**:
-- `dbsp_materialized_view.hpp` - Add NativeOrderByView class
-- `dbsp_sql_parser.hpp` - Parse ORDER BY and LIMIT clauses
-- `dbsp_sql_parser.hpp` - Create OrderByView variant
-- `test/unit/test_sql_parser.cpp` - Parser tests
-- `test/integration/test_cascading_views.cpp` - Functional tests
+- `dbsp_sql_parser.hpp` - Detect SELECT DISTINCT syntax
+- `dbsp_cdc.hpp` - Wire DistinctView to ViewFactory
+- `test/unit/test_sql_parser.cpp` - Add DISTINCT parsing tests
+- `test/integration/test_extension_basic.cpp` - Add functional tests
 
 **Implementation Steps**:
 
-1. **Step 2.1.1**: Design OrderByView architecture
-   - New class: `NativeOrderByView<KeyType, ValueType>`
-   - Stores: Sorted container (std::vector<(key, value)> sorted by order_by_columns)
-   - On updates: Re-sort incrementally
-   - On queries: Return top N rows
-   - Challenge: Efficient incremental sorting for large datasets
+1. **Step 2.1.1**: Update SQL parser to detect DISTINCT
+   ```cpp
+   // In parse_select_list()
+   if (select_node->modifier == SelectModifier::DISTINCT) {
+       def.type = ViewType::DISTINCT;
+   }
+   ```
 
-2. **Step 2.1.2**: Extend ParsedViewDef (dbsp_sql_parser.hpp)
-   - Add: `std::vector<OrderByColumn> order_by_columns`
-   - Add: `std::optional<uint64_t> limit`
-   - Add: `std::optional<uint64_t> offset`
-   - Where OrderByColumn = {column_name, is_ascending}
+2. **Step 2.1.2**: Update ViewFactory to create DistinctView
+   - When `def.type == ViewType::DISTINCT`, instantiate `DistinctView`
+   - Wire to source table
 
-3. **Step 2.1.3**: Update parser (dbsp_sql_parser.hpp)
-   - After parsing GROUP BY, check for ORDER BY
-   - Parse ORDER BY columns: `column_name [ASC|DESC]`
-   - Parse LIMIT: `LIMIT number`
-   - Parse OFFSET: `OFFSET number`
-   - Store in ParsedViewDef
-
-4. **Step 2.1.4**: Implement NativeOrderByView
-   - `apply_changes(delta)`:
-     - For additions: Insert into sorted position
-     - For deletions: Remove from sorted position
-     - For modifications: Update and re-sort if order columns changed
-   - `query()`: Return rows [offset, offset+limit)
-   - `on_dependency_update()`: Re-sort when source data changes
-
-5. **Step 2.1.5**: Integrate with ViewFactory
-   - Detect when ORDER BY/LIMIT are present in ParsedViewDef
-   - Wrap base view with NativeOrderByView
-   - Example: `SelectAll → OrderBy → Results`
-
-6. **Step 2.1.6**: Test ORDER BY and LIMIT
-   - Unit test: Parse ORDER BY and LIMIT
-   - Integration test: Create view with ORDER BY
-   - Integration test: Query returns limited results in order
-   - Integration test: Updates re-sort correctly
+3. **Step 2.1.3**: Test DISTINCT functionality
+   - Unit test: Parse `SELECT DISTINCT`
+   - Integration test: Verify duplicates removed
+   - Integration test: Incremental updates maintain distinctness
+   - Edge case: DISTINCT with NULL values
 
 **Success Criteria**:
-- ✅ Parser recognizes ORDER BY with ASC/DESC
-- ✅ Parser recognizes LIMIT and OFFSET
-- ✅ Results returned in correct sort order
-- ✅ LIMIT/OFFSET pagination works correctly
-- ✅ Multi-column sorting works (e.g., ORDER BY col1 ASC, col2 DESC)
-- ✅ Incremental updates maintain correct sorted order
-- ✅ NULL values sorted correctly (trailing in ascending order)
+- ✅ Parser recognizes `SELECT DISTINCT` without error
+- ✅ Duplicate rows removed from results
+- ✅ Incremental updates correctly maintain uniqueness
+- ✅ NULL values handled correctly (NULLs are distinct from each other in SQL)
+- ✅ Works with WHERE, GROUP BY, JOIN
 - ✅ All new tests pass
 
 **Testing**:
-- Unit: 3+ tests for ORDER BY/LIMIT parsing
-- Integration: 5+ tests for sorting and pagination
-- Edge case: Empty result set with LIMIT
-- Edge case: OFFSET > result set size
-- Edge case: Multi-column sort
-- Edge case: NULL value ordering
-- Performance: Verify incremental updates are efficient
+- Unit: 3+ tests for DISTINCT parsing
+- Integration: 4+ tests for distinct behavior with updates
+- Edge case: All duplicate values
+- Edge case: No duplicates (DISTINCT is no-op)
+- Edge case: Mix of duplicates and unique values
 
-**Dependencies**: P1.2
-**Blockers**: Must handle efficient incremental sorting
-**Risk Level**: MEDIUM - Architecturally complex, but well-understood
+**Dependencies**: None
+**Blockers**: None - implementation already exists
+**Risk Level**: LOW - Simple SQL wiring
 
 ---
 
-### P2.2: Support Complex JOIN Predicates
-**Priority**: 🟡 MEDIUM-HIGH (Improves real-world usability)
+### P2.2: Fix MIN/MAX Incremental Deletions ⭐ CORRECTNESS FIX
+**Priority**: 🔴 CRITICAL (Correctness issue for O(δ) claims)
+**Status**: NOT STARTED
+**Effort**: 3-4 days
+**Target Completion**: Feb 24-27
+**Depends On**: P1.3 (MIN/MAX implementation)
+
+**Description**: Replace O(n) MIN/MAX deletion handling with O(log n) solution
+Current: Rebuilds aggregate when minimum/maximum is deleted (degrades to O(n))
+Target: Maintain ordered multiset per group for true O(log n) incremental updates
+
+**Problem**: Current TODO.md acknowledges at line 272-273:
+> "Challenge: When deleting, how do we know if the min/max changed?"
+> "Solution A (Simple): Rebuild aggregate from remaining elements"
+
+This violates DBSP's O(δ) guarantee and makes MIN/MAX non-incremental.
+
+**Example Issue**:
+```sql
+-- Group has 1M rows, min value appears once
+SELECT dept, MIN(salary) FROM employees GROUP BY dept;
+
+-- Delete the min salary row → O(n) rebuild!
+DELETE FROM employees WHERE salary = 30000;
+```
+
+**Files to Modify**:
+- `dbsp_materialized_view.hpp` - Update AggregateView::AggState
+- `include/dbsp_materialized_view.hpp` - Add ordered multiset tracking
+- `test/integration/test_cascading_views.cpp` - Add MIN/MAX deletion tests
+- `test/benchmarks/bench_aggregates.cpp` - Verify O(log n) performance
+
+**Implementation Steps**:
+
+1. **Step 2.2.1**: Extend AggState to track all values
+   ```cpp
+   struct AggState {
+       int64_t sum = 0;
+       int64_t count = 0;
+       std::multiset<int64_t> values;  // NEW: Ordered values for MIN/MAX
+   };
+   ```
+
+2. **Step 2.2.2**: Update MIN computation
+   ```cpp
+   // Insert: O(log n)
+   state.values.insert(value);
+   
+   // Delete: O(log n)
+   auto it = state.values.find(value);
+   if (it != state.values.end()) {
+       state.values.erase(it);
+   }
+   
+   // MIN: O(1)
+   int64_t min = state.values.empty() ? 0 : *state.values.begin();
+   ```
+
+3. **Step 2.2.3**: Update MAX computation
+   ```cpp
+   // MAX: O(1)
+   int64_t max = state.values.empty() ? 0 : *state.values.rbegin();
+   ```
+
+4. **Step 2.2.4**: Memory optimization (optional)
+   - Only maintain `values` multiset for MIN/MAX aggregates
+   - For SUM/COUNT/AVG, keep current approach (don't waste memory)
+
+5. **Step 2.2.5**: Test and benchmark
+   - Unit test: MIN/MAX with deletions
+   - Integration test: Large group (10k rows), delete min/max values
+   - Benchmark: Verify O(log n) vs old O(n) behavior
+
+**Success Criteria**:
+- ✅ MIN correctly updated when minimum value deleted (O(log n))
+- ✅ MAX correctly updated when maximum value deleted (O(log n))
+- ✅ Multiple occurrences of min/max value handled correctly
+- ✅ Empty groups return NULL (standard SQL behavior)
+- ✅ Benchmark shows O(log n) deletion time, not O(n)
+- ✅ All existing MIN/MAX tests still pass
+
+**Testing**:
+- Unit: 5+ tests for MIN/MAX deletion scenarios
+- Integration: 3+ tests with large groups
+- Performance: Benchmark deletion of min/max in 10k, 100k, 1M groups
+- Edge case: Delete all values (group becomes empty)
+- Edge case: Multiple identical min/max values
+
+**Dependencies**: P1.3
+**Blockers**: None
+**Risk Level**: LOW - Well-understood data structure (std::multiset)
+
+---
+
+### P2.3: Support Complex JOIN Predicates
+**Priority**: 🟡 MEDIUM (Extends correct bilinear join logic)
 **Status**: NOT STARTED
 **Effort**: 2-3 days
-**Target Completion**: Mar 3-5
+**Target Completion**: Feb 28 - Mar 3
 **Depends On**: P1.2 (HAVING)
 
 **Description**: Extend JOIN support from equality-only to complex predicates
@@ -436,24 +502,24 @@ JOIN grades g
 
 **Implementation Steps**:
 
-1. **Step 2.2.1**: Extend JoinPredicate struct
+1. **Step 2.3.1**: Extend JoinPredicate struct
    - Current: Single equality (left_col, right_col)
    - New: List of predicates (AND-ed together)
    - Support: Equality and comparison operators (>, <, >=, <=, !=)
 
-2. **Step 2.2.2**: Update parser to handle compound ON clauses
+2. **Step 2.3.2**: Update parser to handle compound ON clauses
    - Current: Parses single equality
    - New: Parse `ON cond1 AND cond2 AND ... AND condN`
    - Each condition can be `=`, `>`, `<`, `>=`, `<=`, `!=`
    - Store list of predicates in ParsedViewDef
 
-3. **Step 2.2.3**: Update NativeJoinView to evaluate complex predicates
+3. **Step 2.3.3**: Update NativeJoinView to evaluate complex predicates
    - Current: Equality join uses hash table
    - New: For each potential pair, evaluate all predicates
    - Optimization: Still use equality predicates for hash table keys
    - Then filter by non-equi predicates
 
-4. **Step 2.2.4**: Test complex JOIN predicates
+4. **Step 2.3.4**: Test complex JOIN predicates
    - Unit test: Parse complex ON clauses
    - Integration test: Multi-column equality join
    - Integration test: Non-equi predicates (if supported)
@@ -478,111 +544,155 @@ JOIN grades g
 
 ---
 
-### P2.3: Automatic CDC via Transaction Hooks ⭐ PHASE 2 MILESTONE
-**Priority**: 🔴 HIGH (Huge UX improvement)
+### P2.4: Recursive Query Support ⭐ PHASE 2 MILESTONE
+**Priority**: 🟡 MEDIUM-HIGH (Core DBSP differentiator)
 **Status**: NOT STARTED
 **Effort**: 1-2 weeks
-**Target Completion**: Mar 6-10
-**Depends On**: P1.2, P2.1, P2.2 (other tasks should be complete first)
+**Target Completion**: Mar 4-10
+**Depends On**: P2.1, P2.2, P2.3
 
-**Description**: Hook into DuckDB's transaction system for automatic CDC propagation
-Current: Manual `SELECT dbsp_sync('table')` required after each update
-Target: Automatic CDC on COMMIT, zero manual intervention
+**Description**: Implement WITH RECURSIVE for transitive closures and recursive queries
+Current: No recursive query support
+Target: `WITH RECURSIVE ... SELECT ...` with incremental maintenance
 
-**Challenge**: Requires deep DuckDB internals knowledge, API research
+**Background**: Recursive queries are a **core DBSP capability** covered extensively in the formal specification (`recursive.lean`) and VLDB paper Section 7. This is what differentiates DBSP from traditional incremental view maintenance.
 
-**How It Would Work**:
-```
-User: INSERT INTO table VALUES (...)
-      COMMIT;
-      ↓
-DuckDB Transaction System: onCommit() hook
-      ↓
-DBSP: Detect delta, propagate to views
-      ↓
-Result: Views auto-updated, no dbsp_sync() call needed
+**Example Queries to Support**:
+```sql
+-- Transitive closure: Find all reachable nodes in a graph
+WITH RECURSIVE reachable AS (
+    SELECT src, dst FROM edges
+    UNION
+    SELECT e.src, r.dst 
+    FROM edges e 
+    JOIN reachable r ON e.dst = r.src
+)
+SELECT * FROM reachable;
+
+-- Employee hierarchy
+WITH RECURSIVE employee_tree AS (
+    SELECT id, name, manager_id, 0 as level FROM employees WHERE manager_id IS NULL
+    UNION ALL
+    SELECT e.id, e.name, e.manager_id, et.level + 1
+    FROM employees e
+    JOIN employee_tree et ON e.manager_id = et.id
+)
+SELECT * FROM employee_tree;
+
+-- Bill of materials (BOM) explosion
+WITH RECURSIVE bom AS (
+    SELECT part_id, component_id, quantity FROM parts WHERE part_id = 'WIDGET'
+    UNION ALL
+    SELECT b.part_id, p.component_id, b.quantity * p.quantity
+    FROM bom b
+    JOIN parts p ON b.component_id = p.part_id
+)
+SELECT * FROM bom;
 ```
 
 **Files to Modify**:
-- `dbsp_extension.cpp` - Register transaction hooks
-- `dbsp_cdc.hpp` - Update CDCManager to be hook-aware
-- New: `dbsp_transaction_hooks.hpp` - Hook implementations
-- `test/integration/test_extension_cdc.cpp` - Hook behavior tests
+- `dbsp_sql_parser.hpp` - Parse WITH RECURSIVE syntax
+- `include/dbsp_stream.hpp` - Add stream introduction/elimination (δ₀, ∫)
+- `include/dbsp_circuit.hpp` - Add recursive operator support
+- New: `dbsp_recursive.hpp` - Recursive query implementation
+- `test/unit/test_sql_parser.cpp` - Parser tests
+- `test/integration/test_recursive.cpp` - Functional tests (NEW FILE)
 
 **Implementation Steps**:
 
-1. **Step 2.3.1**: Research DuckDB transaction hooks API
-   - Investigate DuckDB source: `src/main/db_instance.cpp`, `src/transaction/`
-   - Find: `onAppend()`, `onDelete()`, `onUpdate()` hooks (or equivalent)
-   - Document: Hook signatures, when they fire, what data available
-   - Design: How to extract row deltas from hooks
+1. **Step 2.4.1**: Study DBSP recursive theory
+   - Read formal spec: `recursive.lean` from Lean formalization
+   - Understand stream introduction δ₀: Creates nested time domain
+   - Understand stream elimination ∫: Computes fixed point
+   - Review VLDB paper Section 7: "Recursive Queries"
 
-2. **Step 2.3.2**: Design hook integration point
-   - Option A: Register global transaction listener
-   - Option B: Per-table hooks (if DuckDB supports)
-   - Choose option with least overhead
-   - Handle: Nested transactions, savepoints, rollbacks
+2. **Step 2.4.2**: Extend SQL parser for WITH RECURSIVE
+   ```cpp
+   // Detect WITH RECURSIVE clause
+   if (statement has WITH clause && is RECURSIVE) {
+       parse recursive CTE definition
+       identify base case (anchor)
+       identify recursive case
+   }
+   ```
 
-3. **Step 2.3.3**: Implement onAppend hook
-   - Hook fires when rows added to tracked table
-   - Extract: (table_name, new_rows)
-   - Call: `CDCManager::record_insertions(table, rows)`
-   - Verify: View updates happen before COMMIT returns
+3. **Step 2.4.3**: Implement stream introduction δ₀
+   ```cpp
+   // dbsp_stream.hpp
+   template <typename T>
+   class StreamIntroduction {
+       // Converts a Z-set into a unit pulse at time 0
+       Stream<ZSet<T>> introduce(const ZSet<T>& initial);
+   };
+   ```
 
-4. **Step 2.3.4**: Implement onDelete hook
-   - Hook fires when rows deleted from tracked table
-   - Extract: (table_name, deleted_rows)
-   - Call: `CDCManager::record_deletions(table, rows)`
+4. **Step 2.4.4**: Implement stream elimination ∫
+   ```cpp
+   // dbsp_stream.hpp
+   template <typename T>
+   class StreamElimination {
+       // Iterates until fixed point is reached
+       ZSet<T> eliminate(Stream<ZSet<T>> recursive_stream);
+   };
+   ```
 
-5. **Step 2.3.5**: Implement onUpdate hook
-   - Hook fires when rows updated in tracked table
-   - Extract: (table_name, old_rows, new_rows)
-   - Handle: Treat as deletion + insertion
-   - Call: `CDCManager::record_deletions()` then `record_insertions()`
+5. **Step 2.4.5**: Create RecursiveView class
+   ```cpp
+   // dbsp_recursive.hpp
+   class RecursiveView : public MaterializedView {
+       void apply_changes(const RowZSet& changes) override {
+           // Apply δ₀ (introduce into nested time)
+           // Run recursive iteration until convergence
+           // Apply ∫ (eliminate back to original time)
+       }
+   };
+   ```
 
-6. **Step 2.3.6**: Add configuration for sync modes
-   - Config: `auto_cdc_enabled` (boolean)
-   - Config: `auto_cdc_mode` (immediate vs deferred)
-   - Default: Both OFF (backward compatible with manual sync)
-   - Users can opt-in to automatic CDC
+6. **Step 2.4.6**: Implement fixed-point detection
+   - Detect when recursive iteration produces no new results
+   - Safety: Limit max iterations (e.g., 1000) to prevent infinite loops
+   - Optimization: Use delta-based convergence check
 
-7. **Step 2.3.7**: Test automatic CDC
-   - Integration test: Enable auto_cdc, INSERT, verify views updated
-   - Integration test: Enable auto_cdc, DELETE, verify views updated
-   - Integration test: Rollback transaction, verify views unchanged
-   - Integration test: Concurrent transactions, verify consistency
+7. **Step 2.4.7**: Test recursive queries
+   - Unit test: Parse WITH RECURSIVE
+   - Integration test: Transitive closure on small graph (5 nodes)
+   - Integration test: Incremental update to edges triggers re-computation
+   - Integration test: Employee hierarchy with new manager
+   - Stress test: Large graph (1000 nodes), ensure convergence
 
 **Success Criteria**:
-- ✅ Auto-CDC can be enabled/disabled via config
-- ✅ Views auto-update after INSERT with AUTO_CDC enabled
-- ✅ Views auto-update after DELETE with AUTO_CDC enabled
-- ✅ Views auto-update after UPDATE with AUTO_CDC enabled
-- ✅ Rolled back transactions don't update views
-- ✅ Concurrent transactions handled correctly
-- ✅ Backward compatible: Manual sync still works
+- ✅ Parser recognizes WITH RECURSIVE syntax
+- ✅ Base case (anchor) and recursive case separated correctly
+- ✅ Transitive closure computes correctly
+- ✅ Fixed-point convergence detection works
+- ✅ Incremental updates trigger minimal re-computation
+- ✅ Safety: Max iteration limit prevents infinite loops
 - ✅ All new tests pass
 
 **Testing**:
-- Integration: 5+ tests for auto-CDC scenarios
-- Concurrency: 2+ tests with multiple concurrent transactions
-- Edge case: Transaction rollback
-- Edge case: Savepoints (if supported)
-- Performance: Verify no significant overhead vs manual sync
+- Unit: 4+ tests for WITH RECURSIVE parsing
+- Integration: 5+ tests for recursive query evaluation
+- Edge case: Empty base case
+- Edge case: No fixed point (error handling)
+- Edge case: Single iteration (base case is complete result)
+- Performance: Benchmark convergence time for large graphs
 
-**Dependencies**: P1.2, P2.1, P2.2 (should be complete)
-**Blockers**: Requires investigation of DuckDB internals
-**Risk Level**: MEDIUM-HIGH - Complex DuckDB API, potential compatibility issues
+**Dependencies**: P2.1, P2.2, P2.3
+**Blockers**: Requires deep understanding of DBSP recursion theory
+**Risk Level**: MEDIUM-HIGH - Complex feature, but well-documented in theory
+
+**Note**: This is an **advanced DBSP feature** that differentiates this extension from simpler incremental view systems. Implementing this correctly demonstrates mastery of DBSP theory.
 
 ---
 
-## 🟡 PHASE 3: PRODUCTION READINESS (Weeks 6-8, Target: Mar 11-24)
+## 🟡 PHASE 3: PRODUCTION READINESS (Weeks 6-7, Target: Mar 11-24)
 
 ### P3.1: Enhanced Error Messages and Diagnostics
 **Priority**: 🟡 MEDIUM (Important for adoption)
 **Status**: NOT STARTED
 **Effort**: 2-3 days
 **Target Completion**: Mar 11-13
-**Depends On**: P1.2 (After key features implemented)
+**Depends On**: P2.4 (After core features implemented)
 
 **Description**: Improve error messages for unsupported features and edge cases
 
@@ -799,7 +909,229 @@ Target: Automated builds and tests on every commit/PR
 
 ---
 
-## 📊 PHASE SUMMARY TABLE
+### P3.4: Circuit Optimization Pass
+**Priority**: 🟡 MEDIUM (Performance improvement)
+**Status**: NOT STARTED
+**Effort**: 5-7 days
+**Target Completion**: Mar 22-24
+**Depends On**: P2.4 (After core features complete)
+
+**Description**: Implement circuit optimization passes for operator fusion and pushdown
+Current: Circuit abstraction exists but no optimization
+Target: Automatic query optimization following DBSP theory
+
+**Background**: DBSP formal specification (`circuits.lean`) proves correctness of a general algorithm for incrementalizing and optimizing circuits. This enables automatic query optimization.
+
+**Optimization Strategies**:
+1. **Filter Pushdown**: Move filters closer to data sources
+2. **Projection Pushdown**: Eliminate unused columns early
+3. **Operator Fusion**: Combine multiple map/filter operations
+4. **Join Reordering**: Optimize join order for smallest intermediates
+
+**Files to Modify**:
+- New: `include/dbsp_optimizer.hpp` - Circuit optimization passes
+- `dbsp_cdc.hpp` - Apply optimization before circuit execution
+- `test/benchmarks/bench_optimization.cpp` - Measure improvements
+- `docs/OPTIMIZATION.md` - Document optimization strategy
+
+**Implementation Steps**:
+
+1. **Step 3.4.1**: Create circuit analysis pass
+   - Traverse circuit graph
+   - Identify optimization opportunities
+   - Build dependency graph
+
+2. **Step 3.4.2**: Implement filter pushdown
+   - Detect filter nodes
+   - Move filters before expensive operations (joins, aggregates)
+   - Verify semantics-preserving transformation
+
+3. **Step 3.4.3**: Implement projection pushdown
+   - Track which columns are actually used
+   - Eliminate unused column projections early
+   - Reduce data volume through pipeline
+
+4. **Step 3.4.4**: Implement operator fusion
+   - Combine consecutive map operations
+   - Combine consecutive filter operations
+   - Reduce materialization overhead
+
+5. **Step 3.4.5**: Benchmark improvements
+   - Measure query execution time before/after optimization
+   - Track memory usage reduction
+   - Document speedup percentages
+
+**Success Criteria**:
+- ✅ Filter pushdown reduces rows processed
+- ✅ Projection pushdown reduces memory usage
+- ✅ Operator fusion reduces overhead
+- ✅ Optimized circuits produce identical results
+- ✅ Benchmark shows 20%+ improvement on complex queries
+- ✅ All existing tests still pass
+
+**Testing**:
+- Unit: 5+ tests for each optimization rule
+- Integration: Verify optimized and unoptimized produce same results
+- Benchmark: Measure performance on TPC-H style queries
+
+**Dependencies**: P2.4
+**Blockers**: None
+**Risk Level**: MEDIUM - Must preserve semantics
+
+---
+
+## 🟢 PHASE 4: ADVANCED FEATURES (Weeks 8+, Target: Mar 25+)
+
+> **Note**: Phase 4 features are **deferred** because they are either:
+> 1. Nice-to-have UX improvements (not core DBSP)
+> 2. Anti-patterns to incremental computation
+> 3. Can be implemented after core DBSP completeness
+
+### P4.1: Automatic CDC via Transaction Hooks
+**Priority**: 🟢 LOW (UX improvement, not core DBSP)
+**Status**: NOT STARTED
+**Effort**: 1-2 weeks
+**Target Completion**: Mar 25 - Apr 5
+**Depends On**: P3.4 (After all core features stable)
+
+**Description**: Hook into DuckDB's transaction system for automatic CDC propagation
+Current: Manual `SELECT dbsp_sync('table')` required after each update
+Target: Automatic CDC on COMMIT, zero manual intervention
+
+**Rationale for Deferral**:
+- CDC mechanism is **external** to DBSP theory
+- Current manual sync works correctly
+- High implementation complexity vs benefit
+- Should focus on DBSP correctness first
+
+**Note**: See original P2.3 specification (now moved to P4.1) for full implementation details.
+
+---
+
+### P4.2: ORDER BY and LIMIT Support
+**Priority**: 🟢 LOW (Anti-pattern to incremental)
+**Status**: NOT STARTED
+**Effort**: 5-7 days
+**Target Completion**: Apr 6-12
+**Depends On**: P3.4
+
+**Description**: Implement ORDER BY and LIMIT/OFFSET for sorted, paginated results
+Current: Error E102/E103 thrown
+Target: `SELECT * FROM view ORDER BY column DESC LIMIT 10 OFFSET 5`
+
+**Rationale for Deferral**:
+- ORDER BY is **not a DBSP primitive** (not in relational algebra formalization)
+- Breaks incremental semantics - entire order can change with one insert
+- Degrades to O(n log n) on every update
+- Client-side sorting of final results is more efficient
+- DBSP papers don't discuss ORDER BY for good reason
+
+**Implementation Caveats**:
+- ⚠️ **Performance Warning**: This will be O(n log n) on updates, not O(δ)
+- ⚠️ **Not Incremental**: Violates DBSP O(δ) guarantee
+- ⚠️ **Better Alternative**: Query materialized view, sort client-side
+
+**If Implemented**:
+- Document performance characteristics clearly
+- Warn users that ORDER BY views are not incremental
+- Consider making it opt-in with explicit flag
+
+**Note**: See original P2.1 specification (now moved to P4.2) for full implementation details if still desired.
+
+---
+
+### P4.3: Window Functions and Streaming Aggregates
+**Priority**: 🟢 LOW (Advanced feature)
+**Status**: NOT STARTED
+**Effort**: 2-3 weeks
+**Target Completion**: Apr 13 - May 3
+**Depends On**: P4.1, P4.2
+
+**Description**: Support window functions for time-based and row-based windows
+Current: No window function support
+Target: `SELECT AVG(price) OVER (ORDER BY time ROWS BETWEEN 10 PRECEDING AND CURRENT ROW)`
+
+**Example Queries**:
+```sql
+-- Moving average
+SELECT product_id, price,
+       AVG(price) OVER (PARTITION BY product_id ORDER BY date ROWS BETWEEN 7 PRECEDING AND CURRENT ROW) as moving_avg
+FROM sales;
+
+-- Running total
+SELECT order_id, amount,
+       SUM(amount) OVER (ORDER BY order_date) as running_total
+FROM orders;
+
+-- Rank
+SELECT name, salary,
+       RANK() OVER (ORDER BY salary DESC) as salary_rank
+FROM employees;
+```
+
+**DBSP Theory**: Window operators can be expressed in DBSP using time-domain transformations, similar to recursive queries but more complex.
+
+**Files to Modify**:
+- `dbsp_sql_parser.hpp` - Parse OVER clause
+- New: `dbsp_window.hpp` - Window operator implementations
+- `test/integration/test_window_functions.cpp` - Window tests
+
+**Success Criteria**:
+- ✅ ROW-based windows work correctly
+- ✅ PARTITION BY works
+- ✅ ORDER BY within window works
+- ✅ Incremental maintenance of windows
+- ✅ All standard window functions (RANK, DENSE_RANK, ROW_NUMBER, LAG, LEAD)
+
+**Dependencies**: P4.1, P4.2
+**Risk Level**: HIGH - Complex feature
+
+---
+
+### P4.4: Set Operations (UNION, INTERSECT, EXCEPT)
+**Priority**: 🟢 LOW (Standard SQL, but not critical)
+**Status**: NOT STARTED
+**Effort**: 3-4 days
+**Target Completion**: May 4-8
+**Depends On**: P2.1 (DISTINCT)
+
+**Description**: Support SQL set operations
+Current: No set operation support
+Target: `SELECT ... UNION SELECT ...` with incremental maintenance
+
+**Example Queries**:
+```sql
+-- UNION
+SELECT customer_id FROM orders
+UNION
+SELECT customer_id FROM subscriptions;
+
+-- INTERSECT
+SELECT product_id FROM inventory
+INTERSECT
+SELECT product_id FROM active_sales;
+
+-- EXCEPT
+SELECT employee_id FROM all_employees
+EXCEPT
+SELECT employee_id FROM terminated_employees;
+```
+
+**DBSP Theory**: Set operations are linear operators, easily incrementalized.
+
+**Success Criteria**:
+- ✅ UNION (with implicit DISTINCT)
+- ✅ UNION ALL (bag union, no distinct)
+- ✅ INTERSECT
+- ✅ EXCEPT
+- ✅ Incremental maintenance
+
+**Dependencies**: P2.1 (DISTINCT)
+**Risk Level**: LOW
+
+---
+
+## 📊 PHASE SUMMARY TABLE (REVISED)
 
 | Phase | Tasks | Duration | Target End | Key Deliverables |
 |-------|-------|----------|-----------|------------------|
@@ -812,21 +1144,36 @@ Target: Automated builds and tests on every commit/PR
 
 ## 🎯 SUCCESS METRICS
 
-After completing all 3 phases:
+After completing Phases 1-3 (Core DBSP Complete):
 
-**Feature Completeness**:
+**DBSP Theoretical Completeness**:
+- [x] Z-sets with integer weights ✅ (implemented)
+- [x] Integration (I) and Differentiation (D) operators ✅ (implemented)
+- [x] Incrementalization Q^Δ = D ∘ Q ∘ I ✅ (implemented)
+- [x] Linear operators (filter, project) ✅ (implemented)
+- [x] Bilinear operators (join) ✅ (implemented)
+- [x] Core aggregates (SUM, COUNT, AVG) ✅ (implemented)
+- [x] MIN/MAX aggregates ✅ (implemented in P1.3)
+- [ ] MIN/MAX with O(log n) deletions (P2.2) 🔴 **CRITICAL**
+- [ ] Distinct operator exposed in SQL (P2.1) 🔴 **CRITICAL**
+- [ ] Recursive queries (WITH RECURSIVE) (P2.4) 🟡 **HIGH**
+- [ ] Circuit optimization passes (P3.4) 🟡 **MEDIUM**
+
+**Feature Completeness** (Core Features Only):
 - [x] Core DBSP algorithms (completed)
 - [x] Table tracking and CDC (completed)
 - [x] Basic materialized views (completed)
-- [ ] Native SQL DDL syntax (P1.1)
-- [ ] HAVING clause support (P1.2)
-- [ ] MIN/MAX aggregates (P1.3)
-- [ ] ORDER BY / LIMIT (P2.1)
-- [ ] Complex JOIN predicates (P2.2)
-- [ ] Automatic CDC (P2.3)
+- [x] Native SQL DDL syntax (P1.1) ✅
+- [x] HAVING clause support (P1.2) ✅
+- [x] MIN/MAX aggregates (P1.3) ✅
+- [ ] **DISTINCT SQL integration** (P2.1) 🔴
+- [ ] **MIN/MAX correctness fix** (P2.2) 🔴
+- [ ] Complex JOIN predicates (P2.3) 🟡
+- [ ] **Recursive queries** (P2.4) 🟡
 - [ ] Enhanced error messages (P3.1)
 - [ ] Concurrent query support (P3.2)
 - [ ] CI/CD automation (P3.3)
+- [ ] Circuit optimization (P3.4)
 
 **Code Quality**:
 - Test coverage: 85%+ (currently ~70%)
@@ -847,17 +1194,42 @@ After completing all 3 phases:
 
 ---
 
-## 📝 NOTES
+## 📝 NOTES (REVISED)
+
+### Design Philosophy Change
+
+**Previous Approach**: Focus on "SQL Completeness" - implementing standard SQL features
+**New Approach**: Focus on **"DBSP Completeness"** - implementing DBSP theory correctly
+
+**Rationale**:
+1. This project should differentiate through **superior incremental computation**, not SQL feature parity
+2. DBSP theory provides correctness guarantees that competitors lack
+3. Features like ORDER BY that break incremental semantics should be deprioritized
+4. Core DBSP features (DISTINCT, recursion) are more valuable than UX sugar (auto-CDC)
 
 ### Design Decisions
 
-1. **Phase 1 First**: Start with quick wins (DDL wiring) to build momentum
-2. **Parser Extension Preferred**: Use DDL syntax instead of table functions
-3. **Incremental Approach**: Each task builds on previous, minimizes churn
-4. **Testing Critical**: Every task includes comprehensive tests
-5. **Backward Compatible**: New features don't break existing API
+1. **DBSP Theory First**: Align roadmap with formal specification and research papers
+2. **Correctness Over Convenience**: Fix MIN/MAX O(n) issue before adding new features
+3. **Differentiation**: Recursive queries set this apart from basic IVM systems
+4. **Defer Anti-Patterns**: ORDER BY degrades to O(n log n), conflicts with DBSP philosophy
+5. **Testing Critical**: Every task includes comprehensive tests + theory validation
 
-### Known Risks
+### Key Changes from Original TODO
+
+**Promoted to Phase 2** (High Priority):
+- P2.1: DISTINCT SQL (was missing) - Already implemented, easy win
+- P2.2: MIN/MAX correctness (was noted as TODO) - O(δ) correctness critical
+- P2.4: Recursive queries (was missing) - Core DBSP differentiator
+
+**Demoted to Phase 4** (Deferred):
+- P4.1: Auto-CDC (was P2.3) - UX improvement, not core theory
+- P4.2: ORDER BY (was P2.1) - Anti-pattern to incremental semantics
+
+**Added to Phase 3**:
+- P3.4: Circuit optimization - DBSP theory provides proven optimization passes
+
+### Known Risks (Updated)
 
 1. **P2.3 Risk**: Automatic CDC requires deep DuckDB internals knowledge
    - Mitigation: Start with research phase, prototype early
@@ -878,12 +1250,30 @@ After completing all 3 phases:
 - **Phase 3**: 2 weeks (mostly glue and testing)
 - **Total**: 7 weeks to completion
 
-### Recommended Start Date
+### Recommended Start Date (UPDATED)
 
-**NOW** - Start with P1.1 (Parser Extension)
-- Estimated completion: Feb 20, 2026
-- Then move to P1.2 (HAVING)
-- Then P1.3 (MIN/MAX)
+**NOW** - Start with **revised Phase 2** priorities:
+
+**Week 1 (Feb 21-22)**: P2.1 - DISTINCT SQL Integration
+- Quick win: Implementation already exists, just needs parser wiring
+- 1-2 days effort
+- High impact: Completes core DBSP relational operators
+
+**Week 2 (Feb 24-27)**: P2.2 - Fix MIN/MAX Deletions  
+- Critical correctness fix for O(δ) guarantee
+- 3-4 days effort
+- Use `std::multiset` for O(log n) deletion handling
+
+**Week 3-4 (Feb 28 - Mar 3)**: P2.3 - Complex JOIN Predicates
+- Extends existing correct join implementation
+- 2-3 days effort
+
+**Week 4-5 (Mar 4-10)**: P2.4 - Recursive Queries
+- Core DBSP differentiator
+- 1-2 weeks effort
+- Study `recursive.lean` formal spec first
+
+**Then proceed to Phase 3** (Production readiness)
 
 ---
 
@@ -891,14 +1281,24 @@ After completing all 3 phases:
 
 **Created**: 2026-02-06
 **Last Updated**: 2026-02-06
-**Current Phase**: Ready to start Phase 1
+**Major Revision**: 2026-02-06 - Realigned with DBSP theory (see analysis.md)
+**Current Phase**: Phase 1 Complete ✅ → Ready to start **revised Phase 2**
+
+**Revision Summary**:
+- Restructured Phase 2 from "SQL Completeness" to "DBSP Core Completeness"
+- Added critical missing features (DISTINCT SQL, MIN/MAX fix, recursive queries)
+- Deferred UX features (auto-CDC, ORDER BY) to Phase 4
+- Added circuit optimization to Phase 3
+- Aligned roadmap with DBSP formal specification and research papers
 
 Track progress by:
 1. Check off subtasks as they complete
 2. Update status field (NOT STARTED → IN PROGRESS → COMPLETED)
 3. Update Depends On sections as needed
 4. Log blockers/risks encountered
+5. **Review analysis.md for detailed DBSP theory alignment**
 
 ---
 
-*For questions or blockers, refer to codebase analysis at: `/Users/ravi/.claude/projects/-Users-ravi-Documents-Dev-duckDBSP/memory/ANALYSIS.md`*
+*For questions or design decisions, refer to comprehensive analysis at: `/Users/ravi/.gemini/antigravity/brain/7ad6fad7-6efe-4bd3-9211-425663792c42/analysis.md`*
+

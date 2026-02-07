@@ -5,6 +5,7 @@
 
 #include "dbsp_duckdb_types.hpp"
 #include "dbsp_errors.hpp"
+#include "dbsp_recursive.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
@@ -14,6 +15,7 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/query_node/recursive_cte_node.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
@@ -29,7 +31,15 @@ namespace dbsp_native {
 
 // Parsed view definition
 struct ParsedViewDef {
-  enum class ViewType { FILTER, PROJECT, AGGREGATE, JOIN, DISTINCT, UNKNOWN };
+  enum class ViewType {
+    FILTER,
+    PROJECT,
+    AGGREGATE,
+    JOIN,
+    DISTINCT,
+    RECURSIVE,
+    UNKNOWN
+  };
 
   ViewType type = ViewType::UNKNOWN;
   std::string view_name;
@@ -50,12 +60,16 @@ struct ParsedViewDef {
   // For projection views
   std::vector<size_t> project_columns;
   std::vector<std::string> project_column_names;
+  // Qualified column references (table_name/alias, column_name)
+  std::vector<std::pair<std::string, std::string>> project_column_refs;
+  // Map of alias -> table_name
+  std::unordered_map<std::string, std::string> table_aliases;
   bool select_all = false;
 
   // For aggregate views
   struct AggInfo {
     std::string function; // SUM, COUNT, AVG, MIN, MAX
-    std::string alias;   // e.g., "revenue" from SUM(...) as revenue
+    std::string alias;    // e.g., "revenue" from SUM(...) as revenue
     size_t value_column_idx;
     std::string value_column_name;
     // For expression-based aggregates like SUM(quantity * price)
@@ -71,16 +85,26 @@ struct ParsedViewDef {
   std::vector<size_t> group_by_columns;
   std::vector<std::string> group_by_names;
 
-  // For join views
+  // For join views - supports multiple column pairs for compound ON clauses
   struct JoinInfo {
     std::string left_table;
     std::string right_table;
-    std::string left_column;
-    std::string right_column;
-    size_t left_column_idx;
-    size_t right_column_idx;
+    // Multiple column pairs for compound ON clauses: ON a.x = b.x AND a.y = b.y
+    std::vector<std::pair<std::string, std::string>>
+        column_pairs; // (left_col, right_col)
+    std::vector<std::pair<size_t, size_t>> column_idx_pairs; // resolved indices
   };
   std::optional<JoinInfo> join_info;
+
+  // For recursive CTE views (WITH RECURSIVE)
+  struct RecursiveCTEInfo {
+    std::string cte_name;      // Name of the recursive CTE
+    bool union_all = false;    // UNION vs UNION ALL
+    std::string source_table;  // Base table referenced
+    std::string anchor_sql;    // SQL for anchor (non-recursive) query
+    std::string recursive_sql; // SQL for recursive step (references cte_name)
+  };
+  std::optional<RecursiveCTEInfo> recursive_cte;
 
   // Is DISTINCT present
   bool is_distinct = false;
@@ -89,10 +113,11 @@ struct ParsedViewDef {
   struct HavingFilter {
     enum RefType { GROUP_COL, AGGREGATE_RESULT };
     RefType ref_type = AGGREGATE_RESULT;
-    std::string column_name;    // Column name (for group cols)
-    std::string agg_function;   // Aggregate function name (for agg refs)
-    std::string agg_col_name;   // Column in aggregate (for agg refs like SUM(amount))
-    std::string op;             // =, >, <, >=, <=, !=
+    std::string column_name;  // Column name (for group cols)
+    std::string agg_function; // Aggregate function name (for agg refs)
+    std::string
+        agg_col_name; // Column in aggregate (for agg refs like SUM(amount))
+    std::string op;   // =, >, <, >=, <=, !=
     duckdb::Value value;
   };
   std::vector<HavingFilter> having_filters;
@@ -104,7 +129,8 @@ public:
   struct ParseResult {
     bool success = false;
     std::string error;
-    ErrorCode error_code = ErrorCode::HAVING_NOT_SUPPORTED; // Default, will be overwritten
+    ErrorCode error_code =
+        ErrorCode::HAVING_NOT_SUPPORTED; // Default, will be overwritten
     ParsedViewDef view_def;
   };
 
@@ -159,26 +185,66 @@ public:
 
     auto *node = stmt.node.get();
 
+    // Check for recursive CTE (WITH RECURSIVE)
+    if (node->type == duckdb::QueryNodeType::RECURSIVE_CTE_NODE) {
+      auto &recursive = node->template Cast<duckdb::RecursiveCTENode>();
+      ParsedViewDef::RecursiveCTEInfo cte_info;
+      cte_info.cte_name = recursive.ctename;
+      cte_info.union_all = recursive.union_all;
+      // Will determine source table from left (anchor) query
+      result.view_def.recursive_cte = cte_info;
+      result.view_def.view_name = view_name;
+      result.view_def.sql = stmt.ToString();
+      result.success = true;
+      determine_view_type(result.view_def);
+      return result;
+    }
+
+    // Check for recursive CTEs in cte_map (before any other checks)
+    // This works regardless of the outer query node type
+    for (auto &cte_entry : node->cte_map.map) {
+      auto &cte_info = cte_entry.second;
+      if (cte_info && cte_info->query && cte_info->query->node) {
+        auto *cte_node = cte_info->query->node.get();
+        if (cte_node->type == duckdb::QueryNodeType::RECURSIVE_CTE_NODE) {
+          auto &recursive = cte_node->template Cast<duckdb::RecursiveCTENode>();
+          ParsedViewDef::RecursiveCTEInfo rec_info;
+          rec_info.cte_name = recursive.ctename;
+          rec_info.union_all = recursive.union_all;
+          // Extract anchor and recursive SQL from left/right sub-queries
+          if (recursive.left) {
+            rec_info.anchor_sql = recursive.left->ToString();
+          }
+          if (recursive.right) {
+            rec_info.recursive_sql = recursive.right->ToString();
+          }
+          result.view_def.recursive_cte = rec_info;
+          result.view_def.view_name = view_name;
+          result.view_def.sql = stmt.ToString();
+          result.success = true;
+          determine_view_type(result.view_def);
+          return result;
+        }
+      }
+    }
+
     // Check for set operations (UNION, INTERSECT, EXCEPT)
     if (node->type == duckdb::QueryNodeType::SET_OPERATION_NODE) {
       auto &set_op = node->template Cast<duckdb::SetOperationNode>();
       switch (set_op.setop_type) {
-        case duckdb::SetOperationType::UNION:
-        case duckdb::SetOperationType::UNION_BY_NAME:
-          return make_error(ErrorCode::UNION_NOT_SUPPORTED,
-                           "UNION operation",
-                           result.view_def.sql);
-        case duckdb::SetOperationType::INTERSECT:
-          return make_error(ErrorCode::INTERSECT_NOT_SUPPORTED,
-                           "INTERSECT operation",
-                           result.view_def.sql);
-        case duckdb::SetOperationType::EXCEPT:
-          return make_error(ErrorCode::EXCEPT_NOT_SUPPORTED,
-                           "EXCEPT operation",
-                           result.view_def.sql);
-        default:
-          result.error = "Unsupported set operation";
-          return result;
+      case duckdb::SetOperationType::UNION:
+      case duckdb::SetOperationType::UNION_BY_NAME:
+        return make_error(ErrorCode::UNION_NOT_SUPPORTED, "UNION operation",
+                          result.view_def.sql);
+      case duckdb::SetOperationType::INTERSECT:
+        return make_error(ErrorCode::INTERSECT_NOT_SUPPORTED,
+                          "INTERSECT operation", result.view_def.sql);
+      case duckdb::SetOperationType::EXCEPT:
+        return make_error(ErrorCode::EXCEPT_NOT_SUPPORTED, "EXCEPT operation",
+                          result.view_def.sql);
+      default:
+        result.error = "Unsupported set operation";
+        return result;
       }
     }
 
@@ -192,21 +258,19 @@ public:
     // Check for unsupported modifiers
     for (auto &modifier : select.modifiers) {
       switch (modifier->type) {
-        case duckdb::ResultModifierType::DISTINCT_MODIFIER:
-          result.view_def.is_distinct = true;
-          break;
-        case duckdb::ResultModifierType::ORDER_MODIFIER:
-          return make_error(ErrorCode::ORDER_BY_NOT_SUPPORTED,
-                           "ORDER BY clause detected",
-                           result.view_def.sql);
-        case duckdb::ResultModifierType::LIMIT_MODIFIER:
-        case duckdb::ResultModifierType::LIMIT_PERCENT_MODIFIER:
-          return make_error(ErrorCode::LIMIT_NOT_SUPPORTED,
-                           "LIMIT clause detected",
-                           result.view_def.sql);
-        default:
-          // Other modifiers not yet encountered
-          break;
+      case duckdb::ResultModifierType::DISTINCT_MODIFIER:
+        result.view_def.is_distinct = true;
+        break;
+      case duckdb::ResultModifierType::ORDER_MODIFIER:
+        return make_error(ErrorCode::ORDER_BY_NOT_SUPPORTED,
+                          "ORDER BY clause detected", result.view_def.sql);
+      case duckdb::ResultModifierType::LIMIT_MODIFIER:
+      case duckdb::ResultModifierType::LIMIT_PERCENT_MODIFIER:
+        return make_error(ErrorCode::LIMIT_NOT_SUPPORTED,
+                          "LIMIT clause detected", result.view_def.sql);
+      default:
+        // Other modifiers not yet encountered
+        break;
       }
     }
 
@@ -220,8 +284,8 @@ public:
     if (select.from_table &&
         select.from_table->type == duckdb::TableReferenceType::SUBQUERY) {
       return make_error(ErrorCode::SUBQUERY_NOT_SUPPORTED,
-                       "Subquery in FROM clause (derived table)",
-                       result.view_def.sql);
+                        "Subquery in FROM clause (derived table)",
+                        result.view_def.sql);
     }
 
     if (!parse_from_clause(select.from_table.get(), result.view_def)) {
@@ -243,8 +307,8 @@ public:
           expr->type == duckdb::ExpressionType::WINDOW_LEAD ||
           expr->type == duckdb::ExpressionType::WINDOW_LAG) {
         return make_error(ErrorCode::WINDOW_FUNCTIONS_NOT_SUPPORTED,
-                         "Window function detected in SELECT list",
-                         result.view_def.sql);
+                          "Window function detected in SELECT list",
+                          result.view_def.sql);
       }
     }
 
@@ -255,8 +319,7 @@ public:
     if (select.where_clause) {
       if (has_subquery_expression(select.where_clause.get())) {
         return make_error(ErrorCode::SUBQUERY_NOT_SUPPORTED,
-                         "Subquery in WHERE clause",
-                         result.view_def.sql);
+                          "Subquery in WHERE clause", result.view_def.sql);
       }
       parse_where_clause(select.where_clause.get(), result.view_def);
     }
@@ -287,6 +350,12 @@ private:
     case duckdb::TableReferenceType::BASE_TABLE: {
       auto &base = ref->template Cast<duckdb::BaseTableRef>();
       def.source_tables.push_back(base.table_name);
+      // Capture alias mapping
+      if (!base.alias.empty()) {
+        def.table_aliases[base.alias] = base.table_name;
+      } else {
+        def.table_aliases[base.table_name] = base.table_name;
+      }
       return true;
     }
 
@@ -322,17 +391,28 @@ private:
 
   void parse_join_condition(duckdb::ParsedExpression *expr,
                             ParsedViewDef::JoinInfo &info) {
-    if (expr->type == duckdb::ExpressionType::COMPARE_EQUAL) {
+    if (!expr)
+      return;
+
+    // Handle compound conditions: ON a.x = b.x AND a.y = b.y
+    if (expr->type == duckdb::ExpressionType::CONJUNCTION_AND) {
+      auto &conj = expr->template Cast<duckdb::ConjunctionExpression>();
+      for (auto &child : conj.children) {
+        parse_join_condition(child.get(), info);
+      }
+    } else if (expr->type == duckdb::ExpressionType::COMPARE_EQUAL) {
       auto &cmp = expr->template Cast<duckdb::ComparisonExpression>();
 
       // Extract column references from both sides
       if (cmp.left->type == duckdb::ExpressionType::COLUMN_REF &&
           cmp.right->type == duckdb::ExpressionType::COLUMN_REF) {
         auto &left_col = cmp.left->template Cast<duckdb::ColumnRefExpression>();
-        auto &right_col = cmp.right->template Cast<duckdb::ColumnRefExpression>();
+        auto &right_col =
+            cmp.right->template Cast<duckdb::ColumnRefExpression>();
 
-        info.left_column = left_col.GetColumnName();
-        info.right_column = right_col.GetColumnName();
+        // Add column pair to the list
+        info.column_pairs.push_back(
+            {left_col.GetColumnName(), right_col.GetColumnName()});
       }
     }
   }
@@ -351,6 +431,10 @@ private:
         auto &col = expr->template Cast<duckdb::ColumnRefExpression>();
         def.project_column_names.push_back(col.GetColumnName());
         def.project_columns.push_back(i);
+        // Capture qualified reference (table name only if qualified)
+        std::string table_name = col.IsQualified() ? col.GetTableName() : "";
+        def.project_column_refs.push_back(
+            {table_name, col.GetColumnName()});
         break;
       }
 
@@ -374,16 +458,26 @@ private:
               auto &col = child->template Cast<duckdb::ColumnRefExpression>();
               agg.value_column_name = col.GetColumnName();
             } else if (child->type == duckdb::ExpressionType::FUNCTION &&
-                       child->GetExpressionClass() == duckdb::ExpressionClass::FUNCTION) {
-              // Binary expression like quantity * price parsed as function(*, quantity, price)
-              auto &child_func = child->template Cast<duckdb::FunctionExpression>();
+                       child->GetExpressionClass() ==
+                           duckdb::ExpressionClass::FUNCTION) {
+              // Binary expression like quantity * price parsed as function(*,
+              // quantity, price)
+              auto &child_func =
+                  child->template Cast<duckdb::FunctionExpression>();
               std::string op_name = child_func.function_name;
-              if ((op_name == "*" || op_name == "+" || op_name == "-" || op_name == "/") &&
+              if ((op_name == "*" || op_name == "+" || op_name == "-" ||
+                   op_name == "/") &&
                   child_func.children.size() == 2 &&
-                  child_func.children[0]->type == duckdb::ExpressionType::COLUMN_REF &&
-                  child_func.children[1]->type == duckdb::ExpressionType::COLUMN_REF) {
-                auto &left_col = child_func.children[0]->template Cast<duckdb::ColumnRefExpression>();
-                auto &right_col = child_func.children[1]->template Cast<duckdb::ColumnRefExpression>();
+                  child_func.children[0]->type ==
+                      duckdb::ExpressionType::COLUMN_REF &&
+                  child_func.children[1]->type ==
+                      duckdb::ExpressionType::COLUMN_REF) {
+                auto &left_col =
+                    child_func.children[0]
+                        ->template Cast<duckdb::ColumnRefExpression>();
+                auto &right_col =
+                    child_func.children[1]
+                        ->template Cast<duckdb::ColumnRefExpression>();
                 agg.is_expression = true;
                 agg.left_col_name = left_col.GetColumnName();
                 agg.right_col_name = right_col.GetColumnName();
@@ -479,13 +573,15 @@ private:
       if (cmp.left->type == duckdb::ExpressionType::FUNCTION) {
         auto &func = cmp.left->template Cast<duckdb::FunctionExpression>();
         std::string func_name = duckdb::StringUtil::Upper(func.function_name);
-        if (func_name == "COUNT_STAR") func_name = "COUNT";
+        if (func_name == "COUNT_STAR")
+          func_name = "COUNT";
 
         filter.ref_type = ParsedViewDef::HavingFilter::AGGREGATE_RESULT;
         filter.agg_function = func_name;
         if (!func.children.empty() &&
             func.children[0]->type == duckdb::ExpressionType::COLUMN_REF) {
-          auto &col = func.children[0]->template Cast<duckdb::ColumnRefExpression>();
+          auto &col =
+              func.children[0]->template Cast<duckdb::ColumnRefExpression>();
           filter.agg_col_name = col.GetColumnName();
         }
       } else if (cmp.left->type == duckdb::ExpressionType::COLUMN_REF) {
@@ -537,8 +633,10 @@ private:
   }
 
   void determine_view_type(ParsedViewDef &def) {
-    // Priority: JOIN > AGGREGATE > DISTINCT > FILTER > PROJECT
-    if (def.join_info.has_value()) {
+    // Priority: RECURSIVE > JOIN > AGGREGATE > DISTINCT > FILTER > PROJECT
+    if (def.recursive_cte.has_value()) {
+      def.type = ParsedViewDef::ViewType::RECURSIVE;
+    } else if (def.join_info.has_value()) {
       def.type = ParsedViewDef::ViewType::JOIN;
     } else if (!def.aggregates.empty()) {
       def.type = ParsedViewDef::ViewType::AGGREGATE;
@@ -556,7 +654,8 @@ private:
 
   // Helper to check for subqueries in expressions
   bool has_subquery_expression(duckdb::ParsedExpression *expr) {
-    if (!expr) return false;
+    if (!expr)
+      return false;
 
     // Check this expression
     if (expr->type == duckdb::ExpressionType::SUBQUERY) {
@@ -569,8 +668,8 @@ private:
   }
 
   // Helper to create error results with proper formatting
-  ParseResult make_error(ErrorCode code, const std::string& detail,
-                        const std::string& sql, size_t pos = 0) {
+  ParseResult make_error(ErrorCode code, const std::string &detail,
+                         const std::string &sql, size_t pos = 0) {
     ParseResult result;
     result.success = false;
     result.error_code = code;
@@ -612,6 +711,9 @@ public:
 
     case ParsedViewDef::ViewType::DISTINCT:
       return create_distinct_view(def, table_schemas);
+
+    case ParsedViewDef::ViewType::RECURSIVE:
+      return create_recursive_view(def, table_schemas);
 
     default:
       return nullptr;
@@ -766,7 +868,8 @@ private:
       }
     }
     result_schema.columns.push_back(
-        {agg.alias.empty() ? agg.function : agg.alias, duckdb::LogicalType::BIGINT});
+        {agg.alias.empty() ? agg.function : agg.alias,
+         duckdb::LogicalType::BIGINT});
 
     // Key function
     auto key_fn = [group_cols](const DuckDBRow &row) -> DuckDBRow {
@@ -780,17 +883,23 @@ private:
     };
 
     // Value function
-    auto value_fn = [value_col_idx, is_expr, left_col_idx, right_col_idx, expr_op](const DuckDBRow &row) -> duckdb::Value {
+    auto value_fn = [value_col_idx, is_expr, left_col_idx, right_col_idx,
+                     expr_op](const DuckDBRow &row) -> duckdb::Value {
       if (is_expr) {
         // Expression-based aggregate: evaluate binary op on two columns
-        if (left_col_idx < row.columns.size() && right_col_idx < row.columns.size()) {
+        if (left_col_idx < row.columns.size() &&
+            right_col_idx < row.columns.size()) {
           int64_t left_val = row.columns[left_col_idx].GetValue<int64_t>();
           int64_t right_val = row.columns[right_col_idx].GetValue<int64_t>();
           int64_t result = 0;
-          if (expr_op == "*") result = left_val * right_val;
-          else if (expr_op == "+") result = left_val + right_val;
-          else if (expr_op == "-") result = left_val - right_val;
-          else if (expr_op == "/" && right_val != 0) result = left_val / right_val;
+          if (expr_op == "*")
+            result = left_val * right_val;
+          else if (expr_op == "+")
+            result = left_val + right_val;
+          else if (expr_op == "-")
+            result = left_val - right_val;
+          else if (expr_op == "/" && right_val != 0)
+            result = left_val / right_val;
           return duckdb::Value::BIGINT(result);
         }
         return duckdb::Value::BIGINT(0);
@@ -818,23 +927,27 @@ private:
       // Capture the having filters for the lambda
       auto having_filters = def.having_filters;
       size_t num_group_cols = group_cols.size();
-      size_t agg_col_idx = num_group_cols; // Aggregate result is after group columns
+      size_t agg_col_idx =
+          num_group_cols; // Aggregate result is after group columns
 
       // Resolve group column names to result row indices
-      std::vector<std::pair<size_t, ParsedViewDef::HavingFilter>> resolved_having;
+      std::vector<std::pair<size_t, ParsedViewDef::HavingFilter>>
+          resolved_having;
       for (const auto &hf : having_filters) {
         size_t col_idx = agg_col_idx; // Default: aggregate column
         if (hf.ref_type == ParsedViewDef::HavingFilter::GROUP_COL) {
           // Find position of this group column in result row
           for (size_t i = 0; i < def.group_by_names.size(); i++) {
-            if (duckdb::StringUtil::CIEquals(def.group_by_names[i], hf.column_name)) {
+            if (duckdb::StringUtil::CIEquals(def.group_by_names[i],
+                                             hf.column_name)) {
               col_idx = i;
               break;
             }
           }
           // Also check project_column_names for non-group-by columns
           for (size_t i = 0; i < def.project_column_names.size(); i++) {
-            if (duckdb::StringUtil::CIEquals(def.project_column_names[i], hf.column_name)) {
+            if (duckdb::StringUtil::CIEquals(def.project_column_names[i],
+                                             hf.column_name)) {
               col_idx = i;
               break;
             }
@@ -845,25 +958,26 @@ private:
 
       having_pred = [resolved_having](const DuckDBRow &result_row) -> bool {
         for (const auto &[col_idx, filter] : resolved_having) {
-          if (col_idx >= result_row.columns.size()) return false;
+          if (col_idx >= result_row.columns.size())
+            return false;
           const auto &col_val = result_row.columns[col_idx];
-          if (!compare_values(col_val, filter.op, filter.value)) return false;
+          if (!compare_values(col_val, filter.op, filter.value))
+            return false;
         }
         return true;
       };
     }
 
-    return std::make_unique<NativeAggregateView>(def.view_name, def.sql, table,
-                                                 result_schema, key_fn,
-                                                 value_fn, agg_type,
-                                                 having_pred);
+    return std::make_unique<NativeAggregateView>(
+        def.view_name, def.sql, table, result_schema, key_fn, value_fn,
+        agg_type, having_pred);
   }
 
   static std::unique_ptr<NativeMaterializedView> create_join_view(
       const ParsedViewDef &def,
       const std::unordered_map<std::string, TableSchema> &table_schemas) {
 
-    if (!def.join_info.has_value())
+    if (!def.join_info.has_value() || def.join_info->column_pairs.empty())
       return nullptr;
     const auto &join = def.join_info.value();
 
@@ -878,37 +992,157 @@ private:
       right_schema = right_schema_it->second;
     }
 
-    size_t left_key_idx = find_column_index(left_schema, join.left_column);
-    size_t right_key_idx = find_column_index(right_schema, join.right_column);
+    // Build column index pairs for composite key
+    std::vector<size_t> left_key_indices, right_key_indices;
+    for (const auto &[left_col, right_col] : join.column_pairs) {
+      left_key_indices.push_back(find_column_index(left_schema, left_col));
+      right_key_indices.push_back(find_column_index(right_schema, right_col));
+    }
 
-    // Create result schema (all columns from both tables)
+    // Composite key functions returning DuckDBRow
+    auto left_key = [left_key_indices](const DuckDBRow &row) -> DuckDBRow {
+      DuckDBRow key;
+      for (size_t idx : left_key_indices) {
+        if (idx < row.columns.size()) {
+          key.columns.push_back(row.columns[idx]);
+        } else {
+          key.columns.push_back(duckdb::Value());
+        }
+      }
+      return key;
+    };
+
+    auto right_key = [right_key_indices](const DuckDBRow &row) -> DuckDBRow {
+      DuckDBRow key;
+      for (size_t idx : right_key_indices) {
+        if (idx < row.columns.size()) {
+          key.columns.push_back(row.columns[idx]);
+        } else {
+          key.columns.push_back(duckdb::Value());
+        }
+      }
+      return key;
+    };
+
+    // Handle projection if specified
+    NativeJoinView::ProjectFn project = nullptr;
     TableSchema result_schema;
     result_schema.table_name = def.view_name;
-    for (const auto &col : left_schema.columns) {
-      result_schema.columns.push_back(col);
-    }
-    for (const auto &col : right_schema.columns) {
-      result_schema.columns.push_back(col);
-    }
 
-    // Key functions
-    auto left_key = [left_key_idx](const DuckDBRow &row) -> duckdb::Value {
-      if (left_key_idx < row.columns.size()) {
-        return row.columns[left_key_idx];
+    if (!def.project_column_refs.empty() && !def.select_all) {
+      // Map (table/alias, col) -> combined index
+      std::map<std::pair<std::string, std::string>, size_t> col_map;
+
+      // Add left columns
+      for (size_t i = 0; i < left_schema.columns.size(); i++) {
+        std::string col = left_schema.columns[i].name;
+        col_map[{join.left_table, col}] = i;
+        // Add aliases for left table
+        for (const auto &[alias, table] : def.table_aliases) {
+          if (table == join.left_table) {
+            col_map[{alias, col}] = i;
+          }
+        }
       }
-      return duckdb::Value();
-    };
 
-    auto right_key = [right_key_idx](const DuckDBRow &row) -> duckdb::Value {
-      if (right_key_idx < row.columns.size()) {
-        return row.columns[right_key_idx];
+      // Add right columns (offset by left size)
+      size_t offset = left_schema.columns.size();
+      for (size_t i = 0; i < right_schema.columns.size(); i++) {
+        std::string col = right_schema.columns[i].name;
+        col_map[{join.right_table, col}] = offset + i;
+        // Add aliases for right table
+        for (const auto &[alias, table] : def.table_aliases) {
+          if (table == join.right_table) {
+            col_map[{alias, col}] = offset + i;
+          }
+        }
       }
-      return duckdb::Value();
-    };
 
-    return std::make_unique<NativeJoinView>(def.view_name, def.sql,
-                                            join.left_table, join.right_table,
-                                            result_schema, left_key, right_key);
+      std::vector<size_t> proj_indices;
+      for (size_t i = 0; i < def.project_column_refs.size(); i++) {
+        const auto &ref = def.project_column_refs[i];
+        std::string table = ref.first;
+        std::string col = ref.second;
+
+        // Try exact match first
+        auto it = col_map.find({table, col});
+        if (it != col_map.end()) {
+          proj_indices.push_back(it->second);
+          // Add to result schema
+          duckdb::LogicalType type = duckdb::LogicalType::VARCHAR; // Default
+          if (it->second < left_schema.columns.size()) {
+            type = left_schema.columns[it->second].type;
+          } else {
+            type = right_schema.columns[it->second - offset].type;
+          }
+          result_schema.columns.push_back({def.project_column_names[i], type});
+        } else if (table.empty()) {
+          // Unqualified name - try to resolve
+          bool found = false;
+          // Check left
+          for (size_t j = 0; j < left_schema.columns.size(); j++) {
+            if (duckdb::StringUtil::CIEquals(left_schema.columns[j].name,
+                                             col)) {
+              proj_indices.push_back(j);
+              result_schema.columns.push_back(
+                  {def.project_column_names[i], left_schema.columns[j].type});
+              found = true;
+              break;
+            }
+          }
+          if (found)
+            continue;
+
+          // Check right
+          for (size_t j = 0; j < right_schema.columns.size(); j++) {
+            if (duckdb::StringUtil::CIEquals(right_schema.columns[j].name,
+                                             col)) {
+              proj_indices.push_back(offset + j);
+              result_schema.columns.push_back(
+                  {def.project_column_names[i], right_schema.columns[j].type});
+              found = true;
+              break;
+            }
+          }
+          if (!found) {
+            // Fallback: push null or error? For now, index 0 safely
+            proj_indices.push_back(0);
+            result_schema.columns.push_back(
+                {def.project_column_names[i], duckdb::LogicalType::INTEGER});
+          }
+        } else {
+          // Explicit table/alias not found - fallback
+          proj_indices.push_back(0);
+          result_schema.columns.push_back(
+              {def.project_column_names[i], duckdb::LogicalType::INTEGER});
+        }
+      }
+
+      project = [proj_indices](const DuckDBRow &row) -> DuckDBRow {
+        DuckDBRow res;
+        for (size_t idx : proj_indices) {
+          if (idx < row.columns.size()) {
+            res.columns.push_back(row.columns[idx]);
+          } else {
+            res.columns.push_back(duckdb::Value());
+          }
+        }
+        return res;
+      };
+
+    } else {
+      // Default: All columns
+      for (const auto &col : left_schema.columns) {
+        result_schema.columns.push_back(col);
+      }
+      for (const auto &col : right_schema.columns) {
+        result_schema.columns.push_back(col);
+      }
+    }
+
+    return std::make_unique<NativeJoinView>(
+        def.view_name, def.sql, join.left_table, join.right_table,
+        result_schema, left_key, right_key, project);
   }
 
   static std::unique_ptr<NativeMaterializedView> create_distinct_view(
@@ -920,13 +1154,117 @@ private:
     const std::string &table = def.source_tables[0];
 
     auto schema_it = table_schemas.find(table);
-    TableSchema schema;
+    TableSchema source_schema;
     if (schema_it != table_schemas.end()) {
-      schema = schema_it->second;
+      source_schema = schema_it->second;
+    }
+
+    // Build projection function and result schema based on SELECT columns
+    NativeDistinctView::ProjectFn project = nullptr;
+    TableSchema result_schema;
+    result_schema.table_name = def.view_name;
+
+    if (!def.project_column_names.empty() && !def.select_all) {
+      // DISTINCT on specific columns: SELECT DISTINCT col1, col2 FROM t
+      std::vector<size_t> col_indices;
+      for (const auto &col_name : def.project_column_names) {
+        size_t idx = find_column_index(source_schema, col_name);
+        col_indices.push_back(idx);
+
+        if (idx < source_schema.columns.size()) {
+          result_schema.columns.push_back(source_schema.columns[idx]);
+        } else {
+          result_schema.columns.push_back(
+              {col_name, duckdb::LogicalType::VARCHAR});
+        }
+      }
+
+      project = [col_indices](const DuckDBRow &row) -> DuckDBRow {
+        DuckDBRow result;
+        for (size_t idx : col_indices) {
+          if (idx < row.columns.size()) {
+            result.columns.push_back(row.columns[idx]);
+          } else {
+            result.columns.push_back(duckdb::Value());
+          }
+        }
+        return result;
+      };
+    } else {
+      // DISTINCT on all columns: SELECT DISTINCT * FROM t
+      result_schema = source_schema;
     }
 
     return std::make_unique<NativeDistinctView>(def.view_name, def.sql, table,
-                                                schema);
+                                                result_schema, project);
+  }
+
+  // Create a recursive view for WITH RECURSIVE queries
+  // Note: Full recursive execution requires complex query compilation
+  // This is a placeholder that detects the query structure
+  static std::unique_ptr<NativeMaterializedView> create_recursive_view(
+      const ParsedViewDef &def,
+      const std::unordered_map<std::string, TableSchema> &table_schemas) {
+
+    if (!def.recursive_cte.has_value()) {
+      return nullptr;
+    }
+
+    const auto &rec = def.recursive_cte.value();
+
+    // Get source schema (from first source table)
+    TableSchema schema;
+    if (!def.source_tables.empty()) {
+      auto it = table_schemas.find(def.source_tables[0]);
+      if (it != table_schemas.end()) {
+        schema = it->second;
+      }
+    }
+
+    // Parse and create anchor view
+    // Note: DBSPSqlParser is defined before ViewFactory, so we can use it here
+    DBSPSqlParser parser;
+
+    // Parse anchor query
+    auto anchor_res = parser.parse(rec.anchor_sql, def.view_name + "_anchor");
+    if (!anchor_res.success) {
+      return nullptr;
+    }
+
+    // Create anchor view
+    auto anchor_view =
+        ViewFactory::create_view(anchor_res.view_def, table_schemas);
+    if (!anchor_view) {
+      return nullptr;
+    }
+
+    // Prepare schemas for recursive step
+    // The recursive step depends on the anchor's output schema (for the CTE
+    // table)
+    auto recursive_schemas = table_schemas;
+    recursive_schemas[rec.cte_name] = anchor_view->result_schema();
+    recursive_schemas[rec.cte_name].table_name = rec.cte_name;
+
+    // Parse recursive query
+    auto step_res = parser.parse(rec.recursive_sql, def.view_name + "_step");
+    if (!step_res.success) {
+      return nullptr;
+    }
+
+    // Create recursive step view
+    auto step_view =
+        ViewFactory::create_view(step_res.view_def, recursive_schemas);
+    if (!step_view) {
+      return nullptr;
+    }
+
+    std::string source_table =
+        def.source_tables.empty() ? "" : def.source_tables[0];
+
+    return std::make_unique<NativeRecursiveView>(
+        def.view_name, rec.cte_name, def.sql, source_table, schema,
+        std::move(anchor_view), std::move(step_view), rec.union_all,
+        1000 /* max_iterations */);
   }
 
   static size_t find_column_index(const TableSchema &schema,

@@ -53,6 +53,7 @@ add_dbsp_test(parser_errors unit/test_parser_errors.cpp)
 add_dbsp_test(view_validation unit/test_view_validation.cpp)
 add_dbsp_test(validation_errors unit/test_validation_errors.cpp)
 add_dbsp_test(null_handling unit/test_null_handling.cpp)
+add_dbsp_test(minmax_correctness unit/test_minmax_correctness.cpp)
 
 # Integration tests (require DuckDB)
 # Note: These tests need the extension functions, so we compile them with dbsp_extension.cpp
@@ -77,6 +78,14 @@ add_executable(test_cascading_views
     ../dbsp_extension.cpp
 )
 target_link_libraries(test_cascading_views catch2_main duckdb_static)
+
+add_executable(test_distinct_ddl
+    integration/test_distinct_ddl.cpp
+    ../dbsp_extension.cpp
+)
+target_link_libraries(test_distinct_ddl catch2_main duckdb_static)
+target_compile_definitions(test_distinct_ddl PRIVATE DUCKDB_EXTENSION_MAIN)
+add_test(NAME distinct_ddl COMMAND test_distinct_ddl)
 target_compile_definitions(test_cascading_views PRIVATE DUCKDB_EXTENSION_MAIN)
 add_test(NAME cascading_views COMMAND test_cascading_views)
 
@@ -103,6 +112,14 @@ add_executable(test_acid_compliance
 target_link_libraries(test_acid_compliance catch2_main duckdb_static)
 target_compile_definitions(test_acid_compliance PRIVATE DUCKDB_EXTENSION_MAIN)
 add_test(NAME acid_compliance COMMAND test_acid_compliance)
+
+add_executable(test_recursive
+    integration/test_recursive.cpp
+    ../dbsp_extension.cpp
+)
+target_link_libraries(test_recursive catch2_main duckdb_static)
+target_compile_definitions(test_recursive PRIVATE DUCKDB_EXTENSION_MAIN)
+add_test(NAME recursive COMMAND test_recursive)
 
 # Benchmarks
 add_executable(bench_incremental

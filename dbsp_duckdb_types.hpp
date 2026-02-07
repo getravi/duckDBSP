@@ -32,8 +32,10 @@ struct DuckDBRow {
       bool other_null = other.columns[i].IsNull();
 
       // For GROUP BY/DISTINCT: NULL == NULL
-      if (this_null && other_null) continue;
-      if (this_null || other_null) return false;
+      if (this_null && other_null)
+        continue;
+      if (this_null || other_null)
+        return false;
 
       // Use DuckDB's value comparison for non-NULL
       if (columns[i] != other.columns[i])
@@ -53,13 +55,18 @@ struct DuckDBRow {
       bool other_null = other.columns[i].IsNull();
 
       // NULL < non-NULL
-      if (this_null && !other_null) return true;
-      if (!this_null && other_null) return false;
-      if (this_null && other_null) continue; // Both NULL, check next column
+      if (this_null && !other_null)
+        return true;
+      if (!this_null && other_null)
+        return false;
+      if (this_null && other_null)
+        continue; // Both NULL, check next column
 
       // Both non-NULL: use DuckDB value comparison
-      if (columns[i] < other.columns[i]) return true;
-      if (other.columns[i] < columns[i]) return false;
+      if (columns[i] < other.columns[i])
+        return true;
+      if (other.columns[i] < columns[i])
+        return false;
       // Equal, continue to next column
     }
     return false; // All columns equal
@@ -75,7 +82,7 @@ struct DuckDBRowHash {
     for (const auto &col : row.columns) {
       size_t col_hash;
       if (col.IsNull()) {
-        col_hash = NULL_HASH;  // Special hash for NULL
+        col_hash = NULL_HASH; // Special hash for NULL
       } else {
         col_hash = col.Hash();
       }
@@ -291,6 +298,9 @@ public:
   // Get current result
   virtual const DuckDBZSet &get_result() const = 0;
 
+  // Get last delta (changes from most recent apply_changes)
+  virtual const DuckDBZSet &get_delta() const = 0;
+
   // Get result schema
   virtual const TableSchema &result_schema() const = 0;
 
@@ -329,12 +339,14 @@ public:
     for (const auto &[row, weight] : changes) {
       if (predicate_(row)) {
         result_.insert(row, weight);
+        delta_.insert(row, weight);
       }
     }
     ++version_;
   }
 
   const DuckDBZSet &get_result() const override { return result_; }
+  const DuckDBZSet &get_delta() const override { return delta_; }
   const TableSchema &result_schema() const override { return schema_; }
   std::vector<std::string> source_tables() const override {
     return {source_table_};
@@ -342,6 +354,7 @@ public:
 
   void reset() override {
     result_.clear();
+    delta_.clear();
     version_ = 0;
   }
 
@@ -350,6 +363,7 @@ private:
   TableSchema schema_;
   PredicateFn predicate_;
   DuckDBZSet result_;
+  DuckDBZSet delta_;
 };
 
 // Projection view: SELECT col1, col2 FROM table
@@ -372,12 +386,14 @@ public:
 
     for (const auto &[row, weight] : changes) {
       DuckDBRow projected = project_(row);
-      result_.insert(std::move(projected), weight);
+      result_.insert(projected, weight); // copied for delta
+      delta_.insert(std::move(projected), weight);
     }
     ++version_;
   }
 
   const DuckDBZSet &get_result() const override { return result_; }
+  const DuckDBZSet &get_delta() const override { return delta_; }
   const TableSchema &result_schema() const override { return schema_; }
   std::vector<std::string> source_tables() const override {
     return {source_table_};
@@ -385,6 +401,7 @@ public:
 
   void reset() override {
     result_.clear();
+    delta_.clear();
     version_ = 0;
   }
 
@@ -393,6 +410,7 @@ private:
   TableSchema schema_;
   ProjectFn project_;
   DuckDBZSet result_;
+  DuckDBZSet delta_;
 };
 
 // Aggregate view: SELECT key, AGG(val) FROM table GROUP BY key
@@ -421,12 +439,16 @@ public:
     if (table_name != source_table_)
       return;
 
+    delta_.clear();
+
     // Group changes by key - NULL-aware
     std::unordered_map<DuckDBRow, int64_t, DuckDBRowHash> delta_sums;
     std::unordered_map<DuckDBRow, int64_t, DuckDBRowHash> delta_counts;
     std::unordered_map<DuckDBRow, int64_t, DuckDBRowHash> delta_null_counts;
     // For MIN/MAX: track individual value changes per group
-    std::unordered_map<DuckDBRow, std::vector<std::pair<int64_t, int64_t>>, DuckDBRowHash> value_changes;
+    std::unordered_map<DuckDBRow, std::vector<std::pair<int64_t, int64_t>>,
+                       DuckDBRowHash>
+        value_changes;
 
     for (const auto &[row, weight] : changes) {
       DuckDBRow key = key_fn_(row);
@@ -453,9 +475,12 @@ public:
 
     // Update aggregates - NULL-aware
     std::set<DuckDBRow> all_keys;
-    for (const auto &[key, _] : delta_sums) all_keys.insert(key);
-    for (const auto &[key, _] : delta_counts) all_keys.insert(key);
-    for (const auto &[key, _] : delta_null_counts) all_keys.insert(key);
+    for (const auto &[key, _] : delta_sums)
+      all_keys.insert(key);
+    for (const auto &[key, _] : delta_counts)
+      all_keys.insert(key);
+    for (const auto &[key, _] : delta_null_counts)
+      all_keys.insert(key);
 
     for (const auto &key : all_keys) {
       auto &state = agg_states_[key];
@@ -469,6 +494,7 @@ public:
         DuckDBRow old_result = make_result_row(key, compute_agg(state));
         if (!having_predicate_ || having_predicate_(old_result)) {
           result_.insert(old_result, -1);
+          delta_.insert(old_result, -1);
         }
       }
 
@@ -503,6 +529,7 @@ public:
         DuckDBRow new_result = make_result_row(key, compute_agg(state));
         if (!having_predicate_ || having_predicate_(new_result)) {
           result_.insert(new_result, 1);
+          delta_.insert(new_result, 1);
         }
       } else {
         agg_states_.erase(key);
@@ -513,6 +540,7 @@ public:
   }
 
   const DuckDBZSet &get_result() const override { return result_; }
+  const DuckDBZSet &get_delta() const override { return delta_; }
   const TableSchema &result_schema() const override { return schema_; }
   std::vector<std::string> source_tables() const override {
     return {source_table_};
@@ -521,15 +549,16 @@ public:
   void reset() override {
     agg_states_.clear();
     result_.clear();
+    delta_.clear();
     version_ = 0;
   }
 
 private:
   struct AggState {
     int64_t sum = 0;
-    int64_t count = 0;         // Non-NULL count (for COUNT(column))
-    int64_t null_count = 0;    // NULL count (for COUNT(*))
-    std::multiset<int64_t> values;  // For MIN/MAX: all individual values
+    int64_t count = 0;             // Non-NULL count (for COUNT(column))
+    int64_t null_count = 0;        // NULL count (for COUNT(*))
+    std::multiset<int64_t> values; // For MIN/MAX: all individual values
   };
 
   duckdb::Value compute_agg(const AggState &state) const {
@@ -537,7 +566,7 @@ private:
     case AggType::SUM:
       // SQL Standard: SUM of all NULLs returns NULL
       if (state.count == 0) {
-        return duckdb::Value(duckdb::LogicalType::BIGINT);  // NULL value
+        return duckdb::Value(duckdb::LogicalType::BIGINT); // NULL value
       }
       return duckdb::Value::BIGINT(state.sum);
 
@@ -548,29 +577,30 @@ private:
     case AggType::AVG:
       // SQL Standard: AVG of all NULLs returns NULL
       if (state.count == 0) {
-        return duckdb::Value(duckdb::LogicalType::BIGINT);  // NULL value
+        return duckdb::Value(duckdb::LogicalType::BIGINT); // NULL value
       }
       return duckdb::Value::BIGINT(state.sum / state.count);
 
     case AggType::MIN:
       if (state.values.empty()) {
-        return duckdb::Value(duckdb::LogicalType::BIGINT);  // NULL if no values
+        return duckdb::Value(duckdb::LogicalType::BIGINT); // NULL if no values
       }
       return duckdb::Value::BIGINT(*state.values.begin());
 
     case AggType::MAX:
       if (state.values.empty()) {
-        return duckdb::Value(duckdb::LogicalType::BIGINT);  // NULL if no values
+        return duckdb::Value(duckdb::LogicalType::BIGINT); // NULL if no values
       }
       return duckdb::Value::BIGINT(*state.values.rbegin());
     }
     return duckdb::Value::BIGINT(state.sum);
   }
 
-  DuckDBRow make_result_row(const DuckDBRow &key, const duckdb::Value &agg_val) const {
+  DuckDBRow make_result_row(const DuckDBRow &key,
+                            const duckdb::Value &agg_val) const {
     DuckDBRow result;
     result.columns = key.columns;
-    result.columns.push_back(agg_val);  // Can be NULL now
+    result.columns.push_back(agg_val); // Can be NULL now
     return result;
   }
 
@@ -582,33 +612,39 @@ private:
   HavingPredicate having_predicate_;
   std::unordered_map<DuckDBRow, AggState, DuckDBRowHash> agg_states_;
   DuckDBZSet result_;
+  DuckDBZSet delta_;
 };
 
 // Join view with incremental bilinear formula
+// Supports multi-column JOIN keys: ON a.x = b.x AND a.y = b.y
 class NativeJoinView : public NativeMaterializedView {
 public:
-  using KeyFn = std::function<duckdb::Value(const DuckDBRow &)>;
+  // Key function returns DuckDBRow to support composite keys
+  using KeyFn = std::function<DuckDBRow(const DuckDBRow &)>;
+  // Projection function for join result
+  using ProjectFn = std::function<DuckDBRow(const DuckDBRow &)>;
 
   NativeJoinView(const std::string &name, const std::string &sql,
                  const std::string &left_table, const std::string &right_table,
                  const TableSchema &result_schema, KeyFn left_key,
-                 KeyFn right_key)
+                 KeyFn right_key, ProjectFn project = nullptr)
       : NativeMaterializedView(name, sql), left_table_(left_table),
         right_table_(right_table), schema_(result_schema),
-        left_key_(std::move(left_key)), right_key_(std::move(right_key)) {
+        left_key_(std::move(left_key)), right_key_(std::move(right_key)),
+        project_(std::move(project)) {
     schema_.table_name = name;
   }
 
   void apply_changes(const std::string &table_name,
                      const DuckDBZSet &changes) override {
+    delta_.clear();
     if (table_name == left_table_) {
-      // Index changes by key
       for (const auto &[row, weight] : changes) {
-        duckdb::Value key = left_key_(row);
+        DuckDBRow key = left_key_(row);
 
         // SQL Standard: NULL never matches NULL in JOINs
-        if (key.IsNull()) {
-          // Don't index NULL keys, they never produce join results
+        // Skip if any key column is NULL
+        if (has_null_column(key)) {
           continue;
         }
 
@@ -625,11 +661,10 @@ public:
       }
     } else if (table_name == right_table_) {
       for (const auto &[row, weight] : changes) {
-        duckdb::Value key = right_key_(row);
+        DuckDBRow key = right_key_(row);
 
         // SQL Standard: NULL never matches NULL in JOINs
-        if (key.IsNull()) {
-          // Don't index NULL keys, they never produce join results
+        if (has_null_column(key)) {
           continue;
         }
 
@@ -649,6 +684,7 @@ public:
   }
 
   const DuckDBZSet &get_result() const override { return result_; }
+  const DuckDBZSet &get_delta() const override { return delta_; }
   const TableSchema &result_schema() const override { return schema_; }
   std::vector<std::string> source_tables() const override {
     return {left_table_, right_table_};
@@ -658,10 +694,20 @@ public:
     left_indexed_.clear();
     right_indexed_.clear();
     result_.clear();
+    delta_.clear();
     version_ = 0;
   }
 
 private:
+  // Check if any column in the key is NULL
+  static bool has_null_column(const DuckDBRow &key) {
+    for (const auto &col : key.columns) {
+      if (col.IsNull())
+        return true;
+    }
+    return false;
+  }
+
   void add_join_result(const DuckDBRow &left, const DuckDBRow &right,
                        Weight weight) {
     DuckDBRow joined;
@@ -672,7 +718,16 @@ private:
     for (const auto &col : right.columns) {
       joined.columns.push_back(col);
     }
-    result_.insert(std::move(joined), weight);
+
+    // Apply projection if present
+    if (project_) {
+      DuckDBRow projected = project_(joined);
+      result_.insert(projected, weight);
+      delta_.insert(std::move(projected), weight);
+    } else {
+      result_.insert(joined, weight);
+      delta_.insert(std::move(joined), weight);
+    }
   }
 
   std::string left_table_;
@@ -680,21 +735,27 @@ private:
   TableSchema schema_;
   KeyFn left_key_;
   KeyFn right_key_;
-  std::unordered_map<duckdb::Value, DuckDBZSet, dbsp_native::DuckDBValueHash>
-      left_indexed_;
-  std::unordered_map<duckdb::Value, DuckDBZSet, dbsp_native::DuckDBValueHash>
-      right_indexed_;
+  ProjectFn project_;
+  // Use DuckDBRow as key for composite key support
+  std::unordered_map<DuckDBRow, DuckDBZSet, DuckDBRowHash> left_indexed_;
+  std::unordered_map<DuckDBRow, DuckDBZSet, DuckDBRowHash> right_indexed_;
   DuckDBZSet result_;
+  DuckDBZSet delta_;
 };
 
 // Distinct view - NULL-aware (SQL Standard: multiple NULLs -> single NULL)
 // Uses DuckDBRowHash and DuckDBRow::operator== which treat NULL == NULL
+// NOTE: For SELECT DISTINCT col1, col2 FROM t, we project first then apply
+// distinct
 class NativeDistinctView : public NativeMaterializedView {
 public:
+  using ProjectFn = std::function<DuckDBRow(const DuckDBRow &)>;
+
   NativeDistinctView(const std::string &name, const std::string &sql,
-                     const std::string &source_table, const TableSchema &schema)
+                     const std::string &source_table, const TableSchema &schema,
+                     ProjectFn project = nullptr)
       : NativeMaterializedView(name, sql), source_table_(source_table),
-        schema_(schema) {
+        schema_(schema), project_(std::move(project)) {
     schema_.table_name = name;
   }
 
@@ -704,7 +765,10 @@ public:
       return;
 
     for (const auto &[row, weight] : changes) {
-      auto it = counts_.find(row);
+      // Project if we have a projection function, otherwise use full row
+      DuckDBRow projected = project_ ? project_(row) : row;
+
+      auto it = counts_.find(projected);
       int64_t old_count = (it != counts_.end()) ? it->second : 0;
       int64_t new_count = old_count + weight;
 
@@ -713,21 +777,24 @@ public:
       bool is_present = new_count > 0;
 
       if (!was_present && is_present) {
-        result_.insert(row, 1);
+        result_.insert(projected, 1);
+        delta_.insert(projected, 1);
       } else if (was_present && !is_present) {
-        result_.insert(row, -1);
+        result_.insert(projected, -1);
+        delta_.insert(projected, -1);
       }
 
       if (new_count == 0) {
-        counts_.erase(row);
+        counts_.erase(projected);
       } else {
-        counts_[row] = new_count;
+        counts_[projected] = new_count;
       }
     }
     ++version_;
   }
 
   const DuckDBZSet &get_result() const override { return result_; }
+  const DuckDBZSet &get_delta() const override { return delta_; }
   const TableSchema &result_schema() const override { return schema_; }
   std::vector<std::string> source_tables() const override {
     return {source_table_};
@@ -736,14 +803,17 @@ public:
   void reset() override {
     counts_.clear();
     result_.clear();
+    delta_.clear();
     version_ = 0;
   }
 
 private:
   std::string source_table_;
   TableSchema schema_;
+  ProjectFn project_;
   std::unordered_map<DuckDBRow, int64_t, DuckDBRowHash> counts_;
   DuckDBZSet result_;
+  DuckDBZSet delta_;
 };
 
 } // namespace dbsp_native
