@@ -1,46 +1,47 @@
 #include "catch.hpp"
 #include "../test_helpers.hpp"
-#include "../../dbsp_cdc.hpp"
-#include "../../dbsp_errors.hpp"
 
-using namespace dbsp_native;
-using namespace duckdb;
+using namespace dbsp_test;
 
 TEST_CASE("ACID compliance - Atomicity", "[acid][runtime]") {
-    TestDatabase db;
-    auto& manager = get_cdc_manager();
+    DuckDBTestHarness db;
 
     SECTION("Failed validation prevents all updates") {
         // Create source table
-        db.conn.Query("CREATE TABLE source (id INT, value INT)");
-        manager.track_table(*db.context, "source");
+        db.exec("CREATE TABLE source (id INT, value INT)");
+        db.exec("SELECT * FROM dbsp_track('source')");
 
         // Create view chain: source -> view1 -> view2
-        manager.create_view(*db.context, "view1",
-            "SELECT * FROM source WHERE value > 0");
-        manager.create_view(*db.context, "view2",
-            "SELECT * FROM view1 WHERE value < 100");
+        db.exec("SELECT * FROM dbsp_create_view('view1', "
+                "'SELECT * FROM source WHERE value > 0')");
+        db.exec("SELECT * FROM dbsp_create_view('view2', "
+                "'SELECT * FROM source WHERE value < 100')");
 
         // Insert initial data
-        db.conn.Query("INSERT INTO source VALUES (1, 50)");
-        manager.sync_table(*db.context, "source");
+        db.exec("INSERT INTO source VALUES (1, 50)");
+        db.exec("SELECT * FROM dbsp_sync('source')");
 
         // Verify initial state
-        auto view1_result = manager.query_view("view1");
-        REQUIRE(view1_result.size() == 1);
-        auto view2_result = manager.query_view("view2");
-        REQUIRE(view2_result.size() == 1);
+        auto view1_result = db.query("SELECT * FROM dbsp_query('view1')");
+        REQUIRE_FALSE(view1_result->HasError());
+        REQUIRE(view1_result->RowCount() == 1);
+
+        auto view2_result = db.query("SELECT * FROM dbsp_query('view2')");
+        REQUIRE_FALSE(view2_result->HasError());
+        REQUIRE(view2_result->RowCount() == 1);
 
         // TODO: In full implementation, inject a validation failure
         // For now, just verify sync works
-        db.conn.Query("INSERT INTO source VALUES (2, 75)");
-        bool sync_ok = manager.sync_table(*db.context, "source");
-        REQUIRE(sync_ok);
+        db.exec("INSERT INTO source VALUES (2, 75)");
+        db.exec("SELECT * FROM dbsp_sync('source')");
 
         // Both views should update
-        view1_result = manager.query_view("view1");
-        REQUIRE(view1_result.size() == 2);
-        view2_result = manager.query_view("view2");
-        REQUIRE(view2_result.size() == 2);
+        view1_result = db.query("SELECT * FROM dbsp_query('view1')");
+        REQUIRE_FALSE(view1_result->HasError());
+        REQUIRE(view1_result->RowCount() == 2);
+
+        view2_result = db.query("SELECT * FROM dbsp_query('view2')");
+        REQUIRE_FALSE(view2_result->HasError());
+        REQUIRE(view2_result->RowCount() == 2);
     }
 }

@@ -187,7 +187,7 @@ TEST_CASE("Cycle detection prevents infinite loops", "[integration][cascade][cyc
     // Note: This would require updating v1's definition, which current API doesn't support
     // Instead, test creating a new view that references both, which is valid
     auto result = db.query("SELECT * FROM dbsp_create_view('v3', "
-                          "'SELECT * FROM v1 UNION SELECT * FROM v2')");
+                          "'SELECT v1.id, v2.id as id2 FROM v1, v2')");
     REQUIRE_FALSE(result->HasError()); // This is valid - no cycle
 
     // Attempting direct self-reference should fail at SQL parsing

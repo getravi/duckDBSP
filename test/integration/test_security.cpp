@@ -123,15 +123,18 @@ TEST_CASE("Security: Path traversal in file operations is prevented", "[security
         REQUIRE_FALSE(result->HasError());
 
         // Clean up
-        db.exec("!rm valid_backup.json");
+        std::filesystem::remove("valid_backup.json");
     }
 
     SECTION("Accept relative path with subdirectory") {
+        // Create directory first
+        std::filesystem::create_directories("backups");
+
         auto result = db.query("SELECT * FROM dbsp_save('backups/valid.json')");
         REQUIRE_FALSE(result->HasError());
 
         // Clean up
-        db.exec("!rm -rf backups");
+        std::filesystem::remove_all("backups");
     }
 
     SECTION("Reject loading from absolute path") {
@@ -156,18 +159,21 @@ TEST_CASE("Security: Persistence with validated identifiers", "[security][persis
 
         db.exec("SELECT * FROM dbsp_create_view('product_summary', 'SELECT * FROM products')");
 
-        // Save to DuckDB table
-        auto result = db.query("SELECT * FROM dbsp_save()");
+        // Save to JSON file (table persistence not supported)
+        auto result = db.query("SELECT * FROM dbsp_save('products_backup.json')");
         REQUIRE_FALSE(result->HasError());
 
         // Load back
-        result = db.query("SELECT * FROM dbsp_load()");
+        result = db.query("SELECT * FROM dbsp_load('products_backup.json', 'json')");
         REQUIRE_FALSE(result->HasError());
 
         // Verify view still works
         result = db.query("SELECT * FROM dbsp_query('product_summary')");
         REQUIRE_FALSE(result->HasError());
         REQUIRE(result->RowCount() == 1);
+
+        // Clean up
+        std::filesystem::remove("products_backup.json");
     }
 
     SECTION("Save to file with validated path") {
@@ -179,10 +185,10 @@ TEST_CASE("Security: Persistence with validated identifiers", "[security][persis
         auto result = db.query("SELECT * FROM dbsp_save('test_backup.json')");
         REQUIRE_FALSE(result->HasError());
 
-        result = db.query("SELECT * FROM dbsp_load('test_backup.json')");
+        result = db.query("SELECT * FROM dbsp_load('test_backup.json', 'json')");
         REQUIRE_FALSE(result->HasError());
 
         // Clean up
-        db.exec("!rm test_backup.json");
+        std::filesystem::remove("test_backup.json");
     }
 }
