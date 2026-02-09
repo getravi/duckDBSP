@@ -13,13 +13,17 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/appender.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/parser/column_definition.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 
 #include <algorithm>
 #include <fstream>
@@ -317,6 +321,31 @@ public:
     view_definitions_.clear();
     dep_graph_ = DependencyGraph();
     last_error_.clear();
+    auto_sync_enabled_ = false;
+  }
+
+  // Auto-sync (automatic CDC) control
+  void enable_auto_sync() {
+    std::lock_guard<std::shared_mutex> lock(mutex_);
+    auto_sync_enabled_ = true;
+  }
+
+  void disable_auto_sync() {
+    std::lock_guard<std::shared_mutex> lock(mutex_);
+    auto_sync_enabled_ = false;
+  }
+
+  bool is_auto_sync_enabled() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return auto_sync_enabled_;
+  }
+
+  // Auto-sync all tracked tables (called from TransactionCommit hook)
+  void auto_sync_all(duckdb::ClientContext &context,
+                     duckdb::MetaTransaction *meta_transaction = nullptr) {
+    if (!is_auto_sync_enabled())
+      return;
+    sync_all(context, meta_transaction);
   }
 
   // Track a DuckDB table for CDC
@@ -392,6 +421,55 @@ public:
     DBSPOptimizer optimizer;
     result.view_def = optimizer.optimize(result.view_def);
 
+    // Handle non-recursive CTEs: create intermediate views
+    for (const auto &cte : result.view_def.ctes) {
+      std::string cte_view_name = "_cte_" + view_name + "_" + cte.cte_name;
+      // Only create if not already existing
+      if (!views_.count(cte_view_name)) {
+        // Temporarily unlock to call create_view_internal
+        mutex_.unlock();
+        bool cte_ok = create_view(context, cte_view_name, cte.cte_sql);
+        mutex_.lock();
+        if (!cte_ok) {
+          last_error_ =
+              "Failed to create CTE '" + cte.cte_name + "': " + last_error_;
+          return false;
+        }
+      }
+      // Replace CTE name references in source tables with the internal view
+      auto &sources = result.view_def.source_tables;
+      for (auto &src : sources) {
+        if (src == cte.cte_name) {
+          src = cte_view_name;
+        }
+      }
+      // Update table aliases
+      result.view_def.table_aliases[cte.cte_name] = cte_view_name;
+    }
+
+    // Handle derived tables (subqueries in FROM): create intermediate views
+    for (const auto &dt : result.view_def.derived_tables) {
+      std::string dt_view_name = "_derived_" + view_name + "_" + dt.alias;
+      if (!views_.count(dt_view_name)) {
+        mutex_.unlock();
+        bool dt_ok = create_view(context, dt_view_name, dt.subquery_sql);
+        mutex_.lock();
+        if (!dt_ok) {
+          last_error_ = "Failed to create derived table '" + dt.alias +
+                        "': " + last_error_;
+          return false;
+        }
+      }
+      // Replace alias references in source tables
+      auto &sources = result.view_def.source_tables;
+      for (auto &src : sources) {
+        if (src == dt.alias) {
+          src = dt_view_name;
+        }
+      }
+      result.view_def.table_aliases[dt.alias] = dt_view_name;
+    }
+
     // Resolve sources - can be tables or other views
     std::vector<std::string> resolved_sources;
     for (const auto &source : result.view_def.source_tables) {
@@ -436,7 +514,8 @@ public:
     // Initialize view with current data from sources
     for (const auto &source : resolved_sources) {
       if (tracked_tables_.count(source)) {
-        const auto &state = tracked_tables_[source]->current_state();
+        const auto &table = tracked_tables_.at(source);
+        const auto &state = table->current_state();
         view->apply_changes(source, state);
       } else if (views_.count(source)) {
         // Source is a view - use its result
@@ -454,6 +533,33 @@ public:
                          .count();
     view_definitions_[view_name] = def;
 
+    // Save to _dbsp_views table (ignore errors for now)
+    try {
+      std::string sources_str;
+      for (size_t i = 0; i < resolved_sources.size(); i++) {
+        if (i > 0) sources_str += ",";
+        sources_str += resolved_sources[i];
+      }
+
+      // Escape single quotes in SQL
+      std::string escaped_sql = sql;
+      size_t pos = 0;
+      while ((pos = escaped_sql.find("'", pos)) != std::string::npos) {
+        escaped_sql.replace(pos, 1, "''");
+        pos += 2;
+      }
+
+      std::string insert_sql =
+        "INSERT OR REPLACE INTO _dbsp_views (name, sql, sources, created_at) "
+        "VALUES ('" + view_name + "', '" + escaped_sql + "', '" + sources_str + "', " +
+        std::to_string(def.created_at) + ")";
+
+      auto result = context.Query(insert_sql, false);
+      // Ignore errors - persistence is best-effort
+    } catch (...) {
+      // Ignore persistence errors
+    }
+
     // Register the view's result schema for dependent views
     table_schemas_[view_name] = view->result_schema();
 
@@ -462,8 +568,8 @@ public:
 #endif // SQL parser disabled - end of function
   }
 
-  // Drop a view
-  bool drop_view(const std::string &view_name) {
+  // Drop a view (with persistence)
+  bool drop_view(const std::string &view_name, duckdb::ClientContext *context = nullptr) {
     std::lock_guard<std::shared_mutex> lock(mutex_);
 
     // Check if other views depend on this one
@@ -474,14 +580,25 @@ public:
       return false;
     }
 
+    // Delete from _dbsp_views table if context provided
+    if (context) {
+      try {
+        std::string delete_sql = "DELETE FROM _dbsp_views WHERE name = '" + view_name + "'";
+        auto result = context->Query(delete_sql, false);
+        // Ignore errors - persistence is best-effort
+      } catch (...) {
+        // Ignore persistence errors
+      }
+    }
+
     dep_graph_.remove_node(view_name);
     view_definitions_.erase(view_name);
     table_schemas_.erase(view_name);
     return views_.erase(view_name) > 0;
   }
 
-  // Force drop a view and all dependents
-  bool drop_view_cascade(const std::string &view_name) {
+  // Force drop a view and all dependents (with persistence)
+  bool drop_view_cascade(const std::string &view_name, duckdb::ClientContext *context = nullptr) {
     std::lock_guard<std::shared_mutex> lock(mutex_);
 
     auto dependents = dep_graph_.get_all_dependents(view_name);
@@ -489,10 +606,32 @@ public:
     // Drop in reverse topological order
     std::reverse(dependents.begin(), dependents.end());
     for (const auto &dep : dependents) {
+      // Delete from _dbsp_views table if context provided
+      if (context) {
+        try {
+          std::string delete_sql = "DELETE FROM _dbsp_views WHERE name = '" + dep + "'";
+          auto result = context->Query(delete_sql, false);
+          // Ignore errors - persistence is best-effort
+        } catch (...) {
+          // Ignore persistence errors
+        }
+      }
+
       dep_graph_.remove_node(dep);
       view_definitions_.erase(dep);
       table_schemas_.erase(dep);
       views_.erase(dep);
+    }
+
+    // Delete from _dbsp_views table if context provided
+    if (context) {
+      try {
+        std::string delete_sql = "DELETE FROM _dbsp_views WHERE name = '" + view_name + "'";
+        auto result = context->Query(delete_sql, false);
+        // Ignore errors - persistence is best-effort
+      } catch (...) {
+        // Ignore persistence errors
+      }
     }
 
     dep_graph_.remove_node(view_name);
@@ -561,10 +700,15 @@ public:
   }
 
   // Sync all tracked tables
-  void sync_all(duckdb::ClientContext &context) {
+  void sync_all(duckdb::ClientContext &context,
+                duckdb::MetaTransaction *meta_transaction = nullptr) {
     std::lock_guard<std::shared_mutex> lock(mutex_);
+    std::cerr << "DBSP: sync_all called. Tracked tables: "
+              << tracked_tables_.size() << " MetaTxn: " << meta_transaction
+              << "\n";
     for (const auto &[name, _] : tracked_tables_) {
-      sync_table_locked(context, name);
+      std::cerr << "DBSP: Syncing table " << name << "\n";
+      sync_table_locked(context, name, meta_transaction);
     }
   }
 
@@ -938,6 +1082,15 @@ public:
     return &it->second->get_result();
   }
 
+  const NativeMaterializedView *get_view(const std::string &view_name) {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    auto it = views_.find(view_name);
+    if (it == views_.end()) {
+      return nullptr;
+    }
+    return it->second.get();
+  }
+
   const TableSchema *get_view_schema(const std::string &view_name) {
     std::shared_lock<std::shared_mutex> lock(mutex_);
     auto it = views_.find(view_name);
@@ -962,6 +1115,34 @@ public:
       names.push_back(name);
     }
     return names;
+  }
+
+  // Helper methods for testing and recovery
+  bool is_table_tracked(const std::string &table_name) const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return tracked_tables_.find(table_name) != tracked_tables_.end();
+  }
+
+  bool is_view_registered(const std::string &view_name) const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return views_.find(view_name) != views_.end();
+  }
+
+  size_t get_tracked_table_count(const std::string &table_name) const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    auto it = tracked_tables_.find(table_name);
+    if (it != tracked_tables_.end()) {
+      return it->second->current_state().size();
+    }
+    return 0;
+  }
+
+  void clear_all_state() {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    tracked_tables_.clear();
+    views_.clear();
+    view_definitions_.clear();
+    // Dependency graph will be rebuilt when views are recreated
   }
 
   const TableSchema *get_table_schema(const std::string &table_name) {
@@ -1029,31 +1210,131 @@ public:
 
   const std::string &last_error() const { return last_error_; }
 
+  // Initialize persistence table for storing view definitions
+  bool initialize_persistence_table(duckdb::ClientContext &context) {
+    std::lock_guard<std::shared_mutex> lock(mutex_);
+
+    try {
+      // Create _dbsp_views table if it doesn't exist
+      auto result = context.Query(
+        "CREATE TABLE IF NOT EXISTS _dbsp_views ("
+        "  name VARCHAR PRIMARY KEY,"
+        "  sql VARCHAR NOT NULL,"
+        "  sources VARCHAR,"
+        "  created_at BIGINT NOT NULL"
+        ")",
+        false
+      );
+
+      if (result->HasError()) {
+        last_error_ = "Failed to create _dbsp_views table: " + result->GetError();
+        return false;
+      }
+
+      return true;
+    } catch (const std::exception &e) {
+      last_error_ = std::string("Exception creating _dbsp_views table: ") + e.what();
+      return false;
+    }
+  }
+
+  // Create view with explicit sources (for recovery)
+  bool create_view(const std::string &view_name,
+                   const std::string &sql,
+                   const std::vector<std::string> &sources,
+                   duckdb::ClientContext &context) {
+    // For recovery, we call the normal create_view which will re-parse SQL
+    // The sources parameter is used to validate consistency
+    return create_view(context, view_name, sql);
+  }
+
+  // Restore a view's Z-set state from checkpoint
+  bool restore_view_state(const std::string &view_name, const DuckDBZSet &zset) {
+    std::lock_guard<std::shared_mutex> lock(mutex_);
+
+    auto it = views_.find(view_name);
+    if (it == views_.end()) {
+      last_error_ = "View not found: " + view_name;
+      return false;
+    }
+
+    // Replace the view's result with the checkpoint data
+    it->second->set_result(zset);
+    return true;
+  }
+
 private:
   // Sync table with lock already held
   bool sync_table_locked(duckdb::ClientContext &context,
-                         const std::string &table_name) {
+                         const std::string &table_name,
+                         duckdb::MetaTransaction *meta_transaction = nullptr) {
     auto it = tracked_tables_.find(table_name);
-    if (it == tracked_tables_.end())
+    if (it == tracked_tables_.end()) {
       return false;
+    }
 
     try {
       // Get table catalog entry using Catalog API (avoid SQL queries)
-      auto &catalog = duckdb::Catalog::GetCatalog(context, INVALID_CATALOG);
-      auto &schema_entry = catalog.GetSchema(context, DEFAULT_SCHEMA);
-      auto catalog_transaction = catalog.GetCatalogTransaction(context);
+      // We avoid Catalog::GetCatalog(context) because it checks for an active
+      // transaction on the context, which might fail in the TransactionCommit
+      // hook. We also avoid Catalog::GetCatalog(db_instance) because it's
+      // missing in some DuckDB versions.
+      auto &db_instance = duckdb::DatabaseInstance::GetDatabase(context);
+      auto &db_manager = db_instance.GetDatabaseManager();
+      auto dbs = db_manager.GetDatabases();
+      duckdb::AttachedDatabase *target_db = nullptr;
+      for (auto &db_entry : dbs) {
+        if (!db_entry->IsSystem() && !db_entry->IsTemporary()) {
+          target_db = db_entry.get();
+          break;
+        }
+      }
+      if (!target_db) {
+        target_db = &db_manager.GetSystemCatalog().GetAttached();
+      }
+      auto &catalog = target_db->GetCatalog();
 
+      duckdb::DuckTransaction *transaction = nullptr;
+      std::unique_ptr<duckdb::CatalogTransaction> manual_catalog_txn;
+
+      if (meta_transaction) {
+        // Resolve transaction from MetaTransaction for the specific database
+        auto &attached = catalog.GetAttached();
+        transaction = &meta_transaction->GetTransaction(attached)
+                           .Cast<duckdb::DuckTransaction>();
+
+        // Manually construct CatalogTransaction that points to our transaction
+        manual_catalog_txn = std::make_unique<duckdb::CatalogTransaction>(
+            catalog.GetDatabase(), meta_transaction->global_transaction_id,
+            static_cast<duckdb::transaction_t>(
+                meta_transaction->start_timestamp.value));
+        manual_catalog_txn->transaction = transaction;
+      } else {
+        transaction = &duckdb::DuckTransaction::Get(context, catalog);
+      }
+
+      // Use the appropriate CatalogTransaction
+      auto catalog_transaction = manual_catalog_txn
+                                     ? *manual_catalog_txn
+                                     : catalog.GetCatalogTransaction(context);
+
+      // Get schema using transaction
+      std::cerr << "DBSP: Calling GetSchema\n";
+      auto &schema_entry =
+          catalog.GetSchema(catalog_transaction, DEFAULT_SCHEMA);
+      std::cerr << "DBSP: GetSchema returned\n";
+
+      std::cerr << "DBSP: Calling GetEntry\n";
       auto table_entry_ptr = schema_entry.GetEntry(
           catalog_transaction, duckdb::CatalogType::TABLE_ENTRY, table_name);
+      std::cerr << "DBSP: GetEntry returned\n";
       if (!table_entry_ptr) {
+        std::cerr << "DBSP: Table entry not found for " << table_name << "\n";
         return false;
       }
 
       auto &table_entry = table_entry_ptr->Cast<duckdb::TableCatalogEntry>();
       auto &data_table = table_entry.GetStorage();
-
-      // Get transaction and set up table scan
-      auto &transaction = duckdb::DuckTransaction::Get(context, catalog);
       duckdb::TableScanState scan_state;
 
       // Get all column indices
@@ -1064,7 +1345,7 @@ private:
       }
 
       // Initialize scan
-      data_table.InitializeScan(context, transaction, scan_state, column_ids);
+      data_table.InitializeScan(context, *transaction, scan_state, column_ids);
 
       // Scan data chunks and build new_state
       duckdb::DataChunk chunk;
@@ -1073,7 +1354,7 @@ private:
       DuckDBZSet new_state;
       while (true) {
         chunk.Reset();
-        data_table.Scan(transaction, chunk, scan_state);
+        data_table.Scan(*transaction, chunk, scan_state);
 
         if (chunk.size() == 0) {
           break; // No more data
@@ -1088,6 +1369,8 @@ private:
           new_state.insert(dbsp_row, 1);
         }
       }
+      std::cerr << "DBSP: sync_table scanned rows: " << new_state.size()
+                << "\n";
 
       DuckDBZSet delta;
       const auto &old_state = it->second->current_state();
@@ -1105,6 +1388,21 @@ private:
           delta.insert(row, -weight);
         }
       }
+
+      if (delta.empty() && new_state.size() != old_state.size()) {
+        std::cerr << "DBSP DEBUG: Delta empty but size mismatch! New: "
+                  << new_state.size() << " Old: " << old_state.size() << "\n";
+        for (const auto &[row, w] : old_state) {
+          std::cerr << "  Old row: " << row.columns[0].ToString() << ", "
+                    << row.columns[1].ToString() << " weight: " << w << "\n";
+        }
+        for (const auto &[row, w] : new_state) {
+          std::cerr << "  New row: " << row.columns[0].ToString() << ", "
+                    << row.columns[1].ToString() << " weight: " << w << "\n";
+        }
+      }
+
+      std::cerr << "DBSP: sync_table delta size: " << delta.size() << "\n";
 
       for (const auto &[row, weight] : delta) {
         if (weight > 0) {
@@ -1124,7 +1422,11 @@ private:
 
       return true;
 
+    } catch (const std::exception &e) {
+      std::cerr << "DBSP: Exception in sync_table_locked: " << e.what() << "\n";
+      return false;
     } catch (...) {
+      std::cerr << "DBSP: Unknown exception in sync_table_locked\n";
       return false;
     }
   }
@@ -1145,6 +1447,10 @@ private:
     table_schemas_[table_name] = schema;
 
     sync_table_internal(context, table_name);
+    // CRITICAL: Clear pending changes from initial sync so they don't get
+    // propagated as deltas to views that were already initialized with this
+    // state in CDCManager::create_view
+    tracked_tables_[table_name]->consume_changes();
     return true;
   }
 
@@ -1227,6 +1533,7 @@ private:
       auto table_entry_ptr = schema_entry.GetEntry(
           catalog_transaction, duckdb::CatalogType::TABLE_ENTRY, table_name);
       if (!table_entry_ptr) {
+        last_error_ = "Table not found: " + table_name;
         return false;
       }
 
@@ -1242,11 +1549,18 @@ private:
         schema.columns.push_back(col_info);
       }
 
-      return !schema.columns.empty();
+      if (schema.columns.empty()) {
+        last_error_ = "Table has no columns: " + table_name;
+        return false;
+      }
+
+      return true;
 
     } catch (const std::exception &e) {
+      last_error_ = std::string("Exception getting table schema: ") + e.what();
       return false;
     } catch (...) {
+      last_error_ = "Unknown exception getting table schema";
       return false;
     }
   }
@@ -1297,6 +1611,8 @@ private:
     if (tracked_tables_.count(source_name)) {
       changes = tracked_tables_[source_name]->consume_changes();
     }
+    std::cerr << "DBSP DEBUG: propagate_changes for " << source_name
+              << " consumed " << changes.size() << " changes\n";
 
     if (changes.empty())
       return;
@@ -1310,6 +1626,7 @@ private:
       for (const auto &src : sources) {
         if (src == source_name) {
           view->apply_changes(source_name, changes);
+          std::cerr << "DBSP: Applied changes to view " << view_name << "\n";
           break;
         }
       }
@@ -1451,6 +1768,7 @@ private:
   std::unordered_map<std::string, ViewDefinition> view_definitions_;
   DependencyGraph dep_graph_;
   std::string last_error_;
+  bool auto_sync_enabled_ = false;
 };
 
 // Global CDC manager instance

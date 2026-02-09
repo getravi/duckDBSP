@@ -1,6 +1,7 @@
 // DBSP Query Optimizer
 // Optimizes ParsedViewDef before view creation
-// Implements: filter pushdown, projection pruning, filter combination
+// Implements: filter combination, filter pushdown, projection pruning,
+//             operator fusion (filter+project)
 
 #pragma once
 
@@ -21,6 +22,7 @@ public:
     combine_filters(optimized);
     pushdown_filters(optimized);
     prune_projections(optimized);
+    fuse_operators(optimized);
 
     optimized.optimized = true;
     return optimized;
@@ -31,6 +33,7 @@ public:
     size_t filters_combined = 0;
     size_t filters_pushed_down = 0;
     size_t columns_pruned = 0;
+    size_t operators_fused = 0;
   };
 
   const OptimizationStats &stats() const { return stats_; }
@@ -49,7 +52,6 @@ private:
 
     // Filters are already stored as a vector and applied with AND semantics
     // This pass ensures they're stored efficiently
-    // In the current implementation, this is already the case
     stats_.filters_combined =
         def.filters.size() > 1 ? def.filters.size() - 1 : 0;
   }
@@ -104,7 +106,7 @@ private:
   // ========================================================================
   // Projection Pruning
   // ========================================================================
-  // Eliminate unused columns from projections
+  // Identify which columns are actually needed from source tables
   void prune_projections(ParsedViewDef &def) {
     if (def.select_all || def.project_column_names.empty()) {
       return; // SELECT * or no projections - can't prune
@@ -163,8 +165,54 @@ private:
       }
     }
 
-    // Count pruned columns (columns in source but not required)
-    // This is informational - actual pruning happens at view creation
+    // Count pruned columns: source columns not in required set
+    // For non-join views, count how many projected columns we could eliminate
+    // from the source fetch
+    if (!def.source_tables.empty()) {
+      // The number of columns not needed = total filter+project columns
+      // referenced minus the minimum set. Since we track used_columns,
+      // any column in the source NOT in used_columns is prunable.
+      // We approximate by counting required vs projected.
+      size_t total_referenced = def.project_column_names.size();
+      for (const auto &f : def.filters) {
+        // Filter column might not be in projection list
+        if (used_columns.count(f.column_name) &&
+            std::find(def.project_column_names.begin(),
+                       def.project_column_names.end(),
+                       f.column_name) == def.project_column_names.end()) {
+          total_referenced++;
+        }
+      }
+      // columns_pruned = columns we DON'T need to output
+      // (filter-only columns that aren't in the final projection)
+      if (total_referenced > def.project_column_names.size()) {
+        stats_.columns_pruned =
+            total_referenced - def.project_column_names.size();
+      }
+    }
+  }
+
+  // ========================================================================
+  // Operator Fusion
+  // ========================================================================
+  // Fuse filter + project operations into a single FILTER_PROJECT view type
+  // when a FILTER-typed view also has projection columns.
+  // This reduces memory by only storing projected columns in the result.
+  void fuse_operators(ParsedViewDef &def) {
+    // Only fuse FILTER views that also have explicit projections
+    if (def.type != ParsedViewDef::ViewType::FILTER) {
+      return;
+    }
+
+    // Must have both filters and non-trivial projections
+    if (def.filters.empty() || def.project_column_names.empty() ||
+        def.select_all) {
+      return;
+    }
+
+    // Upgrade to fused FILTER_PROJECT type
+    def.type = ParsedViewDef::ViewType::FILTER_PROJECT;
+    stats_.operators_fused++;
   }
 
   // ========================================================================

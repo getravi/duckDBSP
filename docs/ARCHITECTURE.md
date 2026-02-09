@@ -81,7 +81,7 @@ public:
 };
 ```
 
-### 2. DuckDB Type Integration (`duckdb_extension/dbsp_duckdb_types.hpp`)
+### 2. DuckDB Type Integration (`src/dbsp_duckdb_types.hpp`)
 
 Native DuckDB Value-based data structures.
 
@@ -98,7 +98,7 @@ struct DuckDBRowHash {
 using DuckDBZSet = ZSet<DuckDBRow, DuckDBRowHash>;
 ```
 
-### 3. SQL Parser (`duckdb_extension/dbsp_sql_parser.hpp`)
+### 3. SQL Parser (`src/dbsp_sql_parser.hpp`)
 
 Uses DuckDB's parser to extract query structure.
 
@@ -175,7 +175,7 @@ Benefit: Reduces memory usage and data movement
 - `right_pushed_filters`: Filters applied to right JOIN input
 - `required_columns`: Minimal column set needed
 
-### 5. Recursive Query Engine (`include/dbsp_sql_parser.hpp` + `NativeRecursiveView`)
+### 5. Recursive Query Engine (`src/dbsp_sql_parser.hpp` + `NativeRecursiveView`)
 
 Implements `WITH RECURSIVE` for transitive closures and fixed-point iteration.
 
@@ -216,7 +216,7 @@ private:
 
 **Safety**: Maximum iteration limit (default 1000) prevents infinite loops.
 
-### 6. CDC Manager (`duckdb_extension/dbsp_cdc.hpp`)
+### 6. CDC Manager (`src/dbsp_cdc.hpp`)
 
 Central coordinator for change tracking and propagation.
 
@@ -269,7 +269,7 @@ public:
 };
 ```
 
-### 6. Extension Entry Point (`duckdb_extension/dbsp_extension.cpp`)
+### 6. Extension Entry Point (`src/dbsp_extension.cpp`)
 
 Registers all DuckDB functions.
 
@@ -409,12 +409,16 @@ State after:
 ## File Layout
 
 ```
-duckdb_extension/
+src/
 ├── dbsp_extension.cpp      # Entry point, function registration
-├── dbsp_extension.hpp      # Extension class declaration
 ├── dbsp_cdc.hpp           # CDC manager, dependency graph
 ├── dbsp_duckdb_types.hpp  # DuckDB-native Z-sets and views
-├── dbsp_sql_parser.hpp    # SQL parsing and view factory
+└── dbsp_sql_parser.hpp    # SQL parsing and view factory
+```
+
+Build layout:
+```
+duckDBSP/
 ├── CMakeLists.txt         # Build configuration
 └── build.sh               # Build script
 ```

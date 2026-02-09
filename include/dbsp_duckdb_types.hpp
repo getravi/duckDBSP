@@ -44,6 +44,8 @@ struct DuckDBRow {
     return true;
   }
 
+  bool operator!=(const DuckDBRow &other) const { return !(*this == other); }
+
   // Ordering operator for std::set compatibility
   // Provides strict weak ordering with NULL < non-NULL
   bool operator<(const DuckDBRow &other) const {
@@ -298,6 +300,9 @@ public:
   // Get current result
   virtual const DuckDBZSet &get_result() const = 0;
 
+  // Set result (for checkpoint restore)
+  virtual void set_result(const DuckDBZSet &result) = 0;
+
   // Get last delta (changes from most recent apply_changes)
   virtual const DuckDBZSet &get_delta() const = 0;
 
@@ -309,6 +314,13 @@ public:
 
   // Reset the view
   virtual void reset() = 0;
+
+  virtual void
+  scan(const std::function<void(const DuckDBRow &, Weight)> &callback) const {
+    for (const auto &[row, weight] : get_result()) {
+      callback(row, weight);
+    }
+  }
 
 protected:
   std::string name_;
@@ -333,6 +345,7 @@ public:
 
   void apply_changes(const std::string &table_name,
                      const DuckDBZSet &changes) override {
+    delta_.clear();
     if (table_name != source_table_)
       return;
 
@@ -346,6 +359,7 @@ public:
   }
 
   const DuckDBZSet &get_result() const override { return result_; }
+  void set_result(const DuckDBZSet &result) override { result_ = result; version_++; }
   const DuckDBZSet &get_delta() const override { return delta_; }
   const TableSchema &result_schema() const override { return schema_; }
   std::vector<std::string> source_tables() const override {
@@ -366,6 +380,63 @@ private:
   DuckDBZSet delta_;
 };
 
+// Fused filter+project view: SELECT col1, col2 FROM table WHERE col3 > 10
+// Applies filter and projection in a single pass, reducing memory by only
+// storing projected columns.
+class NativeFilterProjectView : public NativeMaterializedView {
+public:
+  using PredicateFn = std::function<bool(const DuckDBRow &)>;
+  using ProjectFn = std::function<DuckDBRow(const DuckDBRow &)>;
+
+  NativeFilterProjectView(const std::string &name, const std::string &sql,
+                          const std::string &source_table,
+                          const TableSchema &result_schema,
+                          PredicateFn predicate, ProjectFn project)
+      : NativeMaterializedView(name, sql), source_table_(source_table),
+        schema_(result_schema), predicate_(std::move(predicate)),
+        project_(std::move(project)) {
+    schema_.table_name = name;
+  }
+
+  void apply_changes(const std::string &table_name,
+                     const DuckDBZSet &changes) override {
+    delta_.clear();
+    if (table_name != source_table_)
+      return;
+
+    for (const auto &[row, weight] : changes) {
+      if (predicate_(row)) {
+        DuckDBRow projected = project_(row);
+        result_.insert(projected, weight);
+        delta_.insert(std::move(projected), weight);
+      }
+    }
+    ++version_;
+  }
+
+  const DuckDBZSet &get_result() const override { return result_; }
+  void set_result(const DuckDBZSet &result) override { result_ = result; version_++; }
+  const DuckDBZSet &get_delta() const override { return delta_; }
+  const TableSchema &result_schema() const override { return schema_; }
+  std::vector<std::string> source_tables() const override {
+    return {source_table_};
+  }
+
+  void reset() override {
+    result_.clear();
+    delta_.clear();
+    version_ = 0;
+  }
+
+private:
+  std::string source_table_;
+  TableSchema schema_;
+  PredicateFn predicate_;
+  ProjectFn project_;
+  DuckDBZSet result_;
+  DuckDBZSet delta_;
+};
+
 // Projection view: SELECT col1, col2 FROM table
 class NativeProjectView : public NativeMaterializedView {
 public:
@@ -381,6 +452,7 @@ public:
 
   void apply_changes(const std::string &table_name,
                      const DuckDBZSet &changes) override {
+    delta_.clear();
     if (table_name != source_table_)
       return;
 
@@ -393,6 +465,7 @@ public:
   }
 
   const DuckDBZSet &get_result() const override { return result_; }
+  void set_result(const DuckDBZSet &result) override { result_ = result; version_++; }
   const DuckDBZSet &get_delta() const override { return delta_; }
   const TableSchema &result_schema() const override { return schema_; }
   std::vector<std::string> source_tables() const override {
@@ -540,6 +613,7 @@ public:
   }
 
   const DuckDBZSet &get_result() const override { return result_; }
+  void set_result(const DuckDBZSet &result) override { result_ = result; version_++; }
   const DuckDBZSet &get_delta() const override { return delta_; }
   const TableSchema &result_schema() const override { return schema_; }
   std::vector<std::string> source_tables() const override {
@@ -702,6 +776,7 @@ public:
   }
 
   const DuckDBZSet &get_result() const override { return result_; }
+  void set_result(const DuckDBZSet &result) override { result_ = result; version_++; }
   const DuckDBZSet &get_delta() const override { return delta_; }
   const TableSchema &result_schema() const override { return schema_; }
   std::vector<std::string> source_tables() const override {
@@ -820,6 +895,7 @@ public:
   }
 
   const DuckDBZSet &get_result() const override { return result_; }
+  void set_result(const DuckDBZSet &result) override { result_ = result; version_++; }
   const DuckDBZSet &get_delta() const override { return delta_; }
   const TableSchema &result_schema() const override { return schema_; }
   std::vector<std::string> source_tables() const override {
@@ -838,6 +914,331 @@ private:
   TableSchema schema_;
   ProjectFn project_;
   std::unordered_map<DuckDBRow, int64_t, DuckDBRowHash> counts_;
+  DuckDBZSet result_;
+  DuckDBZSet delta_;
+};
+
+// Sort View: ORDER BY
+// Maintains a sorted multiset of rows to support ordered iteration
+class NativeSortView : public NativeMaterializedView {
+public:
+  struct SortColumn {
+    size_t column_idx;
+    bool ascending;
+    bool nulls_first;
+  };
+
+  using ProjectFn = std::function<DuckDBRow(const DuckDBRow &)>;
+
+  NativeSortView(const std::string &name, const std::string &sql,
+                 const std::string &source_table,
+                 const TableSchema &result_schema,
+                 std::vector<SortColumn> sort_columns,
+                 ProjectFn project = nullptr)
+      : NativeMaterializedView(name, sql), source_table_(source_table),
+        schema_(result_schema), sort_columns_(std::move(sort_columns)),
+        comparator_(sort_columns_), sorted_rows_(comparator_),
+        project_(std::move(project)) {
+    schema_.table_name = name;
+  }
+
+  void apply_changes(const std::string &table_name,
+                     const DuckDBZSet &changes) override {
+    delta_.clear();
+    if (table_name != source_table_)
+      return;
+
+    for (const auto &[row, weight] : changes) {
+      if (weight > 0) {
+        for (Weight i = 0; i < weight; ++i) {
+          sorted_rows_.insert(row);
+        }
+      } else if (weight < 0) {
+        for (Weight i = 0; i > weight; --i) {
+          auto it = sorted_rows_.find(row);
+          if (it != sorted_rows_.end()) {
+            sorted_rows_.erase(it);
+          }
+        }
+      }
+
+      DuckDBRow result_row = project_ ? project_(row) : row;
+      result_.insert(result_row, weight);
+      delta_.insert(result_row, weight);
+    }
+    ++version_;
+  }
+
+  const DuckDBZSet &get_result() const override { return result_; }
+  void set_result(const DuckDBZSet &result) override { result_ = result; version_++; }
+  const DuckDBZSet &get_delta() const override { return delta_; }
+  const TableSchema &result_schema() const override { return schema_; }
+  std::vector<std::string> source_tables() const override {
+    return {source_table_};
+  }
+
+  void reset() override {
+    sorted_rows_.clear();
+    result_.clear();
+    delta_.clear();
+    version_ = 0;
+  }
+
+  // Custom scan that iterates in sorted order
+  void scan(const std::function<void(const DuckDBRow &, Weight)> &callback)
+      const override {
+    if (sorted_rows_.empty())
+      return;
+
+    DuckDBRow prev = *sorted_rows_.begin();
+    bool first = true;
+    Weight count = 0;
+
+    for (const auto &row : sorted_rows_) {
+      if (!first && row == prev) {
+        count++;
+      } else {
+        if (!first) {
+          callback(project_ ? project_(prev) : prev, count);
+        }
+        prev = row;
+        count = 1;
+        first = false;
+      }
+    }
+    if (!first) {
+      callback(project_ ? project_(prev) : prev, count);
+    }
+  }
+
+private:
+  struct RowComparator {
+    const std::vector<SortColumn> &cols;
+
+    explicit RowComparator(const std::vector<SortColumn> &c) : cols(c) {}
+
+    bool operator()(const DuckDBRow &a, const DuckDBRow &b) const {
+      for (const auto &col : cols) {
+        if (col.column_idx >= a.columns.size() ||
+            col.column_idx >= b.columns.size())
+          continue;
+
+        const auto &val_a = a.columns[col.column_idx];
+        const auto &val_b = b.columns[col.column_idx];
+
+        // Handle NULLs
+        bool a_null = val_a.IsNull();
+        bool b_null = val_b.IsNull();
+
+        if (a_null && b_null)
+          continue;
+        if (a_null && !b_null)
+          return col.nulls_first;
+        if (!a_null && b_null)
+          return !col.nulls_first;
+
+        if (val_a == val_b)
+          continue;
+
+        bool less = val_a < val_b;
+        return col.ascending ? less : !less;
+      }
+      // Tie-breaker: full row comparison to distinguish different rows with
+      // same sort key
+      return a < b;
+    }
+  };
+
+  std::string source_table_;
+  TableSchema schema_;
+  std::vector<SortColumn> sort_columns_;
+  RowComparator comparator_;
+  std::multiset<DuckDBRow, RowComparator> sorted_rows_;
+  ProjectFn project_;
+  DuckDBZSet result_;
+  DuckDBZSet delta_;
+};
+
+// Limit View: LIMIT N [OFFSET M]
+class NativeLimitView : public NativeMaterializedView {
+public:
+  using SortColumn = NativeSortView::SortColumn;
+
+  using ProjectFn = NativeSortView::ProjectFn;
+
+  NativeLimitView(const std::string &name, const std::string &sql,
+                  const std::string &source_table,
+                  const TableSchema &result_schema, int64_t limit,
+                  int64_t offset, std::vector<SortColumn> sort_columns,
+                  ProjectFn project = nullptr)
+      : NativeMaterializedView(name, sql), source_table_(source_table),
+        schema_(result_schema), limit_(limit), offset_(offset),
+        sort_columns_(std::move(sort_columns)), comparator_(sort_columns_),
+        sorted_rows_(comparator_), project_(std::move(project)) {
+    schema_.table_name = name;
+  }
+
+  void apply_changes(const std::string &table_name,
+                     const DuckDBZSet &changes) override {
+    delta_.clear();
+    if (table_name != source_table_)
+      return;
+
+    // Apply changes to full state
+    for (const auto &[row, weight] : changes) {
+      if (weight > 0) {
+        for (Weight i = 0; i < weight; ++i)
+          sorted_rows_.insert(row);
+      } else if (weight < 0) {
+        for (Weight i = 0; i > weight; --i) {
+          auto it = sorted_rows_.find(row);
+          if (it != sorted_rows_.end())
+            sorted_rows_.erase(it);
+        }
+      }
+    }
+
+    // Recompute result
+    DuckDBZSet new_result;
+
+    int64_t current_idx = 0;
+    int64_t count = 0;
+
+    for (const auto &row : sorted_rows_) {
+      if (current_idx >= offset_) {
+        if (limit_ < 0 || count < limit_) {
+          DuckDBRow result_row = project_ ? project_(row) : row;
+          new_result.insert(result_row, 1);
+          count++;
+        } else {
+          break;
+        }
+      }
+      current_idx++;
+    }
+
+    // Compute delta (new - old)
+    delta_.clear();
+    // delta = new_result - result_
+    // iterate new_result: if weight > old_weight, +diff.
+    // iterate result_: if weight > new_weight, -diff.
+    // Simpler: delta = new_result + (-result_)
+    delta_ = new_result + (-result_);
+    result_ = new_result;
+
+    ++version_;
+  }
+
+  const DuckDBZSet &get_result() const override { return result_; }
+  void set_result(const DuckDBZSet &result) override { result_ = result; version_++; }
+  const DuckDBZSet &get_delta() const override { return delta_; }
+  const TableSchema &result_schema() const override { return schema_; }
+  std::vector<std::string> source_tables() const override {
+    return {source_table_};
+  }
+
+  void reset() override {
+    sorted_rows_.clear();
+    result_.clear();
+    delta_.clear();
+    version_ = 0;
+  }
+
+  void scan(const std::function<void(const DuckDBRow &, Weight)> &callback)
+      const override {
+    // Iterate local sorted result (which is limited)
+    // Since result_ is an unordered map, we cannot use it for ordered scan.
+    // We must iterate the sorted_rows_ and apply limit/offset again
+    // OR store the limited rows in a sorted structure too?
+    // Re-iterating sorted_rows_ is O(offset+limit). Fine.
+
+    int64_t current_idx = 0;
+    int64_t count = 0;
+
+    // We need to group identical rows to pass correct weight
+    // But sorted_rows_ contains individual instances.
+    // So logic is:
+
+    // We can't easily group because limit cuts off arbitrarily.
+    // e.g. 5 'A's, limit 3. We return 3 'A's.
+    // Callback expects (Row, Weight).
+
+    DuckDBRow prev;
+    bool first_in_output = true;
+    Weight current_weight = 0;
+
+    for (const auto &row : sorted_rows_) {
+      if (current_idx >= offset_) {
+        if (limit_ < 0 || count < limit_) {
+          // This row is in output
+          if (first_in_output) {
+            prev = row;
+            current_weight = 1;
+            first_in_output = false;
+          } else {
+            if (row == prev) {
+              current_weight++;
+            } else {
+              callback(project_ ? project_(prev) : prev, current_weight);
+              prev = row;
+              current_weight = 1;
+            }
+          }
+          count++;
+        } else {
+          break;
+        }
+      }
+      current_idx++;
+    }
+    if (!first_in_output) {
+      callback(project_ ? project_(prev) : prev, current_weight);
+    }
+  }
+
+private:
+  // Comparator needs to be same as SortView (duplicated for now or shared?)
+  // Using nested struct from NativeSortView public interface if possible?
+  // I defined RowComparator private in NativeSortView.
+  // I should define it publicly or copy it.
+  // I'll copy it for safety working with limited context.
+  struct RowComparator {
+    const std::vector<SortColumn> &cols;
+    explicit RowComparator(const std::vector<SortColumn> &c) : cols(c) {}
+    bool operator()(const DuckDBRow &a, const DuckDBRow &b) const {
+      for (const auto &col : cols) {
+        if (col.column_idx >= a.columns.size() ||
+            col.column_idx >= b.columns.size())
+          continue;
+        const auto &val_a = a.columns[col.column_idx];
+        const auto &val_b = b.columns[col.column_idx];
+        bool a_null = val_a.IsNull();
+        bool b_null = val_b.IsNull();
+        if (a_null && b_null)
+          continue;
+        if (a_null && !b_null)
+          return col.nulls_first;
+        if (!a_null && b_null)
+          return !col.nulls_first;
+
+        if (val_a == val_b)
+          continue;
+
+        bool less = val_a < val_b;
+        return col.ascending ? less : !less;
+      }
+      return a < b;
+    }
+  };
+
+  std::string source_table_;
+  TableSchema schema_;
+  int64_t limit_;
+  int64_t offset_;
+  std::vector<SortColumn> sort_columns_;
+  RowComparator comparator_;
+  std::multiset<DuckDBRow, RowComparator> sorted_rows_;
+  ProjectFn project_;
   DuckDBZSet result_;
   DuckDBZSet delta_;
 };

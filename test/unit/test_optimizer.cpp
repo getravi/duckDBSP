@@ -9,6 +9,7 @@ TEST_CASE("Optimizer: Filter Combination", "[optimizer]") {
   DBSPOptimizer optimizer;
   ParsedViewDef def;
   def.type = ParsedViewDef::ViewType::FILTER;
+  def.select_all = true; // SELECT * - no projection to fuse
 
   // Add multiple filters
   // FilterInfo: {column_idx, column_name, op, value}
@@ -20,6 +21,8 @@ TEST_CASE("Optimizer: Filter Combination", "[optimizer]") {
   // The current implementation just updates stats, as filters are already
   // combined in the vector
   REQUIRE(optimizer.stats().filters_combined == 1);
+  // SELECT * with filters stays as FILTER (no projection to fuse)
+  REQUIRE(optimized.type == ParsedViewDef::ViewType::FILTER);
 }
 
 TEST_CASE("Optimizer: Filter Pushdown through JOIN", "[optimizer]") {
@@ -104,4 +107,79 @@ TEST_CASE("Optimizer: Pruning with Aggregates", "[optimizer]") {
                                  optimized.required_columns.end());
   REQUIRE(required.count("col1"));
   REQUIRE(required.count("col2"));
+}
+
+TEST_CASE("Optimizer: Operator Fusion - Filter+Project", "[optimizer]") {
+  DBSPOptimizer optimizer;
+  ParsedViewDef def;
+  def.type = ParsedViewDef::ViewType::FILTER;
+  def.select_all = false;
+  def.source_tables = {"employees"};
+
+  // SELECT name, salary FROM employees WHERE dept = 'Sales'
+  def.project_column_names = {"name", "salary"};
+  def.filters.push_back({2, "dept", "=", duckdb::Value("Sales")});
+
+  auto optimized = optimizer.optimize(def);
+
+  // Should be fused into FILTER_PROJECT
+  REQUIRE(optimized.type == ParsedViewDef::ViewType::FILTER_PROJECT);
+  REQUIRE(optimizer.stats().operators_fused == 1);
+  // Filter and projection data preserved
+  REQUIRE(optimized.filters.size() == 1);
+  REQUIRE(optimized.project_column_names.size() == 2);
+}
+
+TEST_CASE("Optimizer: No Fusion for SELECT *", "[optimizer]") {
+  DBSPOptimizer optimizer;
+  ParsedViewDef def;
+  def.type = ParsedViewDef::ViewType::FILTER;
+  def.select_all = true;
+
+  def.filters.push_back({0, "col1", ">", duckdb::Value("10")});
+
+  auto optimized = optimizer.optimize(def);
+
+  // SELECT * with filter stays as FILTER (nothing to fuse)
+  REQUIRE(optimized.type == ParsedViewDef::ViewType::FILTER);
+  REQUIRE(optimizer.stats().operators_fused == 0);
+}
+
+TEST_CASE("Optimizer: No Fusion for non-FILTER types", "[optimizer]") {
+  DBSPOptimizer optimizer;
+  ParsedViewDef def;
+  def.type = ParsedViewDef::ViewType::AGGREGATE;
+  def.select_all = false;
+
+  def.project_column_names = {"dept"};
+  def.filters.push_back({1, "active", "=", duckdb::Value("true")});
+  def.group_by_names = {"dept"};
+  ParsedViewDef::AggInfo agg;
+  agg.value_column_name = "salary";
+  def.aggregates.push_back(agg);
+
+  auto optimized = optimizer.optimize(def);
+
+  // AGGREGATE views don't get fused (they handle their own filter+project)
+  REQUIRE(optimized.type == ParsedViewDef::ViewType::AGGREGATE);
+  REQUIRE(optimizer.stats().operators_fused == 0);
+}
+
+TEST_CASE("Optimizer: Columns Pruned Stat", "[optimizer]") {
+  DBSPOptimizer optimizer;
+  ParsedViewDef def;
+  def.type = ParsedViewDef::ViewType::FILTER;
+  def.select_all = false;
+  def.source_tables = {"wide_table"};
+
+  // SELECT col1, col2 FROM wide_table WHERE col3 > 10
+  def.project_column_names = {"col1", "col2"};
+  def.filters.push_back({2, "col3", ">", duckdb::Value("10")});
+
+  auto optimized = optimizer.optimize(def);
+
+  // col3 is needed for filtering but not in the output projection
+  REQUIRE(optimizer.stats().columns_pruned == 1);
+  // Should have 3 required columns total (col1, col2, col3)
+  REQUIRE(optimized.required_columns.size() == 3);
 }

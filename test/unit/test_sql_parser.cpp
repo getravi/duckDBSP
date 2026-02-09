@@ -424,3 +424,16 @@ TEST_CASE("Parser errors - Error codes", "[sql_parser][errors]") {
     // Error code should be set (will add specific checks later)
   }
 }
+TEST_CASE("SQL Parser - CREATE MATERIALIZED VIEW", "[sql_parser][ddl]") {
+  DBSPSqlParser parser;
+
+  SECTION("Standard CREATE MATERIALIZED VIEW") {
+    auto result =
+        parser.parse("CREATE MATERIALIZED VIEW my_view AS SELECT * FROM users");
+
+    REQUIRE(result.success);
+    REQUIRE(result.view_def.view_name == "my_view");
+    REQUIRE(result.view_def.source_tables.size() == 1);
+    REQUIRE(result.view_def.source_tables[0] == "users");
+  }
+}

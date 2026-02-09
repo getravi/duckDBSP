@@ -100,7 +100,6 @@ See [examples/](examples/) for more comprehensive demos.
 ### Building from Source
 
 ```bash
-cd duckdb_extension
 ./build.sh
 ```
 
@@ -129,7 +128,7 @@ make
 ./unit_tests
 
 # Run integration tests (requires extension to be built)
-cd ../duckdb_extension && ./build.sh && cd ../build
+./build.sh && cd build
 ./integration_tests
 
 # Run benchmarks
@@ -264,38 +263,35 @@ DBSP (Database Stream Processing) treats database operations as streams of chang
 
 For the mathematical foundations, see [Theory](docs/THEORY.md).
 
-## Performance
+## Performance Benchmarks
 
-| Operation | Traditional View | DBSP View |
-|-----------|-----------------|-----------|
-| Initial creation | O(n) | O(n) |
-| Single row insert | O(n) | O(1)* |
-| Batch insert (k rows) | O(n) | O(k)* |
-| Query | O(1) | O(1) |
+| Operation | Throughput (approx) | Latency (10k batch) |
+|-----------|---------------------|---------------------|
+| **Raw Ingestion** | ~10,000 rows/s | 1.0s |
+| **Incremental Projection** | **~200,000 rows/s** | **0.05s** |
+| **Incremental Aggregation** | **~210,000 rows/s** | **0.05s** |
 
-*Plus O(affected groups) for aggregations
+*Benchmarks run on Apple M1, simple schema, batch size 10,000 rows.*
+*Incremental maintenance is ~20x faster than raw ingestion for these scenarios.*
 
 ## Project Structure
 
-```
 duckDBSP/
-├── include/                    # Core DBSP library (header-only)
+├── include/                   # Core DBSP library (header-only)
 │   ├── dbsp_zset.hpp          # Z-set data structure
 │   ├── dbsp_stream.hpp        # Stream operators
 │   ├── dbsp_circuit.hpp       # Dataflow graph
 │   └── dbsp_materialized_view.hpp
-├── duckdb_extension/          # DuckDB extension
-│   ├── dbsp_extension.cpp     # Extension entry point
+├── src/                       # Extension source
+│   └── dbsp_extension.cpp     # Extension entry point
 │   ├── dbsp_duckdb_types.hpp  # Native DuckDB type integration
 │   ├── dbsp_sql_parser.hpp    # SQL parsing
 │   ├── dbsp_cdc.hpp           # CDC manager
-│   └── build.sh               # Build script
-├── src/                       # Standalone demos
-│   └── dbsp_cli.cpp           # Interactive CLI
+├── build.sh                   # Build script
 ├── test/                      # Unit tests
 ├── docs/                      # Documentation
 └── examples/                  # Usage examples
-```
+
 
 ## Contributing
 

@@ -16,18 +16,22 @@ endif()
 
 # Build DuckDB as a subdirectory
 set(BUILD_UNITTESTS OFF CACHE BOOL "" FORCE)
-set(BUILD_SHELL OFF CACHE BOOL "" FORCE)
+set(BUILD_SHELL ON CACHE BOOL "" FORCE)
 set(BUILD_EXTENSIONS "" CACHE STRING "" FORCE)
 add_subdirectory(${DUCKDB_SOURCE_DIR} duckdb EXCLUDE_FROM_ALL)
 
 # Extension source
-add_library(${TARGET_NAME}_loadable_extension SHARED
-    dbsp_extension.cpp
-)
-
-target_compile_definitions(${TARGET_NAME}_loadable_extension PRIVATE
-    DUCKDB_EXTENSION_MAIN
-    EXT_VERSION_DBSP="${EXT_VERSION_DBSP}"
+# Extension build
+set(DUCKDB_MODULE_BASE_DIR "${DUCKDB_SOURCE_DIR}")
+set(DUCKDB_NORMALIZED_VERSION "v1.4.0")
+set(DUCKDB_EXTENSION_DBSP_EXT_VERSION ${EXT_VERSION_DBSP})
+set(PARAMETERS "-warnings")
+build_loadable_extension(${TARGET_NAME} ${PARAMETERS}
+    src/dbsp_extension.cpp
+    src/dbsp_recovery.cpp
+    src/dbsp_crash_marker.cpp
+    src/dbsp_checkpoint_format.cpp
+    src/dbsp_wal_manager.cpp
 )
 
 target_include_directories(${TARGET_NAME}_loadable_extension PRIVATE
@@ -36,15 +40,27 @@ target_include_directories(${TARGET_NAME}_loadable_extension PRIVATE
     ${DUCKDB_SOURCE_DIR}/src/include
 )
 
-target_link_libraries(${TARGET_NAME}_loadable_extension duckdb_static)
-
-set_target_properties(${TARGET_NAME}_loadable_extension PROPERTIES
-    OUTPUT_NAME ${TARGET_NAME}
-    PREFIX ""
-    SUFFIX ".duckdb_extension"
-)
-
 message(STATUS "")
 message(STATUS "DBSP DuckDB Extension v${EXT_VERSION_DBSP}")
 message(STATUS "  DuckDB: ${DUCKDB_SOURCE_DIR}")
 message(STATUS "")
+
+# Add tests
+enable_testing()
+add_subdirectory(test)
+
+# Benchmark
+add_executable(benchmark_runner
+    benchmark/benchmark_runner.cpp
+    src/dbsp_extension.cpp
+    src/dbsp_recovery.cpp
+    src/dbsp_crash_marker.cpp
+    src/dbsp_checkpoint_format.cpp
+    src/dbsp_wal_manager.cpp
+)
+target_include_directories(benchmark_runner PRIVATE
+    ${DUCKDB_SOURCE_DIR}/src/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(benchmark_runner duckdb_static)

@@ -6,9 +6,9 @@ Comprehensive guide to testing the DBSP for DuckDB project.
 
 The project includes three types of tests:
 
-1. **Unit Tests** (`test/unit_tests.cpp`): Core DBSP library, SQL parser, CDC manager
-2. **Integration Tests** (`test/integration_tests.cpp`): Extension functions with real DuckDB
-3. **Benchmarks** (`test/benchmarks.cpp`): Performance validation of O(delta) updates
+1. **Unit Tests** (`test/unit/`): Core DBSP library, SQL parser, CDC manager
+2. **Integration Tests** (`test/integration/`): Extension functions with real DuckDB
+3. **Benchmarks** (`benchmark/`): Performance validation of O(delta) updates
 
 All tests use a simple, dependency-free assertion framework built into the test files.
 
@@ -36,18 +36,18 @@ Benchmark: Single insert O(1): 0.05ms ✓
 
 ```
 test/
-├── unit_tests.cpp           # Core library tests (no DuckDB)
-├── integration_tests.cpp    # Extension tests (requires DuckDB)
-└── benchmarks.cpp           # Performance tests
+├── unit/                    # Core library tests (no DuckDB)
+├── integration/             # Extension tests (requires DuckDB)
+└── benchmarks/              # Performance tests
 ```
 
 ### Test Categories
 
 | Category | Location | Dependencies | Purpose |
 |----------|----------|--------------|---------|
-| Unit | `test/unit_tests.cpp` | None | Test DBSP algorithms |
-| Integration | `test/integration_tests.cpp` | DuckDB | Test extension API |
-| Benchmarks | `test/benchmarks.cpp` | DuckDB | Validate O(delta) |
+| Unit | `test/unit/` | None | Test DBSP algorithms |
+| Integration | `test/integration/` | DuckDB | Test extension API |
+| Benchmarks | `benchmark/` | DuckDB | Validate O(delta) |
 
 ## Unit Tests
 

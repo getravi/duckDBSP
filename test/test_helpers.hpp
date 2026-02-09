@@ -26,6 +26,18 @@ inline DuckDBRow makeRow(std::initializer_list<Value> values) {
   return row;
 }
 
+// Print helper for Catch2
+inline std::ostream &operator<<(std::ostream &os, const DuckDBRow &row) {
+  os << "[";
+  for (size_t i = 0; i < row.columns.size(); i++) {
+    if (i > 0)
+      os << ", ";
+    os << row.columns[i].ToString();
+  }
+  os << "]";
+  return os;
+}
+
 // Helper to create ZSet from row-weight pairs
 inline DuckDBZSet
 makeZSet(std::initializer_list<std::pair<DuckDBRow, int64_t>> data) {

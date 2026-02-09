@@ -33,8 +33,6 @@
 //   SELECT * FROM dbsp_deps('view_name');
 //   SELECT dbsp_drop_cascade('view_name'); -- Drop view and dependents
 
-#define DUCKDB_EXTENSION_MAIN
-
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -76,6 +74,19 @@ static void RegisterExtensionFunction(DatabaseInstance &instance,
   RegisterExtensionFunction(instance, info);
 }
 
+// Helper: Ensure DBSPContextState is attached to the context
+// This is necessary because OnConnectionOpened isn't always called for the
+// initial connection when loading the extension
+static void EnsureContextState(ClientContext &context) {
+  auto params = context.registered_state->Get<dbsp_native::DBSPContextState>(
+      "dbsp_cdc_state");
+  if (!params) {
+    std::cerr << "DBSP: Lazily attaching ContextState to " << &context << "\n";
+    context.registered_state->GetOrCreate<dbsp_native::DBSPContextState>(
+        "dbsp_cdc_state");
+  }
+}
+
 // ============================================================================
 // dbsp_track - Track a table for automatic CDC
 // Usage: SELECT * FROM dbsp_track('table_name');
@@ -106,6 +117,7 @@ unique_ptr<FunctionData> TrackBind(ClientContext &context,
 
 void TrackFunc(ClientContext &context, TableFunctionInput &input,
                DataChunk &output) {
+  EnsureContextState(context);
   auto &data = input.bind_data->CastNoConst<TrackBindData>();
   if (data.done)
     return;
@@ -184,6 +196,7 @@ unique_ptr<FunctionData> CreateViewBind(ClientContext &context,
 
 void CreateViewFunc(ClientContext &context, TableFunctionInput &input,
                     DataChunk &output) {
+  EnsureContextState(context);
   auto &data = input.bind_data->CastNoConst<CreateViewBindData>();
   if (data.done)
     return;
@@ -290,6 +303,7 @@ unique_ptr<FunctionData> NotifyBind(ClientContext &context,
 
 void NotifyInsertFunc(ClientContext &context, TableFunctionInput &input,
                       DataChunk &output) {
+  EnsureContextState(context);
   auto &data = input.bind_data->CastNoConst<NotifyBindData>();
   if (data.done)
     return;
@@ -304,6 +318,7 @@ void NotifyInsertFunc(ClientContext &context, TableFunctionInput &input,
 
 void NotifyDeleteFunc(ClientContext &context, TableFunctionInput &input,
                       DataChunk &output) {
+  EnsureContextState(context);
   auto &data = input.bind_data->CastNoConst<NotifyBindData>();
   if (data.done)
     return;
@@ -347,6 +362,7 @@ unique_ptr<FunctionData> SyncBind(ClientContext &context,
 
 void SyncFunc(ClientContext &context, TableFunctionInput &input,
               DataChunk &output) {
+  EnsureContextState(context);
   auto &data = input.bind_data->CastNoConst<SyncBindData>();
   if (data.done)
     return;
@@ -391,21 +407,22 @@ unique_ptr<FunctionData> QueryBind(ClientContext &context,
   data->view_name = input.inputs[0].GetValue<string>();
 
   auto &manager = dbsp_native::get_cdc_manager();
-  const auto *result = manager.query_view(data->view_name);
+  const auto *view = manager.get_view(data->view_name);
   const auto *schema = manager.get_view_schema(data->view_name);
 
-  if (!result) {
+  if (!view) {
     throw InvalidInputException("View not found: " + data->view_name);
   }
 
-  // Collect rows with positive weight
-  for (const auto &[row, weight] : *result) {
-    if (weight > 0) {
-      for (int64_t i = 0; i < weight; i++) {
-        data->rows.push_back(row);
-      }
-    }
-  }
+  // Collect rows using scan (supports ordered iteration for sort/limit views)
+  view->scan(
+      [&](const dbsp_native::DuckDBRow &row, dbsp_native::Weight weight) {
+        if (weight > 0) {
+          for (int64_t i = 0; i < weight; i++) {
+            data->rows.push_back(row);
+          }
+        }
+      });
 
   // Build return schema
   if (schema && !schema->columns.empty()) {
@@ -432,6 +449,7 @@ unique_ptr<FunctionData> QueryBind(ClientContext &context,
 
 void QueryFunc(ClientContext &context, TableFunctionInput &input,
                DataChunk &output) {
+  EnsureContextState(context);
   auto &data = input.bind_data->CastNoConst<QueryBindData>();
 
   idx_t count = 0;
@@ -642,8 +660,8 @@ void SaveFunc(ClientContext &context, TableFunctionInput &input,
     msg =
         ok ? "Saved to file: " + data.target : "Error: " + manager.last_error();
   } else {
-    // Table mode - not supported from table functions due to DuckDB transaction
-    // restrictions
+    // Table mode - not supported from table functions due to DuckDB
+    // transaction restrictions
     ok = false;
     msg = "Error: DuckDB table persistence not supported (use JSON files "
           "instead). Try: dbsp_save('view_name', 'file.json', 'json')";
@@ -710,8 +728,8 @@ void LoadFunc(ClientContext &context, TableFunctionInput &input,
     msg = ok ? "Loaded from file: " + data.source
              : "Error: " + manager.last_error();
   } else {
-    // Table mode - not supported from table functions due to DuckDB transaction
-    // restrictions
+    // Table mode - not supported from table functions due to DuckDB
+    // transaction restrictions
     ok = false;
     msg = "Error: DuckDB table persistence not supported (use JSON files "
           "instead). Try: dbsp_load('file.json', 'json')";
@@ -794,6 +812,69 @@ void DepsFunc(ClientContext &context, TableFunctionInput &input,
 }
 
 // ============================================================================
+// dbsp_auto_sync - Enable/disable automatic CDC on transaction commit
+// Usage: SELECT * FROM dbsp_auto_sync(true);   -- Enable
+//        SELECT * FROM dbsp_auto_sync(false);  -- Disable
+//        SELECT * FROM dbsp_auto_sync();       -- Query status
+// ============================================================================
+
+struct AutoSyncBindData : public TableFunctionData {
+  bool enable = false;
+  bool query_only = false;
+  bool done = false;
+};
+
+unique_ptr<FunctionData> AutoSyncBind(ClientContext &context,
+                                      TableFunctionBindInput &input,
+                                      vector<LogicalType> &return_types,
+                                      vector<string> &names) {
+  auto data = make_uniq<AutoSyncBindData>();
+
+  if (input.inputs.empty()) {
+    data->query_only = true;
+  } else {
+    data->enable = input.inputs[0].GetValue<bool>();
+  }
+
+  return_types.push_back(LogicalType::VARCHAR);
+  names.push_back("result");
+  return std::move(data);
+}
+
+void AutoSyncFunc(ClientContext &context, TableFunctionInput &input,
+                  DataChunk &output) {
+  EnsureContextState(context);
+  auto &data = input.bind_data->CastNoConst<AutoSyncBindData>();
+  if (data.done)
+    return;
+
+  auto &manager = dbsp_native::get_cdc_manager();
+
+  if (data.query_only) {
+    bool enabled = manager.is_auto_sync_enabled();
+    output.SetCardinality(1);
+    output.SetValue(
+        0, 0,
+        Value(string("Auto-sync is ") + (enabled ? "ENABLED" : "DISABLED")));
+  } else {
+    if (data.enable) {
+      manager.enable_auto_sync();
+      output.SetCardinality(1);
+      output.SetValue(
+          0, 0,
+          Value("Auto-sync ENABLED: views will update on transaction commit"));
+    } else {
+      manager.disable_auto_sync();
+      output.SetCardinality(1);
+      output.SetValue(
+          0, 0,
+          Value("Auto-sync DISABLED: use dbsp_sync() for manual updates"));
+    }
+  }
+  data.done = true;
+}
+
+// ============================================================================
 // Materialized View DDL - CREATE MATERIALIZED VIEW
 // ============================================================================
 
@@ -817,6 +898,7 @@ unique_ptr<FunctionData> CreateMaterializedViewBind(
 void CreateMaterializedViewExecute(ClientContext &context,
                                    TableFunctionInput &input,
                                    DataChunk &output) {
+  EnsureContextState(context);
   auto &state = input.bind_data->CastNoConst<CreateMaterializedViewData>();
 
   if (state.done) {
@@ -1061,7 +1143,8 @@ using namespace duckdb;
 class DBSPExtensionCallback : public ExtensionCallback {
 public:
   void OnConnectionOpened(ClientContext &context) override {
-    std::cerr << "DBSP: OnConnectionOpened called\n";
+    std::cerr << "DBSP: OnConnectionOpened called (context: " << &context
+              << ")\n";
     // Attach our context state for transaction hooking
     auto &config = DBConfig::GetConfig(context);
 
@@ -1103,14 +1186,12 @@ static void LoadInternal(DatabaseInstance &instance) {
                                CreateMaterializedViewBind);
   RegisterExtensionFunction(instance, create_mv_func);
 
-  TableFunction insert_func("dbsp_notify_insert",
-                            {LogicalType::VARCHAR},
+  TableFunction insert_func("dbsp_notify_insert", {LogicalType::VARCHAR},
                             NotifyInsertFunc, NotifyBind);
   insert_func.varargs = LogicalType::ANY; // For column values
   RegisterExtensionFunction(instance, insert_func);
 
-  TableFunction delete_func("dbsp_notify_delete",
-                            {LogicalType::VARCHAR},
+  TableFunction delete_func("dbsp_notify_delete", {LogicalType::VARCHAR},
                             NotifyDeleteFunc, NotifyBind);
   delete_func.varargs = LogicalType::ANY; // For column values
   RegisterExtensionFunction(instance, delete_func);
@@ -1142,6 +1223,11 @@ static void LoadInternal(DatabaseInstance &instance) {
   load_func.varargs = LogicalType::VARCHAR;
   RegisterExtensionFunction(instance, load_func);
 
+  TableFunction auto_sync_func("dbsp_auto_sync", {}, AutoSyncFunc,
+                               AutoSyncBind);
+  auto_sync_func.varargs = LogicalType::BOOLEAN;
+  RegisterExtensionFunction(instance, auto_sync_func);
+
   // Register scalar functions
   CreateScalarFunctionInfo drop_func_info(
       ScalarFunction("dbsp_drop_view", {LogicalType::VARCHAR},
@@ -1149,9 +1235,8 @@ static void LoadInternal(DatabaseInstance &instance) {
   RegisterExtensionFunction(instance, drop_func_info);
 
   // Alias: dbsp_drop (used by tests and shorter API)
-  CreateScalarFunctionInfo drop_alias_info(
-      ScalarFunction("dbsp_drop", {LogicalType::VARCHAR},
-                     LogicalType::VARCHAR, DropScalar));
+  CreateScalarFunctionInfo drop_alias_info(ScalarFunction(
+      "dbsp_drop", {LogicalType::VARCHAR}, LogicalType::VARCHAR, DropScalar));
   RegisterExtensionFunction(instance, drop_alias_info);
 
   CreateScalarFunctionInfo drop_cascade_func_info(

@@ -87,4 +87,40 @@ TEST_CASE("Optimization Integration", "[optimization]") {
     REQUIRE(result2->GetValue(0, 1).GetValue<int>() == 2);
     REQUIRE(result2->GetValue(1, 1).GetValue<int>() == 11);
   }
+
+  SECTION("Filter+Project Operator Fusion") {
+    // SELECT name, salary FROM employees WHERE dept_id = 1
+    // Optimizer fuses filter+project into a single FILTER_PROJECT view
+    // Result should only contain projected columns (not dept_id)
+    db.exec("CREATE TABLE emp (id INTEGER, name VARCHAR, salary INTEGER, "
+            "dept_id INTEGER)");
+    db.exec("INSERT INTO emp VALUES (1, 'Alice', 80000, 1)");
+    db.exec("INSERT INTO emp VALUES (2, 'Bob', 90000, 2)");
+    db.exec("INSERT INTO emp VALUES (3, 'Charlie', 70000, 1)");
+
+    db.exec("SELECT * FROM dbsp_track('emp')");
+    db.exec("SELECT * FROM dbsp_sync('emp')");
+
+    // This query has both filter (WHERE) and projection (SELECT name, salary)
+    db.exec("SELECT * FROM dbsp_create_view('v_fused', "
+            "'SELECT name, salary FROM emp WHERE dept_id = 1')");
+
+    auto result = db.query("SELECT * FROM dbsp_query('v_fused')");
+    REQUIRE(!result->HasError());
+    REQUIRE(result->RowCount() == 2);
+    // Only 2 columns in result (name, salary) - not 4
+    REQUIRE(result->ColumnCount() == 2);
+
+    // Verify incremental updates work through fused view
+    db.exec("INSERT INTO emp VALUES (4, 'Diana', 85000, 1)");  // matches
+    db.exec("INSERT INTO emp VALUES (5, 'Eve', 95000, 2)");    // filtered out
+    db.exec("SELECT * FROM dbsp_sync('emp')");
+
+    auto result2 = db.query("SELECT * FROM dbsp_query('v_fused')");
+    REQUIRE(!result2->HasError());
+    REQUIRE(result2->RowCount() == 3); // Alice, Charlie, Diana
+    REQUIRE(result2->ColumnCount() == 2);
+
+    db.exec("SELECT dbsp_drop('v_fused')");
+  }
 }
