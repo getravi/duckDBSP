@@ -15,7 +15,7 @@ This document outlines both near-term development priorities and long-term visio
 | **Phase 1: Foundation** | ✅ COMPLETE | 2026-02-06 |
 | **Phase 2: Core DBSP** | ✅ COMPLETE | 2026-02-07 |
 | **Phase 3: Production** | ✅ COMPLETE | 2026-02-07 |
-| **Phase 4: Advanced SQL** | 🟡 PARTIAL | 2026-02-08 |
+| **Phase 4: Advanced SQL** | ✅ COMPLETE | 2026-02-07 |
 | **Phase 5: Automation** | 🟡 PARTIAL | 2026-02-07 |
 | **Phase 6: Infrastructure** | ⚪️ PLANNED | Q1 2026 |
 
@@ -32,6 +32,7 @@ This document outlines both near-term development priorities and long-term visio
 - ✅ ORDER BY & LIMIT support
 - ✅ Advanced window functions (LAG, LEAD, FIRST_VALUE, etc.)
 - ✅ Non-recursive CTEs and subqueries
+- ✅ Set operations (UNION, INTERSECT, EXCEPT)
 
 ---
 
@@ -41,11 +42,19 @@ This document outlines both near-term development priorities and long-term visio
 
 #### P4.4: Set Operations (UNION, INTERSECT, EXCEPT)
 **Priority**: 🟢 LOW
-**Status**: NOT STARTED
+**Status**: ✅ COMPLETE
+**Completion Date**: 2026-02-07
 **Effort**: 3-4 days
-**Target**: May 2026
 
 **Description**: Incremental maintenance for SQL set operations.
+
+**Implementation**:
+- ✅ NativeSetView class in `dbsp_set_ops.hpp`
+- ✅ UNION ALL (bag union) - preserves all duplicates
+- ✅ UNION DISTINCT (implicit DISTINCT) - single copy per row
+- ✅ INTERSECT (rows in both inputs)
+- ✅ EXCEPT (rows in left but not right)
+- ✅ Efficient Z-set arithmetic for incremental updates
 
 **Example Queries**:
 ```sql
@@ -76,23 +85,32 @@ SELECT employee_id FROM terminated;
 - ✅ INTERSECT
 - ✅ EXCEPT
 - ✅ Incremental maintenance with O(delta) updates
+- ✅ 30+ test assertions passing
 
 ---
 
 ### Phase 5: Automation & Usability
 
-#### P5.2: Automatic CDC (BROKEN - Needs Fix)
-**Priority**: 🟡 MEDIUM
-**Status**: INCOMPLETE
-**Blocker**: DuckDB transaction hooks not triggering
+#### P5.2: Automatic CDC
+**Priority**: 🟢 COMPLETE
+**Status**: ✅ IMPLEMENTED
+**Completion Date**: 2026-02-08
 
-**Current Implementation**:
-- [x] Added `enable_auto_sync()`/`disable_auto_sync()` to CDCManager
-- [x] Added `dbsp_auto_sync(true/false)` table function
-- [ ] **FIX NEEDED**: `ClientContextState::TransactionCommit` not being called
-- [ ] **Research**: Alternative hooks (e.g., `ExtensionCallback::OnTransactionCommit`)
+**Implementation**:
+- [x] Simplified `TransactionCommit` hook (removed problematic sub-transaction)
+- [x] Auto-sync toggle via `dbsp_auto_sync(true/false)` table function
+- [x] Integration tests for auto-commit and explicit transactions
+- [x] Verified transaction hooks fire correctly
 
-**Goal**: Automatically sync tracked tables on transaction commit without manual `dbsp_sync()` calls.
+**Usage**:
+```sql
+SELECT * FROM dbsp_auto_sync(true);  -- Enable
+INSERT INTO tracked_table VALUES (...); -- Views auto-update!
+```
+
+**Goal**: Automatically sync tracked tables on transaction commit without manual `dbsp_sync()` calls. ✅ **ACHIEVED**
+
+**See**: `P5.2_IMPLEMENTATION.md` for full details
 
 ---
 

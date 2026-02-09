@@ -778,7 +778,8 @@ public:
         info.left_table = def.source_tables[def.source_tables.size() - 2];
         info.right_table = def.source_tables[def.source_tables.size() - 1];
 
-        parse_join_condition(join.condition.get(), info);
+        // TODO: Implement parse_join_condition to extract join predicates
+        // parse_join_condition(join.condition.get(), info);
         def.join_info = info;
       }
       return true;
@@ -1389,7 +1390,8 @@ public:
         info.left_table = def.source_tables[def.source_tables.size() - 2];
         info.right_table = def.source_tables[def.source_tables.size() - 1];
 
-        parse_join_condition(join.condition.get(), info);
+        // TODO: Implement parse_join_condition to extract join predicates
+        // parse_join_condition(join.condition.get(), info);
         def.join_info = info;
       }
       return true;

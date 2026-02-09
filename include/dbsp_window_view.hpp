@@ -100,6 +100,7 @@ public:
 
   // Implement required abstract methods
   const DuckDBZSet &get_result() const override { return result_; }
+  void set_result(const DuckDBZSet &result) override { result_ = result; version_++; }
   const DuckDBZSet &get_delta() const override { return delta_; }
   const TableSchema &result_schema() const override { return result_schema_; }
   std::vector<std::string> source_tables() const override {

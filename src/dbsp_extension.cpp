@@ -48,6 +48,7 @@
 #include "dbsp_cdc.hpp"
 #include "dbsp_context_state.hpp"
 #include "dbsp_parser_extension.hpp"
+#include "dbsp_recovery.hpp"
 #include "duckdb/planner/extension_callback.hpp"
 
 namespace duckdb {
@@ -1145,6 +1146,30 @@ public:
   void OnConnectionOpened(ClientContext &context) override {
     std::cerr << "DBSP: OnConnectionOpened called (context: " << &context
               << ")\n";
+
+    // First-time initialization: recover from crash if needed
+    static bool recovery_done = false;
+    if (!recovery_done) {
+      auto &recovery_manager = dbsp_native::get_recovery_manager();
+
+      // Get database path from context
+      std::string db_path = "";
+      try {
+        // Try to get database path from attached database
+        auto &db_manager = DatabaseManager::Get(context);
+        auto default_db = db_manager.GetDatabase(context, DEFAULT_SCHEMA);
+        if (default_db) {
+          db_path = default_db->GetName();
+        }
+      } catch (...) {
+        // If we can't get db path, use default recovery path
+      }
+
+      // Perform recovery (will initialize persistence and load views)
+      recovery_manager.recover_from_crash(context, db_path);
+      recovery_done = true;
+    }
+
     // Attach our context state for transaction hooking
     auto &config = DBConfig::GetConfig(context);
 
