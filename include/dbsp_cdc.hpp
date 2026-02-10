@@ -556,8 +556,11 @@ public:
 
       auto result = context.Query(insert_sql, false);
       // Ignore errors - persistence is best-effort
+    } catch (const std::exception &e) {
+      // Ignore persistence errors - log for debugging
+      last_error_ = std::string("Persistence error: ") + e.what();
     } catch (...) {
-      // Ignore persistence errors
+      last_error_ = "Unknown persistence error";
     }
 
     // Register the view's result schema for dependent views
@@ -571,6 +574,12 @@ public:
   // Drop a view (with persistence)
   bool drop_view(const std::string &view_name, duckdb::ClientContext *context = nullptr) {
     std::lock_guard<std::shared_mutex> lock(mutex_);
+
+    // Validate view name to prevent SQL injection
+    if (!is_valid_identifier(view_name)) {
+      last_error_ = "Invalid view name (must be alphanumeric/underscore only): " + view_name;
+      return false;
+    }
 
     // Check if other views depend on this one
     auto dependents = dep_graph_.get_all_dependents(view_name);
@@ -586,8 +595,10 @@ public:
         std::string delete_sql = "DELETE FROM _dbsp_views WHERE name = '" + view_name + "'";
         auto result = context->Query(delete_sql, false);
         // Ignore errors - persistence is best-effort
+      } catch (const std::exception &e) {
+        // Ignore persistence errors - logged for debugging
       } catch (...) {
-        // Ignore persistence errors
+        // Ignore unknown persistence errors
       }
     }
 
@@ -600,6 +611,12 @@ public:
   // Force drop a view and all dependents (with persistence)
   bool drop_view_cascade(const std::string &view_name, duckdb::ClientContext *context = nullptr) {
     std::lock_guard<std::shared_mutex> lock(mutex_);
+
+    // Validate view name to prevent SQL injection
+    if (!is_valid_identifier(view_name)) {
+      last_error_ = "Invalid view name (must be alphanumeric/underscore only): " + view_name;
+      return false;
+    }
 
     auto dependents = dep_graph_.get_all_dependents(view_name);
 
@@ -629,8 +646,10 @@ public:
         std::string delete_sql = "DELETE FROM _dbsp_views WHERE name = '" + view_name + "'";
         auto result = context->Query(delete_sql, false);
         // Ignore errors - persistence is best-effort
+      } catch (const std::exception &e) {
+        // Ignore persistence errors - logged for debugging
       } catch (...) {
-        // Ignore persistence errors
+        // Ignore unknown persistence errors
       }
     }
 
@@ -703,11 +722,7 @@ public:
   void sync_all(duckdb::ClientContext &context,
                 duckdb::MetaTransaction *meta_transaction = nullptr) {
     std::lock_guard<std::shared_mutex> lock(mutex_);
-    std::cerr << "DBSP: sync_all called. Tracked tables: "
-              << tracked_tables_.size() << " MetaTxn: " << meta_transaction
-              << "\n";
     for (const auto &[name, _] : tracked_tables_) {
-      std::cerr << "DBSP: Syncing table " << name << "\n";
       sync_table_locked(context, name, meta_transaction);
     }
   }
@@ -937,8 +952,11 @@ public:
 
       return true;
 
+    } catch (const std::exception &e) {
+      last_error_ = std::string("Exception during file save: ") + e.what();
+      return false;
     } catch (...) {
-      last_error_ = "Exception during file save";
+      last_error_ = "Unknown exception during file save";
       return false;
     }
   }
@@ -1064,8 +1082,11 @@ public:
 
       return true;
 
+    } catch (const std::exception &e) {
+      last_error_ = std::string("Exception during file load: ") + e.what();
+      return false;
     } catch (...) {
-      last_error_ = "Exception during file load";
+      last_error_ = "Unknown exception during file load";
       return false;
     }
   }
@@ -1319,17 +1340,12 @@ private:
                                      : catalog.GetCatalogTransaction(context);
 
       // Get schema using transaction
-      std::cerr << "DBSP: Calling GetSchema\n";
       auto &schema_entry =
           catalog.GetSchema(catalog_transaction, DEFAULT_SCHEMA);
-      std::cerr << "DBSP: GetSchema returned\n";
 
-      std::cerr << "DBSP: Calling GetEntry\n";
       auto table_entry_ptr = schema_entry.GetEntry(
           catalog_transaction, duckdb::CatalogType::TABLE_ENTRY, table_name);
-      std::cerr << "DBSP: GetEntry returned\n";
       if (!table_entry_ptr) {
-        std::cerr << "DBSP: Table entry not found for " << table_name << "\n";
         return false;
       }
 
@@ -1369,8 +1385,6 @@ private:
           new_state.insert(dbsp_row, 1);
         }
       }
-      std::cerr << "DBSP: sync_table scanned rows: " << new_state.size()
-                << "\n";
 
       DuckDBZSet delta;
       const auto &old_state = it->second->current_state();
@@ -1389,20 +1403,7 @@ private:
         }
       }
 
-      if (delta.empty() && new_state.size() != old_state.size()) {
-        std::cerr << "DBSP DEBUG: Delta empty but size mismatch! New: "
-                  << new_state.size() << " Old: " << old_state.size() << "\n";
-        for (const auto &[row, w] : old_state) {
-          std::cerr << "  Old row: " << row.columns[0].ToString() << ", "
-                    << row.columns[1].ToString() << " weight: " << w << "\n";
-        }
-        for (const auto &[row, w] : new_state) {
-          std::cerr << "  New row: " << row.columns[0].ToString() << ", "
-                    << row.columns[1].ToString() << " weight: " << w << "\n";
-        }
-      }
-
-      std::cerr << "DBSP: sync_table delta size: " << delta.size() << "\n";
+      // Debug: Delta calculation complete
 
       for (const auto &[row, weight] : delta) {
         if (weight > 0) {
@@ -1423,10 +1424,10 @@ private:
       return true;
 
     } catch (const std::exception &e) {
-      std::cerr << "DBSP: Exception in sync_table_locked: " << e.what() << "\n";
+      last_error_ = std::string("Exception in sync_table_locked: ") + e.what();
       return false;
     } catch (...) {
-      std::cerr << "DBSP: Unknown exception in sync_table_locked\n";
+      last_error_ = "Unknown exception in sync_table_locked";
       return false;
     }
   }
@@ -1611,8 +1612,6 @@ private:
     if (tracked_tables_.count(source_name)) {
       changes = tracked_tables_[source_name]->consume_changes();
     }
-    std::cerr << "DBSP DEBUG: propagate_changes for " << source_name
-              << " consumed " << changes.size() << " changes\n";
 
     if (changes.empty())
       return;
@@ -1626,7 +1625,6 @@ private:
       for (const auto &src : sources) {
         if (src == source_name) {
           view->apply_changes(source_name, changes);
-          std::cerr << "DBSP: Applied changes to view " << view_name << "\n";
           break;
         }
       }
