@@ -392,7 +392,7 @@ public:
   // Supports referencing other views (cascading views)
   bool create_view(duckdb::ClientContext &context, const std::string &view_name,
                    const std::string &sql) {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> lock(mutex_);
 
     // Validate view name to prevent SQL injection
     if (!is_valid_identifier(view_name)) {
@@ -427,9 +427,9 @@ public:
       // Only create if not already existing
       if (!views_.count(cte_view_name)) {
         // Temporarily unlock to call create_view_internal
-        mutex_.unlock();
+        lock.unlock();
         bool cte_ok = create_view(context, cte_view_name, cte.cte_sql);
-        mutex_.lock();
+        lock.lock();
         if (!cte_ok) {
           last_error_ =
               "Failed to create CTE '" + cte.cte_name + "': " + last_error_;
@@ -451,9 +451,9 @@ public:
     for (const auto &dt : result.view_def.derived_tables) {
       std::string dt_view_name = "_derived_" + view_name + "_" + dt.alias;
       if (!views_.count(dt_view_name)) {
-        mutex_.unlock();
+        lock.unlock();
         bool dt_ok = create_view(context, dt_view_name, dt.subquery_sql);
-        mutex_.lock();
+        lock.lock();
         if (!dt_ok) {
           last_error_ = "Failed to create derived table '" + dt.alias +
                         "': " + last_error_;
@@ -795,7 +795,7 @@ public:
   // Load view definitions from a DuckDB table and recreate views
   bool load_from_table(duckdb::ClientContext &context,
                        const std::string &storage_table = "_dbsp_views") {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> lock(mutex_);
 
     try {
       auto &catalog = duckdb::Catalog::GetCatalog(context, INVALID_CATALOG);
@@ -863,11 +863,11 @@ public:
                 });
 
       // Recreate views (unlock for create_view which takes lock)
-      mutex_.unlock();
+      lock.unlock();
       for (const auto &def : defs) {
         create_view(context, def.name, def.sql);
       }
-      mutex_.lock();
+      lock.lock();
 
       return true;
 
@@ -946,7 +946,7 @@ public:
   // Load from JSON file
   bool load_from_file(duckdb::ClientContext &context,
                       const std::string &filepath) {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> lock(mutex_);
 
     try {
       // Validate filepath to prevent path traversal
@@ -1056,11 +1056,11 @@ public:
                 });
 
       // Recreate views
-      mutex_.unlock();
+      lock.unlock();
       for (const auto &def : defs) {
         create_view(context, def.name, def.sql);
       }
-      mutex_.lock();
+      lock.lock();
 
       return true;
 
