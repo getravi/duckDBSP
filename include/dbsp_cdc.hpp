@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -718,13 +719,43 @@ public:
     return sync_table_locked(context, table_name);
   }
 
-  // Sync all tracked tables
+  // Sync all tracked tables (sequential or parallel based on use_parallel_sync_)
   void sync_all(duckdb::ClientContext &context,
                 duckdb::MetaTransaction *meta_transaction = nullptr) {
     std::lock_guard<std::shared_mutex> lock(mutex_);
-    for (const auto &[name, _] : tracked_tables_) {
-      sync_table_locked(context, name, meta_transaction);
+
+    if (use_parallel_sync_ && tracked_tables_.size() > 1) {
+      // Parallel sync: launch threads for each table
+      std::vector<std::future<void>> futures;
+      for (const auto &entry : tracked_tables_) {
+        std::string table_name = entry.first; // Copy name to avoid C++20 structured binding capture
+        futures.push_back(std::async(std::launch::async, [this, &context, table_name, meta_transaction]() {
+          // Each thread needs its own lock since sync_table_locked expects it
+          std::lock_guard<std::shared_mutex> thread_lock(mutex_);
+          sync_table_locked(context, table_name, meta_transaction);
+        }));
+      }
+      // Wait for all to complete
+      for (auto &f : futures) {
+        f.wait();
+      }
+    } else {
+      // Sequential sync
+      for (const auto &[name, _] : tracked_tables_) {
+        sync_table_locked(context, name, meta_transaction);
+      }
     }
+  }
+
+  // Enable/disable parallel sync
+  void set_parallel_sync(bool enable) {
+    std::lock_guard<std::shared_mutex> lock(mutex_);
+    use_parallel_sync_ = enable;
+  }
+
+  bool get_parallel_sync() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return use_parallel_sync_;
   }
 
   // ========================================================================
@@ -1606,6 +1637,9 @@ private:
 
   // Propagate changes through dependency graph
   void propagate_changes(const std::string &source_name) {
+    // Acquire shared lock for read access to shared state
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+
     // Get changes from source
     DuckDBZSet changes;
 
@@ -1767,6 +1801,7 @@ private:
   DependencyGraph dep_graph_;
   std::string last_error_;
   bool auto_sync_enabled_ = false;
+  bool use_parallel_sync_ = false;
 };
 
 // Global CDC manager instance
