@@ -1346,74 +1346,84 @@ private:
       }
       auto &catalog = target_db->GetCatalog();
 
-      duckdb::DuckTransaction *transaction = nullptr;
-      std::unique_ptr<duckdb::CatalogTransaction> manual_catalog_txn;
+      DuckDBZSet new_state;
 
       if (meta_transaction) {
-        // Resolve transaction from MetaTransaction for the specific database
+        // Auto-CDC commit hook path: use raw storage API with meta_transaction.
+        // DataTable::InitializeScan works here because the meta_transaction
+        // controls the storage locks and there is no conflicting user transaction.
         auto &attached = catalog.GetAttached();
-        transaction = &meta_transaction->GetTransaction(attached)
-                           .Cast<duckdb::DuckTransaction>();
-
-        // Manually construct CatalogTransaction that points to our transaction
-        manual_catalog_txn = std::make_unique<duckdb::CatalogTransaction>(
+        auto *transaction = &meta_transaction->GetTransaction(attached)
+                                .Cast<duckdb::DuckTransaction>();
+        duckdb::CatalogTransaction cat_txn(
             catalog.GetDatabase(), meta_transaction->global_transaction_id,
             static_cast<duckdb::transaction_t>(
                 meta_transaction->start_timestamp.value));
-        manual_catalog_txn->transaction = transaction;
-      } else {
-        transaction = &duckdb::DuckTransaction::Get(context, catalog);
-      }
+        cat_txn.transaction = transaction;
 
-      // Use the appropriate CatalogTransaction
-      auto catalog_transaction = manual_catalog_txn
-                                     ? *manual_catalog_txn
-                                     : catalog.GetCatalogTransaction(context);
-
-      // Get schema using transaction
-      auto &schema_entry =
-          catalog.GetSchema(catalog_transaction, DEFAULT_SCHEMA);
-
-      auto table_entry_ptr = schema_entry.GetEntry(
-          catalog_transaction, duckdb::CatalogType::TABLE_ENTRY, table_name);
-      if (!table_entry_ptr) {
-        return false;
-      }
-
-      auto &table_entry = table_entry_ptr->Cast<duckdb::TableCatalogEntry>();
-      auto &data_table = table_entry.GetStorage();
-      duckdb::TableScanState scan_state;
-
-      // Get all column indices
-      duckdb::vector<duckdb::StorageIndex> column_ids;
-      auto &columns = table_entry.GetColumns();
-      for (idx_t i = 0; i < columns.PhysicalColumnCount(); i++) {
-        column_ids.push_back(duckdb::StorageIndex(i));
-      }
-
-      // Initialize scan
-      data_table.InitializeScan(context, *transaction, scan_state, column_ids);
-
-      // Scan data chunks and build new_state
-      duckdb::DataChunk chunk;
-      chunk.Initialize(context, data_table.GetTypes());
-
-      DuckDBZSet new_state;
-      while (true) {
-        chunk.Reset();
-        data_table.Scan(*transaction, chunk, scan_state);
-
-        if (chunk.size() == 0) {
-          break; // No more data
+        auto &schema_entry = catalog.GetSchema(cat_txn, DEFAULT_SCHEMA);
+        auto table_entry_ptr = schema_entry.GetEntry(
+            cat_txn, duckdb::CatalogType::TABLE_ENTRY, table_name);
+        if (!table_entry_ptr) {
+          return false;
         }
-
-        // Extract rows from chunk
-        for (idx_t row_idx = 0; row_idx < chunk.size(); row_idx++) {
-          DuckDBRow dbsp_row;
-          for (idx_t col_idx = 0; col_idx < chunk.ColumnCount(); col_idx++) {
-            dbsp_row.columns.push_back(chunk.GetValue(col_idx, row_idx));
+        auto &table_entry = table_entry_ptr->Cast<duckdb::TableCatalogEntry>();
+        auto &data_table = table_entry.GetStorage();
+        duckdb::TableScanState scan_state;
+        duckdb::vector<duckdb::StorageIndex> column_ids;
+        auto &columns = table_entry.GetColumns();
+        for (idx_t i = 0; i < columns.PhysicalColumnCount(); i++) {
+          column_ids.push_back(duckdb::StorageIndex(i));
+        }
+        data_table.InitializeScan(context, *transaction, scan_state, column_ids);
+        duckdb::DataChunk chunk;
+        chunk.Initialize(context, data_table.GetTypes());
+        while (true) {
+          chunk.Reset();
+          data_table.Scan(*transaction, chunk, scan_state);
+          if (chunk.size() == 0) break;
+          for (idx_t row_idx = 0; row_idx < chunk.size(); row_idx++) {
+            DuckDBRow dbsp_row;
+            for (idx_t col_idx = 0; col_idx < chunk.ColumnCount(); col_idx++) {
+              dbsp_row.columns.push_back(chunk.GetValue(col_idx, row_idx));
+            }
+            new_state.insert(dbsp_row, 1);
           }
-          new_state.insert(dbsp_row, 1);
+        }
+      } else {
+        // Explicit user call path: create a fresh Connection to the same DB
+        // to avoid blocking on any existing transaction state from the caller's
+        // context. context.Query() blocks when called directly if the connection
+        // has had BeginTransaction() called (even after Commit()), because
+        // Connection::BeginTransaction() uses Query("BEGIN TRANSACTION") internally
+        // which leaves internal DuckDB lock state that conflicts with subsequent
+        // direct context.Query() calls. A fresh Connection has no such state.
+        // Create a fresh Connection to the same DB to avoid blocking on any
+        // existing transaction state from the caller's context.
+        // context.Query() blocks if BeginTransaction() was ever called on the
+        // same connection (even after Commit()), because Connection::BeginTransaction()
+        // uses Query("BEGIN TRANSACTION") internally which leaves lock state that
+        // conflicts with subsequent direct context.Query() calls.
+        auto &fresh_db = duckdb::DatabaseInstance::GetDatabase(context);
+        duckdb::Connection fresh_con(fresh_db);
+        auto sql_result =
+            fresh_con.Query("SELECT * FROM \"" + table_name + "\"");
+        if (!sql_result || sql_result->HasError()) {
+          last_error_ = "Failed to scan table '" + table_name + "': " +
+                        (sql_result ? sql_result->GetError() : "null result");
+          return false;
+        }
+        while (true) {
+          auto chunk_ptr = sql_result->Fetch();
+          if (!chunk_ptr || chunk_ptr->size() == 0) break;
+          auto &chunk = *chunk_ptr;
+          for (idx_t row_idx = 0; row_idx < chunk.size(); row_idx++) {
+            DuckDBRow dbsp_row;
+            for (idx_t col_idx = 0; col_idx < chunk.ColumnCount(); col_idx++) {
+              dbsp_row.columns.push_back(chunk.GetValue(col_idx, row_idx));
+            }
+            new_state.insert(dbsp_row, 1);
+          }
         }
       }
 
@@ -1636,9 +1646,13 @@ private:
   }
 
   // Propagate changes through dependency graph
+  // IMPORTANT: Must be called with mutex_ already held (exclusive lock).
+  // All callers (on_insert, on_delete, on_update, on_batch_insert,
+  // sync_table_locked) hold the exclusive lock before calling this.
   void propagate_changes(const std::string &source_name) {
-    // Acquire shared lock for read access to shared state
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    // Note: mutex_ is already held by the caller (exclusive lock).
+    // Do NOT acquire shared_lock here - that would cause a recursive lock
+    // deadlock since std::shared_mutex is not recursive.
 
     // Get changes from source
     DuckDBZSet changes;

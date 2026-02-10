@@ -778,8 +778,7 @@ public:
         info.left_table = def.source_tables[def.source_tables.size() - 2];
         info.right_table = def.source_tables[def.source_tables.size() - 1];
 
-        // TODO: Implement parse_join_condition to extract join predicates
-        // parse_join_condition(join.condition.get(), info);
+        parse_join_condition(join.condition.get(), info);
         def.join_info = info;
       }
       return true;
@@ -1336,70 +1335,6 @@ public:
     return std::make_unique<NativeDistinctOnView>(def.view_name, def.sql, table,
                                                   result_schema, partition_keys,
                                                   sort_cols);
-  }
-
-  // Parse FROM clause
-  bool parse_from_clause(duckdb::TableRef *ref, ParsedViewDef &def) {
-    if (!ref)
-      return false;
-
-    switch (ref->type) {
-    case duckdb::TableReferenceType::BASE_TABLE: {
-      auto &base = ref->template Cast<duckdb::BaseTableRef>();
-      def.source_tables.push_back(base.table_name);
-      // Capture alias mapping
-      if (!base.alias.empty()) {
-        def.table_aliases[base.alias] = base.table_name;
-      } else {
-        def.table_aliases[base.table_name] = base.table_name;
-      }
-      return true;
-    }
-
-    case duckdb::TableReferenceType::SUBQUERY: {
-      // Subquery in FROM clause (derived table)
-      auto &subquery = ref->template Cast<duckdb::SubqueryRef>();
-      ParsedViewDef::DerivedTableInfo dt;
-      dt.alias = subquery.alias.empty()
-                     ? "_derived_" + std::to_string(def.derived_tables.size())
-                     : subquery.alias;
-      if (subquery.subquery) {
-        dt.subquery_sql = subquery.subquery->ToString();
-      }
-      def.derived_tables.push_back(dt);
-      // Use the alias as a source table name
-      def.source_tables.push_back(dt.alias);
-      if (!subquery.alias.empty()) {
-        def.table_aliases[subquery.alias] = dt.alias;
-      }
-      return true;
-    }
-
-    case duckdb::TableReferenceType::JOIN: {
-      auto &join = ref->template Cast<duckdb::JoinRef>();
-
-      // Parse left and right tables
-      if (!parse_from_clause(join.left.get(), def))
-        return false;
-      if (!parse_from_clause(join.right.get(), def))
-        return false;
-
-      // Parse join condition
-      if (join.condition && def.source_tables.size() >= 2) {
-        ParsedViewDef::JoinInfo info;
-        info.left_table = def.source_tables[def.source_tables.size() - 2];
-        info.right_table = def.source_tables[def.source_tables.size() - 1];
-
-        // TODO: Implement parse_join_condition to extract join predicates
-        // parse_join_condition(join.condition.get(), info);
-        def.join_info = info;
-      }
-      return true;
-    }
-
-    default:
-      return false;
-    }
   }
 
 private:

@@ -273,12 +273,12 @@ TEST_CASE("SQL Parser - View type determination", "[sql_parser]") {
     REQUIRE(result.view_def.type == ParsedViewDef::ViewType::DISTINCT);
   }
 
-  SECTION("FILTER has priority over PROJECT") {
+  SECTION("FILTER_PROJECT for queries with both WHERE and column selection") {
     auto result = parser.parse("SELECT id, name FROM users WHERE age > 18",
                                "filter_project");
 
     REQUIRE(result.success);
-    REQUIRE(result.view_def.type == ParsedViewDef::ViewType::FILTER);
+    REQUIRE(result.view_def.type == ParsedViewDef::ViewType::FILTER_PROJECT);
   }
 
   SECTION("PROJECT type") {

@@ -12,40 +12,43 @@ TEST_CASE("Recursive CTE: Graph Reachability", "[recursive]") {
   duckdb::DuckDB db(nullptr);
   duckdb::Connection con(db);
 
-  // Create edges table
+  // Create edges table (autocommit)
   REQUIRE_NOTHROW(con.Query("CREATE TABLE edges (src INTEGER, dst INTEGER)"));
-  REQUIRE_NOTHROW(con.Query("BEGIN TRANSACTION"));
-  REQUIRE(manager.track_table(*con.context, "edges"));
-  REQUIRE_NOTHROW(con.Query("COMMIT"));
 
-  // Insert initial data: 1->2, 2->3
+  // Track it - uses BeginTransaction() C++ API (not SQL BEGIN TRANSACTION)
+  // which allows catalog access without blocking context.Query() calls
+  con.BeginTransaction();
+  REQUIRE(manager.track_table(*con.context, "edges"));
+  con.Commit();
+
+  // Insert initial data: 1->2, 2->3 (autocommit)
   REQUIRE_NOTHROW(con.Query("INSERT INTO edges VALUES (1, 2), (2, 3)"));
-  REQUIRE_NOTHROW(con.Query("BEGIN TRANSACTION"));
+
+  // Sync in autocommit mode
   REQUIRE(manager.sync_table(*con.context, "edges"));
-  REQUIRE_NOTHROW(con.Query("COMMIT"));
 
   // Define recursive view finding all paths
   std::string sql = R"(
         WITH RECURSIVE path AS (
             SELECT src, dst FROM edges
             UNION ALL
-            SELECT p.src, e.dst 
-            FROM path p 
+            SELECT p.src, e.dst
+            FROM path p
             JOIN edges e ON p.dst = e.src
         )
         SELECT * FROM path
     )";
 
-  REQUIRE_NOTHROW(con.Query("BEGIN TRANSACTION"));
+  // Create view - needs BeginTransaction() for catalog access on source tables
+  con.BeginTransaction();
   REQUIRE(manager.create_view(*con.context, "all_paths", sql));
-  REQUIRE_NOTHROW(con.Query("COMMIT"));
+  con.Commit();
 
   auto result = manager.query_view("all_paths");
   REQUIRE(result != nullptr);
 
   // 1->2, 2->3 implies 1->3
   // Result should be (1,2), (2,3), (1,3)
-  // Note: Weights should be 1.
   REQUIRE(result->size() == 3);
 
   // Verify content
@@ -68,11 +71,11 @@ TEST_CASE("Recursive CTE: Graph Reachability", "[recursive]") {
   }
   REQUIRE(found_1_3);
 
-  // Update: Add edge 3->4
+  // Update: Add edge 3->4 (autocommit)
   REQUIRE_NOTHROW(con.Query("INSERT INTO edges VALUES (3, 4)"));
-  REQUIRE_NOTHROW(con.Query("BEGIN TRANSACTION"));
+
+  // Sync in autocommit mode
   REQUIRE(manager.sync_table(*con.context, "edges"));
-  REQUIRE_NOTHROW(con.Query("COMMIT"));
 
   // New paths expected:
   // (3,4) - from anchor
@@ -105,10 +108,11 @@ TEST_CASE("Recursive CTE: Sequence Generation", "[recursive]") {
   duckdb::DuckDB db(nullptr);
   duckdb::Connection con(db);
 
+  // Create and track table
   REQUIRE_NOTHROW(con.Query("CREATE TABLE trigger_table (i INTEGER)"));
-  REQUIRE_NOTHROW(con.Query("BEGIN TRANSACTION"));
+  con.BeginTransaction();
   REQUIRE(manager.track_table(*con.context, "trigger_table"));
-  REQUIRE_NOTHROW(con.Query("COMMIT"));
+  con.Commit();
 
   // Driven sequence:
   std::string sql_driven = R"(
@@ -120,15 +124,15 @@ TEST_CASE("Recursive CTE: Sequence Generation", "[recursive]") {
         SELECT * FROM t
     )";
 
-  REQUIRE_NOTHROW(con.Query("BEGIN TRANSACTION"));
+  con.BeginTransaction();
   REQUIRE(manager.create_view(*con.context, "seq_view", sql_driven));
-  REQUIRE_NOTHROW(con.Query("COMMIT"));
+  con.Commit();
 
-  // Insert 1
+  // Insert 1 (autocommit)
   REQUIRE_NOTHROW(con.Query("INSERT INTO trigger_table VALUES (1)"));
-  REQUIRE_NOTHROW(con.Query("BEGIN TRANSACTION"));
+
+  // Sync in autocommit mode
   REQUIRE(manager.sync_table(*con.context, "trigger_table"));
-  REQUIRE_NOTHROW(con.Query("COMMIT"));
 
   auto result = manager.query_view("seq_view");
   REQUIRE(result != nullptr);
