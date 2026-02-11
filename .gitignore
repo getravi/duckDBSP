@@ -10,6 +10,16 @@ cmake-build-*/
 *.swo
 *~
 
+# Editor/tool caches
+.cache/
+
+# Backup files
+*.backup
+
+# Runtime state
+.dbsp_recovery/
+*.lock
+
 # Compiled objects
 *.o
 *.obj

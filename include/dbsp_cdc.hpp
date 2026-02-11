@@ -30,6 +30,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <shared_mutex>
 #include <sstream>
@@ -309,14 +310,25 @@ private:
 };
 
 // CDC Manager - coordinates tracked tables, views, and change propagation
+//
+// Three-tier locking (always acquire in this order — NEVER reverse):
+//   Tier 1: struct_mutex_  — guards map membership (track/untrack tables,
+//           create/drop views, dep_graph_, table_schemas_, view_definitions_,
+//           auto_sync_enabled_, use_parallel_sync_)
+//   Tier 2: table_locks_[name] — one per tracked table; guards that table's
+//           TrackedTable state (current_state_, pending_changes_)
+//   Tier 3: view_mutex_  — guards view content (Z-set state, propagation)
+//
 class CDCManager {
 public:
   CDCManager() = default;
 
   // Reset all state (for testing)
   void reset() {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    std::unique_lock<std::shared_mutex> view_lock(view_mutex_);
     tracked_tables_.clear();
+    table_locks_.clear();
     views_.clear();
     table_schemas_.clear();
     view_definitions_.clear();
@@ -327,17 +339,17 @@ public:
 
   // Auto-sync (automatic CDC) control
   void enable_auto_sync() {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> lock(struct_mutex_);
     auto_sync_enabled_ = true;
   }
 
   void disable_auto_sync() {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> lock(struct_mutex_);
     auto_sync_enabled_ = false;
   }
 
   bool is_auto_sync_enabled() const {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
     return auto_sync_enabled_;
   }
 
@@ -352,7 +364,7 @@ public:
   // Track a DuckDB table for CDC
   bool track_table(duckdb::ClientContext &context,
                    const std::string &table_name) {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> lock(struct_mutex_);
 
     // Validate table name to prevent SQL injection
     if (!is_valid_identifier(table_name)) {
@@ -374,6 +386,7 @@ public:
     tracked_tables_[table_name] =
         std::make_unique<TrackedTable>(table_name, schema);
     table_schemas_[table_name] = schema;
+    table_locks_[table_name] = std::make_unique<std::shared_mutex>();
 
     // Note: Initial table sync deferred to avoid SQL query deadlock
     // User should call dbsp_sync() after dbsp_track() to populate initial data
@@ -383,9 +396,10 @@ public:
 
   // Untrack a table
   void untrack_table(const std::string &table_name) {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> lock(struct_mutex_);
     tracked_tables_.erase(table_name);
     table_schemas_.erase(table_name);
+    table_locks_.erase(table_name);
     dep_graph_.remove_node(table_name);
   }
 
@@ -393,7 +407,7 @@ public:
   // Supports referencing other views (cascading views)
   bool create_view(duckdb::ClientContext &context, const std::string &view_name,
                    const std::string &sql) {
-    std::unique_lock<std::shared_mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> struct_lock(struct_mutex_);
 
     // Validate view name to prevent SQL injection
     if (!is_valid_identifier(view_name)) {
@@ -427,10 +441,10 @@ public:
       std::string cte_view_name = "_cte_" + view_name + "_" + cte.cte_name;
       // Only create if not already existing
       if (!views_.count(cte_view_name)) {
-        // Temporarily unlock to call create_view_internal
-        lock.unlock();
+        // Temporarily unlock to call create_view recursively
+        struct_lock.unlock();
         bool cte_ok = create_view(context, cte_view_name, cte.cte_sql);
-        lock.lock();
+        struct_lock.lock();
         if (!cte_ok) {
           last_error_ =
               "Failed to create CTE '" + cte.cte_name + "': " + last_error_;
@@ -452,9 +466,9 @@ public:
     for (const auto &dt : result.view_def.derived_tables) {
       std::string dt_view_name = "_derived_" + view_name + "_" + dt.alias;
       if (!views_.count(dt_view_name)) {
-        lock.unlock();
+        struct_lock.unlock();
         bool dt_ok = create_view(context, dt_view_name, dt.subquery_sql);
-        lock.lock();
+        struct_lock.lock();
         if (!dt_ok) {
           last_error_ = "Failed to create derived table '" + dt.alias +
                         "': " + last_error_;
@@ -505,23 +519,10 @@ public:
       last_error_ = "Could not create view from SQL";
       return false;
     }
-    // Moved below
 
     // Add dependencies
     for (const auto &source : resolved_sources) {
       dep_graph_.add_dependency(view_name, source);
-    }
-
-    // Initialize view with current data from sources
-    for (const auto &source : resolved_sources) {
-      if (tracked_tables_.count(source)) {
-        const auto &table = tracked_tables_.at(source);
-        const auto &state = table->current_state();
-        view->apply_changes(source, state);
-      } else if (views_.count(source)) {
-        // Source is a view - use its result
-        view->apply_changes(source, views_[source]->get_result());
-      }
     }
 
     // Store view definition for persistence
@@ -555,7 +556,7 @@ public:
         "VALUES ('" + view_name + "', '" + escaped_sql + "', '" + sources_str + "', " +
         std::to_string(def.created_at) + ")";
 
-      auto result = context.Query(insert_sql, false);
+      auto res = context.Query(insert_sql, false);
       // Ignore errors - persistence is best-effort
     } catch (const std::exception &e) {
       // Ignore persistence errors - log for debugging
@@ -567,14 +568,35 @@ public:
     // Register the view's result schema for dependent views
     table_schemas_[view_name] = view->result_schema();
 
-    views_[view_name] = std::move(view);
+    // Acquire view_mutex_ to initialize view content and insert into views_
+    // Lock ordering: struct_mutex_ (already held) → view_mutex_
+    {
+      std::unique_lock<std::shared_mutex> view_lock(view_mutex_);
+
+      // Initialize view with current data from sources
+      // struct_mutex_ held exclusively so no concurrent mutations to tracked
+      // tables or other views can occur; reads are safe without table_locks_
+      for (const auto &source : resolved_sources) {
+        if (tracked_tables_.count(source)) {
+          const auto &table = tracked_tables_.at(source);
+          const auto &state = table->current_state();
+          view->apply_changes(source, state);
+        } else if (views_.count(source)) {
+          // Source is a view - use its result
+          view->apply_changes(source, views_[source]->get_result());
+        }
+      }
+
+      views_[view_name] = std::move(view);
+    }
+
     return true;
 #endif // SQL parser disabled - end of function
   }
 
   // Drop a view (with persistence)
   bool drop_view(const std::string &view_name, duckdb::ClientContext *context = nullptr) {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> struct_lock(struct_mutex_);
 
     // Validate view name to prevent SQL injection
     if (!is_valid_identifier(view_name)) {
@@ -594,7 +616,7 @@ public:
     if (context) {
       try {
         std::string delete_sql = "DELETE FROM _dbsp_views WHERE name = '" + view_name + "'";
-        auto result = context->Query(delete_sql, false);
+        auto res = context->Query(delete_sql, false);
         // Ignore errors - persistence is best-effort
       } catch (const std::exception &e) {
         // Ignore persistence errors - logged for debugging
@@ -603,6 +625,7 @@ public:
       }
     }
 
+    std::unique_lock<std::shared_mutex> view_lock(view_mutex_);
     dep_graph_.remove_node(view_name);
     view_definitions_.erase(view_name);
     table_schemas_.erase(view_name);
@@ -611,7 +634,7 @@ public:
 
   // Force drop a view and all dependents (with persistence)
   bool drop_view_cascade(const std::string &view_name, duckdb::ClientContext *context = nullptr) {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> struct_lock(struct_mutex_);
 
     // Validate view name to prevent SQL injection
     if (!is_valid_identifier(view_name)) {
@@ -623,12 +646,15 @@ public:
 
     // Drop in reverse topological order
     std::reverse(dependents.begin(), dependents.end());
+
+    std::unique_lock<std::shared_mutex> view_lock(view_mutex_);
+
     for (const auto &dep : dependents) {
       // Delete from _dbsp_views table if context provided
       if (context) {
         try {
           std::string delete_sql = "DELETE FROM _dbsp_views WHERE name = '" + dep + "'";
-          auto result = context->Query(delete_sql, false);
+          auto res = context->Query(delete_sql, false);
           // Ignore errors - persistence is best-effort
         } catch (...) {
           // Ignore persistence errors
@@ -645,7 +671,7 @@ public:
     if (context) {
       try {
         std::string delete_sql = "DELETE FROM _dbsp_views WHERE name = '" + view_name + "'";
-        auto result = context->Query(delete_sql, false);
+        auto res = context->Query(delete_sql, false);
         // Ignore errors - persistence is best-effort
       } catch (const std::exception &e) {
         // Ignore persistence errors - logged for debugging
@@ -662,99 +688,214 @@ public:
 
   // Record an INSERT
   void on_insert(const std::string &table_name, const DuckDBRow &row) {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
 
     auto it = tracked_tables_.find(table_name);
     if (it == tracked_tables_.end())
       return;
 
-    it->second->insert(row);
-    propagate_changes(table_name);
+    auto lock_it = table_locks_.find(table_name);
+    if (lock_it == table_locks_.end())
+      return;
+
+    DuckDBZSet delta;
+    {
+      std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
+      it->second->insert(row);
+      delta = it->second->consume_changes();
+    }
+
+    if (!delta.empty()) {
+      propagate_changes(table_name, delta);
+    }
   }
 
   // Record a DELETE
   void on_delete(const std::string &table_name, const DuckDBRow &row) {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
 
     auto it = tracked_tables_.find(table_name);
     if (it == tracked_tables_.end())
       return;
 
-    it->second->remove(row);
-    propagate_changes(table_name);
+    auto lock_it = table_locks_.find(table_name);
+    if (lock_it == table_locks_.end())
+      return;
+
+    DuckDBZSet delta;
+    {
+      std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
+      it->second->remove(row);
+      delta = it->second->consume_changes();
+    }
+
+    if (!delta.empty()) {
+      propagate_changes(table_name, delta);
+    }
   }
 
   // Record an UPDATE
   void on_update(const std::string &table_name, const DuckDBRow &old_row,
                  const DuckDBRow &new_row) {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
 
     auto it = tracked_tables_.find(table_name);
     if (it == tracked_tables_.end())
       return;
 
-    it->second->update(old_row, new_row);
-    propagate_changes(table_name);
+    auto lock_it = table_locks_.find(table_name);
+    if (lock_it == table_locks_.end())
+      return;
+
+    DuckDBZSet delta;
+    {
+      std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
+      it->second->update(old_row, new_row);
+      delta = it->second->consume_changes();
+    }
+
+    if (!delta.empty()) {
+      propagate_changes(table_name, delta);
+    }
   }
 
   // Batch insert
   void on_batch_insert(const std::string &table_name,
                        const std::vector<DuckDBRow> &rows) {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
 
     auto it = tracked_tables_.find(table_name);
     if (it == tracked_tables_.end())
       return;
 
-    for (const auto &row : rows) {
-      it->second->insert(row);
+    auto lock_it = table_locks_.find(table_name);
+    if (lock_it == table_locks_.end())
+      return;
+
+    DuckDBZSet delta;
+    {
+      std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
+      for (const auto &row : rows) {
+        it->second->insert(row);
+      }
+      delta = it->second->consume_changes();
     }
-    propagate_changes(table_name);
+
+    if (!delta.empty()) {
+      propagate_changes(table_name, delta);
+    }
   }
 
   // Sync tracked table with actual DuckDB table
   bool sync_table(duckdb::ClientContext &context,
                   const std::string &table_name) {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
-    return sync_table_locked(context, table_name);
+    std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+
+    if (tracked_tables_.find(table_name) == tracked_tables_.end())
+      return false;
+
+    auto lock_it = table_locks_.find(table_name);
+    if (lock_it == table_locks_.end())
+      return false;
+
+    std::optional<DuckDBZSet> delta_opt;
+    {
+      std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
+      delta_opt = sync_table_scan_and_consume(context, table_name);
+    }
+
+    if (!delta_opt.has_value())
+      return false;
+
+    if (!delta_opt->empty()) {
+      propagate_changes(table_name, *delta_opt);
+    }
+
+    return true;
   }
 
   // Sync all tracked tables (sequential or parallel based on use_parallel_sync_)
   void sync_all(duckdb::ClientContext &context,
                 duckdb::MetaTransaction *meta_transaction = nullptr) {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
-
-    if (use_parallel_sync_ && tracked_tables_.size() > 1) {
-      // Parallel sync: launch threads for each table
-      std::vector<std::future<void>> futures;
+    // Snapshot table names and parallel flag under a shared lock, then release
+    // before spawning threads. Holding struct_mutex_ while waiting on futures
+    // that also need struct_mutex_ would block — snapshot it instead.
+    bool do_parallel;
+    std::vector<std::string> table_names;
+    {
+      std::shared_lock<std::shared_mutex> lock(struct_mutex_);
+      do_parallel = use_parallel_sync_ && tracked_tables_.size() > 1;
       for (const auto &entry : tracked_tables_) {
-        std::string table_name = entry.first; // Copy name to avoid C++20 structured binding capture
-        futures.push_back(std::async(std::launch::async, [this, &context, table_name, meta_transaction]() {
-          // Each thread needs its own lock since sync_table_locked expects it
-          std::lock_guard<std::shared_mutex> thread_lock(mutex_);
-          sync_table_locked(context, table_name, meta_transaction);
+        table_names.push_back(entry.first);
+      }
+    }
+
+    if (do_parallel) {
+      // TRUE parallelism: each thread acquires its own per-table lock.
+      // DB scans for different tables run simultaneously.
+      // Propagation serializes at view_mutex_ (fast; not the bottleneck).
+      std::vector<std::future<void>> futures;
+      for (const auto &table_name : table_names) {
+        futures.push_back(std::async(std::launch::async,
+            [this, &context, table_name, meta_transaction]() {
+          std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+
+          auto lock_it = table_locks_.find(table_name);
+          if (lock_it == table_locks_.end())
+            return;
+
+          std::optional<DuckDBZSet> delta_opt;
+          {
+            std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
+            delta_opt = sync_table_scan_and_consume(context, table_name,
+                                                    meta_transaction);
+          }
+
+          if (!delta_opt.has_value())
+            return;
+
+          if (!delta_opt->empty()) {
+            propagate_changes(table_name, *delta_opt);
+          }
         }));
       }
-      // Wait for all to complete
       for (auto &f : futures) {
         f.wait();
       }
     } else {
-      // Sequential sync
-      for (const auto &[name, _] : tracked_tables_) {
-        sync_table_locked(context, name, meta_transaction);
+      // Sequential: hold struct_mutex_ shared for the entire loop so the
+      // table_locks_ map stays stable; acquire each table lock in turn.
+      std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+      for (const auto &name : table_names) {
+        auto lock_it = table_locks_.find(name);
+        if (lock_it == table_locks_.end())
+          continue;
+
+        std::optional<DuckDBZSet> delta_opt;
+        {
+          std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
+          delta_opt = sync_table_scan_and_consume(context, name,
+                                                  meta_transaction);
+        }
+
+        if (!delta_opt.has_value())
+          continue;
+
+        if (!delta_opt->empty()) {
+          propagate_changes(name, *delta_opt);
+        }
       }
     }
   }
 
   // Enable/disable parallel sync
   void set_parallel_sync(bool enable) {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> lock(struct_mutex_);
     use_parallel_sync_ = enable;
   }
 
   bool get_parallel_sync() const {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
     return use_parallel_sync_;
   }
 
@@ -765,14 +906,15 @@ public:
   // Save all view definitions to a DuckDB table
   bool save_to_table(duckdb::ClientContext &context,
                      const std::string &storage_table = "_dbsp_views") {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    std::shared_lock<std::shared_mutex> view_lock(view_mutex_);
     return save_to_table_internal(context, storage_table, view_definitions_);
   }
 
   bool save_view_to_table(duckdb::ClientContext &context,
                           const std::string &view_name,
                           const std::string &storage_table) {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> struct_lock(struct_mutex_);
     // Save just the specified view
     std::unordered_map<std::string, ViewDefinition> single_view;
     auto it = view_definitions_.find(view_name);
@@ -841,7 +983,7 @@ public:
   // Load view definitions from a DuckDB table and recreate views
   bool load_from_table(duckdb::ClientContext &context,
                        const std::string &storage_table = "_dbsp_views") {
-    std::unique_lock<std::shared_mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> lock(struct_mutex_);
 
     try {
       auto &catalog = duckdb::Catalog::GetCatalog(context, INVALID_CATALOG);
@@ -908,7 +1050,7 @@ public:
                   return a.created_at < b.created_at;
                 });
 
-      // Recreate views (unlock for create_view which takes lock)
+      // Recreate views (unlock for create_view which takes struct_mutex_)
       lock.unlock();
       for (const auto &def : defs) {
         create_view(context, def.name, def.sql);
@@ -925,7 +1067,8 @@ public:
 
   // Save to JSON file
   bool save_to_file(const std::string &filepath) {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    std::shared_lock<std::shared_mutex> view_lock(view_mutex_);
 
     try {
       // Validate filepath to prevent path traversal
@@ -995,7 +1138,7 @@ public:
   // Load from JSON file
   bool load_from_file(duckdb::ClientContext &context,
                       const std::string &filepath) {
-    std::unique_lock<std::shared_mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> lock(struct_mutex_);
 
     try {
       // Validate filepath to prevent path traversal
@@ -1104,7 +1247,7 @@ public:
                   return a.created_at < b.created_at;
                 });
 
-      // Recreate views
+      // Recreate views (unlock for create_view which takes struct_mutex_)
       lock.unlock();
       for (const auto &def : defs) {
         create_view(context, def.name, def.sql);
@@ -1127,7 +1270,8 @@ public:
   // ========================================================================
 
   const DuckDBZSet *query_view(const std::string &view_name) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    std::shared_lock<std::shared_mutex> view_lock(view_mutex_);
     auto it = views_.find(view_name);
     if (it == views_.end())
       return nullptr;
@@ -1135,7 +1279,8 @@ public:
   }
 
   const NativeMaterializedView *get_view(const std::string &view_name) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    std::shared_lock<std::shared_mutex> view_lock(view_mutex_);
     auto it = views_.find(view_name);
     if (it == views_.end()) {
       return nullptr;
@@ -1144,7 +1289,8 @@ public:
   }
 
   const TableSchema *get_view_schema(const std::string &view_name) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    std::shared_lock<std::shared_mutex> view_lock(view_mutex_);
     auto it = views_.find(view_name);
     if (it == views_.end())
       return nullptr;
@@ -1152,7 +1298,7 @@ public:
   }
 
   std::vector<std::string> list_views() {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
     std::vector<std::string> names;
     for (const auto &[name, _] : views_) {
       names.push_back(name);
@@ -1161,7 +1307,7 @@ public:
   }
 
   std::vector<std::string> list_tracked_tables() {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
     std::vector<std::string> names;
     for (const auto &[name, _] : tracked_tables_) {
       names.push_back(name);
@@ -1171,17 +1317,17 @@ public:
 
   // Helper methods for testing and recovery
   bool is_table_tracked(const std::string &table_name) const {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
     return tracked_tables_.find(table_name) != tracked_tables_.end();
   }
 
   bool is_view_registered(const std::string &view_name) const {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
     return views_.find(view_name) != views_.end();
   }
 
   size_t get_tracked_table_count(const std::string &table_name) const {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
     auto it = tracked_tables_.find(table_name);
     if (it != tracked_tables_.end()) {
       return it->second->current_state().size();
@@ -1190,15 +1336,17 @@ public:
   }
 
   void clear_all_state() {
-    std::unique_lock<std::shared_mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    std::unique_lock<std::shared_mutex> view_lock(view_mutex_);
     tracked_tables_.clear();
+    table_locks_.clear();
     views_.clear();
     view_definitions_.clear();
     // Dependency graph will be rebuilt when views are recreated
   }
 
   const TableSchema *get_table_schema(const std::string &table_name) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
     auto it = table_schemas_.find(table_name);
     return it != table_schemas_.end() ? &it->second : nullptr;
   }
@@ -1213,7 +1361,8 @@ public:
   };
 
   ViewInfo get_view_info(const std::string &view_name) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    std::shared_lock<std::shared_mutex> view_lock(view_mutex_);
     ViewInfo info;
     auto it = views_.find(view_name);
     if (it != views_.end()) {
@@ -1229,13 +1378,13 @@ public:
 
   // Get view dependencies
   std::vector<std::string> get_view_dependencies(const std::string &view_name) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
     return dep_graph_.get_dependencies(view_name);
   }
 
   // Get views that depend on this view/table
   std::vector<std::string> get_dependents(const std::string &name) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
     return dep_graph_.get_all_dependents(name);
   }
 
@@ -1246,13 +1395,13 @@ public:
 
   // Check if view exists
   bool view_exists(const std::string &view_name) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
     return views_.find(view_name) != views_.end();
   }
 
   // Get drop order for CASCADE (returns views in order to drop)
   std::vector<std::string> get_drop_order(const std::string &view_name) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
     auto dependents = dep_graph_.get_all_dependents(view_name);
 
     // Return in reverse order (drop leaves first, then parents)
@@ -1260,11 +1409,15 @@ public:
     return dependents;
   }
 
-  const std::string &last_error() const { return last_error_; }
+  // Returns last error by value for thread safety (was const std::string&)
+  std::string last_error() const {
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
+    return last_error_;
+  }
 
   // Initialize persistence table for storing view definitions
   bool initialize_persistence_table(duckdb::ClientContext &context) {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> lock(struct_mutex_);
 
     try {
       // Create _dbsp_views table if it doesn't exist
@@ -1302,7 +1455,8 @@ public:
 
   // Restore a view's Z-set state from checkpoint
   bool restore_view_state(const std::string &view_name, const DuckDBZSet &zset) {
-    std::lock_guard<std::shared_mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    std::unique_lock<std::shared_mutex> view_lock(view_mutex_);
 
     auto it = views_.find(view_name);
     if (it == views_.end()) {
@@ -1316,21 +1470,25 @@ public:
   }
 
 private:
-  // Sync table with lock already held
-  bool sync_table_locked(duckdb::ClientContext &context,
-                         const std::string &table_name,
-                         duckdb::MetaTransaction *meta_transaction = nullptr) {
+  // Scan tracked table from DB and compute/apply delta.
+  // Must be called with the table's table_lock held exclusively.
+  // struct_mutex_ must also be held (shared or exclusive) by the caller.
+  //
+  // Returns the consumed delta on success, std::nullopt on error.
+  // On error, last_error_ is set.
+  std::optional<DuckDBZSet> sync_table_scan_and_consume(
+      duckdb::ClientContext &context,
+      const std::string &table_name,
+      duckdb::MetaTransaction *meta_transaction = nullptr) {
+
     auto it = tracked_tables_.find(table_name);
     if (it == tracked_tables_.end()) {
-      return false;
+      last_error_ = "Table not tracked: " + table_name;
+      return std::nullopt;
     }
 
     try {
       // Get table catalog entry using Catalog API (avoid SQL queries)
-      // We avoid Catalog::GetCatalog(context) because it checks for an active
-      // transaction on the context, which might fail in the TransactionCommit
-      // hook. We also avoid Catalog::GetCatalog(db_instance) because it's
-      // missing in some DuckDB versions.
       auto &db_instance = duckdb::DatabaseInstance::GetDatabase(context);
       auto &db_manager = db_instance.GetDatabaseManager();
       auto dbs = db_manager.GetDatabases();
@@ -1350,8 +1508,6 @@ private:
 
       if (meta_transaction) {
         // Auto-CDC commit hook path: use raw storage API with meta_transaction.
-        // DataTable::InitializeScan works here because the meta_transaction
-        // controls the storage locks and there is no conflicting user transaction.
         auto &attached = catalog.GetAttached();
         auto *transaction = &meta_transaction->GetTransaction(attached)
                                 .Cast<duckdb::DuckTransaction>();
@@ -1365,7 +1521,8 @@ private:
         auto table_entry_ptr = schema_entry.GetEntry(
             cat_txn, duckdb::CatalogType::TABLE_ENTRY, table_name);
         if (!table_entry_ptr) {
-          return false;
+          last_error_ = "Table not found in catalog: " + table_name;
+          return std::nullopt;
         }
         auto &table_entry = table_entry_ptr->Cast<duckdb::TableCatalogEntry>();
         auto &data_table = table_entry.GetStorage();
@@ -1393,17 +1550,7 @@ private:
       } else {
         // Explicit user call path: create a fresh Connection to the same DB
         // to avoid blocking on any existing transaction state from the caller's
-        // context. context.Query() blocks when called directly if the connection
-        // has had BeginTransaction() called (even after Commit()), because
-        // Connection::BeginTransaction() uses Query("BEGIN TRANSACTION") internally
-        // which leaves internal DuckDB lock state that conflicts with subsequent
-        // direct context.Query() calls. A fresh Connection has no such state.
-        // Create a fresh Connection to the same DB to avoid blocking on any
-        // existing transaction state from the caller's context.
-        // context.Query() blocks if BeginTransaction() was ever called on the
-        // same connection (even after Commit()), because Connection::BeginTransaction()
-        // uses Query("BEGIN TRANSACTION") internally which leaves lock state that
-        // conflicts with subsequent direct context.Query() calls.
+        // context. A fresh Connection has no such state.
         auto &fresh_db = duckdb::DatabaseInstance::GetDatabase(context);
         duckdb::Connection fresh_con(fresh_db);
         auto sql_result =
@@ -1411,7 +1558,7 @@ private:
         if (!sql_result || sql_result->HasError()) {
           last_error_ = "Failed to scan table '" + table_name + "': " +
                         (sql_result ? sql_result->GetError() : "null result");
-          return false;
+          return std::nullopt;
         }
         while (true) {
           auto chunk_ptr = sql_result->Fetch();
@@ -1427,6 +1574,7 @@ private:
         }
       }
 
+      // Compute delta = new_state - old_state
       DuckDBZSet delta;
       const auto &old_state = it->second->current_state();
 
@@ -1444,8 +1592,8 @@ private:
         }
       }
 
-      // Debug: Delta calculation complete
-
+      // Apply delta to tracked table state (updates current_state_ and
+      // queues pending_changes_), then consume pending_changes_ to clear them.
       for (const auto &[row, weight] : delta) {
         if (weight > 0) {
           for (int i = 0; i < weight; i++) {
@@ -1458,23 +1606,21 @@ private:
         }
       }
 
-      if (!delta.empty()) {
-        propagate_changes(table_name);
-      }
-
-      return true;
+      // Consume and return the queued changes (clears pending_changes_)
+      return it->second->consume_changes();
 
     } catch (const std::exception &e) {
-      last_error_ = std::string("Exception in sync_table_locked: ") + e.what();
-      return false;
+      last_error_ = std::string("Exception in sync_table_scan_and_consume: ") + e.what();
+      return std::nullopt;
     } catch (...) {
-      last_error_ = "Unknown exception in sync_table_locked";
-      return false;
+      last_error_ = "Unknown exception in sync_table_scan_and_consume";
+      return std::nullopt;
     }
   }
 
   bool track_table_internal(duckdb::ClientContext &context,
                             const std::string &table_name) {
+    // Called with struct_mutex_ exclusively held.
     if (tracked_tables_.count(table_name)) {
       return true;
     }
@@ -1487,6 +1633,7 @@ private:
     tracked_tables_[table_name] =
         std::make_unique<TrackedTable>(table_name, schema);
     table_schemas_[table_name] = schema;
+    table_locks_[table_name] = std::make_unique<std::shared_mutex>();
 
     sync_table_internal(context, table_name);
     // CRITICAL: Clear pending changes from initial sync so they don't get
@@ -1535,7 +1682,6 @@ private:
       duckdb::DataChunk chunk;
       chunk.Initialize(context, data_table.GetTypes());
 
-      size_t row_count = 0;
       while (true) {
         chunk.Reset();
         data_table.Scan(transaction, chunk, scan_state);
@@ -1551,7 +1697,6 @@ private:
             dbsp_row.columns.push_back(chunk.GetValue(col_idx, row_idx));
           }
           it->second->insert(dbsp_row);
-          row_count++;
         }
       }
 
@@ -1645,24 +1790,18 @@ private:
     return duckdb::LogicalType::VARCHAR;
   }
 
-  // Propagate changes through dependency graph
-  // IMPORTANT: Must be called with mutex_ already held (exclusive lock).
-  // All callers (on_insert, on_delete, on_update, on_batch_insert,
-  // sync_table_locked) hold the exclusive lock before calling this.
-  void propagate_changes(const std::string &source_name) {
-    // Note: mutex_ is already held by the caller (exclusive lock).
-    // Do NOT acquire shared_lock here - that would cause a recursive lock
-    // deadlock since std::shared_mutex is not recursive.
-
-    // Get changes from source
-    DuckDBZSet changes;
-
-    if (tracked_tables_.count(source_name)) {
-      changes = tracked_tables_[source_name]->consume_changes();
-    }
-
-    if (changes.empty())
+  // Propagate changes through dependency graph.
+  // IMPORTANT: Must be called with struct_mutex_ already held (shared or
+  // exclusive) by the caller. Do NOT re-acquire struct_mutex_ here.
+  // Acquires view_mutex_ exclusively for writing view Z-set state.
+  void propagate_changes(const std::string &source_name,
+                         const DuckDBZSet &delta) {
+    if (delta.empty())
       return;
+
+    // Acquire view_mutex_ exclusively for writing view content.
+    // Lock ordering: struct_mutex_ (held by caller) → view_mutex_ (acquired here).
+    std::unique_lock<std::shared_mutex> view_lock(view_mutex_);
 
     // Get topological order of dependent views
     auto update_order = dep_graph_.topological_order(source_name);
@@ -1672,7 +1811,7 @@ private:
       auto sources = view->source_tables();
       for (const auto &src : sources) {
         if (src == source_name) {
-          view->apply_changes(source_name, changes);
+          view->apply_changes(source_name, delta);
           break;
         }
       }
@@ -1805,7 +1944,26 @@ private:
     return s.size();
   }
 
-  mutable std::shared_mutex mutex_;
+  // =========================================================================
+  // Private data members
+  //
+  // Three-tier locking (always acquire in this order):
+  //   1. struct_mutex_  — guards structural maps (tracked_tables_ keys,
+  //      views_ keys, dep_graph_, table_schemas_, view_definitions_,
+  //      table_locks_ map itself, auto_sync_enabled_, use_parallel_sync_)
+  //   2. table_locks_[name]  — per-table lock, guards TrackedTable state
+  //   3. view_mutex_  — guards view Z-set content (NativeMaterializedView data)
+  // =========================================================================
+
+  // Tier 1: structural lock
+  mutable std::shared_mutex struct_mutex_;
+
+  // Tier 2: per-table locks (keyed by table name)
+  mutable std::unordered_map<std::string, std::unique_ptr<std::shared_mutex>> table_locks_;
+
+  // Tier 3: view content lock
+  mutable std::shared_mutex view_mutex_;
+
   std::unordered_map<std::string, std::unique_ptr<TrackedTable>>
       tracked_tables_;
   std::unordered_map<std::string, TableSchema> table_schemas_;
