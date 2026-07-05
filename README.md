@@ -254,8 +254,7 @@ parser was deleted):**
 - Correlated subqueries (rewrite as a JOIN or intermediate view)
 - WITH RECURSIVE ... USING KEY
 - Non-constant / percentage LIMIT
-- Deletion propagation through recursive views (fixed point ignores
-  negative weights)
+
 
 ## How It Works
 

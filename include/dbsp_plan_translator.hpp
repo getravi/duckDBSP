@@ -28,8 +28,9 @@
 //   C2: LOGICAL_RECURSIVE_CTE via PlanRecursiveNode: anchor inline, the
 //       recursive step as a nested PlannedCircuitView driven to a fixed
 //       point (self-reference = sentinel source). Multi-table recursive
-//       steps work; USING KEY is rejected; deletions are ignored inside the
-//       fixed point (documented parity with the old parser path).
+//       steps work; USING KEY is rejected. Insert-only deltas are
+//       incremental; deltas containing deletions trigger a full fixed-point
+//       recompute from integrated inputs (correct, non-incremental).
 //   C3: DISTINCT ON via NativeDistinctOnView in an EmbeddedViewNode
 //       (column-ref targets; winner-pick order from the DISTINCT node's own
 //       order_by modifier — the ORDER_BY above is presentation, see C1).
@@ -1015,12 +1016,18 @@ private:
 // Fixed-point driver for WITH RECURSIVE. The anchor is computed inline in
 // the outer circuit; the recursive step runs as an inner view (a nested
 // PlannedCircuitView) whose self-reference is a source named `sentinel`.
-// Each step: feed base-table deltas to the inner view, seed the frontier
-// with the anchor delta plus the step's reaction, then iterate the step on
-// the frontier until it stops producing new rows. UNION dedup state
-// persists across calls, so later deltas cannot double-count rows.
-// Deletions (negative weights) are ignored inside the fixed point — a
-// documented limitation carried over from the parser-era implementation.
+//
+// Insert-only deltas are handled incrementally: seed the frontier with the
+// anchor delta plus the step's reaction to base-table deltas, then iterate
+// the step on the frontier until it stops producing new rows (UNION dedup
+// state persists across calls, so later deltas cannot double-count).
+//
+// Deltas containing a deletion fall back to a full fixed-point recompute
+// from integrated anchor/base state: a derived row may be supported by any
+// number of recursion paths, so retraction cannot be decided locally. The
+// node integrates its inputs (anchor_total_, base_totals_) for exactly this
+// purpose and emits the diff against the previous accumulated state.
+// Correct always; O(fixed point) instead of O(delta) when deletions occur.
 class PlanRecursiveNode : public dbsp::Node {
 public:
   using InputFn = std::function<const DuckDBZSet &()>;
@@ -1037,13 +1044,38 @@ public:
 
   void step() override {
     output_.clear();
-    DuckDBZSet seed = anchor_();
+
+    // Integrate inputs; detect deletions
+    const DuckDBZSet &anchor_delta = anchor_();
+    bool has_deletion = false;
+    for (const auto &[row, w] : anchor_delta) {
+      anchor_total_.insert(row, w);
+      has_deletion |= w < 0;
+    }
+    std::vector<std::pair<std::string, const DuckDBZSet *>> base_deltas;
     for (auto &[table, fn] : base_inputs_) {
       const DuckDBZSet &d = fn();
       if (d.empty()) {
         continue;
       }
-      step_view_->apply_changes(table, d);
+      auto &total = base_totals_[table];
+      for (const auto &[row, w] : d) {
+        total.insert(row, w);
+        has_deletion |= w < 0;
+      }
+      base_deltas.emplace_back(table, &d);
+    }
+
+    if (has_deletion) {
+      recompute();
+      has_output_ = !output_.empty();
+      return;
+    }
+
+    // Incremental insert-only path
+    DuckDBZSet seed = anchor_delta;
+    for (const auto &[table, d] : base_deltas) {
+      step_view_->apply_changes(table, *d);
       for (const auto &[row, w] : step_view_->get_delta()) {
         seed.insert(row, w);
       }
@@ -1051,25 +1083,17 @@ public:
     DuckDBZSet frontier;
     for (const auto &[row, w] : seed) {
       if (w > 0) {
-        admit(row, w, frontier);
+        admit(row, w, frontier, output_);
       }
     }
-    size_t iter = 0;
-    while (!frontier.empty() && iter++ < max_iterations_) {
-      step_view_->apply_changes(sentinel_, frontier);
-      DuckDBZSet next;
-      for (const auto &[row, w] : step_view_->get_delta()) {
-        if (w > 0) {
-          admit(row, w, next);
-        }
-      }
-      frontier = std::move(next);
-    }
+    iterate(frontier, output_);
     has_output_ = !output_.empty();
   }
 
   void reset() override {
     accumulated_.clear();
+    anchor_total_.clear();
+    base_totals_.clear();
     output_.clear();
     has_output_ = false;
     step_view_->reset();
@@ -1080,14 +1104,63 @@ public:
   const DuckDBZSet &output() const { return output_; }
 
 private:
-  void admit(const DuckDBRow &row, int64_t w, DuckDBZSet &frontier) {
+  // Re-run the whole fixed point from integrated inputs; output_ becomes
+  // the diff against the previous accumulated state
+  void recompute() {
+    DuckDBZSet old_accumulated = std::move(accumulated_);
+    accumulated_ = DuckDBZSet();
+    step_view_->reset();
+
+    DuckDBZSet seed = anchor_total_;
+    for (const auto &[table, total] : base_totals_) {
+      if (total.empty()) {
+        continue;
+      }
+      step_view_->apply_changes(table, total);
+      for (const auto &[row, w] : step_view_->get_delta()) {
+        seed.insert(row, w);
+      }
+    }
+    DuckDBZSet scratch; // recompute emits via diff, not via admit
+    DuckDBZSet frontier;
+    for (const auto &[row, w] : seed) {
+      if (w > 0) {
+        admit(row, w, frontier, scratch);
+      }
+    }
+    iterate(frontier, scratch);
+
+    for (const auto &[row, w] : accumulated_) {
+      output_.insert(row, w);
+    }
+    for (const auto &[row, w] : old_accumulated) {
+      output_.insert(row, -w);
+    }
+  }
+
+  void iterate(DuckDBZSet &frontier, DuckDBZSet &out) {
+    size_t iter = 0;
+    while (!frontier.empty() && iter++ < max_iterations_) {
+      step_view_->apply_changes(sentinel_, frontier);
+      DuckDBZSet next;
+      for (const auto &[row, w] : step_view_->get_delta()) {
+        if (w > 0) {
+          admit(row, w, next, out);
+        }
+      }
+      frontier = std::move(next);
+    }
+  }
+
+  void admit(const DuckDBRow &row, int64_t w, DuckDBZSet &frontier,
+             DuckDBZSet &out) {
     if (union_all_) {
       accumulated_.insert(row, w);
-      output_.insert(row, w);
+      out.insert(row, w);
       frontier.insert(row, w);
     } else if (accumulated_.get(row) == 0) {
       accumulated_.insert(row, 1);
-      output_.insert(row, 1);
+      out.insert(row, 1);
       frontier.insert(row, 1);
     }
   }
@@ -1099,6 +1172,8 @@ private:
   std::vector<std::pair<std::string, InputFn>> base_inputs_;
   size_t max_iterations_;
   DuckDBZSet accumulated_;
+  DuckDBZSet anchor_total_;                            // ∫ anchor deltas
+  std::unordered_map<std::string, DuckDBZSet> base_totals_; // ∫ per table
   DuckDBZSet output_;
   bool has_output_ = false;
 };

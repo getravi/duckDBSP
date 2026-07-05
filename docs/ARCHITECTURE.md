@@ -147,7 +147,9 @@ SourceNode per base table) covering:
   `EmbeddedViewNode`; a root sort/limit drives `dbsp_query`'s scan order (C1)
 - WITH RECURSIVE — `PlanRecursiveNode`: anchor inline, the recursive step as
   a nested `PlannedCircuitView` iterated to a fixed point; multi-table
-  recursive steps supported, deletions ignored inside the fixed point (C2)
+  recursive steps supported. Insert-only deltas maintain incrementally;
+  deltas with deletions trigger a full fixed-point recompute from
+  integrated inputs (correct, non-incremental) (C2, hardening)
 - DISTINCT ON — `NativeDistinctOnView` behind an `EmbeddedViewNode`;
   winner-pick order comes from the DISTINCT node's own order modifier (C3)
 
@@ -190,8 +192,10 @@ delta plus the step's reaction to base-table deltas, then iterates:
 ```
 
 UNION dedup state persists across deltas, so a row that becomes reachable
-again later is not double-counted. Deletions (negative weights) are ignored
-inside the fixed point — a documented limitation.
+again later is not double-counted. Deltas containing deletions fall back to
+a full fixed-point recompute from integrated anchor/base state (a derived
+row may be supported by many recursion paths, so retraction cannot be
+decided locally); the node emits the diff against its previous result.
 
 **Safety**: Maximum iteration limit (default 1000) prevents infinite loops.
 

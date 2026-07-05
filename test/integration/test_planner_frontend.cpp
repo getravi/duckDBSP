@@ -764,3 +764,56 @@ TEST_CASE("planner C4: join filter pushdown keeps results exact",
   requireViewMatchesQuery(db, "v_pd", sql);
   db.assertViewRowCount("v_pd", 2);
 }
+
+// ===== Recursive views: deletion propagation =====
+
+TEST_CASE("planner recursive: deleting the seed retracts derived rows",
+          "[integration][planner][recursive][rec_delete]") {
+  DuckDBTestHarness db;
+  db.createTable("rseed", "id INT", {"(1)", "(20)"});
+  db.exec("SELECT * FROM dbsp_track('rseed')");
+  db.exec("SELECT * FROM dbsp_sync('rseed')");
+  db.exec("SELECT * FROM dbsp_use_planner(true)");
+
+  const std::string sql =
+      "WITH RECURSIVE r AS (SELECT id FROM rseed UNION ALL "
+      "SELECT id+1 FROM r WHERE id < 5) SELECT * FROM r";
+  db.exec("SELECT * FROM dbsp_create_view('v_rdel', '" + sql + "')");
+  REQUIRE(plannerBuilt("v_rdel"));
+  db.assertViewRowCount("v_rdel", 6); // 1..5 from seed 1, plus 20
+
+  // Deleting seed 1 must retract its whole derived chain
+  db.exec("DELETE FROM rseed WHERE id = 1");
+  db.exec("SELECT * FROM dbsp_sync('rseed')");
+  db.assertViewRowCount("v_rdel", 1); // only 20 remains
+
+  // And reinserting brings it back
+  db.exec("INSERT INTO rseed VALUES (3)");
+  db.exec("SELECT * FROM dbsp_sync('rseed')");
+  db.assertViewRowCount("v_rdel", 4); // 3,4,5 + 20
+}
+
+TEST_CASE("planner recursive: removing an edge shrinks the closure",
+          "[integration][planner][recursive][rec_delete]") {
+  DuckDBTestHarness db;
+  db.createTable("redges", "src INT, dst INT",
+                 {"(1, 2)", "(2, 3)", "(3, 4)"});
+  db.exec("SELECT * FROM dbsp_track('redges')");
+  db.exec("SELECT * FROM dbsp_sync('redges')");
+  db.exec("SELECT * FROM dbsp_use_planner(true)");
+
+  const std::string sql =
+      "WITH RECURSIVE reach AS (SELECT src, dst FROM redges WHERE src = 1 "
+      "UNION SELECT r.src, e.dst FROM reach r JOIN redges e ON r.dst = e.src) "
+      "SELECT * FROM reach";
+  db.exec("SELECT * FROM dbsp_create_view('v_rreach', '" + sql + "')");
+  REQUIRE(plannerBuilt("v_rreach"));
+  db.assertViewRowCount("v_rreach", 3); // (1,2)(1,3)(1,4)
+  requireViewMatchesQuery(db, "v_rreach", sql);
+
+  // Cutting 2->3 must retract everything reachable only through it
+  db.exec("DELETE FROM redges WHERE src = 2 AND dst = 3");
+  db.exec("SELECT * FROM dbsp_sync('redges')");
+  db.assertViewRowCount("v_rreach", 1); // only (1,2)
+  requireViewMatchesQuery(db, "v_rreach", sql);
+}
