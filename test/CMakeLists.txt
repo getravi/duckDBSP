@@ -105,3 +105,13 @@ add_executable(bench_planner_eval
 target_link_libraries(bench_planner_eval catch2_main duckdb_static
                       duckdb_generated_extension_loader
                       core_functions_extension parquet_extension)
+
+# Extended soak (not part of ctest; run manually, SOAK_ROUNDS env to size)
+add_executable(soak_differential
+    benchmarks/soak_differential.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_extension.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_recovery.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_crash_marker.cpp)
+target_link_libraries(soak_differential catch2_main duckdb_static
+                      duckdb_generated_extension_loader
+                      core_functions_extension parquet_extension)
