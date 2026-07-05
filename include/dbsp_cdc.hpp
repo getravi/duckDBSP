@@ -361,9 +361,10 @@ public:
 
   bool is_auto_sync_enabled() const { return auto_sync_enabled_; }
 
-  // Planner frontend (Phase B) control: when enabled, create_view first
-  // tries translating the SQL via DuckDB's binder/planner; on unsupported
-  // plans it falls back to the bespoke parser transparently.
+  // Planner frontend (Phase B) control: when enabled (the default since
+  // B5), create_view first tries translating the SQL via DuckDB's
+  // binder/planner; on unsupported plans (ORDER BY/LIMIT, recursion,
+  // outer joins, ...) it falls back to the bespoke parser transparently.
   void enable_planner() { use_planner_ = true; }
 
   void disable_planner() { use_planner_ = false; }
@@ -520,6 +521,15 @@ public:
         view ? view->source_tables() : result.view_def.source_tables;
     std::vector<std::string> resolved_sources;
     for (const auto &source : requested_sources) {
+      // A view can reference the same table more than once (e.g. the anchor
+      // and recursive parts of WITH RECURSIVE both scan the base table).
+      // Resolve each source only once — the initialization loop below
+      // applies table state once per resolved source, so a duplicate here
+      // would double the view's initial contents.
+      if (std::find(resolved_sources.begin(), resolved_sources.end(),
+                    source) != resolved_sources.end()) {
+        continue;
+      }
       // Check for cycles
       if (dep_graph_.would_create_cycle(view_name, source)) {
         last_error_ =

@@ -63,11 +63,13 @@ TEST_CASE("Recursive CTE with incremental update", "[integration][recursive]") {
 
     // Add edge 2->3 - should now have (1,2), (2,3), (1,3)
     harness.exec("INSERT INTO edges VALUES (2, 3)");
+    harness.exec("SELECT * FROM dbsp_sync('edges')");
     rows = harness.getViewRows("reach");
     REQUIRE(rows.size() == 3);
 
     // Add edge 3->4 - should now have (1,2), (2,3), (3,4), (1,3), (2,4), (1,4)
     harness.exec("INSERT INTO edges VALUES (3, 4)");
+    harness.exec("SELECT * FROM dbsp_sync('edges')");
     rows = harness.getViewRows("reach");
     REQUIRE(rows.size() == 6);
   }
