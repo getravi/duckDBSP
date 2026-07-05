@@ -20,12 +20,95 @@ namespace dbsp_native {
 using Weight = int64_t;
 
 // DuckDB Row - uses native Value types
+// Column container with a lazily cached hash. Mutating operations
+// invalidate the cache; every mutation path goes through this class, so a
+// valid cache can never go stale — copies may therefore keep it, which is
+// the point: a row hashed once keeps its hash across every Z-set and index
+// it flows through.
+class ColumnVec {
+public:
+  static constexpr size_t kNullHash = 0x9e3779b97f4a7c15ULL;
+
+  ColumnVec() = default;
+  ColumnVec(std::initializer_list<duckdb::Value> init) : v_(init) {}
+
+  // --- const API (cache untouched) ---
+  size_t size() const { return v_.size(); }
+  bool empty() const { return v_.empty(); }
+  const duckdb::Value &operator[](size_t i) const { return v_[i]; }
+  const duckdb::Value &back() const { return v_.back(); }
+  std::vector<duckdb::Value>::const_iterator begin() const {
+    return v_.begin();
+  }
+  std::vector<duckdb::Value>::const_iterator end() const { return v_.end(); }
+  const std::vector<duckdb::Value> &raw() const { return v_; }
+
+  size_t hash() const {
+    if (!hash_valid_) {
+      size_t h = 0;
+      for (const auto &col : v_) {
+        size_t col_hash = col.IsNull() ? kNullHash : col.Hash();
+        h ^= col_hash + 0x9e3779b9 + (h << 6) + (h >> 2);
+      }
+      hash_ = h;
+      hash_valid_ = true;
+    }
+    return hash_;
+  }
+  bool hash_valid() const { return hash_valid_; }
+
+  // --- mutating API (invalidates the cache) ---
+  void push_back(const duckdb::Value &v) {
+    hash_valid_ = false;
+    v_.push_back(v);
+  }
+  void push_back(duckdb::Value &&v) {
+    hash_valid_ = false;
+    v_.push_back(std::move(v));
+  }
+  template <typename... Args> void emplace_back(Args &&...args) {
+    hash_valid_ = false;
+    v_.emplace_back(std::forward<Args>(args)...);
+  }
+  void reserve(size_t n) { v_.reserve(n); } // capacity only, content intact
+  void clear() {
+    hash_valid_ = false;
+    v_.clear();
+  }
+  duckdb::Value &operator[](size_t i) { // may be written through
+    hash_valid_ = false;
+    return v_[i];
+  }
+  ColumnVec &operator=(std::initializer_list<duckdb::Value> init) {
+    hash_valid_ = false;
+    v_ = init;
+    return *this;
+  }
+  void insert(std::vector<duckdb::Value>::const_iterator pos,
+              std::vector<duckdb::Value>::const_iterator first,
+              std::vector<duckdb::Value>::const_iterator last) {
+    hash_valid_ = false;
+    v_.insert(v_.begin() + (pos - v_.cbegin()), first, last);
+  }
+  std::vector<duckdb::Value>::const_iterator cbegin() const {
+    return v_.cbegin();
+  }
+
+private:
+  std::vector<duckdb::Value> v_;
+  mutable size_t hash_ = 0;
+  mutable bool hash_valid_ = false;
+};
+
 struct DuckDBRow {
-  std::vector<duckdb::Value> columns;
+  ColumnVec columns;
 
   // Default equality: NULL-aware for GROUP BY/DISTINCT semantics
   // In GROUP BY and DISTINCT: NULL == NULL (same group)
   bool operator==(const DuckDBRow &other) const {
+    if (columns.hash_valid() && other.columns.hash_valid() &&
+        columns.hash() != other.columns.hash())
+      return false; // cheap negative: different hashes cannot be equal
     if (columns.size() != other.columns.size())
       return false;
     for (size_t i = 0; i < columns.size(); i++) {
@@ -76,22 +159,10 @@ struct DuckDBRow {
   }
 };
 
-// Hash function for DuckDBRow - NULL-aware
+// Hash function for DuckDBRow - NULL-aware, cached in the row's columns
 struct DuckDBRowHash {
-  static constexpr size_t NULL_HASH = 0x9e3779b97f4a7c15ULL;
-
   size_t operator()(const DuckDBRow &row) const noexcept {
-    size_t hash = 0;
-    for (const auto &col : row.columns) {
-      size_t col_hash;
-      if (col.IsNull()) {
-        col_hash = NULL_HASH; // Special hash for NULL
-      } else {
-        col_hash = col.Hash();
-      }
-      hash ^= col_hash + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-    }
-    return hash;
+    return row.columns.hash();
   }
 };
 
