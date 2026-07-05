@@ -1604,8 +1604,11 @@ private:
         InternalQueryGuard guard;
         auto &fresh_db = duckdb::DatabaseInstance::GetDatabase(context);
         duckdb::Connection fresh_con(fresh_db);
+        // Streaming execution (H5): rows are consumed chunk by chunk below,
+        // so materializing the whole table into a QueryResult first was one
+        // extra full-table copy per sync
         auto sql_result =
-            fresh_con.Query("SELECT * FROM \"" + table_name + "\"");
+            fresh_con.SendQuery("SELECT * FROM \"" + table_name + "\"");
         if (!sql_result || sql_result->HasError()) {
           last_error_ = "Failed to scan table '" + table_name + "': " +
                         (sql_result ? sql_result->GetError() : "null result");
