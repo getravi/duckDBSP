@@ -377,6 +377,8 @@ public:
 
   bool is_auto_sync_enabled() const { return auto_sync_enabled_; }
 
+  bool parallel_sync_enabled() const { return use_parallel_sync_; }
+
   // The planner frontend is the only frontend since Phase C5 (the bespoke
   // parser was deleted). Kept so the dbsp_use_planner() table function stays
   // callable; toggling is a no-op.
@@ -826,6 +828,16 @@ public:
         table_names.push_back(entry.first);
       }
     }
+    sync_tables(context, table_names, do_parallel, meta_transaction);
+  }
+
+  // Sync only the named tables (H1 touched-table scoping: the transaction
+  // hooks know which tables a transaction wrote, so a commit need not scan
+  // every tracked table). Unknown names are skipped.
+  void sync_tables(duckdb::ClientContext &context,
+                   const std::vector<std::string> &table_names,
+                   bool do_parallel,
+                   duckdb::MetaTransaction *meta_transaction = nullptr) {
 
     if (do_parallel) {
       // TRUE parallelism: each thread acquires its own per-table lock.
@@ -1387,6 +1399,10 @@ public:
   // (observable so tests can prove the fast path actually ran)
   uint64_t captured_delta_syncs() const { return captured_delta_syncs_; }
 
+  // Number of scan-and-diff table scans performed (tests use this to prove
+  // sync scoping skips untouched tables)
+  uint64_t scan_syncs() const { return scan_syncs_; }
+
   size_t get_tracked_table_count(const std::string &table_name) const {
     std::shared_lock<std::shared_mutex> lock(struct_mutex_);
     auto it = tracked_tables_.find(table_name);
@@ -1573,6 +1589,7 @@ private:
       auto &catalog = target_db->GetCatalog();
 
       DuckDBZSet new_state;
+      scan_syncs_++;
 
       {
         // Both paths (commit hook and explicit user call) scan committed state
@@ -2062,6 +2079,7 @@ private:
   std::string last_error_;
   std::atomic<bool> auto_sync_enabled_{false};
   std::atomic<uint64_t> captured_delta_syncs_{0};
+  std::atomic<uint64_t> scan_syncs_{0};
   bool use_parallel_sync_ = false;
 };
 

@@ -192,7 +192,11 @@ TEST_CASE("Benchmark: cascaded view sync cost", "[benchmark][cascade_bench]") {
     }
   });
 
-  // G2 captured-delta path: explicit-txn single-row inserts with auto-sync
+  // G2 captured-delta path: explicit-txn single-row inserts with auto-sync.
+  // Realign the tracked baseline first — the on_insert block above injected
+  // rows into manager state that are not in the DuckDB table, and the
+  // commit guard would (correctly) reject the mismatch.
+  db.exec("SELECT * FROM dbsp_sync('big')");
   db.exec("SELECT * FROM dbsp_auto_sync(true)");
   auto &mgr2 = dbsp_native::get_cdc_manager();
   const uint64_t cap_before = mgr2.captured_delta_syncs();
@@ -207,10 +211,21 @@ TEST_CASE("Benchmark: cascaded view sync cost", "[benchmark][cascade_bench]") {
   db.exec("SELECT * FROM dbsp_auto_sync(false)");
   const uint64_t captured = mgr2.captured_delta_syncs() - cap_before;
 
+  // Floor: identical txn shape with auto-sync off (pure DuckDB cost)
+  double floor_us = measure_us([&]() {
+    for (int i = 0; i < 20; i++) {
+      db.exec("BEGIN");
+      db.exec("INSERT INTO big VALUES (" + std::to_string(500000 + i) +
+              ", 42, 'a')");
+      db.exec("COMMIT");
+    }
+  });
+
   std::cout << "[bench] 3-level chain, full sync (scan-dominated): "
             << (total_us / 20.0) << " us/row; propagate-only (on_insert): "
             << (prop_us / 1000.0)
             << " us/row; captured-delta commit (explicit txn): "
             << (cap_us / 20.0) << " us/commit (" << captured
-            << "/20 via fast path)\n";
+            << "/20 via fast path; bare txn floor "
+            << (floor_us / 20.0) << " us)\n";
 }

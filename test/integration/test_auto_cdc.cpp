@@ -268,3 +268,53 @@ TEST_CASE("G2: randomized explicit-txn churn stays correct",
   }
   db.exec("SELECT * FROM dbsp_auto_sync(false)");
 }
+
+TEST_CASE("H1: commits scan only the tables they touched",
+          "[integration][auto_cdc][scoping]") {
+  DuckDBTestHarness db;
+  db.createTable("sa", "id INT", {"(1)"});
+  db.createTable("sb", "id INT", {"(1)"});
+  db.exec("SELECT * FROM dbsp_track('sa')");
+  db.exec("SELECT * FROM dbsp_track('sb')");
+  db.exec("SELECT * FROM dbsp_sync('sa')");
+  db.exec("SELECT * FROM dbsp_sync('sb')");
+  db.exec("SELECT * FROM dbsp_create_view('v_sa', 'SELECT id FROM sa')");
+  db.exec("SELECT * FROM dbsp_create_view('v_sb', 'SELECT id FROM sb')");
+  db.exec("SELECT * FROM dbsp_auto_sync(true)");
+
+  auto &manager = dbsp_native::get_cdc_manager();
+
+  // Autocommit DELETE on sa: exactly one table scanned, not two
+  uint64_t scans = manager.scan_syncs();
+  db.exec("DELETE FROM sa WHERE id = 1");
+  REQUIRE(manager.scan_syncs() == scans + 1);
+  db.assertViewRowCount("v_sa", 0);
+  db.assertViewRowCount("v_sb", 1);
+
+  // Explicit txn UPDATE on sb: one scan
+  scans = manager.scan_syncs();
+  db.exec("BEGIN");
+  db.exec("UPDATE sb SET id = 2 WHERE id = 1");
+  db.exec("COMMIT");
+  REQUIRE(manager.scan_syncs() == scans + 1);
+  db.assertViewRowCount("v_sb", 1);
+
+  // Read-only explicit txn: zero scans
+  scans = manager.scan_syncs();
+  db.exec("BEGIN");
+  db.exec("SELECT * FROM sa");
+  db.exec("COMMIT");
+  REQUIRE(manager.scan_syncs() == scans);
+
+  // Captured-delta commit: zero scans (fast path, no scan at all)
+  scans = manager.scan_syncs();
+  const uint64_t caps = manager.captured_delta_syncs();
+  db.exec("BEGIN");
+  db.exec("INSERT INTO sa VALUES (7)");
+  db.exec("COMMIT");
+  REQUIRE(manager.captured_delta_syncs() == caps + 1);
+  REQUIRE(manager.scan_syncs() == scans);
+  db.assertViewRowCount("v_sa", 1);
+
+  db.exec("SELECT * FROM dbsp_auto_sync(false)");
+}

@@ -21,7 +21,10 @@
 #include "duckdb/main/client_context_state.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/delete_statement.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
+#include "duckdb/parser/statement/update_statement.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
@@ -31,6 +34,7 @@
 
 #include <iostream>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace dbsp_native {
 
@@ -40,9 +44,18 @@ public:
     if (internal_query_depth > 0) {
       return;
     }
-    // GetCurrentQuery() is already cleared by the time QueryEnd fires:
-    // remember the text here for end-of-query classification
-    last_query_ = context.GetCurrentQuery();
+    if (!get_cdc_manager().is_auto_sync_enabled()) {
+      stmt_ = {};
+      return; // no auto-sync: don't pay the parse on every statement
+    }
+    // Classify here: GetCurrentQuery() is already cleared by QueryEnd, and
+    // for autocommit statements the commit hook fires mid-query — before
+    // QueryEnd — so the commit-time sync scoping needs the classification
+    // of the in-flight statement (stmt_), not just per-txn accumulation
+    stmt_ = classify(context.GetCurrentQuery());
+    if (context.transaction.HasActiveTransaction()) {
+      fold_into_txn(stmt_);
+    }
   }
 
   void TransactionBegin(duckdb::MetaTransaction &transaction,
@@ -97,16 +110,40 @@ public:
     }
 
     try {
-      if (capture_.active && !capture_.dirty &&
+      if (capture_.active && !capture_.dirty && !capture_.unknown_writes &&
           apply_captured(context, manager)) {
         capture_ = {};
         return; // O(delta) fast path served this commit
       }
+
+      // H1: scope the fallback sync to the tables this transaction wrote.
+      // Autocommit commits fire mid-statement, before QueryEnd folded the
+      // in-flight classification — fold it now.
+      if (!capture_.saw_statements && stmt_.kind != StmtClass::NONE) {
+        fold_into_txn(stmt_);
+      }
+      const bool know_all_writes =
+          capture_.saw_statements && !capture_.unknown_writes;
+      std::vector<std::string> touched(capture_.touched.begin(),
+                                       capture_.touched.end());
       capture_ = {};
+
+      if (know_all_writes && touched.empty()) {
+        return; // read-only commit: nothing can have changed
+      }
       // The transaction has already committed successfully at this point.
       // We can safely read the post-commit state and pass the transaction
-      // to sync_all for proper catalog access.
-      manager.sync_all(context, &transaction);
+      // for proper catalog access.
+      if (know_all_writes) {
+        manager.sync_tables(context, touched,
+                            manager.parallel_sync_enabled() &&
+                                touched.size() > 1,
+                            &transaction);
+      } else {
+        // Writes we could not attribute (Appender API, multi-statement,
+        // unparseable SQL): scan everything, as before H1
+        manager.sync_all(context, &transaction);
+      }
     } catch (const std::exception &ex) {
       std::cerr << "DBSP Auto-CDC error: " << ex.what() << "\n";
     } catch (...) {
@@ -126,31 +163,64 @@ private:
   struct TxnCapture {
     bool active = false;
     bool dirty = false;
+    // H1 sync scoping: which tables this transaction wrote, and whether we
+    // saw/classified every statement. Writes we could not attribute
+    // (unparseable, multi-statement, unknown statement kinds) force a full
+    // sync; a transaction with zero seen statements (e.g. the Appender API
+    // bypasses query hooks entirely) also forces a full sync.
+    bool saw_statements = false;
+    bool unknown_writes = false;
+    std::unordered_set<std::string> touched;
     // per tracked table: captured append delta + local rows consumed so far
     std::unordered_map<std::string, std::pair<DuckDBZSet, duckdb::idx_t>>
         appends;
   };
   TxnCapture capture_;
-  std::string last_query_; // captured at QueryBegin
 
-  void classify_and_capture(duckdb::ClientContext &context) {
-    const std::string query = std::move(last_query_);
-    last_query_.clear();
-    if (query.empty()) {
-      return;
+  // Classification of one SQL statement (computed at QueryBegin)
+  struct StmtClass {
+    enum Kind {
+      NONE,        // empty / not seen
+      READ,        // changes nothing
+      INSERT_OK,   // plain INSERT: capturable append
+      WRITE_KNOWN, // write with a known target table (DELETE/UPDATE/upsert)
+      WRITE_UNKNOWN // anything else that might write anywhere
+    };
+    Kind kind = NONE;
+    std::string table;   // INSERT_OK / WRITE_KNOWN target
+    std::string text;    // original statement (INSERT capture needs it)
+  };
+  StmtClass stmt_;
+
+  // H2 guard cache: one internal connection + a prepared COUNT(*) per table
+  std::unique_ptr<duckdb::Connection> guard_con_;
+  std::unordered_map<std::string, duckdb::unique_ptr<duckdb::PreparedStatement>>
+      count_stmts_;
+
+  static std::string base_table_name(const duckdb::TableRef *ref) {
+    if (ref && ref->type == duckdb::TableReferenceType::BASE_TABLE) {
+      return ref->Cast<duckdb::BaseTableRef>().table_name;
     }
+    return {};
+  }
+
+  StmtClass classify(const std::string &query) {
+    StmtClass out;
+    if (query.empty()) {
+      return out;
+    }
+    out.text = query;
     duckdb::Parser parser;
     try {
       parser.ParseQuery(query);
     } catch (...) {
-      capture_.dirty = true; // unparseable: assume the worst
-      return;
+      out.kind = StmtClass::WRITE_UNKNOWN; // unparseable: assume the worst
+      return out;
     }
     if (parser.statements.size() != 1) {
-      if (!parser.statements.empty()) {
-        capture_.dirty = true; // multi-statement: classify conservatively
-      }
-      return;
+      out.kind = parser.statements.empty() ? StmtClass::NONE
+                                           : StmtClass::WRITE_UNKNOWN;
+      return out;
     }
     auto &stmt = *parser.statements[0];
     switch (stmt.type) {
@@ -158,25 +228,71 @@ private:
     case duckdb::StatementType::EXPLAIN_STATEMENT:
     case duckdb::StatementType::PREPARE_STATEMENT:
     case duckdb::StatementType::TRANSACTION_STATEMENT:
-      return; // reads change nothing
-    case duckdb::StatementType::INSERT_STATEMENT:
-      break; // candidate for capture
+      out.kind = StmtClass::READ;
+      return out;
+    case duckdb::StatementType::INSERT_STATEMENT: {
+      auto &insert = stmt.Cast<duckdb::InsertStatement>();
+      out.table = insert.table;
+      out.kind = insert.on_conflict_info ? StmtClass::WRITE_KNOWN
+                                         : StmtClass::INSERT_OK;
+      return out;
+    }
+    case duckdb::StatementType::DELETE_STATEMENT: {
+      auto &del = stmt.Cast<duckdb::DeleteStatement>();
+      out.table = base_table_name(del.table.get());
+      out.kind =
+          out.table.empty() ? StmtClass::WRITE_UNKNOWN : StmtClass::WRITE_KNOWN;
+      return out;
+    }
+    case duckdb::StatementType::UPDATE_STATEMENT: {
+      auto &upd = stmt.Cast<duckdb::UpdateStatement>();
+      out.table = base_table_name(upd.table.get());
+      out.kind =
+          out.table.empty() ? StmtClass::WRITE_UNKNOWN : StmtClass::WRITE_KNOWN;
+      return out;
+    }
     default:
-      capture_.dirty = true; // any other write: scan-diff at commit
+      out.kind = StmtClass::WRITE_UNKNOWN;
+      return out;
+    }
+  }
+
+  // Merge one statement's classification into the transaction's sync scope
+  void fold_into_txn(const StmtClass &c) {
+    if (c.kind == StmtClass::NONE) {
       return;
     }
+    capture_.saw_statements = true;
+    switch (c.kind) {
+    case StmtClass::READ:
+      break;
+    case StmtClass::INSERT_OK:
+    case StmtClass::WRITE_KNOWN:
+      if (get_cdc_manager().is_table_tracked(c.table)) {
+        capture_.touched.insert(c.table);
+      }
+      if (c.kind == StmtClass::WRITE_KNOWN) {
+        capture_.dirty = true; // not capturable, but the target is known
+      }
+      break;
+    default:
+      capture_.dirty = true;
+      capture_.unknown_writes = true;
+      break;
+    }
+  }
 
-    auto &insert = stmt.Cast<duckdb::InsertStatement>();
-    if (insert.on_conflict_info) {
-      capture_.dirty = true; // upsert can modify existing rows
-      return;
+  void classify_and_capture(duckdb::ClientContext &context) {
+    const StmtClass c = std::move(stmt_);
+    stmt_ = {};
+    if (c.kind != StmtClass::INSERT_OK) {
+      return; // scoping already folded at QueryBegin; only capture remains
     }
     auto &manager = get_cdc_manager();
-    if (!manager.is_table_tracked(insert.table)) {
+    if (!manager.is_table_tracked(c.table)) {
       return; // untracked target: irrelevant to views
     }
-
-    capture_appended_rows(context, insert.table);
+    capture_appended_rows(context, c.table);
     capture_.active = true;
   }
 
@@ -255,19 +371,46 @@ private:
 
   // Validate every captured table against the committed COUNT(*) and, if
   // all match, feed the captured deltas straight into propagation
+  // Guard COUNT(*) through a cached connection + prepared statements:
+  // parsing/binding/planning the count per commit was most of the fast
+  // path's cost (H2)
+  int64_t committed_count(duckdb::ClientContext &context,
+                          const std::string &table) {
+    InternalQueryGuard guard;
+    if (!guard_con_) {
+      guard_con_ = std::make_unique<duckdb::Connection>(
+          duckdb::DatabaseInstance::GetDatabase(context));
+    }
+    auto it = count_stmts_.find(table);
+    if (it == count_stmts_.end()) {
+      auto prep =
+          guard_con_->Prepare("SELECT COUNT(*) FROM \"" + table + "\"");
+      if (!prep || prep->HasError()) {
+        return -1;
+      }
+      it = count_stmts_.emplace(table, std::move(prep)).first;
+    }
+    auto res = it->second->Execute();
+    if (!res || res->HasError()) {
+      count_stmts_.erase(it); // schema may have changed: re-prepare next time
+      return -1;
+    }
+    auto chunk = res->Fetch();
+    if (!chunk || chunk->size() == 0) {
+      return -1;
+    }
+    return chunk->GetValue(0, 0).GetValue<int64_t>();
+  }
+
   bool apply_captured(duckdb::ClientContext &context, CDCManager &manager) {
     if (capture_.appends.empty()) {
       return true; // clean read-only transaction: nothing to sync
     }
-    InternalQueryGuard guard;
-    auto &db = duckdb::DatabaseInstance::GetDatabase(context);
-    duckdb::Connection con(db);
     for (const auto &[table, slot] : capture_.appends) {
-      auto res = con.Query("SELECT COUNT(*) FROM \"" + table + "\"");
-      if (!res || res->HasError()) {
+      const int64_t actual = committed_count(context, table);
+      if (actual < 0) {
         return false;
       }
-      const int64_t actual = res->GetValue(0, 0).GetValue<int64_t>();
       int64_t captured = 0;
       for (const auto &[row, w] : slot.first) {
         captured += w;
