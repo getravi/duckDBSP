@@ -131,10 +131,14 @@ tree (one shared SourceNode per base table) from the logical plan:
   rule incl. the Δl⋈Δr self-join term), CROSS_PRODUCT, DISTINCT, and
   UNION [ALL] / INTERSECT [ALL] / EXCEPT [ALL] (`PlanJoinNode`,
   `PlanDistinctNode`, `PlanSetOpNode`, B3)
+- WINDOW — BoundWindowExpressions mapped onto `NativeWindowView`, embedded
+  mid-circuit via `EmbeddedViewNode`; non-recursive CTEs
+  (MATERIALIZED_CTE + CTE_REF) with the definition subtree built once and
+  shared by all references (B4)
 
-Any other operator (outer joins, window functions, ORDER BY/LIMIT, CTEs)
-yields a DBSP-E110 error internally and `create_view` falls back to the SQL
-parser transparently. B4 extends coverage; B5 makes the planner the default.
+Any other operator (outer joins, ORDER BY/LIMIT, correlated subqueries,
+recursive CTEs) yields a DBSP-E110 error internally and `create_view` falls
+back to the SQL parser transparently. B5 makes the planner the default.
 
 ### 3b. SQL Parser (`src/dbsp_sql_parser.hpp`)
 

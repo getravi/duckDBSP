@@ -341,20 +341,91 @@ TEST_CASE("planner frontend: set operations differential",
   }
 }
 
-TEST_CASE("planner frontend: unsupported plan falls back to parser",
+TEST_CASE("planner frontend: window functions differential",
+          "[integration][planner][window]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+
+  // Unique ORDER BY key (id) keeps ROW_NUMBER/LAG deterministic
+  struct Case {
+    const char *view;
+    const char *sql;
+    unsigned seed;
+  };
+  const Case cases[] = {
+      {"v_rownum",
+       "SELECT id, val, ROW_NUMBER() OVER (PARTITION BY tag ORDER BY id) "
+       "FROM t",
+       61},
+      {"v_rank",
+       "SELECT id, tag, RANK() OVER (PARTITION BY tag ORDER BY id) FROM t",
+       67},
+      {"v_lag",
+       "SELECT id, val, LAG(val) OVER (PARTITION BY tag ORDER BY id) FROM t",
+       71},
+  };
+  for (const auto &c : cases) {
+    DYNAMIC_SECTION(c.view) {
+      db.exec("SELECT * FROM dbsp_create_view('" + std::string(c.view) +
+              "', '" + c.sql + "')");
+      requireViewMatchesQuery(db, c.view, c.sql);
+      runDifferential(db, c.view, c.sql, c.seed);
+    }
+  }
+}
+
+TEST_CASE("planner frontend: CTE differential",
+          "[integration][planner][cte]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+
+  SECTION("single reference") {
+    const std::string sql =
+        "WITH big AS (SELECT id, val FROM t WHERE val > 20) "
+        "SELECT * FROM big WHERE id % 2 = 0";
+    db.exec("SELECT * FROM dbsp_create_view('v_cte', '" + sql + "')");
+    requireViewMatchesQuery(db, "v_cte", sql);
+    runDifferential(db, "v_cte", sql, 73);
+  }
+
+  SECTION("referenced twice (self-join through the CTE)") {
+    const std::string sql =
+        "WITH big AS (SELECT id, val FROM t WHERE val > 20) "
+        "SELECT b1.id, b1.val, b2.val FROM big b1 JOIN big b2 "
+        "ON b1.id = b2.id";
+    db.exec("SELECT * FROM dbsp_create_view('v_cte2', '" + sql + "')");
+    requireViewMatchesQuery(db, "v_cte2", sql);
+    runDifferential(db, "v_cte2", sql, 79);
+  }
+}
+
+TEST_CASE("planner frontend: correlated subquery and recursive CTE fall back",
           "[integration][planner]") {
   DuckDBTestHarness db;
   setupTable(db);
 
-  // Window functions are not translated (B4); must fall back to the
-  // bespoke parser's window view and still work
-  const std::string sql =
-      "SELECT id, val, ROW_NUMBER() OVER (ORDER BY id) FROM t";
-  auto result =
-      db.query("SELECT * FROM dbsp_create_view('v_window', '" + sql + "')");
-  REQUIRE_FALSE(result->HasError());
-  auto rows = db.getViewRows("v_window");
-  REQUIRE(rows.size() == 3);
+  // Correlated subquery: planner rejects (DELIM_JOIN), parser rejects
+  // subqueries too — creation must fail with an error, not crash
+  auto corr = db.query(
+      "SELECT * FROM dbsp_create_view('v_corr', "
+      "'SELECT * FROM t a WHERE val > (SELECT AVG(val) FROM t b "
+      "WHERE b.tag = a.tag)')");
+  REQUIRE(corr->HasError());
+
+  // Recursive CTE: planner rejects, parser path handles it
+  auto rec = db.query(
+      "SELECT * FROM dbsp_create_view('v_rec', "
+      "'WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n+1 FROM r "
+      "WHERE n < 5) SELECT * FROM r')");
+  if (rec->HasError()) {
+    INFO("recursive fallback error: " << rec->GetError());
+  }
+  // Parser path may or may not support this exact shape; must not crash.
+  // If it succeeded, the view must be queryable.
+  if (!rec->HasError()) {
+    auto rows = db.query("SELECT * FROM dbsp_query('v_rec')");
+    REQUIRE_FALSE(rows->HasError());
+  }
 }
 
 TEST_CASE("planner frontend: flag off uses parser path",

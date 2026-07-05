@@ -154,9 +154,10 @@ first translates view SQL through DuckDB's own binder/planner instead of the
 bespoke parser. Currently covers scan/filter/projection plans (arbitrary
 expressions, function calls, mixed AND/OR predicates), GROUP BY aggregation
 (multiple aggregates, expression keys, HAVING, global aggregates), inner
-joins (equi + residual predicates), cross joins, DISTINCT, and
-UNION/INTERSECT/EXCEPT (ALL and DISTINCT); anything else falls back to the
-bespoke parser transparently.
+joins (equi + residual predicates), cross joins, DISTINCT,
+UNION/INTERSECT/EXCEPT (ALL and DISTINCT), window functions over plain
+columns, and non-recursive CTEs; anything else falls back to the bespoke
+parser transparently.
 
 ```sql
 SELECT * FROM dbsp_use_planner(true);   -- Enable

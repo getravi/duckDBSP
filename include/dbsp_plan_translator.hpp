@@ -8,13 +8,18 @@
 // LogicalOperator tree is walked and mapped onto circuit nodes; bound
 // expressions are evaluated row-at-a-time through ExpressionExecutor.
 //
-// Current scope (B1-B3):
+// Current scope (B1-B4):
 //   B1: LOGICAL_GET -> LOGICAL_FILTER -> LOGICAL_PROJECTION chains
 //   B2: LOGICAL_AGGREGATE_AND_GROUP_BY (multi-aggregate, expression keys;
 //       HAVING arrives as a FILTER above the aggregate — no special code)
 //   B3: LOGICAL_COMPARISON_JOIN (inner equi + residual comparisons),
 //       LOGICAL_CROSS_PRODUCT, LOGICAL_DISTINCT, LOGICAL_UNION /
 //       LOGICAL_INTERSECT / LOGICAL_EXCEPT (ALL and DISTINCT)
+//   B4: LOGICAL_WINDOW (column-ref partitions/orders/args, mapped onto the
+//       proven NativeWindowView via EmbeddedViewNode), LOGICAL_MATERIALIZED_CTE
+//       + LOGICAL_CTE_REF (definition subtree built once, shared by refs).
+//       Correlated subqueries (DELIM_JOIN) and recursive CTEs are rejected
+//       with explicit messages.
 // Any other operator yields a DBSP-E110 error naming the operator;
 // CDCManager::create_view falls back to the bespoke parser transparently.
 //
@@ -26,6 +31,7 @@
 
 #include "dbsp_circuit_views.hpp"
 #include "dbsp_errors.hpp"
+#include "dbsp_window_view.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -33,14 +39,19 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
+#include "duckdb/planner/operator/logical_window.hpp"
 
 #include <memory>
 #include <set>
@@ -120,7 +131,10 @@ struct PlanOpSpec {
     AGGREGATE,   // PlanAggregateNode (exprs = group keys)
     JOIN,        // PlanJoinNode (inner equi + residual comparisons)
     DISTINCT,    // PlanDistinctNode
-    SET_OP       // PlanSetOpNode
+    SET_OP,      // PlanSetOpNode
+    WINDOW,      // NativeWindowView wrapped in an EmbeddedViewNode
+    CTE,         // materialized CTE: children = {definition, main query}
+    CTE_REF      // reads the shared output of a CTE definition
   };
 
   // Comparison between a left-side and a right-side bound expression
@@ -145,6 +159,10 @@ struct PlanOpSpec {
   std::vector<JoinCond> residual_conds;          // JOIN: other comparisons
   duckdb::vector<duckdb::LogicalType> left_types, right_types; // JOIN
   SetOp set_op = SetOp::UNION_ALL;               // SET_OP
+  std::vector<NativeWindowView::WindowDef> window_defs;   // WINDOW
+  std::vector<ColumnInfo> window_source_cols;             // WINDOW
+  std::vector<ColumnInfo> window_result_cols;             // WINDOW
+  duckdb::idx_t cte_index = 0;                   // CTE / CTE_REF
 };
 
 // Incremental GROUP BY aggregation over bound expressions: retracts the old
@@ -701,6 +719,39 @@ private:
   bool has_output_ = false;
 };
 
+// Runs an existing NativeMaterializedView as a circuit node fed from any
+// upstream node (not just a base table). Used for view types with proven
+// incremental logic that isn't decomposed into fine-grained nodes yet —
+// currently NativeWindowView. The wrapped view is constructed with
+// kInputName as its source table; every circuit step feeds it the upstream
+// delta and exposes the view's own delta as this node's output.
+class EmbeddedViewNode : public dbsp::Node {
+public:
+  using InputFn = std::function<const DuckDBZSet &()>;
+  static constexpr const char *kInputName = "__plan_embedded_input__";
+
+  EmbeddedViewNode(dbsp::NodeId id, InputFn input_fn,
+                   std::unique_ptr<NativeMaterializedView> view)
+      : dbsp::Node(id, view->name() + "_embedded"),
+        input_fn_(std::move(input_fn)), view_(std::move(view)) {}
+
+  void step() override {
+    // The wrapped view clears its delta on every apply_changes call, so an
+    // empty upstream delta correctly yields an empty output
+    view_->apply_changes(kInputName, input_fn_());
+  }
+
+  void reset() override { view_->reset(); }
+
+  bool has_output() const override { return !view_->get_delta().empty(); }
+
+  const DuckDBZSet &output() const { return view_->get_delta(); }
+
+private:
+  InputFn input_fn_;
+  std::unique_ptr<NativeMaterializedView> view_;
+};
+
 // Circuit view built from a translated plan tree. One SourceNode per base
 // table (shared across subtrees, e.g. self-joins); apply_changes pushes the
 // delta into the matching source and steps the whole circuit once.
@@ -900,6 +951,28 @@ private:
           circuit_.next_node_id(), std::move(inputs), spec.set_op));
       return [node]() -> const DuckDBZSet & { return node->output(); };
     }
+    case PlanOpSpec::Kind::WINDOW: {
+      OutputFn child = build(*spec.children[0], keep_alive);
+      TableSchema source_schema;
+      source_schema.table_name = EmbeddedViewNode::kInputName;
+      source_schema.columns = spec.window_source_cols;
+      TableSchema window_schema;
+      window_schema.table_name = name_ + "_window";
+      window_schema.columns = spec.window_result_cols;
+      auto view = std::make_unique<NativeWindowView>(
+          name_ + "_window", "", EmbeddedViewNode::kInputName, window_schema,
+          source_schema, spec.window_defs);
+      auto *node = circuit_.add_node(std::make_unique<EmbeddedViewNode>(
+          circuit_.next_node_id(), std::move(child), std::move(view)));
+      return [node]() -> const DuckDBZSet & { return node->output(); };
+    }
+    case PlanOpSpec::Kind::CTE: {
+      // Build the definition once; all CTE_REFs share its output
+      cte_outputs_[spec.cte_index] = build(*spec.children[0], keep_alive);
+      return build(*spec.children[1], keep_alive);
+    }
+    case PlanOpSpec::Kind::CTE_REF:
+      return cte_outputs_.at(spec.cte_index);
     }
     // Unreachable; keeps compilers happy
     static DuckDBZSet empty;
@@ -910,6 +983,7 @@ private:
   TableSchema schema_;
   std::unordered_map<std::string, RowSource *> sources_;
   std::vector<std::string> source_order_;
+  std::unordered_map<duckdb::idx_t, OutputFn> cte_outputs_;
   RowSink *sink_ = nullptr;
 };
 
@@ -995,6 +1069,20 @@ private:
       case duckdb::LogicalOperatorType::LOGICAL_INTERSECT:
       case duckdb::LogicalOperatorType::LOGICAL_EXCEPT:
         return visit_set_operation(op.Cast<duckdb::LogicalSetOperation>());
+      case duckdb::LogicalOperatorType::LOGICAL_WINDOW:
+        return visit_window(op.Cast<duckdb::LogicalWindow>());
+      case duckdb::LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+        return visit_cte(op.Cast<duckdb::LogicalMaterializedCTE>());
+      case duckdb::LogicalOperatorType::LOGICAL_CTE_REF:
+        return visit_cte_ref(op.Cast<duckdb::LogicalCTERef>());
+      case duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN:
+      case duckdb::LogicalOperatorType::LOGICAL_DELIM_GET:
+        return unsupported(
+            "correlated subquery (DELIM_JOIN) — rewrite as a JOIN "
+            "or create an intermediate view");
+      case duckdb::LogicalOperatorType::LOGICAL_RECURSIVE_CTE:
+        return unsupported(
+            "recursive CTE — handled by the parser frontend");
       default:
         return unsupported("logical operator " + op.GetName());
       }
@@ -1290,6 +1378,257 @@ private:
       columns = std::move(first_columns);
       return spec;
     }
+
+    // Extract a column index from a bound expression; -1 if not a plain ref
+    static int column_ref(const duckdb::Expression &expr) {
+      if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
+        return -1;
+      }
+      return static_cast<int>(
+          expr.Cast<duckdb::BoundReferenceExpression>().index);
+    }
+
+    // Extract a constant int64; false if not a non-NULL constant
+    static bool constant_int(const duckdb::Expression &expr, int64_t &out) {
+      if (expr.GetExpressionClass() !=
+          duckdb::ExpressionClass::BOUND_CONSTANT) {
+        return false;
+      }
+      const auto &val = expr.Cast<duckdb::BoundConstantExpression>().value;
+      if (val.IsNull() || !val.type().IsNumeric()) {
+        return false;
+      }
+      out = val.GetValue<int64_t>();
+      return true;
+    }
+
+    SpecPtr visit_window(duckdb::LogicalWindow &op) {
+      auto child = visit(*op.children[0]);
+      if (!child) {
+        return nullptr;
+      }
+      auto spec = std::make_unique<PlanOpSpec>();
+      spec->kind = PlanOpSpec::Kind::WINDOW;
+      spec->window_source_cols = columns;
+
+      for (const auto &expr : op.expressions) {
+        if (expr->GetExpressionClass() !=
+            duckdb::ExpressionClass::BOUND_WINDOW) {
+          return unsupported("non-window expression in WINDOW");
+        }
+        auto &w = expr->Cast<duckdb::BoundWindowExpression>();
+        if (w.filter_expr || w.distinct || w.ignore_nulls ||
+            !w.arg_orders.empty() ||
+            w.exclude_clause != duckdb::WindowExcludeMode::NO_OTHER) {
+          return unsupported("window FILTER/DISTINCT/IGNORE NULLS/EXCLUDE");
+        }
+
+        NativeWindowView::WindowDef def;
+        def.alias = expr->GetName();
+        def.start = w.start;
+        def.end = w.end;
+
+        for (const auto &p : w.partitions) {
+          int idx = column_ref(*p);
+          if (idx < 0) {
+            return unsupported("window PARTITION BY expression (use a "
+                               "plain column)");
+          }
+          def.partition_indices.push_back(static_cast<size_t>(idx));
+        }
+        for (const auto &o : w.orders) {
+          int idx = column_ref(*o.expression);
+          if (idx < 0) {
+            return unsupported("window ORDER BY expression (use a plain "
+                               "column)");
+          }
+          NativeSortView::SortColumn sc;
+          sc.column_idx = static_cast<size_t>(idx);
+          sc.ascending = o.type != duckdb::OrderType::DESCENDING;
+          sc.nulls_first = o.null_order == duckdb::OrderByNullType::NULLS_FIRST;
+          def.sort_columns.push_back(sc);
+        }
+
+        int64_t n = 0;
+        switch (w.GetExpressionType()) {
+        case duckdb::ExpressionType::WINDOW_ROW_NUMBER:
+          def.function = "ROW_NUMBER";
+          break;
+        case duckdb::ExpressionType::WINDOW_RANK:
+          def.function = "RANK";
+          break;
+        case duckdb::ExpressionType::WINDOW_RANK_DENSE:
+          def.function = "DENSE_RANK";
+          break;
+        case duckdb::ExpressionType::WINDOW_NTILE:
+          def.function = "NTILE";
+          if (w.children.empty() || !constant_int(*w.children[0], n)) {
+            return unsupported("NTILE with non-constant bucket count");
+          }
+          def.offset = static_cast<int>(n);
+          break;
+        case duckdb::ExpressionType::WINDOW_LAG:
+        case duckdb::ExpressionType::WINDOW_LEAD: {
+          def.function = w.GetExpressionType() ==
+                                 duckdb::ExpressionType::WINDOW_LAG
+                             ? "LAG"
+                             : "LEAD";
+          if (w.children.empty()) {
+            return unsupported(def.function + " without argument");
+          }
+          def.arg_column_idx = column_ref(*w.children[0]);
+          if (def.arg_column_idx < 0) {
+            return unsupported(def.function +
+                               " over an expression (use a plain column)");
+          }
+          def.offset = 1;
+          if (w.offset_expr) {
+            if (!constant_int(*w.offset_expr, n)) {
+              return unsupported(def.function + " with non-constant offset");
+            }
+            def.offset = static_cast<int>(n);
+          }
+          if (w.default_expr) {
+            return unsupported(def.function + " with a default value");
+          }
+          break;
+        }
+        case duckdb::ExpressionType::WINDOW_FIRST_VALUE:
+        case duckdb::ExpressionType::WINDOW_LAST_VALUE:
+        case duckdb::ExpressionType::WINDOW_NTH_VALUE: {
+          auto t = w.GetExpressionType();
+          def.function =
+              t == duckdb::ExpressionType::WINDOW_FIRST_VALUE
+                  ? "FIRST_VALUE"
+                  : t == duckdb::ExpressionType::WINDOW_LAST_VALUE
+                        ? "LAST_VALUE"
+                        : "NTH_VALUE";
+          if (w.children.empty()) {
+            return unsupported(def.function + " without argument");
+          }
+          def.arg_column_idx = column_ref(*w.children[0]);
+          if (def.arg_column_idx < 0) {
+            return unsupported(def.function +
+                               " over an expression (use a plain column)");
+          }
+          if (t == duckdb::ExpressionType::WINDOW_NTH_VALUE) {
+            if (w.children.size() < 2 || !constant_int(*w.children[1], n)) {
+              return unsupported("NTH_VALUE with non-constant N");
+            }
+            def.offset = static_cast<int>(n);
+          }
+          break;
+        }
+        case duckdb::ExpressionType::WINDOW_AGGREGATE: {
+          std::string fn =
+              duckdb::StringUtil::Upper(w.aggregate ? w.aggregate->name : "");
+          if (fn == "COUNT_STAR") {
+            fn = "COUNT";
+          }
+          if (fn != "SUM" && fn != "COUNT" && fn != "AVG" && fn != "MIN" &&
+              fn != "MAX") {
+            return unsupported("window aggregate " + fn);
+          }
+          def.function = fn;
+          if (!w.children.empty()) {
+            def.arg_column_idx = column_ref(*w.children[0]);
+            if (def.arg_column_idx < 0) {
+              return unsupported(fn + " OVER an expression (use a plain "
+                                      "column)");
+            }
+          }
+          break;
+        }
+        default:
+          return unsupported(
+              "window function " +
+              duckdb::EnumUtil::ToString(w.GetExpressionType()));
+        }
+
+        // Frame offsets must be constants when boundaries use expressions
+        if (w.start == duckdb::WindowBoundary::EXPR_PRECEDING_ROWS) {
+          if (!w.start_expr || !constant_int(*w.start_expr, n)) {
+            return unsupported("non-constant frame start");
+          }
+          def.start_offset = static_cast<int>(n);
+        }
+        if (w.end == duckdb::WindowBoundary::EXPR_FOLLOWING_ROWS) {
+          if (!w.end_expr || !constant_int(*w.end_expr, n)) {
+            return unsupported("non-constant frame end");
+          }
+          def.end_offset = static_cast<int>(n);
+        }
+
+        // NativeWindowView partitions all windows by the FIRST window's
+        // partition/order; additional windows must match it
+        if (!spec->window_defs.empty()) {
+          const auto &first = spec->window_defs[0];
+          bool same = first.partition_indices == def.partition_indices &&
+                      first.sort_columns.size() == def.sort_columns.size();
+          for (size_t i = 0; same && i < first.sort_columns.size(); i++) {
+            same = first.sort_columns[i].column_idx ==
+                       def.sort_columns[i].column_idx &&
+                   first.sort_columns[i].ascending ==
+                       def.sort_columns[i].ascending &&
+                   first.sort_columns[i].nulls_first ==
+                       def.sort_columns[i].nulls_first;
+          }
+          if (!same) {
+            return unsupported("multiple windows with different "
+                               "PARTITION BY / ORDER BY clauses");
+          }
+        }
+        spec->window_defs.push_back(std::move(def));
+      }
+
+      // Output: child columns then one column per window expression
+      duckdb::idx_t base = op.children[0]->types.size();
+      for (duckdb::idx_t i = 0; i < op.expressions.size(); i++) {
+        columns.push_back({op.expressions[i]->GetName(), op.types[base + i]});
+      }
+      spec->window_result_cols = columns;
+      spec->children.push_back(std::move(child));
+      return spec;
+    }
+
+    SpecPtr visit_cte(duckdb::LogicalMaterializedCTE &op) {
+      auto def = visit(*op.children[0]);
+      if (!def) {
+        return nullptr;
+      }
+      cte_columns[op.table_index] = columns;
+      auto main = visit(*op.children[1]);
+      if (!main) {
+        return nullptr;
+      }
+      auto spec = std::make_unique<PlanOpSpec>();
+      spec->kind = PlanOpSpec::Kind::CTE;
+      spec->cte_index = op.table_index;
+      spec->children.push_back(std::move(def));
+      spec->children.push_back(std::move(main));
+      // columns already reflect the main query's output
+      return spec;
+    }
+
+    SpecPtr visit_cte_ref(duckdb::LogicalCTERef &op) {
+      auto it = cte_columns.find(op.cte_index);
+      if (it == cte_columns.end()) {
+        return unsupported("reference to an untranslated CTE");
+      }
+      auto spec = std::make_unique<PlanOpSpec>();
+      spec->kind = PlanOpSpec::Kind::CTE_REF;
+      spec->cte_index = op.cte_index;
+      columns.clear();
+      for (duckdb::idx_t i = 0; i < op.chunk_types.size(); i++) {
+        std::string name = i < op.bound_columns.size()
+                               ? op.bound_columns[i]
+                               : it->second[i].name;
+        columns.push_back({name, op.chunk_types[i]});
+      }
+      return spec;
+    }
+
+    std::unordered_map<duckdb::idx_t, std::vector<ColumnInfo>> cte_columns;
 
     SpecPtr visit_get(duckdb::LogicalGet &op) {
       auto table_entry = op.GetTable();

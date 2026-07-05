@@ -93,10 +93,15 @@ multi-source operator tree (one shared SourceNode per table). Set ops via
 `PlanSetOpNode` per-input multiplicity state (UNION [ALL] n-ary,
 INTERSECT/EXCEPT [ALL] binary). 37/37 green.
 
-**B4 — Window + CTEs (1 wk)**
-- LOGICAL_WINDOW → wrapped window node
-- CTE / recursive CTE plan shapes → existing combinators
-- Reject correlated-subquery plans (DELIM_JOIN) with a clear error
+**B4 — Window + CTEs (1 wk) — COMPLETE (2026-07-04)**
+Windows: BoundWindowExpressions mapped onto NativeWindowView, embedded
+mid-circuit via `EmbeddedViewNode` (generic adapter for proven view logic).
+Non-recursive CTEs: MATERIALIZED_CTE/CTE_REF plan shape (optimizer-off
+binder does not inline) — definition built once, shared by refs; no
+combinator needed. Recursive CTEs NOT translated (deviation: parser keeps
+them; found + filed a latent parser-path bug where recursive views through
+dbsp_create_view double their rows). DELIM_JOIN rejected with explicit
+message. 37/37 green.
 
 **B5 — Flip and delete (0.5 wk)**
 - Default `dbsp_use_planner` ON; run full suite both ways for one release

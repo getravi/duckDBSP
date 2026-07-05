@@ -154,10 +154,15 @@ unique_ptr<FunctionData> CreateViewBind(ClientContext &context,
   data->view_name = input.inputs[0].GetValue<string>();
   data->sql_or_table = input.inputs[1].GetValue<string>();
 
-  // Detect mode: if second arg starts with SELECT, it's SQL mode
+  // Detect mode: if second arg starts with SELECT or WITH (non-recursive
+  // CTEs), it's SQL mode. WITH RECURSIVE stays rejected here: the recursive
+  // path through this entry point produces duplicated rows (latent bug in
+  // the parser-path initialization); use CREATE MATERIALIZED VIEW DDL.
   string trimmed = data->sql_or_table;
   string upper = StringUtil::Upper(trimmed);
-  if (upper.rfind("SELECT", 0) == 0) {
+  bool starts_with = upper.rfind("WITH", 0) == 0;
+  bool starts_recursive = upper.rfind("WITH RECURSIVE", 0) == 0;
+  if (upper.rfind("SELECT", 0) == 0 || (starts_with && !starts_recursive)) {
     data->is_sql_mode = true;
   } else if (input.inputs.size() >= 4) {
     data->view_type = input.inputs[2].GetValue<string>();

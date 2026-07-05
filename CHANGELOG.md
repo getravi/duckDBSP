@@ -1,5 +1,25 @@
 # Changelog
 
+## Phase B4: Planner Frontend Windows + CTEs - Jul 2026
+
+### B4: Window functions and CTEs through the planner (Jul 4, 2026)
+- LOGICAL_WINDOW translated by mapping BoundWindowExpressions onto the
+  proven `NativeWindowView` (ROW_NUMBER, RANK, DENSE_RANK, NTILE, LAG,
+  LEAD, FIRST/LAST/NTH_VALUE, SUM/COUNT/AVG/MIN/MAX OVER), run mid-circuit
+  via the new `EmbeddedViewNode` adapter. Column-ref partitions/orders/args
+  and constant offsets/frames; anything fancier falls back.
+- Non-recursive CTEs: with the optimizer disabled DuckDB emits
+  LOGICAL_MATERIALIZED_CTE + LOGICAL_CTE_REF (no inlining) — the definition
+  subtree is built once and shared by all references.
+- Correlated subqueries (DELIM_JOIN) and recursive CTEs rejected with
+  explicit DBSP-E110 messages; both fall back transparently.
+- `dbsp_create_view` now accepts SQL starting with WITH (non-recursive).
+  WITH RECURSIVE stays rejected at that entry point: enabling it exposed a
+  latent parser-path bug (rows duplicated because view initialization
+  applies the base table once per reference) — tracked separately.
+- Differential tests: ROW_NUMBER/RANK/LAG windows, CTE single + double
+  reference (self-join through the CTE). 37/37 tests green.
+
 ## Phase B3: Planner Frontend Joins, Distinct, Set Ops - Jul 2026
 
 ### B3: Multi-source plans through the planner (Jul 4, 2026)
