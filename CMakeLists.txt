@@ -23,7 +23,7 @@ add_subdirectory(${DUCKDB_SOURCE_DIR} duckdb EXCLUDE_FROM_ALL)
 # Extension source
 # Extension build
 set(DUCKDB_MODULE_BASE_DIR "${DUCKDB_SOURCE_DIR}")
-set(DUCKDB_NORMALIZED_VERSION "v1.4.0")
+set(DUCKDB_NORMALIZED_VERSION "v1.5.4")
 set(DUCKDB_EXTENSION_DBSP_EXT_VERSION ${EXT_VERSION_DBSP})
 set(PARAMETERS "-warnings")
 build_loadable_extension(${TARGET_NAME} ${PARAMETERS}
@@ -63,4 +63,6 @@ target_include_directories(benchmark_runner PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
-target_link_libraries(benchmark_runner duckdb_static)
+target_link_libraries(benchmark_runner duckdb_static
+                      duckdb_generated_extension_loader
+                      core_functions_extension parquet_extension)

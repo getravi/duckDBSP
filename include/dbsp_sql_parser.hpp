@@ -19,6 +19,7 @@
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node/cte_node.hpp"
 #include "duckdb/parser/query_node/recursive_cte_node.hpp"
@@ -454,15 +455,22 @@ public:
       info.type = set_op.setop_type;
       info.all = set_op.setop_all;
 
-      if (set_op.left) {
-        info.left_view = set_op.left->ToString();
-        // Recursively extract sources from left child
-        extract_sources_from_node(set_op.left.get(), result.view_def);
+      // DuckDB 1.5+: SetOperationNode is n-ary (children vector)
+      if (set_op.children.size() != 2) {
+        result.error = "Set operations with " +
+                       std::to_string(set_op.children.size()) +
+                       " inputs not yet supported (only binary)";
+        return result;
       }
-      if (set_op.right) {
-        info.right_view = set_op.right->ToString();
+      if (set_op.children[0]) {
+        info.left_view = set_op.children[0]->ToString();
+        // Recursively extract sources from left child
+        extract_sources_from_node(set_op.children[0].get(), result.view_def);
+      }
+      if (set_op.children[1]) {
+        info.right_view = set_op.children[1]->ToString();
         // Recursively extract sources from right child
-        extract_sources_from_node(set_op.right.get(), result.view_def);
+        extract_sources_from_node(set_op.children[1].get(), result.view_def);
       }
 
       result.view_def.type =
@@ -807,8 +815,9 @@ public:
       }
     } else if (node->type == duckdb::QueryNodeType::SET_OPERATION_NODE) {
       auto &set_op = node->template Cast<duckdb::SetOperationNode>();
-      extract_sources_from_node(set_op.left.get(), def);
-      extract_sources_from_node(set_op.right.get(), def);
+      for (auto &set_child : set_op.children) {
+        extract_sources_from_node(set_child.get(), def);
+      }
     } else if (node->type == duckdb::QueryNodeType::RECURSIVE_CTE_NODE) {
       auto &rec = node->template Cast<duckdb::RecursiveCTENode>();
       extract_sources_from_node(rec.left.get(), def);
@@ -1202,14 +1211,21 @@ private:
     if (!expr)
       return false;
 
-    // Check this expression
     if (expr->type == duckdb::ExpressionType::SUBQUERY) {
       return true;
     }
 
-    // Note: For simplicity, just check the expression type
-    // A full recursive check would require more complex traversal
-    return false;
+    // Recurse: subqueries usually appear nested (e.g. `x > (SELECT ...)`)
+    bool found = false;
+    duckdb::ParsedExpressionIterator::EnumerateChildren(
+        *expr, [&](const duckdb::ParsedExpression &child) {
+          if (!found &&
+              has_subquery_expression(
+                  &const_cast<duckdb::ParsedExpression &>(child))) {
+            found = true;
+          }
+        });
+    return found;
   }
 
   // Helper to create error results with proper formatting

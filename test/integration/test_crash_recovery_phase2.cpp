@@ -49,7 +49,8 @@ TEST_CASE("Phase 2.1: Checkpoint saves Z-set state correctly",
   REQUIRE(view_result != nullptr);
   REQUIRE(view_result->size() == 2);
 
-  // Save checkpoint
+  // Save checkpoint (save_checkpoint is a no-op while recovery is disabled)
+  recovery_manager.set_recovery_enabled(true);
   REQUIRE(recovery_manager.save_checkpoint(*con.context));
 
   // Verify checkpoint file exists
@@ -96,7 +97,8 @@ TEST_CASE("Phase 2.2: Checkpoint restore recovers view results",
   size_t original_size = view_result->size();
   REQUIRE(original_size == 2);
 
-  // Save checkpoint
+  // Save checkpoint (save_checkpoint is a no-op while recovery is disabled)
+  recovery_manager.set_recovery_enabled(true);
   REQUIRE(recovery_manager.save_checkpoint(*con.context));
 
   // Simulate crash: reset CDC manager
@@ -146,7 +148,8 @@ TEST_CASE("Phase 2.3: Checkpoint checksum detects corruption",
   REQUIRE(cdc_manager.sync_table(*con.context, "test_data"));
   con.Commit();
 
-  // Save checkpoint
+  // Save checkpoint (save_checkpoint is a no-op while recovery is disabled)
+  recovery_manager.set_recovery_enabled(true);
   REQUIRE(recovery_manager.save_checkpoint(*con.context));
 
   // Get checkpoint path
@@ -213,6 +216,8 @@ TEST_CASE("Phase 2.4: Old checkpoints are cleaned up",
     REQUIRE(cdc_manager.sync_table(*con.context, "data"));
     con.Commit();
 
+    // save_checkpoint is a no-op while recovery is disabled
+    recovery_manager.set_recovery_enabled(true);
     REQUIRE(recovery_manager.save_checkpoint(*con.context));
 
     // Small delay to ensure different timestamps
@@ -274,7 +279,8 @@ TEST_CASE("Phase 2.5: Recovery uses checkpoint before resync",
   size_t expected_size = view_result->size();
   REQUIRE(expected_size > 0);
 
-  // Save checkpoint
+  // Save checkpoint (save_checkpoint is a no-op while recovery is disabled)
+  recovery_manager.set_recovery_enabled(true);
   auto start_save = std::chrono::steady_clock::now();
   REQUIRE(recovery_manager.save_checkpoint(*con.context));
   auto end_save = std::chrono::steady_clock::now();

@@ -38,7 +38,9 @@ add_library(catch2_main STATIC catch2_main.cpp)
 function(add_dbsp_test TEST_NAME)
     set(TEST_TARGET test_${TEST_NAME})
     add_executable(${TEST_TARGET} ${ARGN})
-    target_link_libraries(${TEST_TARGET} catch2_main duckdb_static)
+    target_link_libraries(${TEST_TARGET} catch2_main duckdb_static
+                          duckdb_generated_extension_loader
+                          core_functions_extension parquet_extension)
     add_test(NAME ${TEST_NAME} COMMAND ${TEST_TARGET})
 endfunction()
 
@@ -79,7 +81,9 @@ function(add_dbsp_integration_test TEST_NAME SOURCE)
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_checkpoint_format.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_wal_manager.cpp
     )
-    target_link_libraries(${TEST_TARGET} catch2_main duckdb_static)
+    target_link_libraries(${TEST_TARGET} catch2_main duckdb_static
+                          duckdb_generated_extension_loader
+                          core_functions_extension parquet_extension)
     add_test(NAME ${TEST_NAME} COMMAND ${TEST_TARGET})
 endfunction()
 

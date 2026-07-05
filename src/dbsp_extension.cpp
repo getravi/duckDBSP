@@ -53,28 +53,6 @@
 
 namespace duckdb {
 
-static void RegisterExtensionFunction(DatabaseInstance &instance,
-                                      CreateFunctionInfo &info) {
-  Connection con(instance);
-  con.BeginTransaction();
-  auto &catalog = Catalog::GetSystemCatalog(*con.context);
-  info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
-  catalog.CreateFunction(*con.context, info);
-  con.Commit();
-}
-
-static void RegisterExtensionFunction(DatabaseInstance &instance,
-                                      ScalarFunction &function) {
-  CreateScalarFunctionInfo info(function);
-  RegisterExtensionFunction(instance, info);
-}
-
-static void RegisterExtensionFunction(DatabaseInstance &instance,
-                                      TableFunction &function) {
-  CreateTableFunctionInfo info(function);
-  RegisterExtensionFunction(instance, info);
-}
-
 // Helper: Ensure DBSPContextState is attached to the context
 // This is necessary because OnConnectionOpened isn't always called for the
 // initial connection when loading the extension
@@ -1147,9 +1125,14 @@ public:
     std::cerr << "DBSP: OnConnectionOpened called (context: " << &context
               << ")\n";
 
-    // First-time initialization: recover from crash if needed
+    // First-time initialization: recover from crash if needed.
+    // Skip for DBSP's own helper connections (recovery itself opens
+    // connections; recursing here would re-enter recovery).
     static bool recovery_done = false;
-    if (!recovery_done) {
+    if (!recovery_done && dbsp_native::internal_query_depth == 0) {
+      // Set before recovering: connections opened during recovery must not
+      // re-trigger it.
+      recovery_done = true;
       auto &recovery_manager = dbsp_native::get_recovery_manager();
 
       // Get database path from context
@@ -1167,7 +1150,6 @@ public:
 
       // Perform recovery (will initialize persistence and load views)
       recovery_manager.recover_from_crash(context, db_path);
-      recovery_done = true;
     }
 
     // Attach our context state for transaction hooking
@@ -1181,23 +1163,24 @@ public:
   }
 };
 
-static void LoadInternal(DatabaseInstance &instance) {
+static void LoadInternal(ExtensionLoader &loader) {
+  auto &instance = loader.GetDatabaseInstance();
   auto &config = DBConfig::GetConfig(instance);
 
   // Register extension callback
-  config.extension_callbacks.push_back(make_uniq<DBSPExtensionCallback>());
+  ExtensionCallback::Register(config, make_shared_ptr<DBSPExtensionCallback>());
 
   // Register table functions
   TableFunction track_func("dbsp_track", {LogicalType::VARCHAR}, TrackFunc,
                            TrackBind);
-  RegisterExtensionFunction(instance, track_func);
+  loader.RegisterFunction(track_func);
 
   TableFunction create_view_func("dbsp_create_view",
                                  {LogicalType::VARCHAR, LogicalType::VARCHAR},
                                  CreateViewFunc, CreateViewBind);
   // Optional args for simple mode
   create_view_func.varargs = LogicalType::ANY;
-  RegisterExtensionFunction(instance, create_view_func);
+  loader.RegisterFunction(create_view_func);
 
   // Create Materialized View DDL support
   // Note: We cannot register actual SQL syntax here (ParserExtension needed for
@@ -1209,77 +1192,77 @@ static void LoadInternal(DatabaseInstance &instance) {
                                {LogicalType::VARCHAR, LogicalType::VARCHAR},
                                CreateMaterializedViewExecute,
                                CreateMaterializedViewBind);
-  RegisterExtensionFunction(instance, create_mv_func);
+  loader.RegisterFunction(create_mv_func);
 
   TableFunction insert_func("dbsp_notify_insert", {LogicalType::VARCHAR},
                             NotifyInsertFunc, NotifyBind);
   insert_func.varargs = LogicalType::ANY; // For column values
-  RegisterExtensionFunction(instance, insert_func);
+  loader.RegisterFunction(insert_func);
 
   TableFunction delete_func("dbsp_notify_delete", {LogicalType::VARCHAR},
                             NotifyDeleteFunc, NotifyBind);
   delete_func.varargs = LogicalType::ANY; // For column values
-  RegisterExtensionFunction(instance, delete_func);
+  loader.RegisterFunction(delete_func);
 
   TableFunction sync_func("dbsp_sync", {}, SyncFunc, SyncBind);
   sync_func.varargs = LogicalType::VARCHAR; // Optional table name
-  RegisterExtensionFunction(instance, sync_func);
+  loader.RegisterFunction(sync_func);
 
   TableFunction query_func("dbsp_query", {LogicalType::VARCHAR}, QueryFunc,
                            QueryBind);
-  RegisterExtensionFunction(instance, query_func);
+  loader.RegisterFunction(query_func);
 
   TableFunction list_views_func("dbsp_views", {}, ListViewsFunc, ListViewsBind);
-  RegisterExtensionFunction(instance, list_views_func);
+  loader.RegisterFunction(list_views_func);
 
   TableFunction list_tables_func("dbsp_tables", {}, ListTablesFunc,
                                  ListTablesBind);
-  RegisterExtensionFunction(instance, list_tables_func);
+  loader.RegisterFunction(list_tables_func);
 
   TableFunction deps_func("dbsp_deps", {LogicalType::VARCHAR}, DepsFunc,
                           DepsBind);
-  RegisterExtensionFunction(instance, deps_func);
+  loader.RegisterFunction(deps_func);
 
   TableFunction save_func("dbsp_save", {}, SaveFunc, SaveBind);
   save_func.varargs = LogicalType::VARCHAR;
-  RegisterExtensionFunction(instance, save_func);
+  loader.RegisterFunction(save_func);
 
   TableFunction load_func("dbsp_load", {}, LoadFunc, LoadBind);
   load_func.varargs = LogicalType::VARCHAR;
-  RegisterExtensionFunction(instance, load_func);
+  loader.RegisterFunction(load_func);
 
   TableFunction auto_sync_func("dbsp_auto_sync", {}, AutoSyncFunc,
                                AutoSyncBind);
   auto_sync_func.varargs = LogicalType::BOOLEAN;
-  RegisterExtensionFunction(instance, auto_sync_func);
+  loader.RegisterFunction(auto_sync_func);
 
   // Register scalar functions
   CreateScalarFunctionInfo drop_func_info(
       ScalarFunction("dbsp_drop_view", {LogicalType::VARCHAR},
                      LogicalType::VARCHAR, DropScalar));
-  RegisterExtensionFunction(instance, drop_func_info);
+  loader.RegisterFunction(drop_func_info);
 
   // Alias: dbsp_drop (used by tests and shorter API)
   CreateScalarFunctionInfo drop_alias_info(ScalarFunction(
       "dbsp_drop", {LogicalType::VARCHAR}, LogicalType::VARCHAR, DropScalar));
-  RegisterExtensionFunction(instance, drop_alias_info);
+  loader.RegisterFunction(drop_alias_info);
 
   CreateScalarFunctionInfo drop_cascade_func_info(
       ScalarFunction("dbsp_drop_view_cascade", {LogicalType::VARCHAR},
                      LogicalType::VARCHAR, DropCascadeScalar));
-  RegisterExtensionFunction(instance, drop_cascade_func_info);
+  loader.RegisterFunction(drop_cascade_func_info);
 
   // Alias: dbsp_drop_cascade (used by tests and shorter API)
   CreateScalarFunctionInfo drop_cascade_alias_info(
       ScalarFunction("dbsp_drop_cascade", {LogicalType::VARCHAR},
                      LogicalType::VARCHAR, DropCascadeScalar));
-  RegisterExtensionFunction(instance, drop_cascade_alias_info);
+  loader.RegisterFunction(drop_cascade_alias_info);
 
   // Initialize Parser Extension for SQL syntax support
   auto &extension_manager = instance.GetExtensionManager();
   // We need to register the parser extension
-  config.parser_extensions.push_back(
-      dbsp_native::CreateMaterializedViewParserExtension());
+  ParserExtension::Register(
+      config, dbsp_native::CreateMaterializedViewParserExtension());
 }
 
 #ifndef EXT_VERSION_DBSP
@@ -1295,9 +1278,7 @@ public:
   std::string Version() const override;
 };
 
-void DbspExtension::Load(ExtensionLoader &loader) {
-  LoadInternal(loader.GetDatabaseInstance());
-}
+void DbspExtension::Load(ExtensionLoader &loader) { LoadInternal(loader); }
 
 std::string DbspExtension::Name() { return "dbsp"; }
 
@@ -1307,19 +1288,8 @@ std::string DbspExtension::Version() const { return EXT_VERSION_DBSP; }
 
 extern "C" {
 
-DUCKDB_EXTENSION_API void dbsp_init(duckdb::DatabaseInstance &db) {
-  duckdb::ExtensionLoader loader(db, "dbsp");
+DUCKDB_CPP_EXTENSION_ENTRY(dbsp, loader) {
   duckdb::DbspExtension extension;
   extension.Load(loader);
-}
-
-DUCKDB_EXTENSION_API void
-dbsp_duckdb_cpp_init(duckdb::ExtensionLoader &loader) {
-  duckdb::DbspExtension extension;
-  extension.Load(loader);
-}
-
-DUCKDB_EXTENSION_API const char *dbsp_version() {
-  return duckdb::DuckDB::LibraryVersion();
 }
 }

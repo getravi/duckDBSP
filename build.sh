@@ -4,7 +4,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/build"
-DUCKDB_VERSION="v1.4.0"
+DUCKDB_VERSION="v1.5.4"
 
 echo "=== DBSP DuckDB Extension Build ==="
 echo ""

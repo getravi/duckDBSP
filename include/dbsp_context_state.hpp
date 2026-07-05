@@ -12,12 +12,20 @@ class DBSPContextState : public duckdb::ClientContextState {
 public:
   void TransactionBegin(duckdb::MetaTransaction &transaction,
                         duckdb::ClientContext &context) override {
+    if (internal_query_depth > 0) {
+      return;
+    }
     std::cerr << "DBSP: TransactionBegin hook called (context: " << &context
               << ")\n";
   }
 
   void TransactionCommit(duckdb::MetaTransaction &transaction,
                          duckdb::ClientContext &context) override {
+    // Skip commits from DBSP's own internal helper connections - recursing
+    // into CDCManager here deadlocks (issuing thread may hold struct_mutex_)
+    if (internal_query_depth > 0) {
+      return;
+    }
     std::cerr << "DBSP: TransactionCommit hook called (context: " << &context
               << ")\n";
 

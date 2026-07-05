@@ -97,11 +97,12 @@ bool DBSPRecoveryManager::load_views(duckdb::ClientContext &context) {
   try {
     auto &cdc_manager = get_cdc_manager();
 
-    // Query _dbsp_views table for all view definitions
-    auto result = context.Query(
-      "SELECT name, sql, sources FROM _dbsp_views ORDER BY created_at ASC",
-      false
-    );
+    // Query _dbsp_views table for all view definitions. Fresh connection:
+    // `context` may be mid-query (recovery runs inside table functions).
+    InternalQueryGuard guard;
+    duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+    auto result = con.Query(
+      "SELECT name, sql, sources FROM _dbsp_views ORDER BY created_at ASC");
 
     if (result->HasError()) {
       std::cerr << "Failed to load views: " << result->GetError() << std::endl;

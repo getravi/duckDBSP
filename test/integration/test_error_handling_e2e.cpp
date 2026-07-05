@@ -8,23 +8,33 @@ using namespace dbsp_native;
 TEST_CASE("End-to-end error handling", "[e2e][errors]") {
   DuckDBTestHarness db;
 
+  SECTION("ORDER BY views now supported (P3 sort/limit)") {
+    db.exec("CREATE TABLE orders (id INT, customer_id INT, amount INT)");
+    db.exec("SELECT * FROM dbsp_track('orders')");
+
+    auto result = db.query("SELECT * FROM dbsp_create_view('ordered', "
+                           "'SELECT customer_id, amount FROM orders "
+                           "ORDER BY amount DESC')");
+    REQUIRE_FALSE(result->HasError());
+  }
+
   SECTION("Parser error flows through to user") {
     // Create table
     db.exec("CREATE TABLE orders (id INT, customer_id INT, amount INT)");
     db.exec("SELECT * FROM dbsp_track('orders')");
 
-    // Try to create view with ORDER BY (unsupported feature)
-    auto result = db.query("SELECT * FROM dbsp_create_view('ordered', "
+    // Try to create view with a subquery in WHERE (unsupported feature)
+    auto result = db.query("SELECT * FROM dbsp_create_view('sub_view', "
                            "'SELECT customer_id, amount FROM orders "
-                           "ORDER BY amount DESC')");
+                           "WHERE amount > (SELECT AVG(amount) FROM orders)')");
 
     // Should fail with formatted error
     REQUIRE(result->HasError());
     std::string error = result->GetError();
 
     // Verify error contains expected elements
-    REQUIRE(error.find("DBSP-E102") != std::string::npos);
-    REQUIRE(error.find("ORDER BY") != std::string::npos);
+    REQUIRE(error.find("DBSP-E105") != std::string::npos);
+    REQUIRE(error.find("Subquer") != std::string::npos);
     REQUIRE(error.find("Workaround") != std::string::npos);
     REQUIRE(error.find("Documentation:") != std::string::npos);
   }

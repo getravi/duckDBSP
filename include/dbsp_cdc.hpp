@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <atomic>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -40,6 +41,18 @@
 #include <vector>
 
 namespace dbsp_native {
+
+// Marks queries DBSP issues on internal helper connections. Transaction hooks
+// must not recurse into CDCManager for these (deadlock: the issuing thread may
+// already hold struct_mutex_, which is not recursive).
+inline thread_local int internal_query_depth = 0;
+
+struct InternalQueryGuard {
+  InternalQueryGuard() { ++internal_query_depth; }
+  ~InternalQueryGuard() { --internal_query_depth; }
+  InternalQueryGuard(const InternalQueryGuard &) = delete;
+  InternalQueryGuard &operator=(const InternalQueryGuard &) = delete;
+};
 
 // Security validation functions
 
@@ -337,21 +350,14 @@ public:
     auto_sync_enabled_ = false;
   }
 
-  // Auto-sync (automatic CDC) control
-  void enable_auto_sync() {
-    std::unique_lock<std::shared_mutex> lock(struct_mutex_);
-    auto_sync_enabled_ = true;
-  }
+  // Auto-sync (automatic CDC) control. Flag is atomic so transaction hooks
+  // can check it without touching struct_mutex_ (hooks may fire on threads
+  // that already hold it).
+  void enable_auto_sync() { auto_sync_enabled_ = true; }
 
-  void disable_auto_sync() {
-    std::unique_lock<std::shared_mutex> lock(struct_mutex_);
-    auto_sync_enabled_ = false;
-  }
+  void disable_auto_sync() { auto_sync_enabled_ = false; }
 
-  bool is_auto_sync_enabled() const {
-    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
-    return auto_sync_enabled_;
-  }
+  bool is_auto_sync_enabled() const { return auto_sync_enabled_; }
 
   // Auto-sync all tracked tables (called from TransactionCommit hook)
   void auto_sync_all(duckdb::ClientContext &context,
@@ -556,7 +562,11 @@ public:
         "VALUES ('" + view_name + "', '" + escaped_sql + "', '" + sources_str + "', " +
         std::to_string(def.created_at) + ")";
 
-      auto res = context.Query(insert_sql, false);
+      // Use a fresh connection: `context` is mid-query (we run inside a table
+      // function on it), so context.Query() would block on the context lock.
+      InternalQueryGuard guard;
+      duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+      auto res = con.Query(insert_sql);
       // Ignore errors - persistence is best-effort
     } catch (const std::exception &e) {
       // Ignore persistence errors - log for debugging
@@ -1415,31 +1425,48 @@ public:
     return last_error_;
   }
 
-  // Initialize persistence table for storing view definitions
+  // Initialize persistence table for storing view definitions.
+  // Deliberately does NOT hold struct_mutex_ across the query: callers may
+  // already hold it (recovery can be triggered mid-sync), and shared_mutex is
+  // not recursive. The lock is only taken briefly to record errors.
   bool initialize_persistence_table(duckdb::ClientContext &context) {
-    std::unique_lock<std::shared_mutex> lock(struct_mutex_);
-
     try {
-      // Create _dbsp_views table if it doesn't exist
-      auto result = context.Query(
+      // Create _dbsp_views table if it doesn't exist. Fresh connection:
+      // `context` may be mid-query (recovery runs inside table functions).
+      InternalQueryGuard guard;
+      duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+      auto result = con.Query(
         "CREATE TABLE IF NOT EXISTS _dbsp_views ("
         "  name VARCHAR PRIMARY KEY,"
         "  sql VARCHAR NOT NULL,"
         "  sources VARCHAR,"
         "  created_at BIGINT NOT NULL"
-        ")",
-        false
+        ")"
       );
 
       if (result->HasError()) {
-        last_error_ = "Failed to create _dbsp_views table: " + result->GetError();
+        record_error_best_effort("Failed to create _dbsp_views table: " +
+                                 result->GetError());
         return false;
       }
 
       return true;
     } catch (const std::exception &e) {
-      last_error_ = std::string("Exception creating _dbsp_views table: ") + e.what();
+      record_error_best_effort(
+          std::string("Exception creating _dbsp_views table: ") + e.what());
       return false;
+    }
+  }
+
+  // Record an error without risking same-thread relock: callers of some paths
+  // already hold struct_mutex_ (not recursive), so skip recording rather than
+  // deadlock if the lock is contended.
+  void record_error_best_effort(const std::string &msg) {
+    std::unique_lock<std::shared_mutex> lock(struct_mutex_, std::try_to_lock);
+    if (lock.owns_lock()) {
+      last_error_ = msg;
+    } else {
+      std::cerr << "DBSP error (lock busy, not recorded): " << msg << "\n";
     }
   }
 
@@ -1506,51 +1533,17 @@ private:
 
       DuckDBZSet new_state;
 
-      if (meta_transaction) {
-        // Auto-CDC commit hook path: use raw storage API with meta_transaction.
-        auto &attached = catalog.GetAttached();
-        auto *transaction = &meta_transaction->GetTransaction(attached)
-                                .Cast<duckdb::DuckTransaction>();
-        duckdb::CatalogTransaction cat_txn(
-            catalog.GetDatabase(), meta_transaction->global_transaction_id,
-            static_cast<duckdb::transaction_t>(
-                meta_transaction->start_timestamp.value));
-        cat_txn.transaction = transaction;
-
-        auto &schema_entry = catalog.GetSchema(cat_txn, DEFAULT_SCHEMA);
-        auto table_entry_ptr = schema_entry.GetEntry(
-            cat_txn, duckdb::CatalogType::TABLE_ENTRY, table_name);
-        if (!table_entry_ptr) {
-          last_error_ = "Table not found in catalog: " + table_name;
-          return std::nullopt;
-        }
-        auto &table_entry = table_entry_ptr->Cast<duckdb::TableCatalogEntry>();
-        auto &data_table = table_entry.GetStorage();
-        duckdb::TableScanState scan_state;
-        duckdb::vector<duckdb::StorageIndex> column_ids;
-        auto &columns = table_entry.GetColumns();
-        for (idx_t i = 0; i < columns.PhysicalColumnCount(); i++) {
-          column_ids.push_back(duckdb::StorageIndex(i));
-        }
-        data_table.InitializeScan(context, *transaction, scan_state, column_ids);
-        duckdb::DataChunk chunk;
-        chunk.Initialize(context, data_table.GetTypes());
-        while (true) {
-          chunk.Reset();
-          data_table.Scan(*transaction, chunk, scan_state);
-          if (chunk.size() == 0) break;
-          for (idx_t row_idx = 0; row_idx < chunk.size(); row_idx++) {
-            DuckDBRow dbsp_row;
-            for (idx_t col_idx = 0; col_idx < chunk.ColumnCount(); col_idx++) {
-              dbsp_row.columns.push_back(chunk.GetValue(col_idx, row_idx));
-            }
-            new_state.insert(dbsp_row, 1);
-          }
-        }
-      } else {
-        // Explicit user call path: create a fresh Connection to the same DB
-        // to avoid blocking on any existing transaction state from the caller's
-        // context. A fresh Connection has no such state.
+      {
+        // Both paths (commit hook and explicit user call) scan committed state
+        // through a fresh Connection. The commit hook fires after Commit() has
+        // succeeded, so a new transaction sees the committed rows. Scanning
+        // with the just-committed DuckTransaction via the raw storage API
+        // stopped seeing its own rows in DuckDB 1.5 (hook now runs before
+        // Finalize()), so that path was removed.
+        // Guard: OnConnectionOpened must not run first-time recovery here -
+        // this thread holds struct_mutex_ (via sync_table) and recovery
+        // re-acquires it.
+        InternalQueryGuard guard;
         auto &fresh_db = duckdb::DatabaseInstance::GetDatabase(context);
         duckdb::Connection fresh_con(fresh_db);
         auto sql_result =
@@ -1972,7 +1965,7 @@ private:
   std::unordered_map<std::string, ViewDefinition> view_definitions_;
   DependencyGraph dep_graph_;
   std::string last_error_;
-  bool auto_sync_enabled_ = false;
+  std::atomic<bool> auto_sync_enabled_{false};
   bool use_parallel_sync_ = false;
 };
 
