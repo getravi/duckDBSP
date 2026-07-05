@@ -150,16 +150,6 @@ struct TableSchema {
   }
 };
 
-// Change record for CDC
-struct ChangeRecord {
-  enum Type { INSERT, DELETE, UPDATE };
-  Type type;
-  DuckDBRow row;
-  DuckDBRow old_row; // For UPDATE
-  uint64_t timestamp;
-  uint64_t sequence;
-};
-
 // Tracked table that captures all changes
 class TrackedTable {
 public:
@@ -169,17 +159,15 @@ public:
   const std::string &name() const { return name_; }
   const TableSchema &schema() const { return schema_; }
 
-  // Apply changes and record them
+  // Apply changes
   void insert(const DuckDBRow &row) {
     current_state_.insert(row, 1);
     pending_changes_.insert(row, 1);
-    record_change(ChangeRecord::INSERT, row, {});
   }
 
   void remove(const DuckDBRow &row) {
     current_state_.insert(row, -1);
     pending_changes_.insert(row, -1);
-    record_change(ChangeRecord::DELETE, row, {});
   }
 
   void update(const DuckDBRow &old_row, const DuckDBRow &new_row) {
@@ -187,7 +175,15 @@ public:
     current_state_.insert(new_row, 1);
     pending_changes_.insert(old_row, -1);
     pending_changes_.insert(new_row, 1);
-    record_change(ChangeRecord::UPDATE, new_row, old_row);
+  }
+
+  // Replace the whole baseline in one move (scan-based sync: the delta is
+  // computed against the old state by the caller, so re-applying it row by
+  // row through insert()/remove() would just repeat n hash operations)
+  void replace_state(DuckDBZSet &&new_state) {
+    current_state_ = std::move(new_state);
+    pending_changes_.clear();
+    sequence_++;
   }
 
   // Get and clear pending changes (for view updates)
@@ -198,30 +194,12 @@ public:
   }
 
   const DuckDBZSet &current_state() const { return current_state_; }
-  const std::vector<ChangeRecord> &change_log() const { return change_log_; }
-
-  // Clear change log (after checkpoint)
-  void clear_log() { change_log_.clear(); }
 
 private:
-  void record_change(ChangeRecord::Type type, const DuckDBRow &row,
-                     const DuckDBRow &old_row) {
-    ChangeRecord rec;
-    rec.type = type;
-    rec.row = row;
-    rec.old_row = old_row;
-    rec.timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch())
-                        .count();
-    rec.sequence = ++sequence_;
-    change_log_.push_back(rec);
-  }
-
   std::string name_;
   TableSchema schema_;
   DuckDBZSet current_state_;
   DuckDBZSet pending_changes_;
-  std::vector<ChangeRecord> change_log_;
   uint64_t sequence_;
 };
 

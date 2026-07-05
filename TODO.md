@@ -16,11 +16,18 @@ subsystem, bespoke parser, standalone Z-set spilling).
 
 ## Performance
 
-- **Scan-and-diff sync is now the dominant cost**: dbsp_sync full-scans
-  the table to compute the delta (~173ms on 50k rows) while propagating
-  that delta through a 3-level view chain costs ~29µs. Row-level CDC
-  (on_insert/on_delete already exist; auto-CDC hooks feed them) is the
-  path to O(Δ) end-to-end.
+- **Scan-and-diff sync dominates end-to-end** (~119ms on 50k rows after
+  the F1 constant-factor pass — typed chunk extraction, baseline swap-in,
+  change-log removal — vs ~25µs to propagate the delta through a 3-level
+  chain). The remaining floor is two O(n) hash passes (build scanned
+  state + diff), gated on the row-hash refactor below. True O(Δ) sync =
+  capture transaction-local changes in the TransactionCommit hook, which
+  fires BEFORE DuckTransaction::Finalize since DuckDB 1.5 (see the
+  comment in sync_table_scan_and_consume) — appends live in the
+  transaction's LocalStorage at that point. Full design task: extraction
+  from LocalStorage/version info, auto-CDC rewrite, fallback scan-diff
+  for anything uncapturable. on_insert/on_delete already provide the
+  row-level entry points.
 - Phase D1 vectorized filter/map/fused evaluation + zero-copy circuit
   deltas: fused filter 259k→644k rows/s, aggregate 770k→1.88M, join delta
   140k→265k. Remaining ~2.4× gap vs a hand-written lambda is Z-set insert

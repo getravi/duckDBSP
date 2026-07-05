@@ -1553,12 +1553,68 @@ private:
           auto chunk_ptr = sql_result->Fetch();
           if (!chunk_ptr || chunk_ptr->size() == 0) break;
           auto &chunk = *chunk_ptr;
-          for (idx_t row_idx = 0; row_idx < chunk.size(); row_idx++) {
-            DuckDBRow dbsp_row;
-            for (idx_t col_idx = 0; col_idx < chunk.ColumnCount(); col_idx++) {
-              dbsp_row.columns.push_back(chunk.GetValue(col_idx, row_idx));
+          // Typed column extraction: flatten once, read vector data
+          // directly for common types instead of boxing every cell
+          // through DataChunk::GetValue (same lesson as the D1 batch
+          // evaluator — per-cell Value dispatch dominates)
+          chunk.Flatten();
+          const idx_t n = chunk.size();
+          const idx_t ncols = chunk.ColumnCount();
+          std::vector<DuckDBRow> rows(n);
+          for (auto &r : rows) {
+            r.columns.reserve(ncols);
+          }
+          for (idx_t c = 0; c < ncols; c++) {
+            auto &vec = chunk.data[c];
+            const auto &type = vec.GetType();
+            auto &validity = duckdb::FlatVector::Validity(vec);
+            switch (type.id()) {
+            case duckdb::LogicalTypeId::INTEGER: {
+              auto data = duckdb::FlatVector::GetData<int32_t>(vec);
+              for (idx_t i = 0; i < n; i++) {
+                rows[i].columns.push_back(
+                    validity.RowIsValid(i) ? duckdb::Value::INTEGER(data[i])
+                                           : duckdb::Value(type));
+              }
+              break;
             }
-            new_state.insert(dbsp_row, 1);
+            case duckdb::LogicalTypeId::BIGINT: {
+              auto data = duckdb::FlatVector::GetData<int64_t>(vec);
+              for (idx_t i = 0; i < n; i++) {
+                rows[i].columns.push_back(
+                    validity.RowIsValid(i) ? duckdb::Value::BIGINT(data[i])
+                                           : duckdb::Value(type));
+              }
+              break;
+            }
+            case duckdb::LogicalTypeId::DOUBLE: {
+              auto data = duckdb::FlatVector::GetData<double>(vec);
+              for (idx_t i = 0; i < n; i++) {
+                rows[i].columns.push_back(
+                    validity.RowIsValid(i) ? duckdb::Value::DOUBLE(data[i])
+                                           : duckdb::Value(type));
+              }
+              break;
+            }
+            case duckdb::LogicalTypeId::VARCHAR: {
+              auto data = duckdb::FlatVector::GetData<duckdb::string_t>(vec);
+              for (idx_t i = 0; i < n; i++) {
+                rows[i].columns.push_back(
+                    validity.RowIsValid(i)
+                        ? duckdb::Value(data[i].GetString())
+                        : duckdb::Value(type));
+              }
+              break;
+            }
+            default:
+              for (idx_t i = 0; i < n; i++) {
+                rows[i].columns.push_back(chunk.GetValue(c, i));
+              }
+              break;
+            }
+          }
+          for (idx_t i = 0; i < n; i++) {
+            new_state.insert(std::move(rows[i]), 1);
           }
         }
       }
@@ -1581,22 +1637,11 @@ private:
         }
       }
 
-      // Apply delta to tracked table state (updates current_state_ and
-      // queues pending_changes_), then consume pending_changes_ to clear them.
-      for (const auto &[row, weight] : delta) {
-        if (weight > 0) {
-          for (int i = 0; i < weight; i++) {
-            it->second->insert(row);
-          }
-        } else {
-          for (int i = 0; i < -weight; i++) {
-            it->second->remove(row);
-          }
-        }
-      }
-
-      // Consume and return the queued changes (clears pending_changes_)
-      return it->second->consume_changes();
+      // The freshly scanned state IS the new baseline: swap it in whole
+      // instead of replaying the delta row by row (which repeated every
+      // hash operation the diff above already paid for)
+      it->second->replace_state(std::move(new_state));
+      return delta;
 
     } catch (const std::exception &e) {
       last_error_ = std::string("Exception in sync_table_scan_and_consume: ") + e.what();

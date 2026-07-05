@@ -1,5 +1,23 @@
 # Changelog
 
+## Phase F (started): Sync-path cost - Jul 2026
+
+### F1: Scan-and-diff sync constant factors (Jul 5, 2026)
+- Typed chunk extraction in sync_table_scan_and_consume (flatten once,
+  direct FlatVector reads for INT/BIGINT/DOUBLE/VARCHAR instead of
+  per-cell GetValue boxing).
+- The freshly scanned state replaces the tracked-table baseline in one
+  move (TrackedTable::replace_state) instead of replaying the computed
+  delta row by row — the old path repeated every hash operation the diff
+  had already paid for.
+- TrackedTable's change_log_ deleted: appended on every change, read by
+  nothing — a per-row cost and an unbounded memory leak in long-running
+  processes.
+- 3-level-chain bench: full sync 173ms → 119ms per row on a 50k-row
+  table; propagate-only unchanged at ~25µs. Remaining floor is two O(n)
+  hash passes; the designed fix (transaction-local capture at the
+  pre-Finalize commit hook) is recorded in TODO.md.
+
 ## Phase E: Incremental Cascades & Correlated Subqueries - Jul 2026
 
 ### E1: Incremental view-on-view cascades (Jul 5, 2026)
