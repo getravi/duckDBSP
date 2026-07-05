@@ -174,7 +174,7 @@ incremental DISTINCT of the outer side's correlated columns feeding the
 decorrelated subplan (DELIM_GET = shared reference to it), joined back
 with null-safe keys — SINGLE onto LEFT-join padding, MARK onto marks.
 
-Anything else (USING KEY recursion, non-constant LIMIT, ROLLUP/CUBE, ...)
+Anything else (USING KEY recursion, non-constant LIMIT, string_agg, ...)
 fails view creation with a DBSP-E110 error naming the unsupported
 operator.
 

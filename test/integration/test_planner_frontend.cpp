@@ -1329,3 +1329,113 @@ TEST_CASE("planner: parallel level propagation matches sequential",
   }
   db.exec("SELECT * FROM dbsp_parallel(false)");
 }
+
+// ---------------------------------------------------------------------------
+// Phase J: ROLLUP/CUBE/GROUPING SETS + aggregate modifiers
+// ---------------------------------------------------------------------------
+
+TEST_CASE("planner J: ROLLUP differential",
+          "[integration][planner][groupingsets]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  const std::string sql =
+      "SELECT tag, id % 2 AS parity, COUNT(*), SUM(val) FROM t "
+      "GROUP BY ROLLUP(tag, parity)";
+  db.exec("SELECT * FROM dbsp_create_view('v_rollup', '" + sql + "')");
+  requireViewMatchesQuery(db, "v_rollup", sql);
+  runDifferential(db, "v_rollup", sql, 211);
+}
+
+TEST_CASE("planner J: CUBE differential",
+          "[integration][planner][groupingsets]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  const std::string sql =
+      "SELECT tag, id % 3 AS trio, COUNT(*), AVG(val), MIN(val) FROM t "
+      "GROUP BY CUBE(tag, trio)";
+  db.exec("SELECT * FROM dbsp_create_view('v_cube', '" + sql + "')");
+  requireViewMatchesQuery(db, "v_cube", sql);
+  runDifferential(db, "v_cube", sql, 223);
+}
+
+TEST_CASE("planner J: GROUPING SETS with GROUPING() differential",
+          "[integration][planner][groupingsets]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  const std::string sql =
+      "SELECT tag, id % 2 AS parity, SUM(val), "
+      "GROUPING(tag), GROUPING(tag, parity) FROM t "
+      "GROUP BY GROUPING SETS ((tag), (parity), ())";
+  db.exec("SELECT * FROM dbsp_create_view('v_gsets', '" + sql + "')");
+  requireViewMatchesQuery(db, "v_gsets", sql);
+  runDifferential(db, "v_gsets", sql, 227);
+}
+
+TEST_CASE("planner J: FILTER clause differential",
+          "[integration][planner][aggmod]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  const std::string sql =
+      "SELECT tag, COUNT(*) FILTER (WHERE val > 40), "
+      "SUM(val) FILTER (WHERE id % 2 = 0), "
+      "AVG(val) FILTER (WHERE val < 90) FROM t GROUP BY tag";
+  db.exec("SELECT * FROM dbsp_create_view('v_aggfilter', '" + sql + "')");
+  requireViewMatchesQuery(db, "v_aggfilter", sql);
+  runDifferential(db, "v_aggfilter", sql, 229);
+}
+
+TEST_CASE("planner J: DISTINCT aggregates differential",
+          "[integration][planner][aggmod]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  // val repeats across rows (generator draws from 0..99 with dupes) and
+  // includes NULLs — COUNT/SUM/AVG must count each surviving value once
+  const std::string sql =
+      "SELECT tag, COUNT(DISTINCT val), SUM(DISTINCT val), "
+      "AVG(DISTINCT val), MIN(DISTINCT val) FROM t GROUP BY tag";
+  db.exec("SELECT * FROM dbsp_create_view('v_aggdist', '" + sql + "')");
+  requireViewMatchesQuery(db, "v_aggdist", sql);
+  runDifferential(db, "v_aggdist", sql, 233);
+}
+
+TEST_CASE("planner J: DISTINCT + FILTER combined, global",
+          "[integration][planner][aggmod]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  const std::string sql =
+      "SELECT COUNT(DISTINCT val) FILTER (WHERE tag != 'b'), "
+      "SUM(DISTINCT val), COUNT(*) FROM t";
+  std::string escaped = sql;
+  for (size_t pos = 0; (pos = escaped.find('\'', pos)) != std::string::npos;
+       pos += 2) {
+    escaped.insert(pos, 1, '\'');
+  }
+  db.exec("SELECT * FROM dbsp_create_view('v_aggmix', '" + escaped + "')");
+  requireViewMatchesQuery(db, "v_aggmix", sql);
+  runDifferential(db, "v_aggmix", sql, 239);
+}
+
+TEST_CASE("planner J: ORDER BY inside order-insensitive aggregate",
+          "[integration][planner][aggmod]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  // Semantically inert for SUM — accepted, ignored, must equal plain SUM
+  const std::string sql =
+      "SELECT tag, SUM(val ORDER BY id) FROM t GROUP BY tag";
+  db.exec("SELECT * FROM dbsp_create_view('v_aggorder', '" + sql + "')");
+  requireViewMatchesQuery(db, "v_aggorder", sql);
+  runDifferential(db, "v_aggorder", sql, 241);
+}
+
+TEST_CASE("planner J: ROLLUP over join with DISTINCT agg",
+          "[integration][planner][groupingsets]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  setupTableU(db);
+  const std::string sql =
+      "SELECT t.tag, COUNT(DISTINCT u.val), SUM(u.val) "
+      "FROM t JOIN u ON t.id = u.id GROUP BY ROLLUP(t.tag)";
+  db.exec("SELECT * FROM dbsp_create_view('v_rolljoin', '" + sql + "')");
+  requireViewMatchesQuery(db, "v_rolljoin", sql);
+  runDifferentialTwoTables(db, "v_rolljoin", sql, 251);
+}

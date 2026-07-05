@@ -22,14 +22,15 @@ TEST_CASE("End-to-end error handling", "[e2e][errors]") {
     db.exec("CREATE TABLE orders (id INT, customer_id INT, amount INT)");
     db.exec("SELECT * FROM dbsp_track('orders')");
 
-    // ROLLUP (GROUPING SETS): still unsupported — the planner frontend
-    // must reject the plan shape with a DBSP error code that names what
-    // it could not translate. (Subqueries, correlated included, translate
-    // since D3/E2.)
+    // string_agg (order-sensitive aggregate function): still
+    // unsupported — the planner frontend must reject the plan shape
+    // with a DBSP error code that names what it could not translate.
+    // (ROLLUP/CUBE/GROUPING SETS and aggregate modifiers translate
+    // since Phase J.)
     auto result = db.query(
         "SELECT * FROM dbsp_create_view('sub_view', "
-        "'SELECT customer_id, COUNT(*) FROM orders "
-        "GROUP BY ROLLUP(customer_id)')");
+        "'SELECT customer_id, STRING_AGG(CAST(amount AS VARCHAR)) "
+        "FROM orders GROUP BY customer_id')");
 
     REQUIRE(result->HasError());
     std::string error = result->GetError();

@@ -12,7 +12,7 @@ subsystem, bespoke parser, standalone Z-set spilling).
 - WITH RECURSIVE ... USING KEY
 - Non-constant / percentage LIMIT
 - Window ORDER BY / PARTITION BY over expressions (project first)
-- ROLLUP / CUBE / GROUPING SETS; DISTINCT/FILTER/ORDER-BY-in-aggregate
+- Order-sensitive aggregate functions (string_agg, array_agg, ...)
 
 ## Performance
 

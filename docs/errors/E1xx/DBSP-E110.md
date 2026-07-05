@@ -9,7 +9,9 @@ message names the operator.
 
 Filter/projection with arbitrary expressions, GROUP BY aggregation
 (COUNT/SUM/AVG/MIN/MAX/FIRST incl. exact DECIMAL SUM, HAVING, expression
-keys, global aggregates), inner and outer joins (LEFT/RIGHT/FULL; equi +
+keys, global aggregates, DISTINCT and FILTER (WHERE ...) modifiers,
+ROLLUP / CUBE / GROUPING SETS with GROUPING()), inner and outer joins
+(LEFT/RIGHT/FULL; equi +
 residual predicates), cross joins, subqueries (IN / NOT IN, EXISTS /
 NOT EXISTS, scalar comparisons — correlated included), DISTINCT, DISTINCT ON,
 UNION/INTERSECT/EXCEPT (ALL and DISTINCT), window functions over plain
@@ -25,3 +27,7 @@ ORDER BY / LIMIT / OFFSET (constant).
 **Window ORDER BY / PARTITION BY over expressions** — project the
 expression to a column in an inner view first, then window over the
 column.
+
+**Order-sensitive aggregate functions (string_agg, array_agg, ...)** —
+not yet translated; ORDER BY inside the supported order-insensitive
+aggregates (SUM/COUNT/AVG/MIN/MAX) is accepted and ignored.

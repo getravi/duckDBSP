@@ -224,6 +224,9 @@ See [Error Handling Guide](docs/ERROR_HANDLING.md) for details.
 
 **Aggregate Functions:**
 - `SUM`, `COUNT`, `AVG`, `MIN`, `MAX` - all with O(log n) incremental updates
+- `DISTINCT` and `FILTER (WHERE ...)` modifiers, incrementally maintained
+- `ROLLUP` / `CUBE` / `GROUPING SETS` with `GROUPING()` - one incremental
+  aggregate branch per grouping set
 
 **Circuit Optimization:**
 - Automatic filter pushdown through JOINs
@@ -250,15 +253,16 @@ parser was deleted):**
   calls, mixed AND/OR predicates, multi-aggregate GROUP BY, expression
   group/join keys, HAVING, global aggregates). A circuit-IR optimizer
   combines filters, pushes them below joins, and fuses filter+project into
-  one node. Unsupported plans (ROLLUP/CUBE, aggregate modifiers, ...)
-  fail with a DBSP-E110 error naming the operator.
+  one node. Unsupported plans (order-sensitive aggregates like
+  string_agg, USING KEY recursion, ...) fail with a DBSP-E110 error
+  naming the operator.
 
 ### 📋 Not yet supported
 
 - WITH RECURSIVE ... USING KEY
 - Non-constant / percentage LIMIT
 - Window ORDER BY / PARTITION BY over expressions (project first)
-- ROLLUP / CUBE / GROUPING SETS; DISTINCT/FILTER/ORDER BY inside aggregates
+- Order-sensitive aggregate functions (string_agg, array_agg)
 
 
 ## How It Works

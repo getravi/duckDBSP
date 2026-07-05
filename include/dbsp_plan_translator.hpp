@@ -327,6 +327,8 @@ struct PlanAggSpec {
 
   Fn fn;
   const duckdb::Expression *arg = nullptr; // null for COUNT_STAR
+  const duckdb::Expression *filter = nullptr; // FILTER (WHERE ...) clause
+  bool distinct = false;                   // COUNT/SUM/AVG(DISTINCT x)
   bool integer_arg = false;                // SUM/AVG: int64 vs double sum
   bool decimal_arg = false; // SUM over DECIMAL: exact unscaled hugeint sum
   uint8_t decimal_scale = 0;
@@ -561,7 +563,9 @@ public:
 
   struct AggInstance {
     PlanAggSpec::Fn fn;
-    int arg_idx = -1; // index into the batch evaluator; -1 for COUNT_STAR
+    int arg_idx = -1;    // index into the batch evaluator; -1 for COUNT_STAR
+    int filter_idx = -1; // FILTER predicate slot in the batch evaluator
+    bool distinct = false;
     bool integer_arg;
     bool decimal_arg = false;
     uint8_t decimal_scale = 0;
@@ -710,6 +714,9 @@ private:
     double dsum = 0;
     duckdb::hugeint_t hsum = 0; // DECIMAL SUM, unscaled
     std::multiset<duckdb::Value> values; // MIN/MAX
+    // DISTINCT: per-value weights; contributions fire on presence
+    // transitions (0→>0 adds the value once, >0→0 retracts it)
+    std::map<duckdb::Value, int64_t> dvals;
   };
 
   struct GroupState {
@@ -724,6 +731,15 @@ private:
     for (size_t i = 0; i < aggs_.size(); i++) {
       auto &spec = aggs_[i];
       auto &s = state.aggs[i];
+      if (spec.filter_idx >= 0) {
+        // FILTER (WHERE p): rows failing p contribute nothing to THIS
+        // aggregate. Applies symmetrically to inserts and deletes, so
+        // incremental maintenance is unchanged.
+        const duckdb::Value &f = args[static_cast<size_t>(spec.filter_idx)];
+        if (f.IsNull() || !f.GetValue<bool>()) {
+          continue;
+        }
+      }
       if (spec.fn == PlanAggSpec::Fn::COUNT_STAR) {
         s.count += weight;
         continue;
@@ -731,6 +747,39 @@ private:
       const duckdb::Value &v = args[static_cast<size_t>(spec.arg_idx)];
       if (v.IsNull()) {
         continue; // SQL: NULL arguments are ignored
+      }
+      if (spec.distinct) {
+        // Presence transition drives COUNT/SUM/AVG; MIN/MAX fall through
+        // (duplicates never change an extreme)
+        int64_t &dw = s.dvals[v];
+        const bool was = dw > 0;
+        dw += weight;
+        const bool is = dw > 0;
+        if (dw == 0) {
+          s.dvals.erase(v);
+        }
+        if (spec.fn != PlanAggSpec::Fn::MIN &&
+            spec.fn != PlanAggSpec::Fn::MAX) {
+          const int64_t d = (is ? 1 : 0) - (was ? 1 : 0);
+          if (d == 0) {
+            continue;
+          }
+          s.count += d;
+          if (spec.fn == PlanAggSpec::Fn::SUM ||
+              spec.fn == PlanAggSpec::Fn::AVG) {
+            if (spec.decimal_arg) {
+              duckdb::Value wide = v.DefaultCastAs(
+                  duckdb::LogicalType::DECIMAL(38, spec.decimal_scale));
+              s.hsum += wide.GetValueUnsafe<duckdb::hugeint_t>() *
+                        duckdb::hugeint_t(d);
+            } else if (spec.integer_arg) {
+              s.isum += v.GetValue<int64_t>() * d;
+            } else {
+              s.dsum += v.GetValue<double>() * d;
+            }
+          }
+          continue;
+        }
       }
       s.count += weight;
       switch (spec.fn) {
@@ -2327,9 +2376,14 @@ private:
         inst.decimal_arg = agg_spec.decimal_arg;
         inst.decimal_scale = agg_spec.decimal_scale;
         inst.return_type = agg_spec.return_type;
+        inst.distinct = agg_spec.distinct;
         if (agg_spec.arg) {
           inst.arg_idx = static_cast<int>(arg_exprs.size());
           arg_exprs.push_back(agg_spec.arg);
+        }
+        if (agg_spec.filter) {
+          inst.filter_idx = static_cast<int>(arg_exprs.size());
+          arg_exprs.push_back(agg_spec.filter);
         }
         aggs.push_back(std::move(inst));
       }
@@ -2624,6 +2678,10 @@ public:
     if (!root) {
       return {nullptr, walker.error};
     }
+    for (auto &e : walker.owned_exprs) {
+      keep_alive->rewritten_exprs.push_back(std::move(e));
+    }
+    walker.owned_exprs.clear();
     if (root->kind == PlanOpSpec::Kind::SORT_LIMIT) {
       // Only a root sort/limit drives dbsp_query's scan order; nested ones
       // (subqueries) affect membership only
@@ -2655,6 +2713,11 @@ private:
   struct Walker {
     std::vector<ColumnInfo> columns; // schema of current operator's output
     std::string error;
+    // Expressions synthesized during translation (NULL pads / GROUPING
+    // constants for grouping-set branches). Moved into
+    // PlanKeepAlive::rewritten_exprs after the walk so they outlive the
+    // circuit's evaluators.
+    std::vector<std::unique_ptr<duckdb::Expression>> owned_exprs;
 
     using SpecPtr = std::unique_ptr<PlanOpSpec>;
 
@@ -2835,11 +2898,13 @@ private:
     }
 
     SpecPtr visit_aggregate(duckdb::LogicalAggregate &op) {
-      if (!op.grouping_functions.empty()) {
-        return unsupported("GROUPING function");
+      // Parse aggregate expressions once; grouping-set branches reuse them
+      std::vector<PlanAggSpec> parsed;
+      if (!parse_agg_exprs(op, parsed)) {
+        return nullptr;
       }
-      if (op.grouping_sets.size() > 1) {
-        return unsupported("ROLLUP/CUBE/GROUPING SETS");
+      if (op.grouping_sets.size() > 1 || !op.grouping_functions.empty()) {
+        return build_grouping_sets(op, parsed);
       }
       auto child = visit(*op.children[0]);
       if (!child) {
@@ -2852,23 +2917,145 @@ private:
       for (const auto &group : op.groups) {
         spec->exprs.push_back(group.get());
       }
+      spec->agg_specs = std::move(parsed);
+      spec->children.push_back(std::move(child));
+
+      // Output layout: group values first, then aggregate values
+      columns.clear();
+      for (duckdb::idx_t i = 0; i < op.groups.size(); i++) {
+        columns.push_back({op.groups[i]->GetName(), op.types[i]});
+      }
+      for (duckdb::idx_t i = 0; i < op.expressions.size(); i++) {
+        columns.push_back(
+            {op.expressions[i]->GetName(), op.types[op.groups.size() + i]});
+      }
+      return spec;
+    }
+
+    // GROUPING SETS / ROLLUP / CUBE: one aggregate branch per grouping
+    // set over its own copy of the input subtree, each mapped to the full
+    // output layout (excluded group columns → typed NULLs, GROUPING()
+    // → per-branch constant bitmask), then UNION ALL. Each branch is an
+    // ordinary incremental aggregate, so the whole construct is
+    // incremental for free.
+    SpecPtr build_grouping_sets(duckdb::LogicalAggregate &op,
+                                const std::vector<PlanAggSpec> &parsed) {
+      const size_t num_groups = op.groups.size();
+      const size_t num_aggs = op.expressions.size();
+
+      std::vector<duckdb::GroupingSet> sets = op.grouping_sets;
+      if (sets.empty()) {
+        duckdb::GroupingSet all;
+        for (duckdb::idx_t j = 0; j < num_groups; j++) {
+          all.insert(j);
+        }
+        sets.push_back(std::move(all));
+      }
+
+      auto union_spec = std::make_unique<PlanOpSpec>();
+      union_spec->kind = PlanOpSpec::Kind::SET_OP;
+      union_spec->set_op = PlanOpSpec::SetOp::UNION_ALL;
+
+      for (const auto &gset : sets) {
+        auto child = visit(*op.children[0]);
+        if (!child) {
+          return nullptr;
+        }
+
+        auto agg = std::make_unique<PlanOpSpec>();
+        agg->kind = PlanOpSpec::Kind::AGGREGATE;
+        agg->input_types = op.children[0]->types;
+        std::unordered_map<duckdb::idx_t, size_t> pos_in_set;
+        duckdb::vector<duckdb::LogicalType> agg_out_types;
+        for (duckdb::idx_t j : gset) { // set<idx_t>: ascending
+          pos_in_set[j] = agg->exprs.size();
+          agg->exprs.push_back(op.groups[j].get());
+          agg_out_types.push_back(op.types[j]);
+        }
+        agg->agg_specs = parsed;
+        agg->children.push_back(std::move(child));
+        for (size_t k = 0; k < num_aggs; k++) {
+          agg_out_types.push_back(op.types[num_groups + k]);
+        }
+
+        // Map the branch to the full layout
+        auto map = std::make_unique<PlanOpSpec>();
+        map->kind = PlanOpSpec::Kind::MAP_EXPR;
+        map->input_types = agg_out_types;
+        for (duckdb::idx_t j = 0; j < num_groups; j++) {
+          std::unique_ptr<duckdb::Expression> e;
+          auto it = pos_in_set.find(j);
+          if (it != pos_in_set.end()) {
+            e = duckdb::make_uniq<duckdb::BoundReferenceExpression>(
+                op.types[j], it->second);
+          } else {
+            e = duckdb::make_uniq<duckdb::BoundConstantExpression>(
+                duckdb::Value(op.types[j]));
+          }
+          map->exprs.push_back(e.get());
+          owned_exprs.push_back(std::move(e));
+        }
+        for (size_t k = 0; k < num_aggs; k++) {
+          auto e = duckdb::make_uniq<duckdb::BoundReferenceExpression>(
+              op.types[num_groups + k], gset.size() + k);
+          map->exprs.push_back(e.get());
+          owned_exprs.push_back(std::move(e));
+        }
+        for (size_t f = 0; f < op.grouping_functions.size(); f++) {
+          // GROUPING(c1..cn): bit i (MSB-first) set when ci is NOT part
+          // of this branch's grouping set
+          const auto &args = op.grouping_functions[f];
+          int64_t mask = 0;
+          for (size_t a = 0; a < args.size(); a++) {
+            mask <<= 1;
+            if (!gset.count(args[a])) {
+              mask |= 1;
+            }
+          }
+          auto e = duckdb::make_uniq<duckdb::BoundConstantExpression>(
+              duckdb::Value::BIGINT(mask));
+          map->exprs.push_back(e.get());
+          owned_exprs.push_back(std::move(e));
+        }
+        map->children.push_back(std::move(agg));
+        union_spec->children.push_back(std::move(map));
+      }
+
+      columns.clear();
+      for (duckdb::idx_t j = 0; j < num_groups; j++) {
+        columns.push_back({op.groups[j]->GetName(), op.types[j]});
+      }
+      for (size_t k = 0; k < num_aggs; k++) {
+        columns.push_back(
+            {op.expressions[k]->GetName(), op.types[num_groups + k]});
+      }
+      for (size_t f = 0; f < op.grouping_functions.size(); f++) {
+        columns.push_back({"grouping_" + std::to_string(f),
+                           op.types[num_groups + num_aggs + f]});
+      }
+
+      if (union_spec->children.size() == 1) {
+        return std::move(union_spec->children[0]);
+      }
+      return union_spec;
+    }
+
+    // Parse BoundAggregateExpressions into PlanAggSpecs (fn, argument,
+    // FILTER predicate, DISTINCT). Returns false with error set on
+    // unsupported constructs.
+    bool parse_agg_exprs(duckdb::LogicalAggregate &op,
+                         std::vector<PlanAggSpec> &out) {
       for (const auto &expr : op.expressions) {
         if (expr->GetExpressionClass() !=
             duckdb::ExpressionClass::BOUND_AGGREGATE) {
-          return unsupported("non-aggregate expression in AGGREGATE");
+          unsupported("non-aggregate expression in AGGREGATE");
+          return false;
         }
         auto &agg = expr->Cast<duckdb::BoundAggregateExpression>();
-        if (agg.IsDistinct()) {
-          return unsupported("DISTINCT aggregate");
-        }
-        if (agg.filter) {
-          return unsupported("FILTER clause on aggregate");
-        }
-        if (agg.order_bys) {
-          return unsupported("ORDER BY in aggregate");
-        }
 
         PlanAggSpec agg_spec;
+        agg_spec.distinct = agg.IsDistinct();
+        agg_spec.filter = agg.filter.get();
         agg_spec.return_type = agg.return_type;
         const std::string &fn = agg.function.name;
         if (fn == "count_star") {
@@ -2889,14 +3076,25 @@ private:
           // (smallest value) is exact
           agg_spec.fn = PlanAggSpec::Fn::FIRST;
         } else {
-          return unsupported("aggregate function " + fn);
+          unsupported("aggregate function " + fn);
+          return false;
         }
+        if (agg_spec.fn == PlanAggSpec::Fn::FIRST &&
+            (agg_spec.distinct || agg.order_bys)) {
+          // first() IS order/multiplicity sensitive — modifiers would
+          // change its meaning
+          unsupported("DISTINCT/ORDER BY on " + fn);
+          return false;
+        }
+        // ORDER BY inside COUNT/SUM/AVG/MIN/MAX is semantically inert
+        // (order-insensitive aggregates) — accept and ignore
 
         if (agg_spec.fn != PlanAggSpec::Fn::COUNT_STAR) {
           if (agg.children.size() != 1) {
-            return unsupported("aggregate with " +
-                               std::to_string(agg.children.size()) +
-                               " arguments (" + fn + ")");
+            unsupported("aggregate with " +
+                        std::to_string(agg.children.size()) +
+                        " arguments (" + fn + ")");
+            return false;
           }
           agg_spec.arg = agg.children[0].get();
           if (agg_spec.fn == PlanAggSpec::Fn::SUM ||
@@ -2927,25 +3125,15 @@ private:
               }
               break;
             default:
-              return unsupported(fn + " over " +
-                                 agg_spec.arg->return_type.ToString());
+              unsupported(fn + " over " +
+                          agg_spec.arg->return_type.ToString());
+              return false;
             }
           }
         }
-        spec->agg_specs.push_back(std::move(agg_spec));
+        out.push_back(std::move(agg_spec));
       }
-      spec->children.push_back(std::move(child));
-
-      // Output layout: group values first, then aggregate values
-      columns.clear();
-      for (duckdb::idx_t i = 0; i < op.groups.size(); i++) {
-        columns.push_back({op.groups[i]->GetName(), op.types[i]});
-      }
-      for (duckdb::idx_t i = 0; i < op.expressions.size(); i++) {
-        columns.push_back(
-            {op.expressions[i]->GetName(), op.types[op.groups.size() + i]});
-      }
-      return spec;
+      return true;
     }
 
     // Correlated subqueries. DELIM_JOIN evaluates its right subplan with

@@ -1,5 +1,23 @@
 # Changelog
 
+## Phase J: Grouping sets & aggregate modifiers - Jul 2026
+
+- ROLLUP / CUBE / GROUPING SETS: the planner translates N grouping sets
+  into N incremental aggregate branches over the input (excluded group
+  columns padded with typed NULLs, GROUPING() emitted as a per-branch
+  constant bitmask) combined with UNION ALL. Each branch maintains
+  incrementally, so the construct costs N aggregate updates per delta.
+- FILTER (WHERE ...) on aggregates: per-aggregate predicate evaluated in
+  the shared batch; failing rows contribute nothing to that aggregate
+  (symmetric for inserts and deletes).
+- DISTINCT aggregates: COUNT/SUM/AVG(DISTINCT x) maintain a per-group
+  value-weight map; contributions fire on presence transitions (value
+  appears / last copy vanishes). MIN/MAX(DISTINCT) are the plain
+  aggregates (duplicates never move an extreme).
+- ORDER BY inside order-insensitive aggregates (SUM/COUNT/AVG/MIN/MAX)
+  is accepted and ignored; first()/order-sensitive functions still
+  reject it.
+
 ## Phase I2: Parallel view propagation - Jul 2026
 
 - Same-level views step concurrently: propagate_changes groups the
