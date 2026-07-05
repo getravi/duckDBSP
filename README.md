@@ -119,22 +119,15 @@ LOAD '/path/to/dbsp.duckdb_extension';
 ### Running Tests
 
 ```bash
-# Build tests
-cd build
-cmake -DBUILD_TESTS=ON ..
-make
+# Build and run the full suite (unit + integration)
+cd test/build_test
+cmake .. && make -j8
+ctest
 
-# Run unit tests
-./unit_tests
-
-# Run integration tests (requires extension to be built)
-./build.sh && cd build
-./integration_tests
-
-# Run benchmarks
-cmake -DBUILD_BENCHMARKS=ON ..
-make benchmarks
-./benchmarks
+# Benchmarks (built but not part of ctest)
+make bench_planner_eval soak_differential
+./bench_planner_eval
+SOAK_ROUNDS=60 ./soak_differential "[soak]"
 ```
 
 ### Test Coverage
@@ -190,6 +183,13 @@ See [docs/TESTING.md](docs/TESTING.md) for details.
 | `dbsp_notify_insert(table, ...)` | Notify of row insertion |
 | `dbsp_notify_delete(table, ...)` | Notify of row deletion |
 
+### Automatic CDC & Diagnostics
+
+| Function | Description |
+|----------|-------------|
+| `dbsp_auto_sync(bool)` | Toggle automatic sync on transaction commit |
+| `dbsp_use_planner([bool])` | No-op since Phase C (planner is the only frontend); kept for script compatibility |
+
 ## Error Handling
 
 duckDBSP uses a structured error code system (DBSP-Exxx) with helpful error messages:
@@ -228,6 +228,8 @@ See [Error Handling Guide](docs/ERROR_HANDLING.md) for details.
 - Automatic filter pushdown through JOINs
 - Projection pruning to minimize data movement
 - Operator fusion for reduced overhead
+- Shared join arrangements: N views joining the same table share one
+  index (one update per delta instead of N)
 
 **Advanced Features:**
 - Cascading views (views on views with dependency tracking)
@@ -247,13 +249,15 @@ parser was deleted):**
   calls, mixed AND/OR predicates, multi-aggregate GROUP BY, expression
   group/join keys, HAVING, global aggregates). A circuit-IR optimizer
   combines filters, pushes them below joins, and fuses filter+project into
-  one node. Unsupported plans (outer joins, correlated subqueries, ...)
+  one node. Unsupported plans (ROLLUP/CUBE, aggregate modifiers, ...)
   fail with a DBSP-E110 error naming the operator.
 
 ### 📋 Not yet supported
 
 - WITH RECURSIVE ... USING KEY
 - Non-constant / percentage LIMIT
+- Window ORDER BY / PARTITION BY over expressions (project first)
+- ROLLUP / CUBE / GROUPING SETS; DISTINCT/FILTER/ORDER BY inside aggregates
 
 
 ## How It Works
@@ -279,32 +283,38 @@ For the mathematical foundations, see [Theory](docs/THEORY.md).
 
 ## Performance Benchmarks
 
-| Operation | Throughput (approx) | Latency (10k batch) |
-|-----------|---------------------|---------------------|
-| **Raw Ingestion** | ~10,000 rows/s | 1.0s |
-| **Incremental Projection** | **~200,000 rows/s** | **0.05s** |
-| **Incremental Aggregation** | **~210,000 rows/s** | **0.05s** |
+| Metric | Result |
+|--------|--------|
+| **Incremental filter/projection** | ~970,000 rows/s |
+| **Incremental aggregation** | ~2,200,000 rows/s |
+| **Incremental join (100k delta vs 100k index)** | ~460,000 rows/s |
+| **Delta propagation, 3-level view chain** | ~13 µs/row |
+| **Captured-delta commit (explicit INSERT txn)** | ~0.3 ms |
+| **Full scan-and-diff sync (50k rows, 3 views)** | ~41 ms |
 
-*Benchmarks run on Apple M1, simple schema, batch size 10,000 rows.*
-*Incremental maintenance is ~20x faster than raw ingestion for these scenarios.*
+*Apple M-series, release build (`test/build_test`), 100k-row deltas unless
+noted; reproduce with `bench_planner_eval`. Explicit INSERT-only
+transactions commit O(Δ) via captured deltas; other writes pay the
+scan-and-diff sync.*
 
 ## Project Structure
 
 duckDBSP/
-├── include/                   # Core DBSP library (header-only)
-│   ├── dbsp_zset.hpp          # Z-set data structure
-│   ├── dbsp_stream.hpp        # Stream operators
-│   ├── dbsp_circuit.hpp       # Dataflow graph
-│   └── dbsp_materialized_view.hpp
-├── src/                       # Extension source
-│   └── dbsp_extension.cpp     # Extension entry point
-│   ├── dbsp_duckdb_types.hpp  # Native DuckDB type integration
-│   ├── dbsp_plan_translator.hpp # Planner frontend (Phase B)
-│   ├── dbsp_cdc.hpp           # CDC manager
-├── build.sh                   # Build script
-├── test/                      # Unit tests
-├── docs/                      # Documentation
-└── examples/                  # Usage examples
+├── include/                     # Header-only implementation
+│   ├── dbsp_zset.hpp            # Z-set data structure
+│   ├── dbsp_stream.hpp          # Stream operators
+│   ├── dbsp_circuit.hpp         # Dataflow graph
+│   ├── dbsp_plan_translator.hpp # Planner frontend (circuit translation)
+│   ├── dbsp_cdc.hpp             # CDC manager + shared arrangements
+│   ├── dbsp_duckdb_types.hpp    # Native DuckDB type integration
+│   └── dbsp_context_state.hpp   # Transaction hooks (auto-CDC)
+├── src/                         # Extension source
+│   ├── dbsp_extension.cpp       # Extension entry point
+│   └── dbsp_recovery.cpp        # Replay-based crash recovery
+├── build.sh                     # Build script
+├── test/                        # Unit/integration tests, benchmarks
+├── docs/                        # Documentation
+└── examples/                    # Usage examples
 
 
 ## Contributing
