@@ -85,11 +85,14 @@ public:
   bool save_checkpoint(duckdb::ClientContext &context);
 
   /**
-   * @brief Load Z-set state from latest checkpoint
-   * @param context DuckDB client context
-   * @return true if checkpoint loaded successfully
+   * @brief Validate the latest checkpoint file (parse + checksum) without
+   * applying it. Recovery rebuilds all Z-set state by replaying DuckDB's
+   * committed storage through the circuits; checkpoint contents are
+   * diagnostics only.
+   * @param context DuckDB client context (unused)
+   * @return true if a checkpoint exists and is well-formed
    */
-  bool load_checkpoint(duckdb::ClientContext &context);
+  bool validate_checkpoint(duckdb::ClientContext &context);
 
   /**
    * @brief Get the path to the latest checkpoint file

@@ -1448,21 +1448,11 @@ public:
     return create_view(context, view_name, sql);
   }
 
-  // Restore a view's Z-set state from checkpoint
-  bool restore_view_state(const std::string &view_name, const DuckDBZSet &zset) {
-    std::unique_lock<std::shared_mutex> struct_lock(struct_mutex_);
-    std::unique_lock<std::shared_mutex> view_lock(view_mutex_);
-
-    auto it = views_.find(view_name);
-    if (it == views_.end()) {
-      last_error_ = "View not found: " + view_name;
-      return false;
-    }
-
-    // Replace the view's result with the checkpoint data
-    it->second->set_result(zset);
-    return true;
-  }
+  // NOTE: there is deliberately no restore-view-from-checkpoint API.
+  // set_result() fills only a view's sink; internal circuit-node state
+  // (aggregate groups, join indexes, sort/limit multisets, recursive dedup)
+  // cannot be reconstructed from the sink. Recovery rebuilds views by
+  // replaying committed DuckDB storage through create_view instead.
 
 private:
   // Scan tracked table from DB and compute/apply delta.

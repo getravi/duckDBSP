@@ -223,40 +223,33 @@ bool DBSPRecoveryManager::recover_from_crash(duckdb::ClientContext &context,
     // Continue anyway - some views may have loaded
   }
 
-  // Step 4: Try to load from checkpoint (much faster than full resync)
-  bool checkpoint_loaded = load_checkpoint(context);
-  uint64_t checkpoint_timestamp = 0;
-
-  if (checkpoint_loaded) {
-    // Get checkpoint timestamp from filename
-    std::string cp_path = get_latest_checkpoint();
-    size_t ts_start = cp_path.find("checkpoint_") + 11;
-    size_t ts_end = cp_path.find(".dbsp");
-    if (ts_start != std::string::npos && ts_end != std::string::npos) {
-      std::string ts_str = cp_path.substr(ts_start, ts_end - ts_start);
-      checkpoint_timestamp = std::stoull(ts_str);
-    }
+  // Step 4: Validate the latest checkpoint (diagnostics only).
+  //
+  // View state is NOT applied from the checkpoint. DuckDB's own storage is
+  // the single durable source of truth: step 3 already rebuilt every view
+  // by replaying tracked-table scans of committed data through its circuit,
+  // which restores internal node state (aggregate groups, join indexes,
+  // sort/limit multisets, recursive dedup) that a sink-only set_result()
+  // never could. Applying checkpoint Z-sets on top of that corrupted views
+  // (stale rows that never cancel — see the [restore_audit] tests).
+  if (validate_checkpoint(context)) {
+    std::cout << "DBSP Recovery: Latest checkpoint is valid (state was "
+                 "rebuilt from DuckDB storage; checkpoint not applied)"
+              << std::endl;
   }
 
-  // Step 5: Replay WAL entries after checkpoint (zero data loss!)
-  auto &wal_manager = get_wal_manager();
-  if (wal_manager.is_enabled()) {
-    std::cout << "DBSP Recovery: Replaying WAL entries after checkpoint..." << std::endl;
-    if (!wal_manager.replay_wal(context, checkpoint_timestamp)) {
-      std::cerr << "DBSP Recovery: WAL replay failed, some data may be lost" << std::endl;
-    }
-  }
+  // Step 5: WAL table-delta replay is deliberately skipped. Replayed deltas
+  // would double-apply on top of baselines that step 3 already scanned from
+  // committed storage; rows absent from DuckDB storage after a crash were
+  // never committed and must not be resurrected. replay_wal() remains
+  // available for callers that manage their own baselines.
 
-  // Step 6: Resync tracked tables from DuckDB storage (if no checkpoint)
-  // This populates view results from source data
-  if (!checkpoint_loaded) {
-    std::cout << "DBSP Recovery: No checkpoint available, performing full table resync..." << std::endl;
-    if (!resync_tracked_tables(context)) {
-      std::cerr << "DBSP Recovery: Failed to resync tables" << std::endl;
-      // Continue anyway - some tables may have synced
-    }
-  } else {
-    std::cout << "DBSP Recovery: Checkpoint + WAL replay complete, skipping full resync" << std::endl;
+  // Step 6: Resync tracked tables against DuckDB storage. With baselines
+  // fresh from step 3 the deltas are empty; this catches tables tracked in
+  // _dbsp_tables that no view references (step 3 only tracks view sources).
+  if (!resync_tracked_tables(context)) {
+    std::cerr << "DBSP Recovery: Failed to resync tables" << std::endl;
+    // Continue anyway - some tables may have synced
   }
 
   // Step 7: Rebuild dependency graph (mostly automatic)
@@ -403,26 +396,34 @@ bool DBSPRecoveryManager::save_checkpoint(duckdb::ClientContext &context) {
   }
 }
 
-bool DBSPRecoveryManager::load_checkpoint(duckdb::ClientContext &context) {
+// Validate the latest checkpoint file without applying any of it.
+//
+// Checkpoint Z-sets are never written into live views or table baselines:
+// recovery rebuilds all state by replaying DuckDB's committed storage
+// through the circuits (see recover_from_crash step 4). Applying them was
+// actively harmful — sink-only set_result() left every internal circuit
+// node empty, values round-tripped as VARCHAR so retractions could not
+// cancel, and a partial read followed by resync doubled state. Checkpoints
+// stay useful as an integrity snapshot for diagnostics.
+bool DBSPRecoveryManager::validate_checkpoint(duckdb::ClientContext &context) {
+  (void)context;
   if (!recovery_enabled_) return true;
 
   try {
     std::string checkpoint_path = get_latest_checkpoint();
     if (checkpoint_path.empty()) {
-      std::cout << "DBSP: No checkpoint found, will perform full resync" << std::endl;
-      return false;  // No checkpoint available
+      std::cout << "DBSP: No checkpoint found" << std::endl;
+      return false;
     }
 
-    std::cout << "DBSP: Loading checkpoint from " << checkpoint_path << std::endl;
+    std::cout << "DBSP: Validating checkpoint " << checkpoint_path << std::endl;
 
-    // Create checkpoint reader
     CheckpointReader reader(checkpoint_path);
     if (!reader.is_valid()) {
       std::cerr << "Failed to open checkpoint: " << reader.last_error() << std::endl;
       return false;
     }
 
-    // Read header
     CheckpointHeader header;
     if (!reader.read_header(header)) {
       std::cerr << "Failed to read checkpoint header: " << reader.last_error() << std::endl;
@@ -433,54 +434,35 @@ bool DBSPRecoveryManager::load_checkpoint(duckdb::ClientContext &context) {
               << ", views: " << header.num_views
               << ", tables: " << header.num_tables << std::endl;
 
-    auto &cdc_manager = get_cdc_manager();
-
-    // Read all views
+    // Walk every section to prove the file is complete and well-formed;
+    // the parsed Z-sets are discarded
     for (uint32_t i = 0; i < header.num_views; i++) {
       std::string view_name;
       DuckDBZSet zset;
-
       if (!reader.read_view(view_name, zset)) {
         std::cerr << "Failed to read view " << i << ": " << reader.last_error() << std::endl;
         return false;
       }
-
-      // Restore view's Z-set state
-      // Note: Views must already exist (loaded from _dbsp_views)
-      if (cdc_manager.view_exists(view_name)) {
-        cdc_manager.restore_view_state(view_name, zset);
-        std::cout << "DBSP: Restored view '" << view_name << "' with "
-                  << zset.size() << " rows" << std::endl;
-      }
     }
-
-    // Read all tracked tables
     for (uint32_t i = 0; i < header.num_tables; i++) {
       std::string table_name;
       uint64_t sequence;
       DuckDBZSet zset;
-
       if (!reader.read_table(table_name, sequence, zset)) {
         std::cerr << "Failed to read table " << i << ": " << reader.last_error() << std::endl;
         return false;
       }
-
-      // Restore table's Z-set state
-      std::cout << "DBSP: Restored table '" << table_name << "' with "
-                << zset.size() << " rows (sequence: " << sequence << ")" << std::endl;
     }
 
-    // Verify checksum
     if (!reader.verify_checksum()) {
       std::cerr << "Checkpoint checksum verification failed: " << reader.last_error() << std::endl;
       return false;
     }
 
-    std::cout << "DBSP: Checkpoint loaded successfully" << std::endl;
     return true;
 
   } catch (const std::exception &e) {
-    std::cerr << "Exception loading checkpoint: " << e.what() << std::endl;
+    std::cerr << "Exception validating checkpoint: " << e.what() << std::endl;
     return false;
   }
 }

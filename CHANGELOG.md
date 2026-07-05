@@ -1,5 +1,33 @@
 # Changelog
 
+## Pre-Phase-D: Recovery correctness - Jul 2026
+
+### Checkpoint restore rebuilt around replay (Jul 5, 2026)
+- Audit found checkpoint restore broken four ways: values deserialized as
+  VARCHAR (never equal to live rows, so Z-set retractions could not
+  cancel), partial checkpoint loads followed by a full resync doubled
+  state, table baselines read from the checkpoint were discarded, and
+  set_result() filled only view sinks while every internal circuit-node
+  state (aggregate groups, join indexes, sort/limit multisets, recursive
+  dedup) stayed empty — first post-restore delta computed garbage.
+- Fix: recovery no longer applies checkpoint contents at all. DuckDB's
+  committed storage is the single durable source of truth — load_views
+  already rebuilds each view by replaying tracked-table scans through its
+  circuit, which restores sinks AND internal node state consistently.
+  load_checkpoint became validate_checkpoint (parse + checksum,
+  diagnostics only); CDCManager::restore_view_state deleted; WAL
+  table-delta replay skipped during recovery (it double-applied onto
+  baselines already scanned from committed storage — rows absent from
+  DuckDB storage after a crash were never committed and must not be
+  resurrected). replay_wal() itself remains for callers managing their own
+  baselines.
+- read_value now casts values back to the written type where the bare type
+  id suffices (parameterized types stay strings; contents are validated,
+  never applied).
+- New regression tests ([restore_audit]): aggregate view stays correct
+  through the first post-restore delta; ordered views still scan their
+  rows after restore. 32/32 green ×3.
+
 ## Phase C: Planner Completion & Parser Retirement - Jul 2026
 
 ### C5: Bespoke SQL parser deleted (Jul 5, 2026)

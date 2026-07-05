@@ -391,10 +391,19 @@ bool CheckpointReader::read_value(duckdb::Value &value) {
   std::string str_value;
   if (!read_string(str_value)) return false;
 
-  // Parse value based on type (simple approach for Phase 2)
-  // For now, keep values as strings and let DuckDB handle conversion when used
-  // TODO: Add ClientContext parameter to properly cast values during deserialization
+  // Cast back to the written type so round-tripped values compare equal to
+  // live ones. Parameterized types (DECIMAL width/scale, etc.) cannot be
+  // reconstructed from the bare type id — those stay VARCHAR, which is
+  // acceptable because checkpoint contents are validated, never applied.
   value = duckdb::Value(str_value);
+  try {
+    duckdb::LogicalType type(static_cast<duckdb::LogicalTypeId>(type_id));
+    if (type.IsComplete()) {
+      value = value.DefaultCastAs(type);
+    }
+  } catch (const std::exception &) {
+    // Keep the string form
+  }
 
   return true;
 }

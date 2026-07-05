@@ -311,3 +311,137 @@ TEST_CASE("Phase 2.5: Recovery uses checkpoint before resync",
   // Recovery should be fast (< 500ms for 1000 rows)
   REQUIRE(recover_time < 500);
 }
+
+// ===== Pre-Phase-D restore audit =====
+//
+// Checkpoint restore uses set_result(), which fills a view's SINK but
+// leaves every internal circuit-node state empty (aggregate group states,
+// join indexes, embedded sort/limit multisets, recursive dedup state).
+// These tests pin the two user-visible consequences:
+//   1. the first post-restore delta must merge with pre-restore state,
+//      not restart from zero
+//   2. ordered views must still scan their content (scan() delegates to
+//      the embedded sort view's multiset, not the sink)
+
+TEST_CASE("Restore audit: aggregate view stays correct after first "
+          "post-restore delta",
+          "[crash_recovery][phase2][restore_audit]") {
+  DuckDB db(nullptr);
+  Connection con(db);
+
+  auto &recovery_manager = get_recovery_manager();
+  auto &cdc_manager = get_cdc_manager();
+
+  recovery_manager.set_recovery_enabled(false);
+  cdc_manager.reset();
+  REQUIRE(recovery_manager.initialize_persistence(*con.context));
+
+  con.Query("CREATE TABLE nums (g VARCHAR, v INTEGER)");
+  con.Query("INSERT INTO nums VALUES ('a', 10), ('a', 20), ('b', 5)");
+
+  con.BeginTransaction();
+  REQUIRE(cdc_manager.track_table(*con.context, "nums"));
+  con.Commit();
+  con.BeginTransaction();
+  REQUIRE(cdc_manager.create_view(*con.context, "v_sum",
+                                  "SELECT g, SUM(v) AS s FROM nums GROUP BY g"));
+  con.Commit();
+  con.BeginTransaction();
+  REQUIRE(cdc_manager.sync_table(*con.context, "nums"));
+  con.Commit();
+
+  auto *before = cdc_manager.query_view("v_sum");
+  REQUIRE(before != nullptr);
+  REQUIRE(before->size() == 2); // (a,30) (b,5)
+
+  recovery_manager.set_recovery_enabled(true);
+  REQUIRE(recovery_manager.save_checkpoint(*con.context));
+
+  // Simulated crash + recovery via checkpoint
+  cdc_manager.reset();
+  con.BeginTransaction();
+  REQUIRE(recovery_manager.recover_from_crash(*con.context, ""));
+  con.Commit();
+
+  auto *restored = cdc_manager.query_view("v_sum");
+  REQUIRE(restored != nullptr);
+  REQUIRE(restored->size() == 2); // content survives restore
+
+  // First post-restore delta: group 'a' must become 31, not fork a
+  // second row computed from empty aggregate state
+  con.Query("INSERT INTO nums VALUES ('a', 1)");
+  con.BeginTransaction();
+  REQUIRE(cdc_manager.sync_table(*con.context, "nums"));
+  con.Commit();
+
+  auto *after = cdc_manager.query_view("v_sum");
+  REQUIRE(after != nullptr);
+  std::cout << "rows after post-restore delta:" << std::endl;
+  for (const auto &[row, w] : *after) {
+    std::cout << "  " << row.columns[0].ToString() << " -> "
+              << row.columns[1].ToString() << " (w=" << w << ")"
+              << std::endl;
+  }
+  REQUIRE(after->size() == 2); // still one row per group
+  DuckDBRow expect_a;
+  expect_a.columns = {duckdb::Value("a"),
+                      duckdb::Value::Numeric(duckdb::LogicalType::HUGEINT, 31)};
+  // SUM return type for INTEGER args is HUGEINT in DuckDB
+  bool found_31 = false;
+  for (const auto &[row, w] : *after) {
+    if (row.columns[0].ToString() == "a") {
+      found_31 = row.columns[1].ToString() == "31" && w == 1;
+    }
+  }
+  REQUIRE(found_31);
+}
+
+TEST_CASE("Restore audit: ordered view still scans its rows after restore",
+          "[crash_recovery][phase2][restore_audit]") {
+  DuckDB db(nullptr);
+  Connection con(db);
+
+  auto &recovery_manager = get_recovery_manager();
+  auto &cdc_manager = get_cdc_manager();
+
+  recovery_manager.set_recovery_enabled(false);
+  cdc_manager.reset();
+  REQUIRE(recovery_manager.initialize_persistence(*con.context));
+
+  con.Query("CREATE TABLE st (id INTEGER, val INTEGER)");
+  con.Query("INSERT INTO st VALUES (1, 30), (2, 10), (3, 20)");
+
+  con.BeginTransaction();
+  REQUIRE(cdc_manager.track_table(*con.context, "st"));
+  con.Commit();
+  con.BeginTransaction();
+  REQUIRE(cdc_manager.create_view(*con.context, "v_ord",
+                                  "SELECT val, id FROM st ORDER BY val DESC"));
+  con.Commit();
+  con.BeginTransaction();
+  REQUIRE(cdc_manager.sync_table(*con.context, "st"));
+  con.Commit();
+
+  auto count_scanned = [&]() {
+    size_t n = 0;
+    const auto *view = cdc_manager.get_view("v_ord");
+    REQUIRE(view != nullptr);
+    view->scan([&](const DuckDBRow &, Weight w) { n += (w > 0) ? w : 0; });
+    return n;
+  };
+  REQUIRE(count_scanned() == 3);
+
+  recovery_manager.set_recovery_enabled(true);
+  REQUIRE(recovery_manager.save_checkpoint(*con.context));
+
+  cdc_manager.reset();
+  con.BeginTransaction();
+  REQUIRE(recovery_manager.recover_from_crash(*con.context, ""));
+  con.Commit();
+
+  // dbsp_query consumes scan(): after restore it must still see the rows,
+  // not an empty embedded sort multiset
+  REQUIRE(cdc_manager.query_view("v_ord") != nullptr);
+  REQUIRE(cdc_manager.query_view("v_ord")->size() == 3); // sink restored
+  REQUIRE(count_scanned() == 3);                          // scan path too
+}
