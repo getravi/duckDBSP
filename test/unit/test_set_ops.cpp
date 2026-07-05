@@ -1,6 +1,5 @@
 #include "catch.hpp"
 #include "dbsp_set_ops.hpp"
-#include "dbsp_sql_parser.hpp"
 
 using namespace dbsp_native;
 

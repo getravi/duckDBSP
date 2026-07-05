@@ -325,63 +325,6 @@ private:
   DuckDBZSet delta_;
 };
 
-// Fused filter+project view: SELECT col1, col2 FROM table WHERE col3 > 10
-// Applies filter and projection in a single pass, reducing memory by only
-// storing projected columns.
-class NativeFilterProjectView : public NativeMaterializedView {
-public:
-  using PredicateFn = std::function<bool(const DuckDBRow &)>;
-  using ProjectFn = std::function<DuckDBRow(const DuckDBRow &)>;
-
-  NativeFilterProjectView(const std::string &name, const std::string &sql,
-                          const std::string &source_table,
-                          const TableSchema &result_schema,
-                          PredicateFn predicate, ProjectFn project)
-      : NativeMaterializedView(name, sql), source_table_(source_table),
-        schema_(result_schema), predicate_(std::move(predicate)),
-        project_(std::move(project)) {
-    schema_.table_name = name;
-  }
-
-  void apply_changes(const std::string &table_name,
-                     const DuckDBZSet &changes) override {
-    delta_.clear();
-    if (table_name != source_table_)
-      return;
-
-    for (const auto &[row, weight] : changes) {
-      if (predicate_(row)) {
-        DuckDBRow projected = project_(row);
-        result_.insert(projected, weight);
-        delta_.insert(std::move(projected), weight);
-      }
-    }
-    ++version_;
-  }
-
-  const DuckDBZSet &get_result() const override { return result_; }
-  void set_result(const DuckDBZSet &result) override { result_ = result; version_++; }
-  const DuckDBZSet &get_delta() const override { return delta_; }
-  const TableSchema &result_schema() const override { return schema_; }
-  std::vector<std::string> source_tables() const override {
-    return {source_table_};
-  }
-
-  void reset() override {
-    result_.clear();
-    delta_.clear();
-    version_ = 0;
-  }
-
-private:
-  std::string source_table_;
-  TableSchema schema_;
-  PredicateFn predicate_;
-  ProjectFn project_;
-  DuckDBZSet result_;
-  DuckDBZSet delta_;
-};
-
 // Projection view: SELECT col1, col2 FROM table
 class NativeProjectView : public NativeMaterializedView {
 public:

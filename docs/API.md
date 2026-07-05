@@ -149,21 +149,21 @@ SELECT * FROM dbsp_create_view('vip_totals',
 
 ### dbsp_use_planner(enable)
 
-Toggle the planner frontend (Phase B, **default ON**). When enabled,
-`dbsp_create_view` first translates view SQL through DuckDB's own
-binder/planner instead of the bespoke parser. Currently covers
-scan/filter/projection plans (arbitrary expressions, function calls, mixed
-AND/OR predicates), GROUP BY aggregation (multiple aggregates, expression
-keys, HAVING, global aggregates), inner joins (equi + residual predicates),
-cross joins, DISTINCT, UNION/INTERSECT/EXCEPT (ALL and DISTINCT), window
-functions over plain columns, and non-recursive CTEs; anything else
-(ORDER BY/LIMIT, recursive CTEs, outer joins, ...) falls back to the
-bespoke parser transparently.
+**Deprecated no-op since Phase C5.** The planner frontend is the only
+frontend — the bespoke SQL parser it used to toggle against was deleted.
+The function stays callable so existing scripts don't break; it always
+reports ENABLED. `dbsp_create_view` translates view SQL through DuckDB's
+own binder/planner, covering scan/filter/projection (arbitrary
+expressions), GROUP BY aggregation (multiple aggregates, expression keys,
+HAVING, global aggregates, exact DECIMAL SUM), inner joins (equi +
+residual predicates), cross joins, DISTINCT, DISTINCT ON,
+UNION/INTERSECT/EXCEPT (ALL and DISTINCT), window functions over plain
+columns, non-recursive CTEs, WITH RECURSIVE, and ORDER BY/LIMIT/OFFSET.
+Anything else (outer joins, correlated subqueries, ...) fails with a
+DBSP-E110 error naming the operator.
 
 ```sql
-SELECT * FROM dbsp_use_planner(false);  -- Disable (use parser only)
-SELECT * FROM dbsp_use_planner(true);   -- Re-enable (default)
-SELECT * FROM dbsp_use_planner();       -- Query status
+SELECT * FROM dbsp_use_planner();       -- Always: ENABLED
 ```
 
 **Parameters:**
@@ -462,7 +462,7 @@ duckDBSP uses a structured error code system (DBSP-Exxx) that provides:
 
 | Category | Description | Examples |
 |----------|-------------|----------|
-| **E1xx** | Parser errors (unsupported SQL) | E101 (HAVING), E102 (ORDER BY) |
+| **E1xx** | Unsupported SQL | E110 (plan operator not supported) |
 | **E2xx** | Validation errors (invalid input) | E201 (Invalid identifier) |
 | **E3xx** | Runtime errors (execution failures) | E301 (View update failed) |
 | **E4xx** | Resource errors (limits exceeded) | E401 (Too many views) |

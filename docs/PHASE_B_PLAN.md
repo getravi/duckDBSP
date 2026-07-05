@@ -103,11 +103,11 @@ them; found + filed a latent parser-path bug where recursive views through
 dbsp_create_view double their rows). DELIM_JOIN rejected with explicit
 message. 37/37 green.
 
-> **Phase C progress (2026-07-05):** ORDER BY/LIMIT now translate (C1 —
-> `SORT_LIMIT` spec folding sort + limit + trailing column-ref projection
-> into an embedded NativeSortView/NativeLimitView; root sort/limit drives
-> dbsp_query scan order). Remaining before parser deletion: recursive CTEs,
-> DISTINCT ON. See `docs/superpowers/plans/2026-07-05-phase-c-planner-completion.md`.
+> **Phase C COMPLETE (2026-07-05):** all planner gaps closed (C1 ORDER
+> BY/LIMIT, C2 recursive CTEs, C3 DISTINCT ON), optimizer ported to circuit
+> IR (C4), and the bespoke parser DELETED (C5) — success criterion 4 below
+> is now met. See CHANGELOG.md and
+> `docs/superpowers/plans/2026-07-05-phase-c-planner-completion.md`.
 
 **B5 — Flip and delete (0.5 wk) — FLIPPED (2026-07-04); deletion deferred**
 Default `dbsp_use_planner` ON; full suite green both ways (OFF at the B4

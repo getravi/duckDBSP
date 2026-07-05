@@ -1,28 +1,8 @@
 #include "catch.hpp"
 #include "dbsp_duckdb_types.hpp"
-#include "dbsp_sql_parser.hpp"
 #include "dbsp_window_view.hpp"
 
 using namespace dbsp_native;
-
-TEST_CASE("Window Functions Parser", "[window][parser]") {
-  DBSPSqlParser parser;
-
-  SECTION("Parse ROW_NUMBER()") {
-    auto res = parser.parse(
-        "SELECT ROW_NUMBER() OVER (PARTITION BY a ORDER BY b) as rn FROM t");
-    INFO("Error: " << res.error);
-    REQUIRE(res.success);
-    REQUIRE(res.view_def.type == ParsedViewDef::ViewType::WINDOW);
-    REQUIRE(res.view_def.windows.size() == 1);
-    REQUIRE(res.view_def.windows[0].function == "ROW_NUMBER");
-    REQUIRE(res.view_def.windows[0].alias == "rn");
-    REQUIRE(res.view_def.windows[0].partition_by.size() == 1);
-    REQUIRE(res.view_def.windows[0].partition_by[0] == "a");
-    REQUIRE(res.view_def.windows[0].order_by.size() == 1);
-    REQUIRE(res.view_def.windows[0].order_by[0].column_name == "b");
-  }
-}
 
 TEST_CASE("NativeWindowView Execution", "[window][execution]") {
   // Schema: user_id (int), score (int)

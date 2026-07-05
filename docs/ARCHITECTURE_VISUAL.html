@@ -336,14 +336,14 @@
       </button>
       <div class="stack-arrow" aria-hidden="true">&#9660;</div>
       <button class="layer split" aria-expanded="false">
-        <span class="head"><span class="role">Translators</span>
-        <span class="name">Two readers of your SQL</span><span class="caret">&#9656;</span></span>
+        <span class="head"><span class="role">Translator</span>
+        <span class="name">One reader of your SQL</span><span class="caret">&#9656;</span></span>
         <span class="detail">Your question (“total per customer”) is written in SQL.
-        Two translators can turn it into a blueprint for the assembly line below:
-        a new one that borrows DuckDB's own query brain (more fluent, opt-in), and
-        the original in-house one. If the new translator meets a phrase it doesn't
-        know yet, the in-house one quietly takes over — nothing breaks.
-        <span class="tech">Planner Frontend (Phase B, dbsp_use_planner) with transparent fallback to the SQL Parser</span></span>
+        One translator turns it into a blueprint for the assembly line below,
+        borrowing DuckDB's own query brain so it speaks fluent SQL. If it meets
+        a phrase it can't handle (say, an outer join), it tells you exactly
+        which one instead of guessing.
+        <span class="tech">Planner Frontend (the only frontend since Phase C — the in-house SQL parser was retired)</span></span>
       </button>
       <div class="stack-arrow" aria-hidden="true">&#9660;</div>
       <button class="layer" aria-expanded="false">

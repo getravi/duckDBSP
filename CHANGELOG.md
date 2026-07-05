@@ -1,5 +1,49 @@
 # Changelog
 
+## Phase C: Planner Completion & Parser Retirement - Jul 2026
+
+### C5: Bespoke SQL parser deleted (Jul 5, 2026)
+- `dbsp_sql_parser.hpp` (parser + ViewFactory) and `dbsp_optimizer.hpp`
+  (ParsedViewDef-based DBSPOptimizer) are gone; the planner frontend is the
+  only frontend. Translation failure is now a user-visible DBSP-E110 (or
+  binder) error instead of a silent fallback — which also kills the old
+  parser bug that silently dropped OR filters.
+- Pre-deletion inventory gate (suite run with fallback disabled) found and
+  closed three real gaps: views-on-views (MVs now shadowed as empty TEMP
+  tables on the internal connection during ExtractPlan so DuckDB's binder
+  can bind them), COUNT(*)-only scans (virtual rowid columns scan as NULL),
+  and SUM over DECIMAL (exact 128-bit unscaled accumulation; AVG(DECIMAL)
+  uses the double path, matching DuckDB's DOUBLE return type).
+- `dbsp_use_planner()` stays callable as a backwards-compatible no-op that
+  always reports ENABLED.
+- Deleted with the parser: parser-only unit tests (sql_parser, optimizer,
+  order_limit_parser, set_ops_parser, parser_errors, cte_subquery) and
+  dead classes nothing referenced anymore (`NativeFilterProjectView`,
+  `NativeRecursiveView`/dbsp_recursive.hpp — replaced by C4's fused
+  FILTER_MAP node and C2's PlanRecursiveNode respectively).
+- Suite: 32/32 green ×3 (was 37 test binaries; 5 parser-test binaries
+  removed, all remaining coverage intact or migrated).
+
+### C4: Optimizer ported to circuit IR (Jul 5, 2026)
+- `plan_ir::optimize` rewrites the PlanOpSpec tree before circuit
+  construction: adjacent-filter merge, single-side filter pushdown below
+  joins (shrinks join index state; right-side predicate copies live in
+  PlanKeepAlive::rewritten_exprs), and MAP(FILTER(x)) fusion into one
+  PlanFilterMapNode. Projection pruning intentionally not ported — DuckDB's
+  binder already prunes via GET column_ids.
+
+### C1–C3: Planner gaps closed (Jul 5, 2026)
+- C1 ORDER BY/LIMIT: folded (with trailing column-ref projections) into
+  NativeSortView/NativeLimitView behind EmbeddedViewNode; a root sort/limit
+  drives dbsp_query scan order, so ordered views return ordered rows.
+- C2 WITH RECURSIVE: PlanRecursiveNode fixed-point driver over a nested
+  PlannedCircuitView; UNION dedup state persists across deltas and
+  multi-table recursive steps (e.g. transitive closure joining an edge
+  table) now work — both beyond what the parser supported.
+- C3 DISTINCT ON: NativeDistinctOnView behind EmbeddedViewNode; winner-pick
+  order from the DISTINCT node's own order modifier. Also fixed a latent
+  NULL-comparison crash in NativeDistinctOnView's comparator.
+
 ## Phase B5: Planner Frontend Default ON - Jul 2026
 
 ### B5: Planner becomes the default frontend (Jul 4, 2026)

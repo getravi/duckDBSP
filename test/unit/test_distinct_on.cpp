@@ -1,6 +1,5 @@
 #include "../test_helpers.hpp"
 #include "dbsp_distinct_on.hpp"
-#include "dbsp_sql_parser.hpp"
 
 using namespace dbsp_native;
 

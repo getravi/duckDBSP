@@ -144,6 +144,8 @@ struct PlanAggSpec {
   Fn fn;
   const duckdb::Expression *arg = nullptr; // null for COUNT_STAR
   bool integer_arg = false;                // SUM/AVG: int64 vs double sum
+  bool decimal_arg = false; // SUM over DECIMAL: exact unscaled hugeint sum
+  uint8_t decimal_scale = 0;
   duckdb::LogicalType return_type;
 };
 
@@ -371,6 +373,8 @@ public:
     PlanAggSpec::Fn fn;
     std::unique_ptr<RowExprEval> arg; // null for COUNT_STAR
     bool integer_arg;
+    bool decimal_arg = false;
+    uint8_t decimal_scale = 0;
     duckdb::LogicalType return_type;
   };
 
@@ -447,6 +451,7 @@ private:
     int64_t count = 0; // non-NULL argument count (rows for COUNT(*))
     int64_t isum = 0;
     double dsum = 0;
+    duckdb::hugeint_t hsum = 0; // DECIMAL SUM, unscaled
     std::multiset<duckdb::Value> values; // MIN/MAX
   };
 
@@ -475,7 +480,13 @@ private:
         break;
       case PlanAggSpec::Fn::SUM:
       case PlanAggSpec::Fn::AVG:
-        if (spec.integer_arg) {
+        if (spec.decimal_arg) {
+          // Exact: sum the unscaled decimal representation in 128 bits
+          duckdb::Value wide = v.DefaultCastAs(
+              duckdb::LogicalType::DECIMAL(38, spec.decimal_scale));
+          s.hsum += wide.GetValueUnsafe<duckdb::hugeint_t>() *
+                    duckdb::hugeint_t(weight);
+        } else if (spec.integer_arg) {
           s.isum += v.GetValue<int64_t>() * weight;
         } else {
           s.dsum += v.GetValue<double>() * weight;
@@ -510,6 +521,10 @@ private:
     case PlanAggSpec::Fn::SUM:
       if (s.count == 0) {
         return duckdb::Value(spec.return_type);
+      }
+      if (spec.decimal_arg) {
+        return duckdb::Value::DECIMAL(s.hsum, 38, spec.decimal_scale)
+            .DefaultCastAs(spec.return_type);
       }
       if (spec.integer_arg) {
         return duckdb::Value::Numeric(spec.return_type, s.isum);
@@ -1004,8 +1019,8 @@ private:
 // with the anchor delta plus the step's reaction, then iterate the step on
 // the frontier until it stops producing new rows. UNION dedup state
 // persists across calls, so later deltas cannot double-count rows.
-// Deletions (negative weights) are ignored inside the fixed point — parity
-// with the parser-path NativeRecursiveView this replaces.
+// Deletions (negative weights) are ignored inside the fixed point — a
+// documented limitation carried over from the parser-era implementation.
 class PlanRecursiveNode : public dbsp::Node {
 public:
   using InputFn = std::function<const DuckDBZSet &()>;
@@ -1247,6 +1262,8 @@ private:
         PlanAggregateNode::AggInstance inst;
         inst.fn = agg_spec.fn;
         inst.integer_arg = agg_spec.integer_arg;
+        inst.decimal_arg = agg_spec.decimal_arg;
+        inst.decimal_scale = agg_spec.decimal_scale;
         inst.return_type = agg_spec.return_type;
         if (agg_spec.arg) {
           inst.arg = std::make_unique<RowExprEval>(keep_alive, *agg_spec.arg,
@@ -1449,13 +1466,37 @@ public:
 
   // Translate view SQL into a circuit view via DuckDB's planner.
   // Caller must hold an InternalQueryGuard.
-  static Result translate(duckdb::ClientContext &context,
-                          const std::string &view_name,
-                          const std::string &sql) {
+  //
+  // mv_schemas: name + schema of every existing materialized view. MVs are
+  // not in DuckDB's catalog, so views-on-views would fail to bind; empty
+  // TEMP tables mirroring their schemas are created on the internal
+  // connection (the temp schema shadows main, matching CDC's own
+  // views-before-tables resolution order). They exist only for plan
+  // extraction — no data ever flows through them.
+  static Result translate(
+      duckdb::ClientContext &context, const std::string &view_name,
+      const std::string &sql,
+      const std::vector<std::pair<std::string, TableSchema>> &mv_schemas = {}) {
     auto keep_alive = std::make_shared<PlanKeepAlive>();
     try {
       keep_alive->connection = std::make_unique<duckdb::Connection>(
           duckdb::DatabaseInstance::GetDatabase(context));
+      for (const auto &[mv_name, mv_schema] : mv_schemas) {
+        std::string ddl = "CREATE TEMP TABLE \"" + mv_name + "\" (";
+        for (size_t i = 0; i < mv_schema.columns.size(); i++) {
+          if (i > 0) {
+            ddl += ", ";
+          }
+          ddl += "\"" + mv_schema.columns[i].name + "\" " +
+                 mv_schema.columns[i].type.ToString();
+        }
+        ddl += ")";
+        auto res = keep_alive->connection->Query(ddl);
+        if (res->HasError()) {
+          return {nullptr, "planner frontend: could not shadow view '" +
+                               mv_name + "': " + res->GetError()};
+        }
+      }
       // Canonical plan shapes: no filter pushdown into GET, no projection
       // collapse. ExtractPlan still runs ColumnBindingResolver and
       // ResolveOperatorTypes.
@@ -1756,6 +1797,17 @@ private:
             case duckdb::LogicalTypeId::FLOAT:
             case duckdb::LogicalTypeId::DOUBLE:
               agg_spec.integer_arg = false;
+              break;
+            case duckdb::LogicalTypeId::DECIMAL:
+              if (agg_spec.fn == PlanAggSpec::Fn::SUM) {
+                // SUM(DECIMAL) stays exact; AVG(DECIMAL) returns DOUBLE in
+                // DuckDB, so the double path matches its semantics
+                agg_spec.decimal_arg = true;
+                agg_spec.decimal_scale =
+                    duckdb::DecimalType::GetScale(agg_spec.arg->return_type);
+              } else {
+                agg_spec.integer_arg = false;
+              }
               break;
             default:
               return unsupported(fn + " over " +
@@ -2296,23 +2348,27 @@ private:
 
       // CDC rows carry ALL table columns in declared order; GET's output is
       // column_ids order. Emit an index-selection map unless it's identity.
+      // Virtual columns (rowid) become NULL: CDC deltas have no stable row
+      // ids. Plans only request them when nothing reads the value (e.g. the
+      // binder projects rowid as the cheapest column for COUNT(*)).
       const auto &column_ids = op.GetColumnIds();
       std::vector<duckdb::idx_t> idxs;
       bool identity = column_ids.size() == op.returned_types.size();
+      columns.clear();
       for (duckdb::idx_t i = 0; i < column_ids.size(); i++) {
         duckdb::idx_t col = column_ids[i].GetPrimaryIndex();
         if (col >= op.returned_types.size()) {
-          return unsupported("virtual column scan (e.g. rowid)");
+          // Out-of-range index: the MAP_COLS lambda emits NULL for it
+          identity = false;
+          idxs.push_back(col);
+          columns.push_back({"rowid", op.types[i]});
+          continue;
         }
         if (col != i) {
           identity = false;
         }
         idxs.push_back(col);
-      }
-
-      columns.clear();
-      for (auto idx : idxs) {
-        columns.push_back({op.names[idx], op.returned_types[idx]});
+        columns.push_back({op.names[col], op.returned_types[col]});
       }
       if (identity) {
         return source;

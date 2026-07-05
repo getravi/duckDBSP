@@ -891,28 +891,14 @@ void UsePlannerFunc(ClientContext &context, TableFunctionInput &input,
   if (data.done)
     return;
 
-  auto &manager = dbsp_native::get_cdc_manager();
-
-  if (data.query_only) {
-    bool enabled = manager.is_planner_enabled();
-    output.SetCardinality(1);
-    output.SetValue(0, 0,
-                    Value(string("Planner frontend is ") +
-                          (enabled ? "ENABLED" : "DISABLED")));
-  } else {
-    if (data.enable) {
-      manager.enable_planner();
-      output.SetCardinality(1);
-      output.SetValue(0, 0,
-                      Value("Planner frontend ENABLED: views translate "
-                            "through DuckDB's planner when supported"));
-    } else {
-      manager.disable_planner();
-      output.SetCardinality(1);
-      output.SetValue(
-          0, 0, Value("Planner frontend DISABLED: using bespoke parser"));
-    }
-  }
+  // The planner is the only frontend since Phase C5 (the bespoke parser was
+  // deleted); toggling is a no-op kept for backwards compatibility
+  output.SetCardinality(1);
+  output.SetValue(0, 0,
+                  Value("Planner frontend is ENABLED (always: the bespoke "
+                        "parser was removed in Phase C5)"));
+  (void)data.query_only;
+  (void)data.enable;
   data.done = true;
 }
 

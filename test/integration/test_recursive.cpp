@@ -1,5 +1,5 @@
 // Integration tests for WITH RECURSIVE support
-// Tests fixed-point iteration via NativeRecursiveView
+// Tests fixed-point iteration of recursive views (planner frontend)
 
 #include "../test_helpers.hpp"
 

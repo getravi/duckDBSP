@@ -6,7 +6,7 @@ This guide explains the error handling system in duckDBSP and how to troubleshoo
 
 All errors in duckDBSP use structured error codes in the format `DBSP-Exxx`:
 
-- **E1xx**: Parser errors (unsupported SQL features)
+- **E1xx**: Unsupported SQL (plan shapes the planner frontend cannot translate)
 - **E2xx**: Validation errors (invalid input)
 - **E3xx**: Runtime errors (execution failures)
 - **E4xx**: Resource errors (limits exceeded)
@@ -62,20 +62,27 @@ SELECT * FROM dbsp_create_view('large_depts',
     'SELECT * FROM dept_counts WHERE cnt > 10');
 ```
 
-### E102: ORDER BY Not Supported
+### E110: Plan Operator Not Supported
 
-**Solution**: Sort results after querying
+The planner frontend names the operator it could not translate (e.g.
+correlated subqueries / DELIM_JOIN, outer joins, non-constant LIMIT).
+
+**Solution**: Rewrite the query — e.g. turn a correlated subquery into a
+JOIN, or split it into an intermediate view:
 
 ```sql
 -- Instead of:
-SELECT * FROM orders ORDER BY created_at DESC
+SELECT * FROM orders o WHERE amount > (SELECT AVG(amount) FROM orders)
 
 -- Do this:
-SELECT * FROM dbsp_create_view('all_orders', 'SELECT * FROM orders');
-
--- Then in your application:
-SELECT * FROM dbsp_query('all_orders') ORDER BY created_at DESC;
+SELECT * FROM dbsp_create_view('avg_amount',
+    'SELECT AVG(amount) AS a FROM orders');
+SELECT * FROM dbsp_create_view('big_orders',
+    'SELECT o.* FROM orders o JOIN avg_amount v ON o.amount > v.a');
 ```
+
+Note: ORDER BY / LIMIT are fully supported since Phase C1 — `dbsp_query`
+returns rows in ORDER BY order for sorted views.
 
 ## Getting Help
 
@@ -91,4 +98,4 @@ When adding features that may error:
 2. Add workaround to `get_workaround()`
 3. Create documentation in `docs/errors/E{category}xx/`
 4. Update error catalog README
-5. Add test cases in `test/unit/test_parser_errors.cpp`
+5. Add test cases in `test/integration/test_error_handling_e2e.cpp`

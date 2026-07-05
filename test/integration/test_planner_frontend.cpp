@@ -123,25 +123,20 @@ void runDifferentialTwoTables(DuckDBTestHarness &db, const std::string &view,
 
 } // namespace
 
-TEST_CASE("dbsp_use_planner toggles and reports status",
+TEST_CASE("dbsp_use_planner stays callable and always reports ENABLED",
           "[integration][planner]") {
   DuckDBTestHarness db;
 
-  // Default is ON since B5
-  auto status = db.query("SELECT * FROM dbsp_use_planner()");
-  REQUIRE(status->GetValue(0, 0).ToString().find("ENABLED") !=
-          std::string::npos);
-
-  auto off = db.query("SELECT * FROM dbsp_use_planner(false)");
-  REQUIRE(off->GetValue(0, 0).ToString().find("DISABLED") !=
-          std::string::npos);
-
-  status = db.query("SELECT * FROM dbsp_use_planner()");
-  REQUIRE(status->GetValue(0, 0).ToString().find("DISABLED") !=
-          std::string::npos);
-
-  auto on = db.query("SELECT * FROM dbsp_use_planner(true)");
-  REQUIRE(on->GetValue(0, 0).ToString().find("ENABLED") != std::string::npos);
+  // The planner is the only frontend since C5 (parser deleted): the toggle
+  // is a backwards-compatible no-op — existing scripts calling it must not
+  // break, and it must never claim a parser fallback exists
+  for (const char *call : {"dbsp_use_planner()", "dbsp_use_planner(false)",
+                           "dbsp_use_planner(true)"}) {
+    auto status = db.query(std::string("SELECT * FROM ") + call);
+    REQUIRE_FALSE(status->HasError());
+    REQUIRE(status->GetValue(0, 0).ToString().find("ENABLED") !=
+            std::string::npos);
+  }
 }
 
 TEST_CASE("planner frontend: filter view differential",
@@ -429,13 +424,14 @@ TEST_CASE("planner frontend: correlated subquery and recursive CTE fall back",
   }
 }
 
-TEST_CASE("planner frontend: flag off uses parser path",
+TEST_CASE("planner frontend: dbsp_use_planner(false) no longer disables it",
           "[integration][planner]") {
   DuckDBTestHarness db;
   db.createTable("t", "id INT, val INT, tag VARCHAR", {"(1, 10, 'a')"});
   db.exec("SELECT * FROM dbsp_track('t')");
   db.exec("SELECT * FROM dbsp_sync('t')");
-  // Explicitly disable (default is ON since B5)
+  // No parser to fall back to since C5: the old disable call is a no-op and
+  // view creation must keep working through the planner
   db.exec("SELECT * FROM dbsp_use_planner(false)");
 
   db.exec("SELECT * FROM dbsp_create_view('v_off', "

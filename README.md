@@ -139,7 +139,7 @@ make benchmarks
 
 ### Test Coverage
 
-- **Unit tests**: Core DBSP library, SQL parser, CDC manager
+- **Unit tests**: Core DBSP library, native views, CDC manager
 - **Integration tests**: All extension functions, CDC, cascading views, persistence
 - **Benchmarks**: O(delta) performance validation
 
@@ -234,24 +234,28 @@ See [Error Handling Guide](docs/ERROR_HANDLING.md) for details.
 - NULL-aware operations (SQL semantics for GROUP BY, JOINs, aggregates)
 - Incremental recursive query evaluation
 
-**Planner Frontend (Phase B — default ON, `dbsp_use_planner(false)` to
-disable):**
-- View SQL planned by DuckDB's own binder/planner instead of the bespoke
-  parser; scan/filter/projection, GROUP BY aggregation, inner joins
-  (equi + residual predicates), cross joins, DISTINCT, set operations,
-  window functions, and non-recursive CTEs translate directly to circuit
-  nodes with full DuckDB expression coverage (function calls, mixed AND/OR
-  predicates, multi-aggregate GROUP BY, expression group/join keys, HAVING,
-  global aggregates). Unsupported plans (ORDER BY/LIMIT, recursive CTEs,
-  outer joins) fall back to the parser transparently.
+**Planner Frontend (the only frontend since Phase C — the bespoke SQL
+parser was deleted):**
+- View SQL planned by DuckDB's own binder/planner; scan/filter/projection,
+  GROUP BY aggregation (incl. exact SUM over DECIMAL), inner joins
+  (equi + residual predicates), cross joins, DISTINCT, DISTINCT ON, set
+  operations, window functions, non-recursive CTEs, WITH RECURSIVE
+  (multi-table recursive steps), and ORDER BY/LIMIT/OFFSET translate
+  directly to circuit nodes with full DuckDB expression coverage (function
+  calls, mixed AND/OR predicates, multi-aggregate GROUP BY, expression
+  group/join keys, HAVING, global aggregates). A circuit-IR optimizer
+  combines filters, pushes them below joins, and fuses filter+project into
+  one node. Unsupported plans (outer joins, correlated subqueries, ...)
+  fail with a DBSP-E110 error naming the operator.
 
-### 📋 Planned (Phase 4+)
+### 📋 Not yet supported
 
-- `ORDER BY` / `LIMIT` (anti-pattern - degrades to O(n), deferred)
-- Window functions (`ROW_NUMBER`, `RANK`, `LAG`, `LEAD`)
-- Set operations: `UNION`, `INTERSECT`, `EXCEPT`
-- Automatic CDC via transaction hooks
-- Subqueries and CTEs (non-recursive)
+- Outer joins (LEFT/RIGHT/FULL)
+- Correlated subqueries (rewrite as a JOIN or intermediate view)
+- WITH RECURSIVE ... USING KEY
+- Non-constant / percentage LIMIT
+- Deletion propagation through recursive views (fixed point ignores
+  negative weights)
 
 ## How It Works
 
@@ -296,7 +300,6 @@ duckDBSP/
 ├── src/                       # Extension source
 │   └── dbsp_extension.cpp     # Extension entry point
 │   ├── dbsp_duckdb_types.hpp  # Native DuckDB type integration
-│   ├── dbsp_sql_parser.hpp    # SQL parsing
 │   ├── dbsp_plan_translator.hpp # Planner frontend (Phase B)
 │   ├── dbsp_cdc.hpp           # CDC manager
 ├── build.sh                   # Build script

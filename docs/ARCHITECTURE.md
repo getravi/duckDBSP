@@ -19,22 +19,22 @@ Internal design of the DBSP DuckDB extension.
 │  │  - Change Propagation - Persistence                         ││
 │  └─────────────────────────────────────────────────────────────┘│
 │                              │                                   │
-│  ┌──────────────────────────────┬──────────────────────────────┐│
-│  │  Planner Frontend (default)  │      SQL Parser (fallback)   ││
-│  │  dbsp_use_planner(false)     │  - Uses DuckDB's parser      ││
-│  │    to disable                │  - Extracts tables, columns, ││
-│  │  - Connection::ExtractPlan   │    predicates, aggregates    ││
-│  │    (optimizer disabled)      │  - Creates view definitions  ││
-│  │  - Logical ops → circuit     │  - Handles ORDER BY/LIMIT,   ││
-│  │    nodes; ExpressionExecutor │    recursive CTEs            ││
-│  │  - Unsupported plan → falls back to SQL Parser ─────────►   ││
-│  └──────────────────────────────┴──────────────────────────────┘│
+│  ┌─────────────────────────────────────────────────────────────┐│
+│  │            Planner Frontend (the only frontend)              ││
+│  │  - Connection::ExtractPlan (DuckDB optimizer disabled)       ││
+│  │  - Logical ops → PlanOpSpec tree → circuit nodes;            ││
+│  │    bound expressions via ExpressionExecutor                  ││
+│  │  - Circuit-IR optimizer: filter combine, join pushdown,      ││
+│  │    filter+project fusion (plan_ir::optimize)                 ││
+│  │  - Unsupported plan → DBSP-E110 error to the user            ││
+│  └─────────────────────────────────────────────────────────────┘│
 │                              │                                   │
 │  ┌─────────────────────────────────────────────────────────────┐│
-│  │             Materialized Views (circuit-backed)              ││
-│  │  Fine-grained: Filter, Project, FilterProject, Aggregate    ││
-│  │  Opaque nodes: Join, Distinct, Sort, Limit, Window          ││
-│  │  Combinators:  SetOp, Recursive, CTE (compose circuit views)││
+│  │        Materialized Views (PlannedCircuitView circuits)      ││
+│  │  Fine-grained nodes: Filter, Map, FilterMap (fused),         ││
+│  │    Aggregate, Join, Distinct, SetOp, Recursive               ││
+│  │  Embedded views:     Window, Sort/Limit, DistinctOn          ││
+│  │    (proven Native* views behind EmbeddedViewNode)            ││
 │  └─────────────────────────────────────────────────────────────┘│
 │                              │                                   │
 │  ┌─────────────────────────────────────────────────────────────┐│
@@ -109,24 +109,31 @@ struct DuckDBRowHash {
 using DuckDBZSet = ZSet<DuckDBRow, DuckDBRowHash>;
 ```
 
-### 3. Planner Frontend (`include/dbsp_plan_translator.hpp`, Phase B)
+### 3. Planner Frontend (`include/dbsp_plan_translator.hpp`)
 
-The default frontend since B5 (`SELECT * FROM dbsp_use_planner(false)` to
-fall back to the parser only). View SQL is parsed, bound, and planned by DuckDB
-itself via `Connection::ExtractPlan` on an internal connection with the
-optimizer disabled (keeps plan shapes canonical — no filter pushdown into
-scans). The bound `LogicalOperator` tree is walked and mapped onto circuit
-nodes; bound expressions are evaluated row-at-a-time through
-`ExpressionExecutor`.
+The only frontend since Phase C5 (the bespoke SQL parser was deleted once
+the planner covered everything it did; `dbsp_use_planner()` remains callable
+as a no-op). View SQL is parsed, bound, and planned by DuckDB itself via
+`Connection::ExtractPlan` on an internal connection with the optimizer
+disabled (keeps plan shapes canonical — no filter pushdown into scans). The
+bound `LogicalOperator` tree is walked into a `PlanOpSpec` tree, rewritten
+by the circuit-IR optimizer, and built into circuit nodes; bound expressions
+are evaluated row-at-a-time through `ExpressionExecutor`.
 
-Current scope (B1–B3): `PlannedCircuitView` builds a multi-source operator
-tree (one shared SourceNode per base table) from the logical plan:
+Because materialized views are not in DuckDB's catalog, views-on-views are
+bound by shadowing every existing MV as an empty TEMP table on the internal
+connection during plan extraction (the temp schema shadows main, matching
+CDC's own views-before-tables resolution order).
+
+`PlannedCircuitView` builds a multi-source operator tree (one shared
+SourceNode per base table) covering:
 
 - GET / FILTER / PROJECTION — arbitrary expressions, function calls, mixed
-  AND/OR predicates (B1)
+  AND/OR predicates; virtual columns (rowid) scan as NULL (B1, C5)
 - AGGREGATE — multi-aggregate GROUP BY, expression keys, HAVING (a FILTER
   above the aggregate); global aggregates keep exactly one row, even on
-  empty input (`PlanAggregateNode`, B2)
+  empty input; SUM(DECIMAL) accumulates exactly in 128-bit unscaled form
+  (`PlanAggregateNode`, B2, C5)
 - COMPARISON_JOIN (inner; equi keys + residual comparisons, bilinear delta
   rule incl. the Δl⋈Δr self-join term), CROSS_PRODUCT, DISTINCT, and
   UNION [ALL] / INTERSECT [ALL] / EXCEPT [ALL] (`PlanJoinNode`,
@@ -135,127 +142,56 @@ tree (one shared SourceNode per base table) from the logical plan:
   mid-circuit via `EmbeddedViewNode`; non-recursive CTEs
   (MATERIALIZED_CTE + CTE_REF) with the definition subtree built once and
   shared by all references (B4)
+- ORDER BY / LIMIT / OFFSET — folded (with a trailing pure-column-ref
+  projection) into one `NativeSortView`/`NativeLimitView` behind an
+  `EmbeddedViewNode`; a root sort/limit drives `dbsp_query`'s scan order (C1)
+- WITH RECURSIVE — `PlanRecursiveNode`: anchor inline, the recursive step as
+  a nested `PlannedCircuitView` iterated to a fixed point; multi-table
+  recursive steps supported, deletions ignored inside the fixed point (C2)
+- DISTINCT ON — `NativeDistinctOnView` behind an `EmbeddedViewNode`;
+  winner-pick order comes from the DISTINCT node's own order modifier (C3)
 
-Any other operator (outer joins, ORDER BY/LIMIT, correlated subqueries,
-recursive CTEs) yields a DBSP-E110 error internally and `create_view` falls
-back to the SQL parser transparently. The parser stays until those gaps
-close; deleting it is deferred past Phase B.
+Anything else (outer joins, correlated subqueries, USING KEY recursion,
+non-constant LIMIT, ...) fails view creation with a DBSP-E110 error naming
+the unsupported operator.
 
-### 3b. SQL Parser (`src/dbsp_sql_parser.hpp`)
+### 4. Circuit-IR Optimizer (`plan_ir::optimize`, in `dbsp_plan_translator.hpp`)
 
-Uses DuckDB's parser to extract query structure.
-
-```cpp
-struct ParsedViewDef {
-    enum ViewType { FILTER, PROJECT, AGGREGATE, JOIN, DISTINCT };
-    ViewType type;
-    std::string view_name;
-    std::vector<std::string> source_tables;
-    std::vector<FilterInfo> filters;
-    std::vector<AggInfo> aggregates;
-    // ...
-};
-
-class DBSPSqlParser {
-public:
-    ParseResult parse(const std::string& sql, const std::string& view_name);
-};
-
-class ViewFactory {
-public:
-    static std::unique_ptr<NativeMaterializedView> create_view(
-        const ParsedViewDef& def,
-        const std::unordered_map<std::string, TableSchema>& schemas);
-};
-```
-
-### 4. DBSPOptimizer (`include/dbsp_optimizer.hpp`)
-
-Circuit optimization passes for performance improvements.
-
-```cpp
-class DBSPOptimizer {
-    OptimizationStats stats_;
-
-public:
-    ParsedViewDef optimize(const ParsedViewDef& def);
-    
-    // Optimization passes
-    ParsedViewDef combine_filters(const ParsedViewDef& def);
-    ParsedViewDef pushdown_filters(const ParsedViewDef& def);
-    ParsedViewDef prune_projections(const ParsedViewDef& def);
-    
-    const OptimizationStats& stats() const { return stats_; }
-};
-```
-
-**Filter Pushdown**: Moves filters closer to data sources through JOIN operations.
+Rewrites the `PlanOpSpec` tree between translation and circuit construction
+(Phase C4; successor of the deleted `ParsedViewDef`-based DBSPOptimizer).
+Gated by `dbsp_native::g_plan_ir_optimize` (default on).
 
 ```
-Before:
-  JOIN(orders, customers) → FILTER(amount > 100)
-
-After:
-  JOIN(FILTER(orders, amount > 100), customers)
-  
-Benefit: Reduces rows entering the join, improving performance
+1. combine_filters:  FILTER(FILTER(x))  →  one FILTER with an AND list
+2. pushdown_filters: FILTER above JOIN  →  per-side FILTERs below the join
+   (right-side predicates get column indices shifted; copies live in
+   PlanKeepAlive::rewritten_exprs so node lambdas never dangle)
+3. fuse_filter_map:  MAP(FILTER(x))     →  one PlanFilterMapNode
+   (no intermediate Z-set between WHERE and SELECT)
 ```
 
-**Projection Pruning**: Eliminates unused columns early in the pipeline.
+Projection pruning was deliberately not ported: DuckDB's binder already
+prunes via GET `column_ids`, so canonical plans have nothing left to prune.
+
+### 5. Recursive Queries (`PlanRecursiveNode`, in `dbsp_plan_translator.hpp`)
+
+Implements `WITH RECURSIVE` for transitive closures and fixed-point
+iteration. The anchor subtree builds inline in the outer circuit; the
+recursive step becomes a nested `PlannedCircuitView` whose self-reference is
+a sentinel source. Each circuit step seeds the frontier with the anchor
+delta plus the step's reaction to base-table deltas, then iterates:
 
 ```
-Before:
-  SELECT a, b FROM (SELECT a, b, c, d FROM table)
-
-After:
-  SELECT a, b FROM (SELECT a, b FROM table)
-  
-Benefit: Reduces memory usage and data movement
+1. Seed:    frontier = Δanchor ∪ step(Δbase-tables)
+2. Iterate: feed frontier into the sentinel source, collect the step's
+            output delta, admit new rows (UNION dedups against persistent
+            accumulated state; UNION ALL admits everything)
+3. Stop:    frontier empty, or max_iterations (1000) reached
 ```
 
-**Implementation**: The optimizer runs before view creation, transforming `ParsedViewDef` to include:
-- `left_pushed_filters`: Filters applied to left JOIN input
-- `right_pushed_filters`: Filters applied to right JOIN input
-- `required_columns`: Minimal column set needed
-
-### 5. Recursive Query Engine (`src/dbsp_sql_parser.hpp` + `NativeRecursiveView`)
-
-Implements `WITH RECURSIVE` for transitive closures and fixed-point iteration.
-
-```cpp
-class NativeRecursiveView : public NativeMaterializedView {
-    std::unique_ptr<NativeMaterializedView> anchor_view_;
-    std::unique_ptr<NativeMaterializedView> recursive_view_;
-    DuckDBZSet fixed_point_;
-    
-public:
-    void apply_changes(const std::string& table_name, 
-                      const DuckDBZSet& changes) override;
-                      
-private:
-    void compute_fixed_point();
-    bool has_converged(const DuckDBZSet& delta);
-};
-```
-
-**Recursive Evaluation**:
-
-```
-1. Initialize: Evaluate anchor query (non-recursive part)
-   T₀ = SELECT src, dst FROM edges
-
-2. Iterate: Apply recursive query until convergence
-   T₁ = T₀ ∪ (SELECT e.src, r.dst FROM edges e JOIN T₀ r ON e.dst = r.src)
-   T₂ = T₁ ∪ (SELECT e.src, r.dst FROM edges e JOIN T₁ r ON e.dst = r.src)
-   ...
-   
-3. Fixed point: When Tₙ₊₁ = Tₙ (no new rows), return result
-```
-
-**Incremental Updates**: When base table changes:
-1. Compute Δ for anchor view
-2. Re-run fixed-point iteration with new delta
-3. Output changes to recursive view result
+UNION dedup state persists across deltas, so a row that becomes reachable
+again later is not double-counted. Deletions (negative weights) are ignored
+inside the fixed point — a documented limitation.
 
 **Safety**: Maximum iteration limit (default 1000) prevents infinite loops.
 
@@ -270,7 +206,6 @@ class CDCManager {
     std::unordered_map<std::string, NativeMaterializedView> views_;
     std::unordered_map<std::string, ViewDefinition> view_definitions_;
     DependencyGraph dep_graph_;
-    DBSPOptimizer optimizer_;  // NEW: Circuit optimizer
 
 public:
     // Table tracking
@@ -336,25 +271,20 @@ static void LoadInternal(DatabaseInstance &instance) {
 1. User: CREATE MATERIALIZED VIEW totals AS 
          SELECT customer, SUM(amount) FROM orders GROUP BY customer
          │
-2. SQL Parser: Parse SQL, extract structure
+2. Planner frontend: DuckDB binds and plans the SQL
+   (Connection::ExtractPlan, optimizer off; existing MVs shadowed as
+   empty TEMP tables so views-on-views bind)
          │
          ▼
-   ParsedViewDef {
-     type: AGGREGATE,
-     sources: ["orders"],
-     aggregates: [{function: "SUM", column: "amount"}],
-     group_by: ["customer"]
+   LogicalOperator tree → PlanOpSpec tree {
+     AGGREGATE { groups: [customer], aggs: [SUM(amount)] }
+       └─ SOURCE { table: orders }
    }
          │
-3. DBSPOptimizer: Apply optimization passes
+3. Circuit-IR optimizer (plan_ir::optimize): filter combine,
+   join pushdown, filter+project fusion
          │
-         ▼
-   Optimized ParsedViewDef {
-     ...optimized structure...
-     required_columns: ["customer", "amount"]
-   }
-         │
-4. ViewFactory: Create appropriate view class
+4. PlannedCircuitView: build circuit nodes from the spec tree
          │
          ▼
    NativeAggregateView {
@@ -448,27 +378,28 @@ State after:
 
 ## Extension Points
 
-### Adding New View Types
+### Adding New Plan Operators
 
-1. Create class inheriting `NativeMaterializedView`
-2. Implement `apply_changes()` with incremental logic
-3. Add case to `ViewFactory::create_view()`
-4. Update SQL parser to detect the pattern
+1. Add a `PlanOpSpec::Kind` and a `Walker::visit_*` for the logical operator
+2. Add the matching `PlannedCircuitView::build` case (fine-grained node, or
+   wrap a proven `Native*` view in an `EmbeddedViewNode`)
+3. Cover it in `test/integration/test_planner_frontend.cpp` (differential)
 
 ### Adding New Aggregate Functions
 
-1. Add to `AggType` enum
-2. Implement in `NativeAggregateView::compute_agg()`
-3. Update parser to recognize function name
+1. Add to `PlanAggSpec::Fn` and map the DuckDB function name in
+   `Walker::visit_aggregate`
+2. Implement accumulate/emit in `PlanAggregateNode`
 
 ## File Layout
 
 ```
 src/
-├── dbsp_extension.cpp      # Entry point, function registration
-├── dbsp_cdc.hpp           # CDC manager, dependency graph
-├── dbsp_duckdb_types.hpp  # DuckDB-native Z-sets and views
-└── dbsp_sql_parser.hpp    # SQL parsing and view factory
+├── dbsp_extension.cpp           # Entry point, function registration
+include/
+├── dbsp_cdc.hpp                 # CDC manager, dependency graph
+├── dbsp_duckdb_types.hpp        # DuckDB-native Z-sets and views
+└── dbsp_plan_translator.hpp     # Planner frontend + circuit-IR optimizer
 ```
 
 Build layout:

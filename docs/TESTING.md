@@ -6,7 +6,7 @@ Comprehensive guide to testing the DBSP for DuckDB project.
 
 The project includes three types of tests:
 
-1. **Unit Tests** (`test/unit/`): Core DBSP library, SQL parser, CDC manager
+1. **Unit Tests** (`test/unit/`): Core DBSP library, native views, CDC manager
 2. **Integration Tests** (`test/integration/`): Extension functions with real DuckDB
 3. **Benchmarks** (`benchmark/`): Performance validation of O(delta) updates
 
@@ -76,12 +76,10 @@ make
 - Join (bilinear formula)
 - Distinct
 
-**SQL Parser** (12 tests)
-- SELECT parsing
-- WHERE conditions
-- GROUP BY
-- JOIN syntax
-- Cascading view dependencies
+**Planner frontend** (differential suite, `test_planner_frontend.cpp`)
+- Every supported plan shape diffed against DuckDB's own answer across
+  randomized insert/delete rounds
+- Circuit-IR optimizer rewrites proven via node counts
 
 **CDC Manager** (8 tests)
 - Track/untrack tables
@@ -362,7 +360,7 @@ grep -r "assert(" test/ | wc -l
 
 - [ ] Z-Set: insert, delete, negate, add
 - [ ] Operators: filter, aggregate, join, distinct
-- [ ] SQL Parser: SELECT, WHERE, GROUP BY, JOIN
+- [ ] Planner frontend: SELECT, WHERE, GROUP BY, JOIN, ORDER BY/LIMIT, recursion
 - [ ] CDC: track, sync, notify
 - [ ] Extension: all 15+ SQL functions
 - [ ] Persistence: save/load to file and table
@@ -423,7 +421,7 @@ conn->Query("LOAD '/absolute/path/to/dbsp.duckdb_extension'");
 ```cpp
 void test_<component>_<feature>() {
     // Example: test_zset_insert()
-    // Example: test_sql_parser_join()
+    // Example: test_planner_join()
     // Example: test_cdc_sync_detection()
 }
 ```

@@ -18,25 +18,23 @@ TEST_CASE("End-to-end error handling", "[e2e][errors]") {
     REQUIRE_FALSE(result->HasError());
   }
 
-  SECTION("Parser error flows through to user") {
-    // Create table
+  SECTION("Unsupported SQL yields a formatted, actionable error") {
     db.exec("CREATE TABLE orders (id INT, customer_id INT, amount INT)");
     db.exec("SELECT * FROM dbsp_track('orders')");
 
-    // Try to create view with a subquery in WHERE (unsupported feature)
+    // Subquery in WHERE: the planner frontend rejects the plan shape with a
+    // DBSP error code that names what it could not translate — the user
+    // must be able to tell WHY creation failed and what to change
     auto result = db.query("SELECT * FROM dbsp_create_view('sub_view', "
                            "'SELECT customer_id, amount FROM orders "
                            "WHERE amount > (SELECT AVG(amount) FROM orders)')");
 
-    // Should fail with formatted error
     REQUIRE(result->HasError());
     std::string error = result->GetError();
-
-    // Verify error contains expected elements
-    REQUIRE(error.find("DBSP-E105") != std::string::npos);
-    REQUIRE(error.find("Subquer") != std::string::npos);
-    REQUIRE(error.find("Workaround") != std::string::npos);
-    REQUIRE(error.find("Documentation:") != std::string::npos);
+    INFO("actual error: " << error);
+    REQUIRE(error.find("DBSP-E110") != std::string::npos);
+    REQUIRE(error.find("unsupported in planner frontend") !=
+            std::string::npos);
   }
 
   SECTION("HAVING clause works after Phase 1 implementation") {
