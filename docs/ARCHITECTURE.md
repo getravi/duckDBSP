@@ -27,9 +27,10 @@ Internal design of the DBSP DuckDB extension.
 │  └─────────────────────────────────────────────────────────────┘│
 │                              │                                   │
 │  ┌─────────────────────────────────────────────────────────────┐│
-│  │                  Materialized Views                          ││
-│  │  CircuitFilterView (via circuit IR) │ ProjectView,          ││
-│  │  AggregateView, JoinView, ... (direct; migrating to IR)     ││
+│  │             Materialized Views (circuit-backed)              ││
+│  │  Fine-grained: Filter, Project, FilterProject, Aggregate    ││
+│  │  Opaque nodes: Join, Distinct, Sort, Limit, Window          ││
+│  │  Combinators:  SetOp, Recursive, CTE (compose circuit views)││
 │  └─────────────────────────────────────────────────────────────┘│
 │                              │                                   │
 │  ┌─────────────────────────────────────────────────────────────┐│

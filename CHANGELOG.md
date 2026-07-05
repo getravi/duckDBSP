@@ -20,13 +20,23 @@
   since February). Also fixed: recursive subquery detection, stale ORDER BY
   error test, checkpoint tests saving while recovery disabled.
 
-### Phase A: Circuit IR Unification - Started (Jul 4, 2026)
+### Phase A: Circuit IR Unification - COMPLETE (Jul 4, 2026)
+All view execution now flows through the `dbsp::Circuit` substrate
+(`dbsp_circuit_views.hpp`); verified 36/36 tests green.
 - `DuckDBZSet` unified with generic `dbsp::ZSet<DuckDBRow, DuckDBRowHash>` —
   circuit nodes operate on production rows with no boundary conversion.
-- New `dbsp_circuit_views.hpp`: `CircuitFilterView` executes filter views
-  through `dbsp::Circuit` (Source → Filter → Sink); ViewFactory emits it for
-  `ViewType::FILTER`. Remaining view types migrate incrementally.
+- Fine-grained circuit views: Filter (Source→Filter→Sink), Project
+  (Source→Map→Sink), FilterProject (Source→Filter→Map→Sink), Aggregate
+  (Source→RowAggregateNode→Sink; group state + MIN/MAX multiset live in the
+  node, the sink integrates emitted retract/emit deltas).
+- Opaque circuit nodes via `WrappedViewNode`/`CircuitWrappedView`: Join,
+  Distinct, Sort, Limit, Window, DistinctOn — proven state logic reused
+  verbatim, to be decomposed into fine-grained nodes later.
+- SetOp / Recursive / CTE remain combinators composing circuit-backed views.
 - `SinkNode::set_materialized` added for checkpoint restore.
+- Deferred to Phase C: porting DBSPOptimizer's 4 passes from ParsedViewDef
+  rewrites to IR graph rewrites (they run pre-construction and still work
+  unchanged; rewriting them belongs with naive-circuit construction).
 
 ## Phase 5: Advanced SQL & Automation - Completed Feb 2026
 

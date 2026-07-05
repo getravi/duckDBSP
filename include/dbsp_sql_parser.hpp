@@ -1271,21 +1271,25 @@ public:
     case ParsedViewDef::ViewType::AGGREGATE:
       return create_aggregate_view(def, table_schemas);
 
+    // Phase A: types below run as opaque circuit nodes (wrap_in_circuit)
+    // until decomposed into fine-grained operator nodes.
     case ParsedViewDef::ViewType::JOIN:
-      return create_join_view(def, table_schemas);
+      return wrap_in_circuit(create_join_view(def, table_schemas));
 
     case ParsedViewDef::ViewType::DISTINCT:
-      return create_distinct_view(def, table_schemas);
+      return wrap_in_circuit(create_distinct_view(def, table_schemas));
 
     case ParsedViewDef::ViewType::SORT:
-      return create_sort_view(def, table_schemas);
+      return wrap_in_circuit(create_sort_view(def, table_schemas));
 
     case ParsedViewDef::ViewType::LIMIT:
-      return create_limit_view(def, table_schemas);
+      return wrap_in_circuit(create_limit_view(def, table_schemas));
 
     case ParsedViewDef::ViewType::WINDOW:
-      return create_window_view(def, table_schemas);
+      return wrap_in_circuit(create_window_view(def, table_schemas));
 
+    // RECURSIVE and SET_OP are combinators: they compose inner views (which
+    // are themselves circuit-backed) with fixed-point / Z-set arithmetic.
     case ParsedViewDef::ViewType::RECURSIVE:
       return create_recursive_view(def, table_schemas);
 
@@ -1293,7 +1297,7 @@ public:
       return create_set_op_view(def, table_schemas);
 
     case ParsedViewDef::ViewType::DISTINCT_ON:
-      return create_distinct_on_view(def, table_schemas);
+      return wrap_in_circuit(create_distinct_on_view(def, table_schemas));
 
     case ParsedViewDef::ViewType::CTE:
       // CTE views are handled by the CDCManager which creates
@@ -1304,11 +1308,11 @@ public:
         def_copy.ctes.clear();
         // Fall through to the actual view type
         if (def_copy.join_info.has_value())
-          return create_join_view(def_copy, table_schemas);
+          return wrap_in_circuit(create_join_view(def_copy, table_schemas));
         if (!def_copy.aggregates.empty())
           return create_aggregate_view(def_copy, table_schemas);
         if (def_copy.is_distinct)
-          return create_distinct_view(def_copy, table_schemas);
+          return wrap_in_circuit(create_distinct_view(def_copy, table_schemas));
         if (!def_copy.filters.empty())
           return create_filter_view(def_copy, table_schemas);
         if (!def_copy.project_column_names.empty() && !def_copy.select_all)
@@ -1532,7 +1536,8 @@ private:
       return result;
     };
 
-    return std::make_unique<NativeFilterProjectView>(
+    // Phase A: fused filter+project views execute through the circuit IR
+    return std::make_unique<CircuitFilterProjectView>(
         def.view_name, def.sql, table, result_schema, predicate, project);
   }
 
@@ -1653,8 +1658,9 @@ private:
       return result;
     };
 
-    return std::make_unique<NativeProjectView>(def.view_name, def.sql, table,
-                                               result_schema, project);
+    // Phase A: projection views execute through the circuit IR
+    return std::make_unique<CircuitProjectView>(def.view_name, def.sql, table,
+                                                result_schema, project);
   }
 
   static std::unique_ptr<NativeMaterializedView> create_aggregate_view(
@@ -1817,7 +1823,8 @@ private:
       };
     }
 
-    return std::make_unique<NativeAggregateView>(
+    // Phase A: aggregate views execute through the circuit IR
+    return std::make_unique<CircuitAggregateView>(
         def.view_name, def.sql, table, result_schema, key_fn, value_fn,
         agg_type, having_pred);
   }
