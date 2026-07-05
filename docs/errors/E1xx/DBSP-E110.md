@@ -8,30 +8,32 @@ message names the operator.
 ## Supported SQL (no E110)
 
 Filter/projection with arbitrary expressions, GROUP BY aggregation
-(COUNT/SUM/AVG/MIN/MAX incl. exact DECIMAL SUM, HAVING, expression keys,
-global aggregates), inner joins (equi + residual predicates), cross joins,
-DISTINCT, DISTINCT ON, UNION/INTERSECT/EXCEPT (ALL and DISTINCT), window
-functions over plain columns, non-recursive CTEs, WITH RECURSIVE
-(including deletions), ORDER BY / LIMIT / OFFSET (constant).
+(COUNT/SUM/AVG/MIN/MAX/FIRST incl. exact DECIMAL SUM, HAVING, expression
+keys, global aggregates), inner and outer joins (LEFT/RIGHT/FULL; equi +
+residual predicates), cross joins, IN / NOT IN subqueries, uncorrelated
+scalar subquery comparisons, DISTINCT, DISTINCT ON,
+UNION/INTERSECT/EXCEPT (ALL and DISTINCT), window functions over plain
+columns, non-recursive CTEs, WITH RECURSIVE (including deletions),
+ORDER BY / LIMIT / OFFSET (constant).
 
 ## Common triggers and rewrites
 
-**Correlated subquery (DELIM_JOIN)**
+**Correlated subquery (DELIM_JOIN)** — the subquery references the outer
+row. (Uncorrelated scalar subqueries and IN/NOT IN translate directly.)
 
 ```sql
 -- Instead of:
-SELECT * FROM orders o WHERE amount > (SELECT AVG(amount) FROM orders);
+SELECT * FROM orders o
+WHERE amount > (SELECT AVG(amount) FROM orders o2
+                WHERE o2.customer = o.customer);
 
 -- Do this:
-SELECT * FROM dbsp_create_view('avg_amount',
-    'SELECT AVG(amount) AS a FROM orders');
+SELECT * FROM dbsp_create_view('avg_by_customer',
+    'SELECT customer, AVG(amount) AS a FROM orders GROUP BY customer');
 SELECT * FROM dbsp_create_view('big_orders',
-    'SELECT o.* FROM orders o JOIN avg_amount v ON o.amount > v.a');
+    'SELECT o.* FROM orders o JOIN avg_by_customer v '
+    'ON o.customer = v.customer AND o.amount > v.a');
 ```
-
-**Outer joins (LEFT/RIGHT/FULL)** — not yet supported; restructure as an
-inner join plus a set-operation view, or track the unmatched side
-separately.
 
 **WITH RECURSIVE ... USING KEY** — use plain WITH RECURSIVE.
 

@@ -1,5 +1,31 @@
 # Changelog
 
+## Phase D: Vectorized Eval, Outer Joins, Subqueries - Jul 2026
+
+### D1: Vectorized node evaluation + zero-copy circuit deltas (Jul 5, 2026)
+- Filter/map/fused nodes evaluate expressions over shared 2048-row
+  DataChunks (BatchEvaluator: typed column fill/read fast paths,
+  SelectionVector + Slice for filter survivors); sources and sinks borrow
+  the caller's deltas instead of copying/rehashing them.
+- bench_planner_eval: fused filter 259k→644k rows/s, aggregate
+  770k→1.88M, join delta 140k→265k; overhead vs hand lambda 4.6×→2.4×.
+  Remaining gap is Z-set insert hashing, not expression evaluation.
+
+### D2: Outer joins (Jul 5, 2026)
+- PlanJoinNode supports LEFT/RIGHT/FULL: padded sides track per-row total
+  weights (incl. NULL-key rows) and reconcile NULL pads per affected row
+  after each delta (desired pad = row weight when its weighted count of
+  residual-passing matches is zero). Randomized differentials for all
+  three types plus residual-participating matching.
+
+### D3: MARK joins + FIRST aggregate (Jul 5, 2026)
+- IN / NOT IN subqueries translate via left-preserving MARK joins with
+  three-valued null-aware marks (subquery-side emptiness / NULL-presence
+  transitions flip unmatched marks in bulk).
+- first()/arbitrary() aggregate implemented, unlocking uncorrelated
+  scalar subquery comparisons (val > (SELECT AVG(...))).
+- Correlated subqueries (DELIM_JOIN) remain DBSP-E110.
+
 ## Pre-Phase-D: Recovery correctness - Jul 2026
 
 ### Checkpoint/WAL subsystem deleted (Jul 5, 2026)

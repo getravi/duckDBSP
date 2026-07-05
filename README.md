@@ -237,8 +237,9 @@ See [Error Handling Guide](docs/ERROR_HANDLING.md) for details.
 **Planner Frontend (the only frontend since Phase C — the bespoke SQL
 parser was deleted):**
 - View SQL planned by DuckDB's own binder/planner; scan/filter/projection,
-  GROUP BY aggregation (incl. exact SUM over DECIMAL), inner joins
-  (equi + residual predicates), cross joins, DISTINCT, DISTINCT ON, set
+  GROUP BY aggregation (incl. exact SUM over DECIMAL), inner and outer
+  joins (LEFT/RIGHT/FULL; equi + residual predicates), cross joins,
+  IN/NOT IN and uncorrelated scalar subqueries, DISTINCT, DISTINCT ON, set
   operations, window functions, non-recursive CTEs, WITH RECURSIVE
   (multi-table recursive steps), and ORDER BY/LIMIT/OFFSET translate
   directly to circuit nodes with full DuckDB expression coverage (function
@@ -250,8 +251,7 @@ parser was deleted):**
 
 ### 📋 Not yet supported
 
-- Outer joins (LEFT/RIGHT/FULL)
-- Correlated subqueries (rewrite as a JOIN or intermediate view)
+- Correlated subqueries / DELIM_JOIN (rewrite as a JOIN or intermediate view)
 - WITH RECURSIVE ... USING KEY
 - Non-constant / percentage LIMIT
 

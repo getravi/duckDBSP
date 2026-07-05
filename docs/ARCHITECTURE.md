@@ -130,14 +130,19 @@ SourceNode per base table) covering:
 
 - GET / FILTER / PROJECTION — arbitrary expressions, function calls, mixed
   AND/OR predicates; virtual columns (rowid) scan as NULL (B1, C5)
-- AGGREGATE — multi-aggregate GROUP BY, expression keys, HAVING (a FILTER
-  above the aggregate); global aggregates keep exactly one row, even on
-  empty input; SUM(DECIMAL) accumulates exactly in 128-bit unscaled form
-  (`PlanAggregateNode`, B2, C5)
-- COMPARISON_JOIN (inner; equi keys + residual comparisons, bilinear delta
-  rule incl. the Δl⋈Δr self-join term), CROSS_PRODUCT, DISTINCT, and
-  UNION [ALL] / INTERSECT [ALL] / EXCEPT [ALL] (`PlanJoinNode`,
-  `PlanDistinctNode`, `PlanSetOpNode`, B3)
+- AGGREGATE — COUNT/SUM/AVG/MIN/MAX/FIRST, multi-aggregate GROUP BY,
+  expression keys, HAVING (a FILTER above the aggregate); global
+  aggregates keep exactly one row, even on empty input; SUM(DECIMAL)
+  accumulates exactly in 128-bit unscaled form (`PlanAggregateNode`,
+  B2, C5, D3). FIRST unlocks uncorrelated scalar-subquery comparisons
+  (CROSS_PRODUCT + first()/count_star() guard plans).
+- COMPARISON_JOIN — INNER (equi keys + residual comparisons, bilinear
+  delta rule incl. the Δl⋈Δr self-join term); LEFT/RIGHT/FULL with
+  incrementally reconciled NULL padding (per-row weighted match counts);
+  MARK for IN/NOT IN with three-valued null-aware marks — plus
+  CROSS_PRODUCT, DISTINCT, and UNION [ALL] / INTERSECT [ALL] /
+  EXCEPT [ALL] (`PlanJoinNode`, `PlanDistinctNode`, `PlanSetOpNode`,
+  B3, D2, D3)
 - WINDOW — BoundWindowExpressions mapped onto `NativeWindowView`, embedded
   mid-circuit via `EmbeddedViewNode`; non-recursive CTEs
   (MATERIALIZED_CTE + CTE_REF) with the definition subtree built once and
@@ -153,7 +158,13 @@ SourceNode per base table) covering:
 - DISTINCT ON — `NativeDistinctOnView` behind an `EmbeddedViewNode`;
   winner-pick order comes from the DISTINCT node's own order modifier (C3)
 
-Anything else (outer joins, correlated subqueries, USING KEY recursion,
+Filter/map/fused nodes evaluate expressions in vectorized DataChunk
+batches (`BatchEvaluator`, one shared chunk per node, typed column
+fill/read fast paths, `Slice` for filter survivors); sources and sinks
+borrow the caller's deltas instead of copying (D1: 2-2.5x on the
+maintenance and recovery-replay paths).
+
+Anything else (correlated subqueries / DELIM_JOIN, USING KEY recursion,
 non-constant LIMIT, ...) fails view creation with a DBSP-E110 error naming
 the unsupported operator.
 

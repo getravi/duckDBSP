@@ -9,19 +9,21 @@ subsystem, bespoke parser, standalone Z-set spilling).
 
 ## Not supported (DBSP-E110 at view creation)
 
-- Outer joins (LEFT/RIGHT/FULL)
-- Correlated subqueries (rewrite as JOIN or intermediate view)
+- Correlated subqueries / DELIM_JOIN (rewrite as JOIN or intermediate view)
 - WITH RECURSIVE ... USING KEY
 - Non-constant / percentage LIMIT
 - Window ORDER BY / PARTITION BY over expressions (project first)
 - ROLLUP / CUBE / GROUPING SETS; DISTINCT/FILTER/ORDER-BY-in-aggregate
 
-## Performance (Phase D candidates, benchmarked 2026-07-05)
+## Performance
 
-- RowExprEval is ~4.6× slower than a hand-written lambda (259k vs 1.2M
-  rows/s on the filter path): vectorize node evaluation with batched
-  DataChunks. Recovery replays full tables through this path, so it pays
-  the cost too. See test/benchmarks/bench_planner_eval.cpp.
+- Phase D1 vectorized filter/map/fused evaluation + zero-copy circuit
+  deltas: fused filter 259k→644k rows/s, aggregate 770k→1.88M, join delta
+  140k→265k. Remaining ~2.4× gap vs a hand-written lambda is Z-set insert
+  hashing (DuckDBRow hashes every column Value) — candidate: cache row
+  hashes. See test/benchmarks/bench_planner_eval.cpp.
+- Aggregate keys/args, join keys, and residuals still evaluate per-row
+  (RowExprEval); batch if profiles demand.
 - Deletions through recursive views trigger a full fixed-point recompute
   (correct but non-incremental).
 

@@ -38,6 +38,12 @@
 //       combine adjacent filters, push single-side filters below joins,
 //       fuse MAP(FILTER(x)) into one batched node. Successor of the
 //       ParsedViewDef-based DBSPOptimizer.
+//   D1: vectorized evaluation — filter/map/fused nodes run expressions
+//       over shared DataChunk batches (BatchEvaluator); sources/sinks
+//       borrow deltas instead of copying.
+//   D2: LEFT/RIGHT/FULL outer joins (incrementally reconciled NULL pads).
+//   D3: MARK joins (IN/NOT IN, three-valued null-aware marks) and the
+//       first() aggregate (uncorrelated scalar subquery comparisons).
 // Any other operator yields a DBSP-E110 error naming the operator;
 // CDCManager::create_view falls back to the bespoke parser transparently.
 //
