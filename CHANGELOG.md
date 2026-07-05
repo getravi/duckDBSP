@@ -1,5 +1,32 @@
 # Changelog
 
+## Phase B5: Planner Frontend Default ON - Jul 2026
+
+### B5: Planner becomes the default frontend (Jul 4, 2026)
+- `dbsp_use_planner` now defaults to ON: every view first translates
+  through DuckDB's binder/planner; the bespoke parser handles what the
+  planner rejects (ORDER BY/LIMIT, recursive CTEs, plus anything DBSP-E110).
+  `dbsp_use_planner(false)` restores the old behavior entirely.
+- Full suite green both ways: with the default OFF (previous commit) and
+  ON (this commit) — 37/37.
+- Flipping the default exposed two tests coded to parser quirks, both
+  fixed: the pure non-equi JOIN test only ever passed through its error
+  path (parser requires an equality condition; planner supports the join,
+  and the test was missing a dbsp_sync), and the window RANGE test indexed
+  a `val` column the parser leaked into window view output (planner honors
+  the SQL projection exactly; test now reads the last column).
+- Deviation from the plan: the bespoke parser extraction paths are NOT
+  deleted yet. The planner deliberately defers ORDER BY/LIMIT and
+  recursion to the parser, so deleting it would remove working features.
+  Deletion moves to when those gaps close (Phase C or a dedicated
+  follow-up).
+- Known lifetime issue (workaround in place): planner views hold an
+  internal Connection that keeps the DatabaseInstance alive; if the
+  process-static CDCManager destroys them at exit, DuckDB shuts down
+  during static teardown (intermittent exit segfaults). Tests now reset
+  the manager before the database closes; the proper fix (instance-scoped
+  view lifetime) is tracked for Phase C.
+
 ## Phase B4: Planner Frontend Windows + CTEs - Jul 2026
 
 ### B4: Window functions and CTEs through the planner (Jul 4, 2026)

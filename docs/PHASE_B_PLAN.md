@@ -103,10 +103,14 @@ them; found + filed a latent parser-path bug where recursive views through
 dbsp_create_view double their rows). DELIM_JOIN rejected with explicit
 message. 37/37 green.
 
-**B5 — Flip and delete (0.5 wk)**
-- Default `dbsp_use_planner` ON; run full suite both ways for one release
-- Delete the bespoke parsing paths in `dbsp_sql_parser.hpp` (keep the node
-  builders that survived); update ARCHITECTURE.md, README, CHANGELOG
+**B5 — Flip and delete (0.5 wk) — FLIPPED (2026-07-04); deletion deferred**
+Default `dbsp_use_planner` ON; full suite green both ways (OFF at the B4
+commit, ON since this one). Parser paths NOT deleted — deviation: the
+planner deliberately defers ORDER BY/LIMIT and recursive CTEs to the
+parser, so deleting it would remove working features. Deletion happens
+when those gaps close (Phase C or a dedicated follow-up). Flipping exposed
+two tests coded to parser quirks (pure non-equi JOIN passing via its error
+path; window RANGE test reading a column the parser leaked) — both fixed.
 
 ## Success criteria
 

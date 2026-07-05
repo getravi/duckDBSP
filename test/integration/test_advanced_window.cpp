@@ -27,7 +27,7 @@ TEST_CASE("Window RANGE frame integration", "[integration][window][range]") {
 
   for (const auto &row : rows) {
     int32_t ts = row[1].GetValue<int32_t>();
-    double sum = row[3].GetValue<double>();
+    double sum = row.back().GetValue<double>();
 
     if (ts == 10) {
       REQUIRE(sum == 3.0);
@@ -47,7 +47,7 @@ TEST_CASE("Window RANGE frame integration", "[integration][window][range]") {
   rows = harness.getViewRows("peer_sum");
   for (const auto &row : rows) {
     int32_t ts = row[1].GetValue<int32_t>();
-    double sum = row[3].GetValue<double>();
+    double sum = row.back().GetValue<double>();
 
     if (ts == 10) {
       REQUIRE(sum == 3.0);
@@ -68,7 +68,7 @@ TEST_CASE("Window RANGE frame integration", "[integration][window][range]") {
   REQUIRE(rows.size() == 4);
   for (const auto &row : rows) {
     int32_t ts = row[1].GetValue<int32_t>();
-    double sum = row[3].GetValue<double>();
+    double sum = row.back().GetValue<double>();
     if (ts == 10)
       REQUIRE(sum == 3.0);
     if (ts == 20)

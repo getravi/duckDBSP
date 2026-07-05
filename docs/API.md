@@ -149,19 +149,20 @@ SELECT * FROM dbsp_create_view('vip_totals',
 
 ### dbsp_use_planner(enable)
 
-Toggle the planner frontend (Phase B). When enabled, `dbsp_create_view`
-first translates view SQL through DuckDB's own binder/planner instead of the
-bespoke parser. Currently covers scan/filter/projection plans (arbitrary
-expressions, function calls, mixed AND/OR predicates), GROUP BY aggregation
-(multiple aggregates, expression keys, HAVING, global aggregates), inner
-joins (equi + residual predicates), cross joins, DISTINCT,
-UNION/INTERSECT/EXCEPT (ALL and DISTINCT), window functions over plain
-columns, and non-recursive CTEs; anything else falls back to the bespoke
-parser transparently.
+Toggle the planner frontend (Phase B, **default ON**). When enabled,
+`dbsp_create_view` first translates view SQL through DuckDB's own
+binder/planner instead of the bespoke parser. Currently covers
+scan/filter/projection plans (arbitrary expressions, function calls, mixed
+AND/OR predicates), GROUP BY aggregation (multiple aggregates, expression
+keys, HAVING, global aggregates), inner joins (equi + residual predicates),
+cross joins, DISTINCT, UNION/INTERSECT/EXCEPT (ALL and DISTINCT), window
+functions over plain columns, and non-recursive CTEs; anything else
+(ORDER BY/LIMIT, recursive CTEs, outer joins, ...) falls back to the
+bespoke parser transparently.
 
 ```sql
-SELECT * FROM dbsp_use_planner(true);   -- Enable
-SELECT * FROM dbsp_use_planner(false);  -- Disable (default)
+SELECT * FROM dbsp_use_planner(false);  -- Disable (use parser only)
+SELECT * FROM dbsp_use_planner(true);   -- Re-enable (default)
 SELECT * FROM dbsp_use_planner();       -- Query status
 ```
 

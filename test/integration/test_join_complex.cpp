@@ -31,6 +31,7 @@ TEST_CASE("JOIN with non-equi predicate: greater than", "[integration][join]") {
   } else {
     // Non-equi join is supported
     harness.exec("INSERT INTO orders VALUES (4, 300)");
+    harness.exec("SELECT * FROM dbsp_sync('orders')");
 
     auto rows = harness.getViewRows("order_levels");
     // Order 1 (100) > bronze (0): matches

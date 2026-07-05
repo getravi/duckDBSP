@@ -349,7 +349,7 @@ public:
     dep_graph_ = DependencyGraph();
     last_error_.clear();
     auto_sync_enabled_ = false;
-    use_planner_ = false;
+    use_planner_ = true;
   }
 
   // Auto-sync (automatic CDC) control. Flag is atomic so transaction hooks
@@ -2004,7 +2004,7 @@ private:
   DependencyGraph dep_graph_;
   std::string last_error_;
   std::atomic<bool> auto_sync_enabled_{false};
-  std::atomic<bool> use_planner_{false};
+  std::atomic<bool> use_planner_{true};
   bool use_parallel_sync_ = false;
 };
 

@@ -20,13 +20,13 @@ Internal design of the DBSP DuckDB extension.
 │  └─────────────────────────────────────────────────────────────┘│
 │                              │                                   │
 │  ┌──────────────────────────────┬──────────────────────────────┐│
-│  │  Planner Frontend (Phase B)  │        SQL Parser            ││
-│  │  dbsp_use_planner(true)      │  (default / fallback)        ││
-│  │  - Connection::ExtractPlan   │  - Uses DuckDB's parser      ││
-│  │    (optimizer disabled)      │  - Extracts tables, columns, ││
-│  │  - Translates GET/FILTER/    │    predicates, aggregates    ││
-│  │    PROJECTION → circuit nodes│  - Creates view definitions  ││
-│  │  - ExpressionExecutor rows   │                              ││
+│  │  Planner Frontend (default)  │      SQL Parser (fallback)   ││
+│  │  dbsp_use_planner(false)     │  - Uses DuckDB's parser      ││
+│  │    to disable                │  - Extracts tables, columns, ││
+│  │  - Connection::ExtractPlan   │    predicates, aggregates    ││
+│  │    (optimizer disabled)      │  - Creates view definitions  ││
+│  │  - Logical ops → circuit     │  - Handles ORDER BY/LIMIT,   ││
+│  │    nodes; ExpressionExecutor │    recursive CTEs            ││
 │  │  - Unsupported plan → falls back to SQL Parser ─────────►   ││
 │  └──────────────────────────────┴──────────────────────────────┘│
 │                              │                                   │
@@ -111,8 +111,8 @@ using DuckDBZSet = ZSet<DuckDBRow, DuckDBRowHash>;
 
 ### 3. Planner Frontend (`include/dbsp_plan_translator.hpp`, Phase B)
 
-Opt-in alternative to the bespoke SQL parser (`SELECT * FROM
-dbsp_use_planner(true)`). View SQL is parsed, bound, and planned by DuckDB
+The default frontend since B5 (`SELECT * FROM dbsp_use_planner(false)` to
+fall back to the parser only). View SQL is parsed, bound, and planned by DuckDB
 itself via `Connection::ExtractPlan` on an internal connection with the
 optimizer disabled (keeps plan shapes canonical — no filter pushdown into
 scans). The bound `LogicalOperator` tree is walked and mapped onto circuit
@@ -138,7 +138,8 @@ tree (one shared SourceNode per base table) from the logical plan:
 
 Any other operator (outer joins, ORDER BY/LIMIT, correlated subqueries,
 recursive CTEs) yields a DBSP-E110 error internally and `create_view` falls
-back to the SQL parser transparently. B5 makes the planner the default.
+back to the SQL parser transparently. The parser stays until those gaps
+close; deleting it is deferred past Phase B.
 
 ### 3b. SQL Parser (`src/dbsp_sql_parser.hpp`)
 

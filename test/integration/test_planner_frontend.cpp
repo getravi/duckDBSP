@@ -127,20 +127,21 @@ TEST_CASE("dbsp_use_planner toggles and reports status",
           "[integration][planner]") {
   DuckDBTestHarness db;
 
+  // Default is ON since B5
   auto status = db.query("SELECT * FROM dbsp_use_planner()");
-  REQUIRE(status->GetValue(0, 0).ToString().find("DISABLED") !=
-          std::string::npos);
-
-  auto on = db.query("SELECT * FROM dbsp_use_planner(true)");
-  REQUIRE(on->GetValue(0, 0).ToString().find("ENABLED") != std::string::npos);
-
-  status = db.query("SELECT * FROM dbsp_use_planner()");
   REQUIRE(status->GetValue(0, 0).ToString().find("ENABLED") !=
           std::string::npos);
 
   auto off = db.query("SELECT * FROM dbsp_use_planner(false)");
   REQUIRE(off->GetValue(0, 0).ToString().find("DISABLED") !=
           std::string::npos);
+
+  status = db.query("SELECT * FROM dbsp_use_planner()");
+  REQUIRE(status->GetValue(0, 0).ToString().find("DISABLED") !=
+          std::string::npos);
+
+  auto on = db.query("SELECT * FROM dbsp_use_planner(true)");
+  REQUIRE(on->GetValue(0, 0).ToString().find("ENABLED") != std::string::npos);
 }
 
 TEST_CASE("planner frontend: filter view differential",
@@ -434,7 +435,8 @@ TEST_CASE("planner frontend: flag off uses parser path",
   db.createTable("t", "id INT, val INT, tag VARCHAR", {"(1, 10, 'a')"});
   db.exec("SELECT * FROM dbsp_track('t')");
   db.exec("SELECT * FROM dbsp_sync('t')");
-  // Planner stays disabled (default)
+  // Explicitly disable (default is ON since B5)
+  db.exec("SELECT * FROM dbsp_use_planner(false)");
 
   db.exec("SELECT * FROM dbsp_create_view('v_off', "
           "'SELECT * FROM t WHERE val > 5')");

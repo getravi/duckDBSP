@@ -234,15 +234,16 @@ See [Error Handling Guide](docs/ERROR_HANDLING.md) for details.
 - NULL-aware operations (SQL semantics for GROUP BY, JOINs, aggregates)
 - Incremental recursive query evaluation
 
-**Planner Frontend (Phase B, experimental — `dbsp_use_planner(true)`):**
+**Planner Frontend (Phase B — default ON, `dbsp_use_planner(false)` to
+disable):**
 - View SQL planned by DuckDB's own binder/planner instead of the bespoke
   parser; scan/filter/projection, GROUP BY aggregation, inner joins
   (equi + residual predicates), cross joins, DISTINCT, set operations,
   window functions, and non-recursive CTEs translate directly to circuit
   nodes with full DuckDB expression coverage (function calls, mixed AND/OR
   predicates, multi-aggregate GROUP BY, expression group/join keys, HAVING,
-  global aggregates). Unsupported plans fall back to the parser
-  transparently. Default OFF.
+  global aggregates). Unsupported plans (ORDER BY/LIMIT, recursive CTEs,
+  outer joins) fall back to the parser transparently.
 
 ### 📋 Planned (Phase 4+)
 
