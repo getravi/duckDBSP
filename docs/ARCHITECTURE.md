@@ -434,6 +434,18 @@ State after:
 - Persistence saves definitions only, not materialized state
 - On load, views are rebuilt from current table data
 
+### Lifetime
+
+- Planner-frontend views hold an internal DuckDB Connection and therefore
+  **pin the DatabaseInstance** while they exist. This is required: their
+  expression-executor buffers come from the instance's allocator, so a view
+  must never outlive its instance. Drop views (or `reset()` the manager) to
+  release the instance while the process runs.
+- `CDCManager` is a **deliberately leaked** heap singleton: no destructors
+  run at process exit, so DuckDB shutdown never happens during static
+  teardown (which previously caused intermittent exit segfaults). The OS
+  reclaims everything at exit.
+
 ## Extension Points
 
 ### Adding New View Types

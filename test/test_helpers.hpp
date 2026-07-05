@@ -79,10 +79,10 @@ public:
   }
 
   ~DuckDBTestHarness() {
-    // Destroy views BEFORE the database: planner-frontend views hold an
-    // internal Connection (keeps the DatabaseInstance alive), and letting
-    // the static CDCManager destroy them at process teardown runs DuckDB
-    // shutdown during static destruction — intermittent exit segfaults.
+    // Free views (and their internal Connections) promptly so each test's
+    // DatabaseInstance is released as soon as the harness goes away. The
+    // exit-crash itself is fixed by the leaked CDCManager singleton (see
+    // get_cdc_manager); this is hygiene, not correctness.
     dbsp_native::get_cdc_manager().reset();
   }
 

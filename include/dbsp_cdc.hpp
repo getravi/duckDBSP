@@ -2009,9 +2009,17 @@ private:
 };
 
 // Global CDC manager instance
+// Deliberately leaked heap singleton (never destroyed). Planner-frontend
+// views hold an internal Connection that keeps the DatabaseInstance alive
+// (they must not outlive it: expression-executor buffers come from the
+// instance's allocator). A function-local static CDCManager would destroy
+// those views during static teardown at process exit, running DuckDB
+// shutdown at static-destruction time — intermittent exit segfaults. With
+// the leak, no destructors run at exit and the OS reclaims everything.
+// Views are still freed normally via drop_view/reset while running.
 inline CDCManager &get_cdc_manager() {
-  static CDCManager manager;
-  return manager;
+  static CDCManager *manager = new CDCManager();
+  return *manager;
 }
 
 } // namespace dbsp_native

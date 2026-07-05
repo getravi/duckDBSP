@@ -20,12 +20,16 @@
   recursion to the parser, so deleting it would remove working features.
   Deletion moves to when those gaps close (Phase C or a dedicated
   follow-up).
-- Known lifetime issue (workaround in place): planner views hold an
-  internal Connection that keeps the DatabaseInstance alive; if the
-  process-static CDCManager destroys them at exit, DuckDB shuts down
-  during static teardown (intermittent exit segfaults). Tests now reset
-  the manager before the database closes; the proper fix (instance-scoped
-  view lifetime) is tracked for Phase C.
+- Lifetime issue RESOLVED (follow-up commit): CDCManager is now a
+  deliberately leaked heap singleton, so no view destructors run during
+  static teardown at process exit. Planner views intentionally pin the
+  DatabaseInstance while alive (they must not outlive it — executor
+  buffers come from the instance's allocator); the exit segfault came
+  purely from the singleton's destructor running DuckDB shutdown at
+  static-destruction time. Verified: 0/20 crashes with the test-harness
+  workaround disabled (was ~50%). True instance-scoped ownership is
+  impossible without a reference cycle, so "views pin the instance" is
+  the documented semantic; drop_view/reset release it while running.
 
 ## Phase B4: Planner Frontend Windows + CTEs - Jul 2026
 
