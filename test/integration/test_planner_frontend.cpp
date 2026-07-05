@@ -442,3 +442,137 @@ TEST_CASE("planner frontend: flag off uses parser path",
           "'SELECT * FROM t WHERE val > 5')");
   db.assertViewRowCount("v_off", 1);
 }
+
+// ===== Phase C1: ORDER BY / LIMIT through the planner =====
+
+namespace {
+
+// True when the view was built by the planner frontend (no parser fallback)
+bool plannerBuilt(const std::string &view) {
+  const auto *v = dbsp_native::get_cdc_manager().get_view(view);
+  return dynamic_cast<const dbsp_native::PlannedCircuitView *>(v) != nullptr;
+}
+
+// Rows of dbsp_query in scan order (first column only, as int64)
+std::vector<int64_t> scanColumn0(DuckDBTestHarness &db,
+                                 const std::string &view) {
+  auto result = db.query("SELECT * FROM dbsp_query('" + view + "')");
+  REQUIRE_FALSE(result->HasError());
+  std::vector<int64_t> out;
+  for (size_t r = 0; r < result->RowCount(); r++) {
+    out.push_back(result->GetValue(0, r).GetValue<int64_t>());
+  }
+  return out;
+}
+
+} // namespace
+
+TEST_CASE("planner C1: ORDER BY view scans in sorted order",
+          "[integration][planner][sort]") {
+  DuckDBTestHarness db;
+  db.createTable("st", "id INT, val INT", {"(1, 30)", "(2, 10)", "(3, 20)"});
+  db.exec("SELECT * FROM dbsp_track('st')");
+  db.exec("SELECT * FROM dbsp_sync('st')");
+  db.exec("SELECT * FROM dbsp_use_planner(true)");
+
+  const std::string sql = "SELECT val, id FROM st ORDER BY val DESC";
+  db.exec("SELECT * FROM dbsp_create_view('v_sorted', '" + sql + "')");
+  REQUIRE(plannerBuilt("v_sorted"));
+
+  REQUIRE(scanColumn0(db, "v_sorted") == std::vector<int64_t>{30, 20, 10});
+
+  db.exec("INSERT INTO st VALUES (4, 25)");
+  db.exec("SELECT * FROM dbsp_sync('st')");
+  REQUIRE(scanColumn0(db, "v_sorted") ==
+          std::vector<int64_t>{30, 25, 20, 10});
+
+  db.exec("DELETE FROM st WHERE id = 1");
+  db.exec("SELECT * FROM dbsp_sync('st')");
+  REQUIRE(scanColumn0(db, "v_sorted") == std::vector<int64_t>{25, 20, 10});
+}
+
+TEST_CASE("planner C1: ORDER BY on column dropped from output",
+          "[integration][planner][sort]") {
+  DuckDBTestHarness db;
+  db.createTable("st2", "id INT, val INT", {"(1, 30)", "(2, 10)", "(3, 20)"});
+  db.exec("SELECT * FROM dbsp_track('st2')");
+  db.exec("SELECT * FROM dbsp_sync('st2')");
+  db.exec("SELECT * FROM dbsp_use_planner(true)");
+
+  // val is the sort key but NOT in the SELECT list: the trailing projection
+  // must fold into the sort view so scan order still follows val
+  const std::string sql = "SELECT id FROM st2 ORDER BY val DESC";
+  db.exec("SELECT * FROM dbsp_create_view('v_sorted_drop', '" + sql + "')");
+  REQUIRE(plannerBuilt("v_sorted_drop"));
+  REQUIRE(scanColumn0(db, "v_sorted_drop") == std::vector<int64_t>{1, 3, 2});
+}
+
+TEST_CASE("planner C1: LIMIT with ORDER BY maintains top-k incrementally",
+          "[integration][planner][limit]") {
+  DuckDBTestHarness db;
+  db.createTable("lt", "id INT, val INT", {"(1, 30)", "(2, 10)", "(3, 20)"});
+  db.exec("SELECT * FROM dbsp_track('lt')");
+  db.exec("SELECT * FROM dbsp_sync('lt')");
+  db.exec("SELECT * FROM dbsp_use_planner(true)");
+
+  const std::string sql = "SELECT id FROM lt ORDER BY val DESC, id LIMIT 2";
+  db.exec("SELECT * FROM dbsp_create_view('v_top2', '" + sql + "')");
+  REQUIRE(plannerBuilt("v_top2"));
+  REQUIRE(scanColumn0(db, "v_top2") == std::vector<int64_t>{1, 3}); // 30, 20
+
+  // New max displaces the tail
+  db.exec("INSERT INTO lt VALUES (4, 40)");
+  db.exec("SELECT * FROM dbsp_sync('lt')");
+  REQUIRE(scanColumn0(db, "v_top2") == std::vector<int64_t>{4, 1}); // 40, 30
+
+  // Deleting the max re-admits the displaced row
+  db.exec("DELETE FROM lt WHERE id = 4");
+  db.exec("SELECT * FROM dbsp_sync('lt')");
+  REQUIRE(scanColumn0(db, "v_top2") == std::vector<int64_t>{1, 3}); // 30, 20
+}
+
+TEST_CASE("planner C1: bare LIMIT/OFFSET", "[integration][planner][limit]") {
+  DuckDBTestHarness db;
+  db.createTable("bt", "id INT",
+                 {"(1)", "(2)", "(3)", "(4)", "(5)"});
+  db.exec("SELECT * FROM dbsp_track('bt')");
+  db.exec("SELECT * FROM dbsp_sync('bt')");
+  db.exec("SELECT * FROM dbsp_use_planner(true)");
+
+  const std::string sql = "SELECT id FROM bt LIMIT 3 OFFSET 1";
+  db.exec("SELECT * FROM dbsp_create_view('v_lim', '" + sql + "')");
+  REQUIRE(plannerBuilt("v_lim"));
+  db.assertViewRowCount("v_lim", 3);
+}
+
+TEST_CASE("planner C1: percentage LIMIT is not planner-built",
+          "[integration][planner][limit]") {
+  DuckDBTestHarness db;
+  db.createTable("pt", "id INT", {"(1)", "(2)"});
+  db.exec("SELECT * FROM dbsp_track('pt')");
+  db.exec("SELECT * FROM dbsp_sync('pt')");
+  db.exec("SELECT * FROM dbsp_use_planner(true)");
+
+  // Non-constant/percentage limits must yield E110, not a wrong translation.
+  // (Until C5 this falls back to the parser; either way it must not be a
+  // PlannedCircuitView claiming to support it.)
+  auto res = db.query("SELECT * FROM dbsp_create_view('v_pct', "
+                      "'SELECT id FROM pt LIMIT 50%')");
+  REQUIRE_FALSE(plannerBuilt("v_pct"));
+  (void)res;
+}
+
+TEST_CASE("planner C1: ORDER BY + LIMIT differential",
+          "[integration][planner][limit]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+
+  // Total order (val DESC, id) keeps the LIMIT subset deterministic on both
+  // sides even with duplicate vals from the randomized rounds
+  const std::string sql =
+      "SELECT id, val FROM t ORDER BY val DESC, id LIMIT 5";
+  db.exec("SELECT * FROM dbsp_create_view('v_topk', '" + sql + "')");
+  REQUIRE(plannerBuilt("v_topk"));
+  requireViewMatchesQuery(db, "v_topk", sql);
+  runDifferential(db, "v_topk", sql, 71);
+}

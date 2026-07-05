@@ -20,6 +20,11 @@
 //       + LOGICAL_CTE_REF (definition subtree built once, shared by refs).
 //       Correlated subqueries (DELIM_JOIN) and recursive CTEs are rejected
 //       with explicit messages.
+//   C1: LOGICAL_ORDER_BY / LOGICAL_LIMIT (constant limit/offset only) fold —
+//       together with a trailing pure-column-ref projection — into one
+//       NativeSortView/NativeLimitView behind an EmbeddedViewNode. When the
+//       sort/limit is the plan root, PlannedCircuitView::scan delegates to it
+//       so dbsp_query returns rows in ORDER BY order.
 // Any other operator yields a DBSP-E110 error naming the operator;
 // CDCManager::create_view falls back to the bespoke parser transparently.
 //
@@ -48,7 +53,9 @@
 #include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
+#include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "duckdb/planner/operator/logical_window.hpp"
@@ -134,7 +141,8 @@ struct PlanOpSpec {
     SET_OP,      // PlanSetOpNode
     WINDOW,      // NativeWindowView wrapped in an EmbeddedViewNode
     CTE,         // materialized CTE: children = {definition, main query}
-    CTE_REF      // reads the shared output of a CTE definition
+    CTE_REF,     // reads the shared output of a CTE definition
+    SORT_LIMIT   // NativeSortView/NativeLimitView in an EmbeddedViewNode
   };
 
   // Comparison between a left-side and a right-side bound expression
@@ -163,6 +171,16 @@ struct PlanOpSpec {
   std::vector<ColumnInfo> window_source_cols;             // WINDOW
   std::vector<ColumnInfo> window_result_cols;             // WINDOW
   duckdb::idx_t cte_index = 0;                   // CTE / CTE_REF
+
+  // SORT_LIMIT: ORDER BY / LIMIT / OFFSET folded into one embedded view.
+  // project_idxs is a trailing pure-column-ref projection folded in so sort
+  // keys dropped from the output still order it. presentation_root marks the
+  // plan root: only then does the view's ordered scan drive dbsp_query.
+  std::vector<NativeSortView::SortColumn> sort_columns;
+  int64_t limit = -1; // -1 = no limit
+  int64_t offset = 0;
+  std::vector<duckdb::idx_t> project_idxs; // empty = identity
+  bool presentation_root = false;
 };
 
 // Incremental GROUP BY aggregation over bound expressions: retracts the old
@@ -807,6 +825,17 @@ public:
     version_ = 0;
   }
 
+  // Root ORDER BY/LIMIT: delegate to the embedded sort/limit view so
+  // dbsp_query sees rows in ORDER BY order (content identical to the sink)
+  void scan(const std::function<void(const DuckDBRow &, Weight)> &callback)
+      const override {
+    if (ordered_view_) {
+      ordered_view_->scan(callback);
+      return;
+    }
+    NativeMaterializedView::scan(callback);
+  }
+
 private:
   OutputFn build(const PlanOpSpec &spec,
                  const std::shared_ptr<PlanKeepAlive> &keep_alive) {
@@ -973,6 +1002,40 @@ private:
     }
     case PlanOpSpec::Kind::CTE_REF:
       return cte_outputs_.at(spec.cte_index);
+    case PlanOpSpec::Kind::SORT_LIMIT: {
+      OutputFn child = build(*spec.children[0], keep_alive);
+      TableSchema vschema;
+      vschema.table_name = name_ + "_sortlimit";
+      NativeSortView::ProjectFn project = nullptr;
+      if (!spec.project_idxs.empty()) {
+        auto idxs = spec.project_idxs;
+        project = [idxs](const DuckDBRow &row) {
+          DuckDBRow out;
+          out.columns.reserve(idxs.size());
+          for (auto i : idxs) {
+            out.columns.push_back(i < row.columns.size() ? row.columns[i]
+                                                         : duckdb::Value());
+          }
+          return out;
+        };
+      }
+      std::unique_ptr<NativeMaterializedView> view;
+      if (spec.limit >= 0 || spec.offset > 0) {
+        view = std::make_unique<NativeLimitView>(
+            name_ + "_limit", "", EmbeddedViewNode::kInputName, vschema,
+            spec.limit, spec.offset, spec.sort_columns, project);
+      } else {
+        view = std::make_unique<NativeSortView>(
+            name_ + "_sort", "", EmbeddedViewNode::kInputName, vschema,
+            spec.sort_columns, project);
+      }
+      if (spec.presentation_root) {
+        ordered_view_ = view.get();
+      }
+      auto *node = circuit_.add_node(std::make_unique<EmbeddedViewNode>(
+          circuit_.next_node_id(), std::move(child), std::move(view)));
+      return [node]() -> const DuckDBZSet & { return node->output(); };
+    }
     }
     // Unreachable; keeps compilers happy
     static DuckDBZSet empty;
@@ -985,6 +1048,8 @@ private:
   std::vector<std::string> source_order_;
   std::unordered_map<duckdb::idx_t, OutputFn> cte_outputs_;
   RowSink *sink_ = nullptr;
+  // Embedded sort/limit view at the plan root; owned by its EmbeddedViewNode
+  NativeMaterializedView *ordered_view_ = nullptr;
 };
 
 class PlanTranslator {
@@ -1016,6 +1081,11 @@ public:
     auto root = walker.visit(*keep_alive->plan);
     if (!root) {
       return {nullptr, walker.error};
+    }
+    if (root->kind == PlanOpSpec::Kind::SORT_LIMIT) {
+      // Only a root sort/limit drives dbsp_query's scan order; nested ones
+      // (subqueries) affect membership only
+      root->presentation_root = true;
     }
 
     TableSchema schema;
@@ -1075,6 +1145,11 @@ private:
         return visit_cte(op.Cast<duckdb::LogicalMaterializedCTE>());
       case duckdb::LogicalOperatorType::LOGICAL_CTE_REF:
         return visit_cte_ref(op.Cast<duckdb::LogicalCTERef>());
+      case duckdb::LogicalOperatorType::LOGICAL_ORDER_BY:
+        return visit_order(op.Cast<duckdb::LogicalOrder>(), /*limit=*/-1,
+                           /*offset=*/0);
+      case duckdb::LogicalOperatorType::LOGICAL_LIMIT:
+        return visit_limit(op.Cast<duckdb::LogicalLimit>());
       case duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN:
       case duckdb::LogicalOperatorType::LOGICAL_DELIM_GET:
         return unsupported(
@@ -1092,6 +1167,31 @@ private:
       auto child = visit(*op.children[0]);
       if (!child) {
         return nullptr;
+      }
+      // A pure column-ref projection directly above ORDER BY/LIMIT folds into
+      // the sort/limit view as its ProjectFn: sort keys dropped from the
+      // SELECT list still order the output (the view sorts full input rows)
+      if (child->kind == PlanOpSpec::Kind::SORT_LIMIT &&
+          child->project_idxs.empty()) {
+        bool pure_refs = true;
+        for (const auto &expr : op.expressions) {
+          if (expr->GetExpressionClass() !=
+              duckdb::ExpressionClass::BOUND_REF) {
+            pure_refs = false;
+            break;
+          }
+        }
+        if (pure_refs) {
+          for (const auto &expr : op.expressions) {
+            child->project_idxs.push_back(
+                expr->Cast<duckdb::BoundReferenceExpression>().index);
+          }
+          columns.clear();
+          for (duckdb::idx_t i = 0; i < op.expressions.size(); i++) {
+            columns.push_back({op.expressions[i]->GetName(), op.types[i]});
+          }
+          return child;
+        }
       }
       auto spec = std::make_unique<PlanOpSpec>();
       spec->kind = PlanOpSpec::Kind::MAP_EXPR;
@@ -1124,6 +1224,70 @@ private:
       }
       spec->children.push_back(std::move(child));
       // Filter passes rows through unchanged; columns stay as-is
+      return spec;
+    }
+
+    SpecPtr visit_limit(duckdb::LogicalLimit &op) {
+      int64_t limit = -1, offset = 0;
+      using LT = duckdb::LimitNodeType;
+      if (op.limit_val.Type() == LT::CONSTANT_VALUE) {
+        limit = static_cast<int64_t>(op.limit_val.GetConstantValue());
+      } else if (op.limit_val.Type() != LT::UNSET) {
+        return unsupported("non-constant LIMIT");
+      }
+      if (op.offset_val.Type() == LT::CONSTANT_VALUE) {
+        offset = static_cast<int64_t>(op.offset_val.GetConstantValue());
+      } else if (op.offset_val.Type() != LT::UNSET) {
+        return unsupported("non-constant OFFSET");
+      }
+      auto &child = *op.children[0];
+      if (child.type == duckdb::LogicalOperatorType::LOGICAL_ORDER_BY) {
+        return visit_order(child.Cast<duckdb::LogicalOrder>(), limit, offset);
+      }
+      auto child_spec = visit(child);
+      if (!child_spec) {
+        return nullptr;
+      }
+      return make_sort_limit(std::move(child_spec), {}, limit, offset);
+    }
+
+    SpecPtr visit_order(duckdb::LogicalOrder &op, int64_t limit,
+                        int64_t offset) {
+      if (!op.projection_map.empty()) {
+        return unsupported("ORDER BY with projection map");
+      }
+      std::vector<NativeSortView::SortColumn> cols;
+      for (auto &o : op.orders) {
+        if (o.expression->GetExpressionClass() !=
+            duckdb::ExpressionClass::BOUND_REF) {
+          return unsupported("ORDER BY expression (use a plain column)");
+        }
+        auto &ref = o.expression->Cast<duckdb::BoundReferenceExpression>();
+        NativeSortView::SortColumn sc;
+        sc.column_idx = static_cast<size_t>(ref.index);
+        sc.ascending = o.type != duckdb::OrderType::DESCENDING;
+        sc.nulls_first = o.null_order == duckdb::OrderByNullType::NULLS_FIRST;
+        cols.push_back(sc);
+      }
+      auto child_spec = visit(*op.children[0]);
+      if (!child_spec) {
+        return nullptr;
+      }
+      return make_sort_limit(std::move(child_spec), std::move(cols), limit,
+                             offset);
+    }
+
+    // ORDER BY/LIMIT pass rows through (LIMIT changes membership, not
+    // layout): columns stay as the child left them
+    SpecPtr make_sort_limit(SpecPtr child,
+                            std::vector<NativeSortView::SortColumn> cols,
+                            int64_t limit, int64_t offset) {
+      auto spec = std::make_unique<PlanOpSpec>();
+      spec->kind = PlanOpSpec::Kind::SORT_LIMIT;
+      spec->sort_columns = std::move(cols);
+      spec->limit = limit;
+      spec->offset = offset;
+      spec->children.push_back(std::move(child));
       return spec;
     }
 
