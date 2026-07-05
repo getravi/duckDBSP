@@ -239,7 +239,8 @@ parser was deleted):**
 - View SQL planned by DuckDB's own binder/planner; scan/filter/projection,
   GROUP BY aggregation (incl. exact SUM over DECIMAL), inner and outer
   joins (LEFT/RIGHT/FULL; equi + residual predicates), cross joins,
-  IN/NOT IN and uncorrelated scalar subqueries, DISTINCT, DISTINCT ON, set
+  IN/NOT IN and scalar subqueries (correlated included), EXISTS,
+  DISTINCT, DISTINCT ON, set
   operations, window functions, non-recursive CTEs, WITH RECURSIVE
   (multi-table recursive steps), and ORDER BY/LIMIT/OFFSET translate
   directly to circuit nodes with full DuckDB expression coverage (function
@@ -251,7 +252,6 @@ parser was deleted):**
 
 ### 📋 Not yet supported
 
-- Correlated subqueries / DELIM_JOIN (rewrite as a JOIN or intermediate view)
 - WITH RECURSIVE ... USING KEY
 - Non-constant / percentage LIMIT
 

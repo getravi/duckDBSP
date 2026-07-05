@@ -1,5 +1,31 @@
 # Changelog
 
+## Phase E: Incremental Cascades & Correlated Subqueries - Jul 2026
+
+### E1: Incremental view-on-view cascades (Jul 5, 2026)
+- propagate_changes no longer resets cascaded views and re-applies full
+  source state; a single topological pass carries pending deltas from
+  each updated source into its dependents (owned unions for multi-source
+  rounds, borrowed get_delta() otherwise). Propagating one row through a
+  3-level chain over 50k rows: ~29µs (was two full 50k-row view
+  recomputes). Scan-and-diff sync (~173ms) is now the dominant end-to-end
+  cost — recorded in TODO.md (row-level CDC is the path).
+
+### E2: Correlated subqueries (Jul 5, 2026)
+- DELIM_JOIN translates: incremental DISTINCT of the outer side's
+  correlated columns feeds every DELIM_GET through a shared output; the
+  subplan translates as ordinary operators; the join back uses null-safe
+  (IS NOT DISTINCT FROM) keys with SINGLE mapped onto LEFT-join padding
+  and MARK onto the mark machinery. Correlated scalar / EXISTS /
+  NOT EXISTS all differential-tested. Plain joins accept
+  IS NOT DISTINCT FROM too (mixed null-safe + plain keys rejected).
+
+### E3: Row-hash caching — DEFERRED
+- Every safe design either loses the win (cache reset on copy) or risks
+  stale hashes and silent Z-set corruption. The sound version is a
+  compiler-enforced encapsulation of DuckDBRow::columns (~350 sites) —
+  deferred to a dedicated change. Recorded in TODO.md.
+
 ## Phase D: Vectorized Eval, Outer Joins, Subqueries - Jul 2026
 
 ### D1: Vectorized node evaluation + zero-copy circuit deltas (Jul 5, 2026)

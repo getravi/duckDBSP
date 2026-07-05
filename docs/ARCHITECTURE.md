@@ -164,9 +164,14 @@ fill/read fast paths, `Slice` for filter survivors); sources and sinks
 borrow the caller's deltas instead of copying (D1: 2-2.5x on the
 maintenance and recovery-replay paths).
 
-Anything else (correlated subqueries / DELIM_JOIN, USING KEY recursion,
-non-constant LIMIT, ...) fails view creation with a DBSP-E110 error naming
-the unsupported operator.
+Correlated subqueries translate too (E2): DELIM_JOIN becomes an
+incremental DISTINCT of the outer side's correlated columns feeding the
+decorrelated subplan (DELIM_GET = shared reference to it), joined back
+with null-safe keys — SINGLE onto LEFT-join padding, MARK onto marks.
+
+Anything else (USING KEY recursion, non-constant LIMIT, ROLLUP/CUBE, ...)
+fails view creation with a DBSP-E110 error naming the unsupported
+operator.
 
 ### 4. Circuit-IR Optimizer (`plan_ir::optimize`, in `dbsp_plan_translator.hpp`)
 

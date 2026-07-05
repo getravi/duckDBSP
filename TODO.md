@@ -9,7 +9,6 @@ subsystem, bespoke parser, standalone Z-set spilling).
 
 ## Not supported (DBSP-E110 at view creation)
 
-- Correlated subqueries / DELIM_JOIN (rewrite as JOIN or intermediate view)
 - WITH RECURSIVE ... USING KEY
 - Non-constant / percentage LIMIT
 - Window ORDER BY / PARTITION BY over expressions (project first)
@@ -29,6 +28,10 @@ subsystem, bespoke parser, standalone Z-set spilling).
   hashes. See test/benchmarks/bench_planner_eval.cpp.
 - Aggregate keys/args, join keys, and residuals still evaluate per-row
   (RowExprEval); batch if profiles demand.
+- Row-hash caching (the ~2.4× insert-hashing gap) requires encapsulating
+  DuckDBRow::columns behind const/mutating accessors (~350 call sites,
+  compiler-enforced) so a cached hash can never go stale — do as a
+  dedicated mechanical refactor, not alongside feature work.
 - Deletions through recursive views trigger a full fixed-point recompute
   (correct but non-incremental).
 
