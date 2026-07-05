@@ -1,10 +1,18 @@
-// Phase 2 Crash Recovery Integration Tests
-// Tests checkpoint-based snapshots and faster recovery
+// Crash Recovery: replay-based restore
+//
+// Recovery rebuilds all Z-set state by replaying DuckDB's committed
+// storage through each view's circuit (load_views → create_view →
+// tracked-table scan). There is deliberately no snapshot/WAL state
+// restore: a sink-only restore cannot reconstruct internal circuit-node
+// state (aggregate groups, join indexes, sort/limit multisets, recursive
+// dedup), and replaying persisted deltas double-applies on top of
+// baselines scanned from committed storage. These tests pin both the
+// happy path and the failure modes that killed the old checkpoint/WAL
+// subsystem.
 
 #include "../../include/dbsp_cdc.hpp"
 #include "../../include/dbsp_recovery.hpp"
 #include "../../include/dbsp_crash_marker.hpp"
-#include "../../include/dbsp_checkpoint_format.hpp"
 #include "../test_helpers.hpp"
 #include "catch.hpp"
 #include <filesystem>
@@ -12,8 +20,8 @@
 using namespace dbsp_native;
 using namespace duckdb;
 
-TEST_CASE("Phase 2.1: Checkpoint saves Z-set state correctly",
-          "[crash_recovery][phase2][checkpoint]") {
+TEST_CASE("Replay restore: filter view content survives recovery",
+          "[crash_recovery][phase2][restore]") {
   DuckDB db(nullptr);
   Connection con(db);
 
@@ -22,57 +30,6 @@ TEST_CASE("Phase 2.1: Checkpoint saves Z-set state correctly",
 
   recovery_manager.set_recovery_enabled(false);
   cdc_manager.reset();
-
-  // Initialize persistence
-  REQUIRE(recovery_manager.initialize_persistence(*con.context));
-
-  // Create table with data
-  con.Query("CREATE TABLE products (id INTEGER, price INTEGER)");
-  con.Query("INSERT INTO products VALUES (1, 100), (2, 200), (3, 300)");
-
-  // Track and sync
-  con.BeginTransaction();
-  REQUIRE(cdc_manager.track_table(*con.context, "products"));
-  con.Commit();
-
-  con.BeginTransaction();
-  REQUIRE(cdc_manager.create_view(*con.context, "expensive",
-                                  "SELECT * FROM products WHERE price > 150"));
-  con.Commit();
-
-  con.BeginTransaction();
-  REQUIRE(cdc_manager.sync_table(*con.context, "products"));
-  con.Commit();
-
-  // Verify view has data (2 rows: price 200, 300)
-  auto view_result = cdc_manager.query_view("expensive");
-  REQUIRE(view_result != nullptr);
-  REQUIRE(view_result->size() == 2);
-
-  // Save checkpoint (save_checkpoint is a no-op while recovery is disabled)
-  recovery_manager.set_recovery_enabled(true);
-  REQUIRE(recovery_manager.save_checkpoint(*con.context));
-
-  // Verify checkpoint file exists
-  std::string checkpoint_path = recovery_manager.get_latest_checkpoint();
-  REQUIRE_FALSE(checkpoint_path.empty());
-  REQUIRE(std::filesystem::exists(checkpoint_path));
-
-  std::cout << "Checkpoint saved to: " << checkpoint_path << std::endl;
-}
-
-TEST_CASE("Phase 2.2: Checkpoint restore recovers view results",
-          "[crash_recovery][phase2][checkpoint]") {
-  DuckDB db(nullptr);
-  Connection con(db);
-
-  auto &recovery_manager = get_recovery_manager();
-  auto &cdc_manager = get_cdc_manager();
-
-  recovery_manager.set_recovery_enabled(false);
-  cdc_manager.reset();
-
-  // Initialize and create data
   REQUIRE(recovery_manager.initialize_persistence(*con.context));
 
   con.Query("CREATE TABLE items (id INTEGER, value INTEGER)");
@@ -81,251 +38,36 @@ TEST_CASE("Phase 2.2: Checkpoint restore recovers view results",
   con.BeginTransaction();
   REQUIRE(cdc_manager.track_table(*con.context, "items"));
   con.Commit();
-
   con.BeginTransaction();
   REQUIRE(cdc_manager.create_view(*con.context, "high_value",
                                   "SELECT * FROM items WHERE value >= 30"));
   con.Commit();
-
   con.BeginTransaction();
   REQUIRE(cdc_manager.sync_table(*con.context, "items"));
   con.Commit();
 
-  // Verify view has 2 rows (value 30, 40)
   auto view_result = cdc_manager.query_view("high_value");
   REQUIRE(view_result != nullptr);
-  size_t original_size = view_result->size();
-  REQUIRE(original_size == 2);
+  REQUIRE(view_result->size() == 2);
 
-  // Save checkpoint (save_checkpoint is a no-op while recovery is disabled)
+  // Simulated crash + recovery (replay from DuckDB storage)
   recovery_manager.set_recovery_enabled(true);
-  REQUIRE(recovery_manager.save_checkpoint(*con.context));
-
-  // Simulate crash: reset CDC manager
   cdc_manager.reset();
   REQUIRE_FALSE(cdc_manager.view_exists("high_value"));
 
-  // Recover: load views, then load checkpoint
-  recovery_manager.set_recovery_enabled(true);
   con.BeginTransaction();
   REQUIRE(recovery_manager.recover_from_crash(*con.context, ""));
   con.Commit();
 
-  // Verify view was restored
   REQUIRE(cdc_manager.view_exists("high_value"));
-
   view_result = cdc_manager.query_view("high_value");
   REQUIRE(view_result != nullptr);
-  REQUIRE(view_result->size() == original_size);
+  REQUIRE(view_result->size() == 2);
 }
 
-TEST_CASE("Phase 2.3: Checkpoint checksum detects corruption",
-          "[crash_recovery][phase2][checkpoint]") {
-  DuckDB db(nullptr);
-  Connection con(db);
-
-  auto &recovery_manager = get_recovery_manager();
-  auto &cdc_manager = get_cdc_manager();
-
-  recovery_manager.set_recovery_enabled(false);
-  cdc_manager.reset();
-
-  REQUIRE(recovery_manager.initialize_persistence(*con.context));
-
-  con.Query("CREATE TABLE test_data (id INTEGER, val INTEGER)");
-  con.Query("INSERT INTO test_data VALUES (1, 100)");
-
-  con.BeginTransaction();
-  REQUIRE(cdc_manager.track_table(*con.context, "test_data"));
-  con.Commit();
-
-  con.BeginTransaction();
-  REQUIRE(cdc_manager.create_view(*con.context, "test_view",
-                                  "SELECT * FROM test_data"));
-  con.Commit();
-
-  con.BeginTransaction();
-  REQUIRE(cdc_manager.sync_table(*con.context, "test_data"));
-  con.Commit();
-
-  // Save checkpoint (save_checkpoint is a no-op while recovery is disabled)
-  recovery_manager.set_recovery_enabled(true);
-  REQUIRE(recovery_manager.save_checkpoint(*con.context));
-
-  // Get checkpoint path
-  std::string checkpoint_path = recovery_manager.get_latest_checkpoint();
-  REQUIRE_FALSE(checkpoint_path.empty());
-
-  // Corrupt the checkpoint file (flip some bytes)
-  {
-    std::fstream file(checkpoint_path, std::ios::in | std::ios::out | std::ios::binary);
-    REQUIRE(file.is_open());
-
-    // Seek to middle of file and corrupt a byte
-    file.seekp(100);
-    char byte;
-    file.read(&byte, 1);
-    file.seekp(100);
-    byte = ~byte;  // Flip bits
-    file.write(&byte, 1);
-    file.close();
-  }
-
-  // Reset and try to recover
-  cdc_manager.reset();
-  recovery_manager.set_recovery_enabled(true);
-
-  // Recovery should fail due to checksum mismatch, fall back to resync
-  con.BeginTransaction();
-  bool recovery_result = recovery_manager.recover_from_crash(*con.context, "");
-  con.Commit();
-
-  // Recovery should still succeed (falls back to resync)
-  REQUIRE(recovery_result);
-}
-
-TEST_CASE("Phase 2.4: Old checkpoints are cleaned up",
-          "[crash_recovery][phase2][checkpoint]") {
-  DuckDB db(nullptr);
-  Connection con(db);
-
-  auto &recovery_manager = get_recovery_manager();
-  auto &cdc_manager = get_cdc_manager();
-
-  recovery_manager.set_recovery_enabled(false);
-  cdc_manager.reset();
-
-  REQUIRE(recovery_manager.initialize_persistence(*con.context));
-
-  con.Query("CREATE TABLE data (id INTEGER)");
-  con.BeginTransaction();
-  REQUIRE(cdc_manager.track_table(*con.context, "data"));
-  con.Commit();
-
-  // Create multiple checkpoints
-  for (int i = 0; i < 10; i++) {
-    con.Query("INSERT INTO data VALUES (" + std::to_string(i) + ")");
-
-    con.BeginTransaction();
-    std::string view_name = "view_" + std::to_string(i);
-    REQUIRE(cdc_manager.create_view(*con.context, view_name,
-                                    "SELECT * FROM data WHERE id = " + std::to_string(i)));
-    con.Commit();
-
-    con.BeginTransaction();
-    REQUIRE(cdc_manager.sync_table(*con.context, "data"));
-    con.Commit();
-
-    // save_checkpoint is a no-op while recovery is disabled
-    recovery_manager.set_recovery_enabled(true);
-    REQUIRE(recovery_manager.save_checkpoint(*con.context));
-
-    // Small delay to ensure different timestamps
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
-
-  // Count checkpoint files
-  std::string recovery_path = recovery_manager.get_recovery_path();
-  int checkpoint_count = 0;
-  for (const auto &entry : std::filesystem::directory_iterator(recovery_path)) {
-    if (entry.path().filename().string().find("checkpoint_") == 0) {
-      checkpoint_count++;
-    }
-  }
-
-  // Should keep only 5 most recent
-  REQUIRE(checkpoint_count <= 5);
-  std::cout << "Checkpoints after cleanup: " << checkpoint_count << std::endl;
-}
-
-TEST_CASE("Phase 2.5: Recovery uses checkpoint before resync",
-          "[crash_recovery][phase2][checkpoint]") {
-  DuckDB db(nullptr);
-  Connection con(db);
-
-  auto &recovery_manager = get_recovery_manager();
-  auto &cdc_manager = get_cdc_manager();
-
-  recovery_manager.set_recovery_enabled(false);
-  cdc_manager.reset();
-
-  REQUIRE(recovery_manager.initialize_persistence(*con.context));
-
-  // Create large dataset
-  con.Query("CREATE TABLE large_table (id INTEGER, value INTEGER)");
-
-  std::string insert_sql = "INSERT INTO large_table VALUES ";
-  for (int i = 0; i < 1000; i++) {
-    if (i > 0) insert_sql += ", ";
-    insert_sql += "(" + std::to_string(i) + ", " + std::to_string(i * 10) + ")";
-  }
-  con.Query(insert_sql);
-
-  con.BeginTransaction();
-  REQUIRE(cdc_manager.track_table(*con.context, "large_table"));
-  con.Commit();
-
-  con.BeginTransaction();
-  REQUIRE(cdc_manager.create_view(*con.context, "large_view",
-                                  "SELECT * FROM large_table WHERE value > 5000"));
-  con.Commit();
-
-  con.BeginTransaction();
-  REQUIRE(cdc_manager.sync_table(*con.context, "large_table"));
-  con.Commit();
-
-  // Get view size before checkpoint
-  auto view_result = cdc_manager.query_view("large_view");
-  size_t expected_size = view_result->size();
-  REQUIRE(expected_size > 0);
-
-  // Save checkpoint (save_checkpoint is a no-op while recovery is disabled)
-  recovery_manager.set_recovery_enabled(true);
-  auto start_save = std::chrono::steady_clock::now();
-  REQUIRE(recovery_manager.save_checkpoint(*con.context));
-  auto end_save = std::chrono::steady_clock::now();
-  auto save_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_save - start_save).count();
-
-  std::cout << "Checkpoint save time: " << save_time << "ms" << std::endl;
-
-  // Simulate crash
-  cdc_manager.reset();
-
-  // Recover with checkpoint
-  recovery_manager.set_recovery_enabled(true);
-
-  auto start_recover = std::chrono::steady_clock::now();
-  con.BeginTransaction();
-  REQUIRE(recovery_manager.recover_from_crash(*con.context, ""));
-  con.Commit();
-  auto end_recover = std::chrono::steady_clock::now();
-  auto recover_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_recover - start_recover).count();
-
-  std::cout << "Recovery time with checkpoint: " << recover_time << "ms" << std::endl;
-
-  // Verify recovered data
-  view_result = cdc_manager.query_view("large_view");
-  REQUIRE(view_result != nullptr);
-  REQUIRE(view_result->size() == expected_size);
-
-  // Recovery should be fast (< 500ms for 1000 rows)
-  REQUIRE(recover_time < 500);
-}
-
-// ===== Pre-Phase-D restore audit =====
-//
-// Checkpoint restore uses set_result(), which fills a view's SINK but
-// leaves every internal circuit-node state empty (aggregate group states,
-// join indexes, embedded sort/limit multisets, recursive dedup state).
-// These tests pin the two user-visible consequences:
-//   1. the first post-restore delta must merge with pre-restore state,
-//      not restart from zero
-//   2. ordered views must still scan their content (scan() delegates to
-//      the embedded sort view's multiset, not the sink)
-
-TEST_CASE("Restore audit: aggregate view stays correct after first "
-          "post-restore delta",
-          "[crash_recovery][phase2][restore_audit]") {
+TEST_CASE("Replay restore: aggregate view stays correct after first "
+          "post-recovery delta",
+          "[crash_recovery][phase2][restore][restore_audit]") {
   DuckDB db(nullptr);
   Connection con(db);
 
@@ -354,10 +96,8 @@ TEST_CASE("Restore audit: aggregate view stays correct after first "
   REQUIRE(before != nullptr);
   REQUIRE(before->size() == 2); // (a,30) (b,5)
 
+  // Simulated crash + recovery
   recovery_manager.set_recovery_enabled(true);
-  REQUIRE(recovery_manager.save_checkpoint(*con.context));
-
-  // Simulated crash + recovery via checkpoint
   cdc_manager.reset();
   con.BeginTransaction();
   REQUIRE(recovery_manager.recover_from_crash(*con.context, ""));
@@ -365,10 +105,10 @@ TEST_CASE("Restore audit: aggregate view stays correct after first "
 
   auto *restored = cdc_manager.query_view("v_sum");
   REQUIRE(restored != nullptr);
-  REQUIRE(restored->size() == 2); // content survives restore
+  REQUIRE(restored->size() == 2);
 
-  // First post-restore delta: group 'a' must become 31, not fork a
-  // second row computed from empty aggregate state
+  // First post-recovery delta: group 'a' must become 31 — internal
+  // aggregate state has to have been rebuilt by replay, not left empty
   con.Query("INSERT INTO nums VALUES ('a', 1)");
   con.BeginTransaction();
   REQUIRE(cdc_manager.sync_table(*con.context, "nums"));
@@ -376,17 +116,7 @@ TEST_CASE("Restore audit: aggregate view stays correct after first "
 
   auto *after = cdc_manager.query_view("v_sum");
   REQUIRE(after != nullptr);
-  std::cout << "rows after post-restore delta:" << std::endl;
-  for (const auto &[row, w] : *after) {
-    std::cout << "  " << row.columns[0].ToString() << " -> "
-              << row.columns[1].ToString() << " (w=" << w << ")"
-              << std::endl;
-  }
   REQUIRE(after->size() == 2); // still one row per group
-  DuckDBRow expect_a;
-  expect_a.columns = {duckdb::Value("a"),
-                      duckdb::Value::Numeric(duckdb::LogicalType::HUGEINT, 31)};
-  // SUM return type for INTEGER args is HUGEINT in DuckDB
   bool found_31 = false;
   for (const auto &[row, w] : *after) {
     if (row.columns[0].ToString() == "a") {
@@ -396,8 +126,8 @@ TEST_CASE("Restore audit: aggregate view stays correct after first "
   REQUIRE(found_31);
 }
 
-TEST_CASE("Restore audit: ordered view still scans its rows after restore",
-          "[crash_recovery][phase2][restore_audit]") {
+TEST_CASE("Replay restore: ordered view still scans its rows after recovery",
+          "[crash_recovery][phase2][restore][restore_audit]") {
   DuckDB db(nullptr);
   Connection con(db);
 
@@ -432,16 +162,93 @@ TEST_CASE("Restore audit: ordered view still scans its rows after restore",
   REQUIRE(count_scanned() == 3);
 
   recovery_manager.set_recovery_enabled(true);
-  REQUIRE(recovery_manager.save_checkpoint(*con.context));
-
   cdc_manager.reset();
   con.BeginTransaction();
   REQUIRE(recovery_manager.recover_from_crash(*con.context, ""));
   con.Commit();
 
-  // dbsp_query consumes scan(): after restore it must still see the rows,
-  // not an empty embedded sort multiset
+  // dbsp_query consumes scan(): the embedded sort view's multiset must
+  // have been rebuilt by replay, not left empty next to a populated sink
   REQUIRE(cdc_manager.query_view("v_ord") != nullptr);
-  REQUIRE(cdc_manager.query_view("v_ord")->size() == 3); // sink restored
-  REQUIRE(count_scanned() == 3);                          // scan path too
+  REQUIRE(cdc_manager.query_view("v_ord")->size() == 3);
+  REQUIRE(count_scanned() == 3);
+}
+
+TEST_CASE("End-to-end crash recovery across database restarts",
+          "[crash_recovery][phase2][restore][e2e]") {
+  std::filesystem::remove_all(".dbsp_recovery");
+  std::filesystem::remove("test_e2e.db");
+
+  // Session 1: normal operation, then simulated crash (no session end)
+  {
+    DuckDB db("test_e2e.db");
+    Connection con(db);
+
+    auto &cdc_manager = get_cdc_manager();
+    auto &recovery_manager = get_recovery_manager();
+    cdc_manager.reset();
+
+    REQUIRE(recovery_manager.initialize_persistence(*con.context));
+    recovery_manager.mark_session_start();
+
+    con.Query("CREATE TABLE accounts (id INTEGER, balance DOUBLE)");
+    con.BeginTransaction();
+    REQUIRE(cdc_manager.track_table(*con.context, "accounts"));
+    REQUIRE(cdc_manager.create_view(
+        *con.context, "high_balance",
+        "SELECT id, balance FROM accounts WHERE balance > 1000"));
+    con.Commit();
+
+    con.Query("INSERT INTO accounts VALUES (1, 1500), (2, 2500), (3, 500)");
+    con.BeginTransaction();
+    REQUIRE(cdc_manager.sync_table(*con.context, "accounts"));
+    con.Commit();
+
+    REQUIRE(cdc_manager.query_view("high_balance")->size() == 2);
+    // No mark_session_end: simulates a crash
+  }
+
+  // Session 2: crash detected; replay restores committed state
+  {
+    DuckDB db("test_e2e.db");
+    Connection con(db);
+
+    auto &cdc_manager = get_cdc_manager();
+    cdc_manager.clear_all_state();
+
+    auto &recovery_manager = get_recovery_manager();
+    REQUIRE(DBSPCrashMarker::detect_crash(".dbsp_recovery"));
+    con.BeginTransaction(); // catalog access during view replay
+    REQUIRE(recovery_manager.recover_from_crash(*con.context, "test_e2e.db"));
+    con.Commit();
+
+    REQUIRE(cdc_manager.view_exists("high_balance"));
+    // Replay of committed storage: ids 1 and 2 pass the predicate
+    REQUIRE(cdc_manager.query_view("high_balance")->size() == 2);
+
+    recovery_manager.mark_session_end();
+  }
+
+  // Session 3: clean restart
+  {
+    DuckDB db("test_e2e.db");
+    Connection con(db);
+
+    auto &cdc_manager = get_cdc_manager();
+    cdc_manager.clear_all_state();
+
+    auto &recovery_manager = get_recovery_manager();
+    REQUIRE_FALSE(DBSPCrashMarker::detect_crash(".dbsp_recovery"));
+    con.BeginTransaction();
+    REQUIRE(recovery_manager.recover_from_crash(*con.context, "test_e2e.db"));
+    con.Commit();
+
+    REQUIRE(cdc_manager.view_exists("high_balance"));
+    REQUIRE(cdc_manager.query_view("high_balance")->size() == 2);
+
+    recovery_manager.mark_session_end();
+  }
+
+  std::filesystem::remove_all(".dbsp_recovery");
+  std::filesystem::remove("test_e2e.db");
 }

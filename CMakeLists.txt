@@ -30,8 +30,6 @@ build_loadable_extension(${TARGET_NAME} ${PARAMETERS}
     src/dbsp_extension.cpp
     src/dbsp_recovery.cpp
     src/dbsp_crash_marker.cpp
-    src/dbsp_checkpoint_format.cpp
-    src/dbsp_wal_manager.cpp
 )
 
 target_include_directories(${TARGET_NAME}_loadable_extension PRIVATE
@@ -55,8 +53,6 @@ add_executable(benchmark_runner
     src/dbsp_extension.cpp
     src/dbsp_recovery.cpp
     src/dbsp_crash_marker.cpp
-    src/dbsp_checkpoint_format.cpp
-    src/dbsp_wal_manager.cpp
 )
 target_include_directories(benchmark_runner PRIVATE
     ${DUCKDB_SOURCE_DIR}/src/include

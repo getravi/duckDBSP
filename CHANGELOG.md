@@ -2,6 +2,20 @@
 
 ## Pre-Phase-D: Recovery correctness - Jul 2026
 
+### Checkpoint/WAL subsystem deleted (Jul 5, 2026)
+- Follow-through on the replay-based recovery fix: once checkpoint contents
+  were validated-but-never-applied and WAL replay was skipped, the entire
+  subsystem was write-only overhead. Deleted: dbsp_checkpoint_format.*,
+  dbsp_wal_manager.*, save/validate/get_latest/cleanup checkpoint APIs, the
+  WAL flush in the commit hook, and the phase-3 WAL test binary.
+- Recovery is now exactly: crash markers → _dbsp_views definitions →
+  create_view replay of committed DuckDB storage → resync safety pass.
+- load_views no longer counts failed view recreations as recovered; it
+  logs CDCManager::last_error() per failure.
+- Phase-2 tests rewritten as replay-restore tests (filter content,
+  aggregate-after-delta, ordered-view scan, cross-restart e2e with crash
+  markers). Suite: 31/31 green ×3.
+
 ### Checkpoint restore rebuilt around replay (Jul 5, 2026)
 - Audit found checkpoint restore broken four ways: values deserialized as
   VARCHAR (never equal to live rows, so Z-set retractions could not

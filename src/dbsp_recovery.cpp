@@ -1,8 +1,6 @@
 #include "dbsp_recovery.hpp"
 #include "dbsp_crash_marker.hpp"
 #include "dbsp_cdc.hpp"
-#include "dbsp_checkpoint_format.hpp"
-#include "dbsp_wal_manager.hpp"
 #include <filesystem>
 #include <iostream>
 #include <chrono>
@@ -127,10 +125,15 @@ bool DBSPRecoveryManager::load_views(duckdb::ClientContext &context) {
         sources.push_back(source);
       }
 
-      // Recreate view (this will re-parse SQL and rebuild the view)
+      // Recreate view (re-plans the SQL and rebuilds the circuit by
+      // replaying committed table state)
       try {
-        cdc_manager.create_view(name, sql, sources, context);
-        view_count++;
+        if (cdc_manager.create_view(name, sql, sources, context)) {
+          view_count++;
+        } else {
+          std::cerr << "Failed to recreate view '" << name
+                    << "': " << cdc_manager.last_error() << std::endl;
+        }
       } catch (const std::exception &e) {
         std::cerr << "Failed to recreate view '" << name << "': " << e.what() << std::endl;
         // Continue with other views
@@ -223,28 +226,16 @@ bool DBSPRecoveryManager::recover_from_crash(duckdb::ClientContext &context,
     // Continue anyway - some views may have loaded
   }
 
-  // Step 4: Validate the latest checkpoint (diagnostics only).
-  //
-  // View state is NOT applied from the checkpoint. DuckDB's own storage is
-  // the single durable source of truth: step 3 already rebuilt every view
-  // by replaying tracked-table scans of committed data through its circuit,
-  // which restores internal node state (aggregate groups, join indexes,
-  // sort/limit multisets, recursive dedup) that a sink-only set_result()
-  // never could. Applying checkpoint Z-sets on top of that corrupted views
-  // (stale rows that never cancel — see the [restore_audit] tests).
-  if (validate_checkpoint(context)) {
-    std::cout << "DBSP Recovery: Latest checkpoint is valid (state was "
-                 "rebuilt from DuckDB storage; checkpoint not applied)"
-              << std::endl;
-  }
+  // NOTE: there is deliberately no snapshot/WAL restore step. DuckDB's own
+  // committed storage is the single durable source of truth: step 3 rebuilt
+  // every view by replaying tracked-table scans of committed data through
+  // its circuit, which restores internal node state (aggregate groups, join
+  // indexes, sort/limit multisets, recursive dedup) that a sink-only
+  // restore never could. The former checkpoint/WAL subsystem applied stale
+  // Z-sets on top of that (or double-applied deltas) and was removed — see
+  // the [restore_audit] tests for the failure modes it caused.
 
-  // Step 5: WAL table-delta replay is deliberately skipped. Replayed deltas
-  // would double-apply on top of baselines that step 3 already scanned from
-  // committed storage; rows absent from DuckDB storage after a crash were
-  // never committed and must not be resurrected. replay_wal() remains
-  // available for callers that manage their own baselines.
-
-  // Step 6: Resync tracked tables against DuckDB storage. With baselines
+  // Step 4: Resync tracked tables against DuckDB storage. With baselines
   // fresh from step 3 the deltas are empty; this catches tables tracked in
   // _dbsp_tables that no view references (step 3 only tracks view sources).
   if (!resync_tracked_tables(context)) {
@@ -252,7 +243,7 @@ bool DBSPRecoveryManager::recover_from_crash(duckdb::ClientContext &context,
     // Continue anyway - some tables may have synced
   }
 
-  // Step 7: Rebuild dependency graph (mostly automatic)
+  // Step 5: Rebuild dependency graph (mostly automatic)
   if (!rebuild_dependency_graph()) {
     std::cerr << "DBSP Recovery: Failed to rebuild dependency graph" << std::endl;
     return false;
@@ -269,242 +260,6 @@ bool DBSPRecoveryManager::recover_from_crash(duckdb::ClientContext &context,
   }
 
   return true;
-}
-
-std::string DBSPRecoveryManager::get_latest_checkpoint() const {
-  try {
-    std::filesystem::path recovery_dir(recovery_path_);
-    if (!std::filesystem::exists(recovery_dir)) {
-      return "";
-    }
-
-    // Find checkpoint files matching pattern: checkpoint_<timestamp>.dbsp
-    std::string latest_checkpoint;
-    uint64_t latest_timestamp = 0;
-
-    for (const auto &entry : std::filesystem::directory_iterator(recovery_dir)) {
-      if (!entry.is_regular_file()) continue;
-
-      std::string filename = entry.path().filename().string();
-      if (filename.find("checkpoint_") != 0) continue;
-      if (filename.substr(filename.size() - 5) != ".dbsp") continue;
-
-      // Extract timestamp from filename
-      std::string ts_str = filename.substr(11, filename.size() - 16);  // Remove "checkpoint_" and ".dbsp"
-      try {
-        uint64_t timestamp = std::stoull(ts_str);
-        if (timestamp > latest_timestamp) {
-          latest_timestamp = timestamp;
-          latest_checkpoint = entry.path().string();
-        }
-      } catch (...) {
-        continue;  // Invalid filename format, skip
-      }
-    }
-
-    return latest_checkpoint;
-
-  } catch (const std::exception &e) {
-    std::cerr << "Error finding latest checkpoint: " << e.what() << std::endl;
-    return "";
-  }
-}
-
-bool DBSPRecoveryManager::save_checkpoint(duckdb::ClientContext &context) {
-  if (!recovery_enabled_) return true;
-
-  try {
-    // Ensure recovery directory exists
-    std::filesystem::path recovery_dir(recovery_path_);
-    if (!std::filesystem::exists(recovery_dir)) {
-      std::filesystem::create_directories(recovery_dir);
-    }
-
-    // Generate checkpoint filename with timestamp
-    auto now = std::chrono::system_clock::now();
-    auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        now.time_since_epoch()).count();
-
-    std::ostringstream oss;
-    oss << recovery_path_ << "/checkpoint_" << timestamp << ".dbsp";
-    std::string checkpoint_path = oss.str();
-
-    std::cout << "DBSP: Saving checkpoint to " << checkpoint_path << std::endl;
-
-    // Create checkpoint writer
-    CheckpointWriter writer(checkpoint_path);
-
-    // Prepare header
-    CheckpointHeader header;
-    header.timestamp = timestamp;
-
-    auto &cdc_manager = get_cdc_manager();
-    auto view_names = cdc_manager.list_views();
-    auto table_names = cdc_manager.list_tracked_tables();
-
-    header.num_views = static_cast<uint32_t>(view_names.size());
-    header.num_tables = static_cast<uint32_t>(table_names.size());
-
-    // Write header
-    if (!writer.write_header(header)) {
-      std::cerr << "Failed to write checkpoint header: " << writer.last_error() << std::endl;
-      return false;
-    }
-
-    // Write all views
-    for (const auto &view_name : view_names) {
-      auto result = cdc_manager.query_view(view_name);
-      if (result) {
-        if (!writer.write_view(view_name, *result)) {
-          std::cerr << "Failed to write view " << view_name << ": " << writer.last_error() << std::endl;
-          return false;
-        }
-      }
-    }
-
-    // Write all tracked tables
-    for (const auto &table_name : table_names) {
-      // Get table's current Z-set state
-      auto result = cdc_manager.query_view(table_name);  // Tables are tracked as views internally
-      if (result) {
-        // Use timestamp as sequence number for now
-        if (!writer.write_table(table_name, timestamp, *result)) {
-          std::cerr << "Failed to write table " << table_name << ": " << writer.last_error() << std::endl;
-          return false;
-        }
-      }
-    }
-
-    // Finalize (write checksum)
-    if (!writer.finalize()) {
-      std::cerr << "Failed to finalize checkpoint: " << writer.last_error() << std::endl;
-      return false;
-    }
-
-    std::cout << "DBSP: Checkpoint saved successfully ("
-              << header.num_views << " views, "
-              << header.num_tables << " tables)" << std::endl;
-
-    // Clean up old checkpoints (keep only last 5)
-    cleanup_old_checkpoints(5);
-
-    return true;
-
-  } catch (const std::exception &e) {
-    std::cerr << "Exception saving checkpoint: " << e.what() << std::endl;
-    return false;
-  }
-}
-
-// Validate the latest checkpoint file without applying any of it.
-//
-// Checkpoint Z-sets are never written into live views or table baselines:
-// recovery rebuilds all state by replaying DuckDB's committed storage
-// through the circuits (see recover_from_crash step 4). Applying them was
-// actively harmful — sink-only set_result() left every internal circuit
-// node empty, values round-tripped as VARCHAR so retractions could not
-// cancel, and a partial read followed by resync doubled state. Checkpoints
-// stay useful as an integrity snapshot for diagnostics.
-bool DBSPRecoveryManager::validate_checkpoint(duckdb::ClientContext &context) {
-  (void)context;
-  if (!recovery_enabled_) return true;
-
-  try {
-    std::string checkpoint_path = get_latest_checkpoint();
-    if (checkpoint_path.empty()) {
-      std::cout << "DBSP: No checkpoint found" << std::endl;
-      return false;
-    }
-
-    std::cout << "DBSP: Validating checkpoint " << checkpoint_path << std::endl;
-
-    CheckpointReader reader(checkpoint_path);
-    if (!reader.is_valid()) {
-      std::cerr << "Failed to open checkpoint: " << reader.last_error() << std::endl;
-      return false;
-    }
-
-    CheckpointHeader header;
-    if (!reader.read_header(header)) {
-      std::cerr << "Failed to read checkpoint header: " << reader.last_error() << std::endl;
-      return false;
-    }
-
-    std::cout << "DBSP: Checkpoint timestamp: " << header.timestamp
-              << ", views: " << header.num_views
-              << ", tables: " << header.num_tables << std::endl;
-
-    // Walk every section to prove the file is complete and well-formed;
-    // the parsed Z-sets are discarded
-    for (uint32_t i = 0; i < header.num_views; i++) {
-      std::string view_name;
-      DuckDBZSet zset;
-      if (!reader.read_view(view_name, zset)) {
-        std::cerr << "Failed to read view " << i << ": " << reader.last_error() << std::endl;
-        return false;
-      }
-    }
-    for (uint32_t i = 0; i < header.num_tables; i++) {
-      std::string table_name;
-      uint64_t sequence;
-      DuckDBZSet zset;
-      if (!reader.read_table(table_name, sequence, zset)) {
-        std::cerr << "Failed to read table " << i << ": " << reader.last_error() << std::endl;
-        return false;
-      }
-    }
-
-    if (!reader.verify_checksum()) {
-      std::cerr << "Checkpoint checksum verification failed: " << reader.last_error() << std::endl;
-      return false;
-    }
-
-    return true;
-
-  } catch (const std::exception &e) {
-    std::cerr << "Exception validating checkpoint: " << e.what() << std::endl;
-    return false;
-  }
-}
-
-void DBSPRecoveryManager::cleanup_old_checkpoints(size_t keep_count) {
-  try {
-    std::filesystem::path recovery_dir(recovery_path_);
-    if (!std::filesystem::exists(recovery_dir)) return;
-
-    // Collect all checkpoint files with timestamps
-    std::vector<std::pair<uint64_t, std::string>> checkpoints;
-
-    for (const auto &entry : std::filesystem::directory_iterator(recovery_dir)) {
-      if (!entry.is_regular_file()) continue;
-
-      std::string filename = entry.path().filename().string();
-      if (filename.find("checkpoint_") != 0) continue;
-      if (filename.substr(filename.size() - 5) != ".dbsp") continue;
-
-      // Extract timestamp
-      std::string ts_str = filename.substr(11, filename.size() - 16);
-      try {
-        uint64_t timestamp = std::stoull(ts_str);
-        checkpoints.push_back({timestamp, entry.path().string()});
-      } catch (...) {
-        continue;
-      }
-    }
-
-    // Sort by timestamp (newest first)
-    std::sort(checkpoints.begin(), checkpoints.end(),
-              [](const auto &a, const auto &b) { return a.first > b.first; });
-
-    // Delete old checkpoints
-    for (size_t i = keep_count; i < checkpoints.size(); i++) {
-      std::filesystem::remove(checkpoints[i].second);
-      std::cout << "DBSP: Removed old checkpoint: " << checkpoints[i].second << std::endl;
-    }
-
-  } catch (const std::exception &e) {
-    std::cerr << "Error cleaning up checkpoints: " << e.what() << std::endl;
-  }
 }
 
 } // namespace dbsp_native

@@ -77,29 +77,6 @@ public:
    */
   void set_recovery_enabled(bool enabled) { recovery_enabled_ = enabled; }
 
-  /**
-   * @brief Save checkpoint of current Z-set state
-   * @param context DuckDB client context
-   * @return true if checkpoint saved successfully
-   */
-  bool save_checkpoint(duckdb::ClientContext &context);
-
-  /**
-   * @brief Validate the latest checkpoint file (parse + checksum) without
-   * applying it. Recovery rebuilds all Z-set state by replaying DuckDB's
-   * committed storage through the circuits; checkpoint contents are
-   * diagnostics only.
-   * @param context DuckDB client context (unused)
-   * @return true if a checkpoint exists and is well-formed
-   */
-  bool validate_checkpoint(duckdb::ClientContext &context);
-
-  /**
-   * @brief Get the path to the latest checkpoint file
-   * @return Path to checkpoint file, or empty string if none exists
-   */
-  std::string get_latest_checkpoint() const;
-
 private:
   /**
    * @brief Check if crash markers exist
@@ -138,12 +115,6 @@ private:
    * @return Recovery directory path
    */
   std::string determine_recovery_path(const std::string &db_path) const;
-
-  /**
-   * @brief Clean up old checkpoint files, keeping only the most recent N
-   * @param keep_count Number of checkpoints to keep
-   */
-  void cleanup_old_checkpoints(size_t keep_count);
 
   std::string recovery_path_;  ///< Path to recovery directory
   bool recovery_enabled_;      ///< Whether recovery is enabled

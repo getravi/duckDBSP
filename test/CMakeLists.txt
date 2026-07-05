@@ -72,8 +72,6 @@ function(add_dbsp_integration_test TEST_NAME SOURCE)
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_extension.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_recovery.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_crash_marker.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_checkpoint_format.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_wal_manager.cpp
     )
     target_link_libraries(${TEST_TARGET} catch2_main duckdb_static
                           duckdb_generated_extension_loader
@@ -99,16 +97,13 @@ add_dbsp_integration_test(distinct_ddl integration/test_distinct_ddl.cpp)
 add_dbsp_integration_test(set_ops_integration integration/test_set_ops.cpp)
 add_dbsp_integration_test(crash_recovery_phase1 integration/test_crash_recovery_phase1.cpp)
 add_dbsp_integration_test(crash_recovery_phase2 integration/test_crash_recovery_phase2.cpp)
-add_dbsp_integration_test(crash_recovery_phase3 integration/test_crash_recovery_phase3.cpp)
 
 # Benchmarks (not part of ctest; run manually: ./bench_planner_eval)
 add_executable(bench_planner_eval
     benchmarks/bench_planner_eval.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_extension.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_recovery.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_crash_marker.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_wal_manager.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_checkpoint_format.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_crash_marker.cpp)
 target_link_libraries(bench_planner_eval catch2_main duckdb_static
                       duckdb_generated_extension_loader
                       core_functions_extension parquet_extension)

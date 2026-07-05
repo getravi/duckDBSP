@@ -1,7 +1,6 @@
 #pragma once
 
 #include "dbsp_cdc.hpp"
-#include "dbsp_wal_manager.hpp"
 #include "duckdb.hpp"
 #include "duckdb/main/client_context_state.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
@@ -42,15 +41,6 @@ public:
       // We can safely read the post-commit state and pass the transaction
       // to sync_all for proper catalog access.
       manager.sync_all(context, &transaction);
-      std::cerr << "DBSP: sync_all completed successfully\n";
-
-      // Flush WAL to ensure durability
-      auto &wal_manager = get_wal_manager();
-      if (wal_manager.is_enabled()) {
-        wal_manager.flush();
-        std::cerr << "DBSP: WAL flushed\n";
-      }
-
     } catch (const std::exception &ex) {
       std::cerr << "DBSP Auto-CDC error: " << ex.what() << "\n";
     } catch (...) {
