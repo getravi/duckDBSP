@@ -25,6 +25,7 @@
 #include "duckdb/transaction/meta_transaction.hpp"
 
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
 #include <atomic>
 #include <future>
@@ -138,7 +139,24 @@ inline std::string validate_filepath(const std::string &filepath) {
     return ""; // Reject backslashes
   }
 
-  // Valid relative path
+  // The string checks above cannot see symlinks: a relative path through a
+  // link pointing outside the working directory would escape. Resolve the
+  // path (weakly_canonical follows links in existing components and
+  // tolerates a not-yet-created tail) and require it to stay under the
+  // canonical working directory.
+  try {
+    namespace fs = std::filesystem;
+    const fs::path base = fs::canonical(fs::current_path());
+    const fs::path resolved = fs::weakly_canonical(base / filepath);
+    const auto rel = resolved.lexically_relative(base);
+    if (rel.empty() || rel.native().rfind("..", 0) == 0) {
+      return "";
+    }
+  } catch (const std::exception &) {
+    return ""; // unresolvable path: reject
+  }
+
+  // Valid relative path confined to the working directory
   return filepath;
 }
 

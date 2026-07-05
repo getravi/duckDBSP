@@ -1,4 +1,5 @@
 #include "catch.hpp"
+#include <filesystem>
 #include "dbsp_cdc.hpp"
 
 using namespace dbsp_native;
@@ -98,4 +99,22 @@ TEST_CASE("validate_filepath prevents path traversal attacks",
     REQUIRE(validate_filepath("backup") == "backup");
     REQUIRE(validate_filepath("data/backup") == "data/backup");
   }
+}
+
+TEST_CASE("validate_filepath rejects symlink escapes from the working dir",
+          "[security][validation]") {
+  namespace fs = std::filesystem;
+  // A relative path that passes every string check but escapes the working
+  // directory through a symlink must be rejected: string filters alone
+  // cannot see where "link/" actually points
+  fs::remove_all("vf_test_link");
+  fs::create_directory_symlink(fs::temp_directory_path(), "vf_test_link");
+
+  REQUIRE(validate_filepath("vf_test_link/evil.json") == "");
+
+  fs::remove("vf_test_link");
+
+  // Plain relative paths keep working (directory need not exist)
+  REQUIRE(validate_filepath("vf_missing_dir/ok.json") ==
+          "vf_missing_dir/ok.json");
 }
