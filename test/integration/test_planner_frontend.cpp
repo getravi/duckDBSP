@@ -395,18 +395,23 @@ TEST_CASE("planner frontend: CTE differential",
   }
 }
 
-TEST_CASE("planner frontend: correlated subquery and recursive CTE fall back",
+TEST_CASE("planner frontend: self-correlated subquery and table-less recursion",
           "[integration][planner]") {
   DuckDBTestHarness db;
   setupTable(db);
 
-  // Correlated subquery: planner rejects (DELIM_JOIN), parser rejects
-  // subqueries too — creation must fail with an error, not crash
+  // Self-correlated subquery (DELIM_JOIN over the same table): supported
+  // since E2 — must create and match DuckDB's answer
+  const std::string corr_sql =
+      "SELECT * FROM t a WHERE val > (SELECT AVG(val) FROM t b "
+      "WHERE b.tag = a.tag)";
   auto corr = db.query(
       "SELECT * FROM dbsp_create_view('v_corr', "
       "'SELECT * FROM t a WHERE val > (SELECT AVG(val) FROM t b "
       "WHERE b.tag = a.tag)')");
-  REQUIRE(corr->HasError());
+  INFO("corr error: " << (corr->HasError() ? corr->GetError() : "none"));
+  REQUIRE_FALSE(corr->HasError());
+  requireViewMatchesQuery(db, "v_corr", corr_sql);
 
   // Recursive CTE: planner rejects, parser path handles it
   auto rec = db.query(
@@ -1076,4 +1081,51 @@ TEST_CASE("planner E1: diamond dependency applies both parent deltas",
   db.exec("DELETE FROM t WHERE id IN (100, 101)");
   db.exec("SELECT * FROM dbsp_sync('t')");
   requireViewMatchesQuery(db, "v_e1_u", sql_u_direct);
+}
+
+// ===== Phase E2: correlated subqueries (DELIM_JOIN) =====
+
+TEST_CASE("planner E2: correlated scalar subquery differential",
+          "[integration][planner][delim]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  setupTableU(db);
+
+  const std::string sql =
+      "SELECT id, val FROM t WHERE val > "
+      "(SELECT AVG(val) FROM u WHERE u.id = t.id)";
+  db.exec("SELECT * FROM dbsp_create_view('v_corr', '" + sql + "')");
+  REQUIRE(plannerBuilt("v_corr"));
+  requireViewMatchesQuery(db, "v_corr", sql);
+  runDifferentialTwoTables(db, "v_corr", sql, 907);
+}
+
+TEST_CASE("planner E2: correlated EXISTS differential",
+          "[integration][planner][delim]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  setupTableU(db);
+
+  const std::string sql =
+      "SELECT id, val FROM t WHERE EXISTS "
+      "(SELECT 1 FROM u WHERE u.id = t.id AND u.val > t.val)";
+  db.exec("SELECT * FROM dbsp_create_view('v_exists', '" + sql + "')");
+  REQUIRE(plannerBuilt("v_exists"));
+  requireViewMatchesQuery(db, "v_exists", sql);
+  runDifferentialTwoTables(db, "v_exists", sql, 911);
+}
+
+TEST_CASE("planner E2: correlated NOT EXISTS differential",
+          "[integration][planner][delim]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  setupTableU(db);
+
+  const std::string sql =
+      "SELECT id, val FROM t WHERE NOT EXISTS "
+      "(SELECT 1 FROM u WHERE u.id = t.id)";
+  db.exec("SELECT * FROM dbsp_create_view('v_nexists', '" + sql + "')");
+  REQUIRE(plannerBuilt("v_nexists"));
+  requireViewMatchesQuery(db, "v_nexists", sql);
+  runDifferentialTwoTables(db, "v_nexists", sql, 919);
 }

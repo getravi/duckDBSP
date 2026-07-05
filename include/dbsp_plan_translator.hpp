@@ -71,6 +71,7 @@
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
+#include "duckdb/planner/operator/logical_delim_get.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -349,7 +350,11 @@ struct PlanOpSpec {
     SORT_LIMIT,  // NativeSortView/NativeLimitView in an EmbeddedViewNode
     REC_CTE,     // WITH RECURSIVE: children = {anchor, recursive step}
     DISTINCT_ON, // NativeDistinctOnView in an EmbeddedViewNode
-    FILTER_MAP   // fused filter+project (IR optimizer, exprs = projection)
+    FILTER_MAP,  // fused filter+project (IR optimizer, exprs = projection)
+    DELIM_JOIN,  // correlated subquery: children = {outer, subplan};
+                 // exprs = duplicate-eliminated (correlated) columns
+    DELIM_REF    // DELIM_GET: reads the shared distinct-correlated-keys
+                 // output of the enclosing DELIM_JOIN
   };
 
   // Comparison between a left-side and a right-side bound expression
@@ -375,6 +380,7 @@ struct PlanOpSpec {
   duckdb::vector<duckdb::LogicalType> left_types, right_types; // JOIN
   SetOp set_op = SetOp::UNION_ALL;               // SET_OP
   duckdb::JoinType join_type = duckdb::JoinType::INNER; // JOIN
+  bool null_safe_keys = false; // JOIN/DELIM: IS NOT DISTINCT FROM keys
   std::vector<NativeWindowView::WindowDef> window_defs;   // WINDOW
   std::vector<ColumnInfo> window_source_cols;             // WINDOW
   std::vector<ColumnInfo> window_result_cols;             // WINDOW
@@ -778,12 +784,14 @@ public:
                duckdb::JoinType join_type = duckdb::JoinType::INNER,
                duckdb::vector<duckdb::LogicalType> left_types = {},
                duckdb::vector<duckdb::LogicalType> right_types = {},
+               bool null_safe_keys = false,
                std::string name = "plan_join")
       : dbsp::Node(id, std::move(name)), left_fn_(std::move(left_fn)),
         right_fn_(std::move(right_fn)), keys_(std::move(keys)),
         residuals_(std::move(residuals)), join_type_(join_type),
         left_types_(std::move(left_types)),
-        right_types_(std::move(right_types)) {
+        right_types_(std::move(right_types)),
+        null_safe_keys_(null_safe_keys) {
     pads_left_ = join_type_ == duckdb::JoinType::LEFT ||
                  join_type_ == duckdb::JoinType::OUTER;
     pads_right_ = join_type_ == duckdb::JoinType::RIGHT ||
@@ -907,12 +915,14 @@ private:
   using RowWeights = std::unordered_map<DuckDBRow, int64_t, DuckDBRowHash>;
   using Index = std::unordered_map<DuckDBRow, RowWeights, DuckDBRowHash>;
 
-  // Returns false when any key value is NULL (row can never match)
+  // Returns false when any key value is NULL (row can never match) —
+  // unless keys are null-safe (IS NOT DISTINCT FROM, DELIM joins), where
+  // NULL is an ordinary key value (DuckDBRow equality treats NULL == NULL)
   bool eval_key(const DuckDBRow &row, bool left, DuckDBRow &key) {
     key.columns.reserve(keys_.size());
     for (auto &k : keys_) {
       duckdb::Value v = left ? k.left->eval(row) : k.right->eval(row);
-      if (v.IsNull()) {
+      if (v.IsNull() && !null_safe_keys_) {
         return false;
       }
       key.columns.push_back(v);
@@ -1188,6 +1198,7 @@ private:
   duckdb::vector<duckdb::LogicalType> left_types_, right_types_;
   bool pads_left_ = false, pads_right_ = false;
   bool marks_ = false;
+  bool null_safe_keys_ = false;
   Index left_index_, right_index_;
   RowWeights left_weights_, right_weights_;   // incl. NULL-key rows
   RowWeights left_pad_, right_pad_;           // currently emitted pad weight
@@ -1852,7 +1863,7 @@ private:
       auto *node = circuit_.add_node(std::make_unique<PlanJoinNode>(
           circuit_.next_node_id(), std::move(left), std::move(right),
           std::move(keys), std::move(residuals), spec.join_type,
-          spec.left_types, spec.right_types));
+          spec.left_types, spec.right_types, spec.null_safe_keys));
       return [node]() -> const DuckDBZSet & { return node->output(); };
     }
     case PlanOpSpec::Kind::DISTINCT: {
@@ -1899,6 +1910,46 @@ private:
           spec.filter_exprs, spec.exprs, spec.input_types));
       return [node]() -> const DuckDBZSet & { return node->output(); };
     }
+    case PlanOpSpec::Kind::DELIM_JOIN: {
+      OutputFn left = build(*spec.children[0], keep_alive);
+      // DISTINCT of the correlated key columns, shared by every DELIM_GET
+      // in the right subplan (incremental: emits key deltas as the set of
+      // distinct outer keys changes)
+      auto *keys_node = circuit_.add_node(std::make_unique<PlanBatchNode>(
+          circuit_.next_node_id(), left, keep_alive,
+          std::vector<const duckdb::Expression *>{}, spec.exprs,
+          spec.left_types));
+      auto *distinct_node =
+          circuit_.add_node(std::make_unique<PlanDistinctNode>(
+              circuit_.next_node_id(),
+              [keys_node]() -> const DuckDBZSet & {
+                return keys_node->output();
+              },
+              "plan_delim_keys"));
+      delim_stack_.push_back([distinct_node]() -> const DuckDBZSet & {
+        return distinct_node->output();
+      });
+      OutputFn right = build(*spec.children[1], keep_alive);
+      delim_stack_.pop_back();
+
+      std::vector<PlanJoinNode::KeyPair> keys;
+      for (const auto &cond : spec.equi_conds) {
+        PlanJoinNode::KeyPair kp;
+        kp.left = std::make_unique<RowExprEval>(keep_alive, *cond.left,
+                                                spec.left_types);
+        kp.right = std::make_unique<RowExprEval>(keep_alive, *cond.right,
+                                                 spec.right_types);
+        keys.push_back(std::move(kp));
+      }
+      auto *node = circuit_.add_node(std::make_unique<PlanJoinNode>(
+          circuit_.next_node_id(), std::move(left), std::move(right),
+          std::move(keys), std::vector<PlanJoinNode::Residual>{},
+          spec.join_type, spec.left_types, spec.right_types,
+          spec.null_safe_keys, "plan_delim_join"));
+      return [node]() -> const DuckDBZSet & { return node->output(); };
+    }
+    case PlanOpSpec::Kind::DELIM_REF:
+      return delim_stack_.back();
     case PlanOpSpec::Kind::DISTINCT_ON: {
       OutputFn child = build(*spec.children[0], keep_alive);
       TableSchema vschema;
@@ -1994,6 +2045,7 @@ private:
   std::unordered_map<std::string, RowSource *> sources_;
   std::vector<std::string> source_order_;
   std::unordered_map<duckdb::idx_t, OutputFn> cte_outputs_;
+  std::vector<OutputFn> delim_stack_; // enclosing DELIM joins' key outputs
   RowSink *sink_ = nullptr;
   // Embedded sort/limit view at the plan root; owned by its EmbeddedViewNode
   NativeMaterializedView *ordered_view_ = nullptr;
@@ -2125,10 +2177,9 @@ private:
       case duckdb::LogicalOperatorType::LOGICAL_LIMIT:
         return visit_limit(op.Cast<duckdb::LogicalLimit>());
       case duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN:
+        return visit_delim_join(op.Cast<duckdb::LogicalComparisonJoin>());
       case duckdb::LogicalOperatorType::LOGICAL_DELIM_GET:
-        return unsupported(
-            "correlated subquery (DELIM_JOIN) — rewrite as a JOIN "
-            "or create an intermediate view");
+        return visit_delim_get(op.Cast<duckdb::LogicalDelimGet>());
       case duckdb::LogicalOperatorType::LOGICAL_RECURSIVE_CTE:
         return visit_recursive_cte(op.Cast<duckdb::LogicalRecursiveCTE>());
       default:
@@ -2378,6 +2429,101 @@ private:
       return spec;
     }
 
+    // Correlated subqueries. DELIM_JOIN evaluates its right subplan with
+    // DELIM_GET = the DISTINCT correlated-key values of the left side,
+    // then joins back with null-safe (IS NOT DISTINCT FROM) conditions.
+    // SINGLE (scalar subquery, inner is grouped by the key so at most one
+    // match) maps onto the LEFT-join padding machinery; MARK (EXISTS) onto
+    // the mark machinery.
+    std::vector<std::vector<ColumnInfo>> delim_columns_stack;
+
+    SpecPtr visit_delim_join(duckdb::LogicalComparisonJoin &op) {
+      switch (op.join_type) {
+      case duckdb::JoinType::SINGLE:
+      case duckdb::JoinType::MARK:
+      case duckdb::JoinType::INNER:
+      case duckdb::JoinType::LEFT:
+        break;
+      default:
+        return unsupported("DELIM join type " +
+                           duckdb::EnumUtil::ToString(op.join_type));
+      }
+      auto spec = std::make_unique<PlanOpSpec>();
+      spec->kind = PlanOpSpec::Kind::DELIM_JOIN;
+      spec->join_type = op.join_type == duckdb::JoinType::SINGLE
+                            ? duckdb::JoinType::LEFT
+                            : op.join_type;
+      for (const auto &cond : op.conditions) {
+        PlanOpSpec::JoinCond jc{cond.left.get(), cond.right.get(),
+                                cond.comparison};
+        switch (cond.comparison) {
+        case duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM:
+          spec->null_safe_keys = true;
+          spec->equi_conds.push_back(jc);
+          break;
+        case duckdb::ExpressionType::COMPARE_EQUAL:
+          spec->equi_conds.push_back(jc);
+          break;
+        default:
+          return unsupported("DELIM join comparison " +
+                             duckdb::EnumUtil::ToString(cond.comparison));
+        }
+      }
+
+      auto left = visit(*op.children[0]);
+      if (!left) {
+        return nullptr;
+      }
+      std::vector<ColumnInfo> left_columns = columns;
+
+      // Correlated (duplicate-eliminated) columns, evaluated over the left
+      // output; DELIM_GET leaves in the right subplan read their DISTINCT
+      std::vector<ColumnInfo> delim_cols;
+      for (duckdb::idx_t i = 0; i < op.duplicate_eliminated_columns.size();
+           i++) {
+        const auto &e = op.duplicate_eliminated_columns[i];
+        spec->exprs.push_back(e.get());
+        delim_cols.push_back(
+            {"delim_" + std::to_string(i), e->return_type});
+      }
+      if (spec->exprs.empty()) {
+        return unsupported("DELIM join without correlated columns");
+      }
+
+      delim_columns_stack.push_back(delim_cols);
+      auto right = visit(*op.children[1]);
+      delim_columns_stack.pop_back();
+      if (!right) {
+        return nullptr;
+      }
+
+      spec->left_types = op.children[0]->types;
+      spec->right_types = op.children[1]->types;
+      spec->children.push_back(std::move(left));
+      spec->children.push_back(std::move(right));
+
+      if (op.join_type == duckdb::JoinType::MARK) {
+        columns = std::move(left_columns);
+        columns.push_back({"mark", duckdb::LogicalType::BOOLEAN});
+      } else {
+        std::vector<ColumnInfo> combined = std::move(left_columns);
+        combined.insert(combined.end(), columns.begin(), columns.end());
+        columns = std::move(combined);
+      }
+      return spec;
+    }
+
+    SpecPtr visit_delim_get(duckdb::LogicalDelimGet &op) {
+      if (delim_columns_stack.empty()) {
+        return unsupported("DELIM_GET outside a DELIM join");
+      }
+      (void)op;
+      auto spec = std::make_unique<PlanOpSpec>();
+      spec->kind = PlanOpSpec::Kind::DELIM_REF;
+      columns = delim_columns_stack.back();
+      return spec;
+    }
+
     SpecPtr visit_join(duckdb::LogicalComparisonJoin &op) {
       switch (op.join_type) {
       case duckdb::JoinType::INNER:
@@ -2408,6 +2554,12 @@ private:
         PlanOpSpec::JoinCond jc{cond.left.get(), cond.right.get(),
                                 cond.comparison};
         switch (cond.comparison) {
+        case duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM:
+          // Null-safe equality (NULL matches NULL) — emitted by subquery
+          // decorrelation; DuckDBRow key equality is already null-safe
+          spec->null_safe_keys = true;
+          spec->equi_conds.push_back(jc);
+          break;
         case duckdb::ExpressionType::COMPARE_EQUAL:
           spec->equi_conds.push_back(jc);
           break;
@@ -2422,6 +2574,16 @@ private:
           return unsupported(
               "join comparison " +
               duckdb::EnumUtil::ToString(cond.comparison));
+        }
+      }
+      if (spec->null_safe_keys) {
+        // null_safe applies to ALL equi keys of the node; mixing = and
+        // IS NOT DISTINCT FROM in one join would null-match the = key too
+        for (const auto &cond : op.conditions) {
+          if (cond.comparison == duckdb::ExpressionType::COMPARE_EQUAL) {
+            return unsupported(
+                "mixed null-safe and plain equality join keys");
+          }
         }
       }
 
