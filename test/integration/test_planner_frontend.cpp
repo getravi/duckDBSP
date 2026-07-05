@@ -693,3 +693,78 @@ TEST_CASE("planner C3: DISTINCT ON differential",
   requireViewMatchesQuery(db, "v_don_diff", sql);
   runDifferential(db, "v_don_diff", sql, 83);
 }
+
+// ===== Phase C4: circuit-IR optimizer =====
+
+namespace {
+
+size_t nodeCount(const std::string &view) {
+  const auto *v = dynamic_cast<const dbsp_native::PlannedCircuitView *>(
+      dbsp_native::get_cdc_manager().get_view(view));
+  REQUIRE(v != nullptr);
+  return v->node_count();
+}
+
+} // namespace
+
+TEST_CASE("planner C4: filter+project fuse into one node",
+          "[integration][planner][ir_opt]") {
+  DuckDBTestHarness db;
+  db.createTable("ot", "id INT, val INT", {"(1, 5)", "(2, 15)"});
+  db.exec("SELECT * FROM dbsp_track('ot')");
+  db.exec("SELECT * FROM dbsp_sync('ot')");
+  db.exec("SELECT * FROM dbsp_use_planner(true)");
+
+  const std::string sql = "SELECT id FROM ot WHERE val > 10";
+  db.exec("SELECT * FROM dbsp_create_view('v_fused', '" + sql + "')");
+  REQUIRE(plannerBuilt("v_fused"));
+  size_t fused = nodeCount("v_fused");
+
+  // Same view without the IR optimizer: one extra node (filter + map split)
+  dbsp_native::g_plan_ir_optimize = false;
+  db.exec("SELECT * FROM dbsp_create_view('v_raw', '" + sql + "')");
+  dbsp_native::g_plan_ir_optimize = true;
+  size_t raw = nodeCount("v_raw");
+  REQUIRE(fused < raw);
+
+  // Identical behavior, incrementally too
+  db.exec("INSERT INTO ot VALUES (3, 20), (4, 1)");
+  db.exec("SELECT * FROM dbsp_sync('ot')");
+  requireViewMatchesQuery(db, "v_fused", sql);
+  requireViewMatchesQuery(db, "v_raw", sql);
+}
+
+TEST_CASE("planner C4: join filter pushdown keeps results exact",
+          "[integration][planner][ir_opt]") {
+  DuckDBTestHarness db;
+  db.createTable("pl", "id INT, x INT", {"(1, 5)", "(2, 20)"});
+  db.exec("SELECT * FROM dbsp_track('pl')");
+  db.exec("SELECT * FROM dbsp_sync('pl')");
+  db.createTable("pr", "id INT, y INT", {"(1, 7)", "(2, 2)"});
+  db.exec("SELECT * FROM dbsp_track('pr')");
+  db.exec("SELECT * FROM dbsp_sync('pr')");
+  db.exec("SELECT * FROM dbsp_use_planner(true)");
+
+  const std::string sql =
+      "SELECT pl.id FROM pl JOIN pr ON pl.id = pr.id "
+      "WHERE pl.x > 10 AND pr.y < 5";
+  db.exec("SELECT * FROM dbsp_create_view('v_pd', '" + sql + "')");
+  REQUIRE(plannerBuilt("v_pd"));
+
+  // Pushdown must actually fire: pushed-down plan has MORE nodes (two
+  // filters below the join) than the unoptimized one (one filter above)
+  size_t pushed = nodeCount("v_pd");
+  dbsp_native::g_plan_ir_optimize = false;
+  db.exec("SELECT * FROM dbsp_create_view('v_pd_raw', '" + sql + "')");
+  dbsp_native::g_plan_ir_optimize = true;
+  REQUIRE(pushed != nodeCount("v_pd_raw"));
+
+  db.assertViewRowCount("v_pd", 1); // only id=2 passes both predicates
+
+  db.exec("INSERT INTO pl VALUES (3, 30)");
+  db.exec("INSERT INTO pr VALUES (3, 1)");
+  db.exec("SELECT * FROM dbsp_sync('pl')");
+  db.exec("SELECT * FROM dbsp_sync('pr')");
+  requireViewMatchesQuery(db, "v_pd", sql);
+  db.assertViewRowCount("v_pd", 2);
+}

@@ -33,6 +33,10 @@
 //   C3: DISTINCT ON via NativeDistinctOnView in an EmbeddedViewNode
 //       (column-ref targets; winner-pick order from the DISTINCT node's own
 //       order_by modifier — the ORDER_BY above is presentation, see C1).
+//   C4: circuit-IR optimizer (plan_ir::optimize, g_plan_ir_optimize flag):
+//       combine adjacent filters, push single-side filters below joins,
+//       fuse MAP(FILTER(x)) into one PlanFilterMapNode. Successor of the
+//       ParsedViewDef-based DBSPOptimizer.
 // Any other operator yields a DBSP-E110 error naming the operator;
 // CDCManager::create_view falls back to the bespoke parser transparently.
 //
@@ -56,6 +60,7 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
@@ -70,6 +75,7 @@
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "duckdb/planner/operator/logical_window.hpp"
 
+#include <atomic>
 #include <memory>
 #include <set>
 #include <string>
@@ -82,6 +88,10 @@ namespace dbsp_native {
 struct PlanKeepAlive {
   std::unique_ptr<duckdb::Connection> connection;
   std::unique_ptr<duckdb::LogicalOperator> plan;
+  // Expressions the IR optimizer rewrote (e.g. right-side join pushdown
+  // shifts column indices): node lambdas reference them, so they must live
+  // exactly as long as the plan itself
+  std::vector<std::unique_ptr<duckdb::Expression>> rewritten_exprs;
 };
 
 // Row-at-a-time adapter over ExpressionExecutor: builds a 1-row DataChunk
@@ -154,7 +164,8 @@ struct PlanOpSpec {
     CTE_REF,     // reads the shared output of a CTE definition
     SORT_LIMIT,  // NativeSortView/NativeLimitView in an EmbeddedViewNode
     REC_CTE,     // WITH RECURSIVE: children = {anchor, recursive step}
-    DISTINCT_ON  // NativeDistinctOnView in an EmbeddedViewNode
+    DISTINCT_ON, // NativeDistinctOnView in an EmbeddedViewNode
+    FILTER_MAP   // fused filter+project (IR optimizer, exprs = projection)
   };
 
   // Comparison between a left-side and a right-side bound expression
@@ -197,7 +208,152 @@ struct PlanOpSpec {
   int64_t offset = 0;
   std::vector<duckdb::idx_t> project_idxs; // empty = identity
   bool presentation_root = false;
+
+  // FILTER_MAP: predicates evaluated before the projection in `exprs`.
+  // Pointers reference either the bound plan or PlanKeepAlive::rewritten_exprs
+  std::vector<const duckdb::Expression *> filter_exprs;
 };
+
+// ===== Circuit-IR optimizer (Phase C4) =====
+//
+// Rewrites the translated PlanOpSpec tree before circuit construction —
+// the successor of the retired ParsedViewDef-based DBSPOptimizer. Passes:
+//   1. combine_filters:  FILTER(FILTER(x))      -> one FILTER (AND list)
+//   2. pushdown_filters: FILTER above JOIN      -> per-side FILTER below it
+//                        (shrinks join index state)
+//   3. fuse_filter_map:  MAP(FILTER(x))         -> one FILTER_MAP node
+// Projection pruning is deliberately NOT ported: DuckDB's binder already
+// prunes via GET column_ids, so canonical plans have nothing left to prune.
+inline std::atomic<bool> g_plan_ir_optimize{true};
+
+namespace plan_ir {
+
+inline void collect_bound_refs(const duckdb::Expression &expr,
+                               std::vector<duckdb::idx_t> &out) {
+  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+    out.push_back(expr.Cast<duckdb::BoundReferenceExpression>().index);
+  }
+  duckdb::ExpressionIterator::EnumerateChildren(
+      expr, [&](const duckdb::Expression &child) {
+        collect_bound_refs(child, out);
+      });
+}
+
+inline void shift_bound_refs(duckdb::Expression &expr, duckdb::idx_t delta) {
+  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+    expr.Cast<duckdb::BoundReferenceExpression>().index -= delta;
+  }
+  duckdb::ExpressionIterator::EnumerateChildren(
+      expr,
+      [&](duckdb::Expression &child) { shift_bound_refs(child, delta); });
+}
+
+// FILTER(FILTER(x)) -> FILTER(x) with concatenated AND lists
+inline void combine_filters(std::unique_ptr<PlanOpSpec> &spec) {
+  while (spec->kind == PlanOpSpec::Kind::FILTER_EXPR &&
+         spec->children[0]->kind == PlanOpSpec::Kind::FILTER_EXPR) {
+    auto &child = spec->children[0];
+    spec->exprs.insert(spec->exprs.end(), child->exprs.begin(),
+                       child->exprs.end());
+    // Filters preserve schema: the grandchild's output types are the same
+    spec->input_types = child->input_types;
+    auto grandchild = std::move(child->children[0]);
+    spec->children[0] = std::move(grandchild);
+  }
+}
+
+// FILTER above JOIN: move single-side predicates below the join, shrinking
+// the join's per-side index state. Right-side predicates need their column
+// indices shifted; the copies live in keep_alive->rewritten_exprs.
+inline void pushdown_filters(std::unique_ptr<PlanOpSpec> &spec,
+                             PlanKeepAlive &keep_alive) {
+  if (spec->kind != PlanOpSpec::Kind::FILTER_EXPR ||
+      spec->children[0]->kind != PlanOpSpec::Kind::JOIN) {
+    return;
+  }
+  auto &join = spec->children[0];
+  const duckdb::idx_t left_width = join->left_types.size();
+
+  std::vector<const duckdb::Expression *> keep;
+  std::vector<const duckdb::Expression *> left_push;
+  std::vector<const duckdb::Expression *> right_push;
+  for (const auto *expr : spec->exprs) {
+    std::vector<duckdb::idx_t> refs;
+    collect_bound_refs(*expr, refs);
+    bool all_left = true, all_right = true;
+    for (auto idx : refs) {
+      (idx < left_width ? all_right : all_left) = false;
+    }
+    if (!refs.empty() && all_left) {
+      left_push.push_back(expr); // left indices are already 0-based
+    } else if (!refs.empty() && all_right) {
+      auto copy = expr->Copy();
+      shift_bound_refs(*copy, left_width);
+      right_push.push_back(copy.get());
+      keep_alive.rewritten_exprs.push_back(std::move(copy));
+    } else {
+      keep.push_back(expr);
+    }
+  }
+  if (left_push.empty() && right_push.empty()) {
+    return;
+  }
+
+  auto make_side_filter = [](std::unique_ptr<PlanOpSpec> child,
+                             duckdb::vector<duckdb::LogicalType> types,
+                             std::vector<const duckdb::Expression *> exprs) {
+    auto f = std::make_unique<PlanOpSpec>();
+    f->kind = PlanOpSpec::Kind::FILTER_EXPR;
+    f->input_types = std::move(types);
+    f->exprs = std::move(exprs);
+    f->children.push_back(std::move(child));
+    return f;
+  };
+  if (!left_push.empty()) {
+    join->children[0] = make_side_filter(
+        std::move(join->children[0]), join->left_types, std::move(left_push));
+  }
+  if (!right_push.empty()) {
+    join->children[1] =
+        make_side_filter(std::move(join->children[1]), join->right_types,
+                         std::move(right_push));
+  }
+
+  if (keep.empty()) {
+    spec = std::move(spec->children[0]); // filter fully absorbed
+  } else {
+    spec->exprs = std::move(keep);
+  }
+}
+
+// MAP(FILTER(x)) -> FILTER_MAP(x): one node, no intermediate Z-set
+inline void fuse_filter_map(std::unique_ptr<PlanOpSpec> &spec) {
+  if (spec->kind != PlanOpSpec::Kind::MAP_EXPR ||
+      spec->children[0]->kind != PlanOpSpec::Kind::FILTER_EXPR) {
+    return;
+  }
+  auto &filter = spec->children[0];
+  spec->kind = PlanOpSpec::Kind::FILTER_MAP;
+  spec->filter_exprs = std::move(filter->exprs);
+  // MAP's input == FILTER's output == FILTER's input (schema-preserving)
+  if (!filter->input_types.empty()) {
+    spec->input_types = filter->input_types;
+  }
+  auto grandchild = std::move(filter->children[0]);
+  spec->children[0] = std::move(grandchild);
+}
+
+inline void optimize(std::unique_ptr<PlanOpSpec> &spec,
+                     PlanKeepAlive &keep_alive) {
+  combine_filters(spec);
+  pushdown_filters(spec, keep_alive);
+  fuse_filter_map(spec);
+  for (auto &child : spec->children) {
+    optimize(child, keep_alive);
+  }
+}
+
+} // namespace plan_ir
 
 // Incremental GROUP BY aggregation over bound expressions: retracts the old
 // group row, applies weighted deltas to per-group accumulators, emits the new
@@ -786,6 +942,61 @@ private:
   std::unique_ptr<NativeMaterializedView> view_;
 };
 
+// Fused filter+project (IR optimizer): evaluates predicates and, for
+// surviving rows, the projection — one node, no intermediate Z-set between
+// WHERE and SELECT. Weight-preserving, like FilterNode and MapNode.
+class PlanFilterMapNode : public dbsp::Node {
+public:
+  using InputFn = std::function<const DuckDBZSet &()>;
+  using Evals = std::vector<std::unique_ptr<RowExprEval>>;
+
+  PlanFilterMapNode(dbsp::NodeId id, InputFn input_fn,
+                    std::shared_ptr<Evals> filters,
+                    std::shared_ptr<Evals> projs)
+      : dbsp::Node(id, "plan_filter_project"), input_fn_(std::move(input_fn)),
+        filters_(std::move(filters)), projs_(std::move(projs)) {}
+
+  void step() override {
+    output_.clear();
+    for (const auto &[row, w] : input_fn_()) {
+      bool pass = true;
+      for (auto &f : *filters_) {
+        duckdb::Value v = f->eval(row);
+        if (v.IsNull() || !v.GetValue<bool>()) {
+          pass = false;
+          break;
+        }
+      }
+      if (!pass) {
+        continue;
+      }
+      DuckDBRow out;
+      out.columns.reserve(projs_->size());
+      for (auto &p : *projs_) {
+        out.columns.push_back(p->eval(row));
+      }
+      output_.insert(out, w);
+    }
+    has_output_ = !output_.empty();
+  }
+
+  void reset() override {
+    output_.clear();
+    has_output_ = false;
+  }
+
+  bool has_output() const override { return has_output_; }
+
+  const DuckDBZSet &output() const { return output_; }
+
+private:
+  InputFn input_fn_;
+  std::shared_ptr<Evals> filters_;
+  std::shared_ptr<Evals> projs_;
+  DuckDBZSet output_;
+  bool has_output_ = false;
+};
+
 // Fixed-point driver for WITH RECURSIVE. The anchor is computed inline in
 // the outer circuit; the recursive step runs as an inner view (a nested
 // PlannedCircuitView) whose self-reference is a source named `sentinel`.
@@ -926,6 +1137,9 @@ public:
   std::vector<std::string> source_tables() const override {
     return source_order_;
   }
+
+  // Circuit size; used by IR-optimizer tests to prove rewrites fired
+  size_t node_count() const { return circuit_.node_count(); }
 
   void reset() override {
     circuit_.reset();
@@ -1109,6 +1323,23 @@ private:
     }
     case PlanOpSpec::Kind::CTE_REF:
       return cte_outputs_.at(spec.cte_index);
+    case PlanOpSpec::Kind::FILTER_MAP: {
+      OutputFn child = build(*spec.children[0], keep_alive);
+      auto filters = std::make_shared<PlanFilterMapNode::Evals>();
+      for (const auto *expr : spec.filter_exprs) {
+        filters->push_back(std::make_unique<RowExprEval>(keep_alive, *expr,
+                                                         spec.input_types));
+      }
+      auto projs = std::make_shared<PlanFilterMapNode::Evals>();
+      for (const auto *expr : spec.exprs) {
+        projs->push_back(std::make_unique<RowExprEval>(keep_alive, *expr,
+                                                       spec.input_types));
+      }
+      auto *node = circuit_.add_node(std::make_unique<PlanFilterMapNode>(
+          circuit_.next_node_id(), std::move(child), std::move(filters),
+          std::move(projs)));
+      return [node]() -> const DuckDBZSet & { return node->output(); };
+    }
     case PlanOpSpec::Kind::DISTINCT_ON: {
       OutputFn child = build(*spec.children[0], keep_alive);
       TableSchema vschema;
@@ -1243,6 +1474,9 @@ public:
       // Only a root sort/limit drives dbsp_query's scan order; nested ones
       // (subqueries) affect membership only
       root->presentation_root = true;
+    }
+    if (g_plan_ir_optimize) {
+      plan_ir::optimize(root, *keep_alive);
     }
 
     TableSchema schema;
