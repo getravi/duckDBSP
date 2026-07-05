@@ -17,6 +17,8 @@ Internal design of the DBSP DuckDB extension.
 │  │  - Tracked Tables     - View Registry                       ││
 │  │  - Change Detection   - Dependency Graph                    ││
 │  │  - Incremental cascade: one topological pass, deltas only   ││
+│  │  - Shared join arrangements: one index per (table, keys)    ││
+│  │    fingerprint, probed by matching joins across all views   ││
 │  └─────────────────────────────────────────────────────────────┘│
 │                              │                                   │
 │  ┌─────────────────────────────────────────────────────────────┐│
@@ -137,7 +139,9 @@ SourceNode per base table) covering:
   B2, C5, D3). FIRST unlocks uncorrelated scalar-subquery comparisons
   (CROSS_PRODUCT + first()/count_star() guard plans).
 - COMPARISON_JOIN — INNER (equi keys + residual comparisons, bilinear
-  delta rule incl. the Δl⋈Δr self-join term); LEFT/RIGHT/FULL with
+  delta rule incl. the Δl⋈Δr self-join term; a bare-scan side may probe
+  a shared CDC-owned arrangement instead of a private index — see
+  CDC Manager below); LEFT/RIGHT/FULL with
   incrementally reconciled NULL padding (per-row weighted match counts);
   MARK for IN/NOT IN with three-valued null-aware marks — plus
   CROSS_PRODUCT, DISTINCT, and UNION [ALL] / INTERSECT [ALL] /
@@ -226,6 +230,11 @@ class CDCManager {
     std::unordered_map<std::string, NativeMaterializedView> views_;
     std::unordered_map<std::string, ViewDefinition> view_definitions_;
     DependencyGraph dep_graph_;
+    // I1: shared join arrangements — one index per (table, projection,
+    // key-exprs) fingerprint, probed by every matching join side across
+    // views; weak refs (join nodes own), updated before views step in
+    // propagate_changes
+    std::unordered_map<std::string, std::weak_ptr<SharedArrangement>> arrangements_;
 
 public:
     // Table tracking

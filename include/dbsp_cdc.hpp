@@ -364,6 +364,8 @@ public:
     table_schemas_.clear();
     view_definitions_.clear();
     dep_graph_ = DependencyGraph();
+    arrangements_.clear();
+    arrangements_by_table_.clear();
     last_error_.clear();
     auto_sync_enabled_ = false;
   }
@@ -573,10 +575,23 @@ public:
     {
       std::unique_lock<std::shared_mutex> view_lock(view_mutex_);
 
+      // I1: resolve shared-arrangement requests before initialization —
+      // a shared join side reads a CDC-maintained arrangement instead of
+      // integrating its own copy, and its source table is then EXCLUDED
+      // from init replay (the arrangement already holds full state;
+      // replaying it would double-count through Δother ⋈ arrangement)
+      auto *pview = dynamic_cast<PlannedCircuitView *>(view.get());
+      if (pview) {
+        register_arrangements(*pview);
+      }
+
       // Initialize view with current data from sources
       // struct_mutex_ held exclusively so no concurrent mutations to tracked
       // tables or other views can occur; reads are safe without table_locks_
       for (const auto &source : resolved_sources) {
+        if (pview && pview->shared_init_skip().count(source)) {
+          continue;
+        }
         if (tracked_tables_.count(source)) {
           const auto &table = tracked_tables_.at(source);
           const auto &state = table->current_state();
@@ -591,6 +606,54 @@ public:
     }
 
     return true;
+  }
+
+  // I1 shared join arrangements: one arrangement per (table, key exprs,
+  // flags) fingerprint, shared by every join side that matches it. The
+  // registry holds weak refs — nodes own the arrangement; when the last
+  // consuming view is dropped it dies and the entry is pruned lazily.
+  // Caller holds struct_mutex_ (exclusive) and view_mutex_ (exclusive).
+  void register_arrangements(PlannedCircuitView &pview) {
+    for (const auto &req : pview.arrangement_requests()) {
+      const bool source_is_table = tracked_tables_.count(req.table) > 0;
+      const bool source_is_view = views_.count(req.table) > 0;
+      if (!source_is_table && !source_is_view) {
+        continue; // untracked — node keeps its local index
+      }
+      std::shared_ptr<SharedArrangement> arr;
+      auto it = arrangements_.find(req.fingerprint);
+      if (it != arrangements_.end()) {
+        arr = it->second.lock();
+      }
+      if (!arr) {
+        arr = std::make_shared<SharedArrangement>();
+        arr->table = req.table;
+        arr->null_safe = req.null_safe;
+        arr->track_weights = req.track_weights;
+        arr->track_counters = req.track_counters;
+        arr->project = req.project;
+        arr->column_idxs = req.column_idxs;
+        arr->keep_alive = req.keep_alive;
+        if (!req.key_exprs.empty()) {
+          arr->key_eval = std::make_unique<BatchEvaluator>(
+              req.keep_alive, req.key_exprs, req.side_types);
+          for (const auto *e : req.key_exprs) {
+            arr->row_key_evals.push_back(std::make_unique<RowExprEval>(
+                req.keep_alive, *e, req.side_types));
+          }
+        }
+        // Backfill full current state so init replay can skip this table
+        if (source_is_table) {
+          arr->apply(tracked_tables_.at(req.table)->current_state());
+        } else {
+          arr->apply(views_.at(req.table)->get_result());
+        }
+        arrangements_[req.fingerprint] = arr;
+        arrangements_by_table_[req.table].push_back(arr);
+      }
+      req.node->set_shared_arrangement(req.left_side, arr);
+      pview.mark_shared_init_skip(req.table);
+    }
   }
 
   // Drop a view (with persistence)
@@ -1399,6 +1462,18 @@ public:
   // (observable so tests can prove the fast path actually ran)
   uint64_t captured_delta_syncs() const { return captured_delta_syncs_; }
 
+  // Live shared join arrangements (I1); lets tests prove sharing happened
+  size_t shared_arrangement_count() const {
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
+    size_t n = 0;
+    for (const auto &[fp, w] : arrangements_) {
+      if (!w.expired()) {
+        n++;
+      }
+    }
+    return n;
+  }
+
   // Number of scan-and-diff table scans performed (tests use this to prove
   // sync scoping skips untouched tables)
   uint64_t scan_syncs() const { return scan_syncs_; }
@@ -1917,6 +1992,11 @@ private:
     std::deque<DuckDBZSet> arena;
     pending[source_name] = &delta;
 
+    // Shared arrangements are updated BEFORE any consuming view steps —
+    // join nodes rely on the arrangement being post-delta and drop their
+    // Δl⋈Δr term to compensate (Δl⋈R_new = Δl⋈R_old + Δl⋈Δr)
+    apply_to_arrangements(source_name, delta);
+
     for (const auto &view_name : dep_graph_.topological_order(source_name)) {
       auto it = views_.find(view_name);
       if (it == views_.end())
@@ -1950,11 +2030,36 @@ private:
       if (single_delta) {
         if (!single_delta->empty()) {
           pending[view_name] = single_delta;
+          apply_to_arrangements(view_name, *single_delta);
         }
       } else if (!accumulated.empty()) {
         arena.push_back(std::move(accumulated));
         pending[view_name] = &arena.back();
+        apply_to_arrangements(view_name, arena.back());
       }
+    }
+  }
+
+  // Update every live shared arrangement over `name` with `delta`; prune
+  // dead entries (their consuming views were dropped). Caller holds
+  // view_mutex_ exclusively.
+  void apply_to_arrangements(const std::string &name,
+                             const DuckDBZSet &delta) {
+    auto it = arrangements_by_table_.find(name);
+    if (it == arrangements_by_table_.end()) {
+      return;
+    }
+    auto &vec = it->second;
+    for (auto w = vec.begin(); w != vec.end();) {
+      if (auto arr = w->lock()) {
+        arr->apply(delta);
+        ++w;
+      } else {
+        w = vec.erase(w);
+      }
+    }
+    if (vec.empty()) {
+      arrangements_by_table_.erase(it);
     }
   }
 
@@ -2076,6 +2181,14 @@ private:
 
   std::unordered_map<std::string, std::unique_ptr<TrackedTable>>
       tracked_tables_;
+  // I1: fingerprint → arrangement (weak; consuming join nodes own it),
+  // plus per-table dispatch list for delta updates. Map shape mutated
+  // under view_mutex_ exclusive (create_view / propagate_changes).
+  std::unordered_map<std::string, std::weak_ptr<SharedArrangement>>
+      arrangements_;
+  std::unordered_map<std::string,
+                     std::vector<std::weak_ptr<SharedArrangement>>>
+      arrangements_by_table_;
   std::unordered_map<std::string, TableSchema> table_schemas_;
   std::unordered_map<std::string, std::unique_ptr<NativeMaterializedView>>
       views_;

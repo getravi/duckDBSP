@@ -1129,3 +1129,119 @@ TEST_CASE("planner E2: correlated NOT EXISTS differential",
   requireViewMatchesQuery(db, "v_nexists", sql);
   runDifferentialTwoTables(db, "v_nexists", sql, 919);
 }
+
+// ---------------------------------------------------------------------------
+// Phase I1: shared join arrangements — N views joining the same table reuse
+// one CDC-maintained index instead of N private copies
+// ---------------------------------------------------------------------------
+
+TEST_CASE("planner I1: identical join sides share one arrangement",
+          "[integration][planner][arrangement]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  setupTableU(db);
+  auto &mgr = dbsp_native::get_cdc_manager();
+  const size_t base = mgr.shared_arrangement_count();
+
+  // Identical SQL → identical plan → identical fingerprint: one
+  // arrangement serves both views
+  const std::string sql1 =
+      "SELECT t.id, t.val, u.val FROM t JOIN u ON t.id = u.id";
+  db.exec("SELECT * FROM dbsp_create_view('v_arr1', '" + sql1 + "')");
+  db.exec("SELECT * FROM dbsp_create_view('v_arr2', '" + sql1 + "')");
+  REQUIRE(mgr.shared_arrangement_count() == base + 1);
+
+  // Different column needs → different projected row shape → a separate
+  // arrangement (fingerprint includes the side's column projection)
+  const std::string sql3 =
+      "SELECT t.tag, u.tag FROM t JOIN u ON t.id = u.id WHERE t.val > 20";
+  db.exec("SELECT * FROM dbsp_create_view('v_arr3', '" + sql3 + "')");
+  REQUIRE(mgr.shared_arrangement_count() == base + 2);
+
+  requireViewMatchesQuery(db, "v_arr1", sql1);
+  requireViewMatchesQuery(db, "v_arr2", sql1);
+  requireViewMatchesQuery(db, "v_arr3", sql3);
+
+  // All views stay correct across randomized updates of BOTH tables
+  runDifferentialTwoTables(db, "v_arr1", sql1, 101);
+  requireViewMatchesQuery(db, "v_arr2", sql1);
+  requireViewMatchesQuery(db, "v_arr3", sql3);
+}
+
+TEST_CASE("planner I1: arrangement survives dropping one of two views",
+          "[integration][planner][arrangement]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  setupTableU(db);
+  auto &mgr = dbsp_native::get_cdc_manager();
+  const size_t base = mgr.shared_arrangement_count();
+
+  const std::string sql =
+      "SELECT t.id, u.val FROM t JOIN u ON t.id = u.id";
+  db.exec("SELECT * FROM dbsp_create_view('v_keep', '" + sql + "')");
+  db.exec("SELECT * FROM dbsp_create_view('v_drop', '" + sql + "')");
+  REQUIRE(mgr.shared_arrangement_count() == base + 1);
+
+  db.exec("SELECT dbsp_drop('v_drop')");
+  // Survivor still owns the arrangement and stays correct
+  REQUIRE(mgr.shared_arrangement_count() == base + 1);
+  runDifferentialTwoTables(db, "v_keep", sql, 103);
+
+  db.exec("SELECT dbsp_drop('v_keep')");
+  REQUIRE(mgr.shared_arrangement_count() == base);
+}
+
+TEST_CASE("planner I1: LEFT join probing a shared right side",
+          "[integration][planner][arrangement][outer]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  setupTableU(db);
+
+  // Right side (u) is a pure probe target in a LEFT join — shareable;
+  // pads for unmatched t rows must still appear/disappear correctly
+  const std::string sql =
+      "SELECT t.id, t.val, u.val FROM t LEFT JOIN u ON t.id = u.id";
+  db.exec("SELECT * FROM dbsp_create_view('v_arr_left', '" + sql + "')");
+  auto &mgr = dbsp_native::get_cdc_manager();
+  REQUIRE(mgr.shared_arrangement_count() >= 1);
+  requireViewMatchesQuery(db, "v_arr_left", sql);
+  runDifferentialTwoTables(db, "v_arr_left", sql, 107);
+}
+
+TEST_CASE("planner I1: NOT IN with shared right-side counters",
+          "[integration][planner][arrangement][mark]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  setupTableU(db);
+
+  // MARK join: right side shared, three-valued logic driven by the
+  // arrangement's total/null counters (NULL u.val rows in the generator)
+  const std::string sql =
+      "SELECT id, val FROM t WHERE val NOT IN (SELECT val FROM u)";
+  db.exec("SELECT * FROM dbsp_create_view('v_arr_mark', '" + sql + "')");
+  requireViewMatchesQuery(db, "v_arr_mark", sql);
+  runDifferentialTwoTables(db, "v_arr_mark", sql, 109);
+
+  // Drain u completely: every mark flips through the empty-right category
+  db.exec("DELETE FROM u");
+  db.exec("SELECT * FROM dbsp_sync('u')");
+  requireViewMatchesQuery(db, "v_arr_mark", sql);
+}
+
+TEST_CASE("planner I1: self-padding sides refuse to share",
+          "[integration][planner][arrangement][outer]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  setupTableU(db);
+  auto &mgr = dbsp_native::get_cdc_manager();
+  const size_t base = mgr.shared_arrangement_count();
+
+  // FULL OUTER: both sides self-pad — no arrangement may be created
+  // (sharing one would lose unmatched-row pads at init)
+  const std::string sql =
+      "SELECT t.id, t.val, u.val FROM t FULL JOIN u ON t.id = u.id";
+  db.exec("SELECT * FROM dbsp_create_view('v_arr_full', '" + sql + "')");
+  REQUIRE(mgr.shared_arrangement_count() == base);
+  requireViewMatchesQuery(db, "v_arr_full", sql);
+  runDifferentialTwoTables(db, "v_arr_full", sql, 113);
+}

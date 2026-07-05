@@ -87,6 +87,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace dbsp_native {
@@ -838,6 +839,159 @@ private:
 // conditions are checked per candidate pair via Value comparison. With no
 // conditions at all this degenerates to a cross product (single bucket).
 // Output row = left columns followed by right columns (LogicalJoin layout).
+// Shared join arrangement (I1): one table-side equi-key index maintained
+// ONCE per table delta by the CDC layer and consumed read-only by every
+// join that registered for the same (table, key expressions) fingerprint.
+// Updated at the START of propagation, so consuming joins see the NEW
+// state for this side; their bilinear formula drops the Δl⋈Δr term
+// accordingly (v1 shares at most one side per join, which keeps view
+// initialization = plain replay of the local side).
+struct SharedArrangement {
+  using RowWeights = std::unordered_map<DuckDBRow, int64_t, DuckDBRowHash>;
+  using Index = std::unordered_map<DuckDBRow, RowWeights, DuckDBRowHash>;
+
+  std::string table;
+  bool null_safe = false;
+  bool track_weights = false; // per-row totals (outer pads / marks)
+  bool track_counters = false; // total + null-key weights (marks)
+  // Column projection applied to raw table rows before indexing — join
+  // sides are usually MAP_COLS(SOURCE), so the arrangement stores rows in
+  // the shape the join consumes
+  bool project = false;
+  std::vector<duckdb::idx_t> column_idxs;
+
+  Index index;
+  RowWeights weights;
+  int64_t total = 0;
+  int64_t nulls = 0;
+
+  // Key evaluation owned by the arrangement (first registrant's bound
+  // expressions; keep_alive pins that plan for the arrangement's lifetime)
+  std::shared_ptr<PlanKeepAlive> keep_alive;
+  std::unique_ptr<BatchEvaluator> key_eval;
+  std::vector<std::unique_ptr<RowExprEval>> row_key_evals; // single-row
+
+  bool eval_key(const DuckDBRow &row, DuckDBRow &key) const {
+    std::vector<duckdb::Value> vals;
+    vals.reserve(row_key_evals.size());
+    for (const auto &k : row_key_evals) {
+      duckdb::Value v = k->eval(row);
+      if (v.IsNull() && !null_safe) {
+        return false;
+      }
+      vals.push_back(std::move(v));
+    }
+    key.columns.assign(std::move(vals));
+    return true;
+  }
+
+  void apply(const DuckDBZSet &delta) {
+    // Project raw table rows into the join side's shape first (mirrors
+    // the view's own MAP_COLS node), then batched key extraction and the
+    // same integration the join used
+    std::vector<DuckDBRow> projected;
+    std::vector<const DuckDBRow *> rows;
+    std::vector<int64_t> ws;
+    rows.reserve(delta.size());
+    ws.reserve(delta.size());
+    if (project) {
+      projected.reserve(delta.size());
+      for (const auto &[row, w] : delta) {
+        DuckDBRow out;
+        std::vector<duckdb::Value> vals;
+        vals.reserve(column_idxs.size());
+        for (auto idx : column_idxs) {
+          vals.push_back(idx < row.columns.size() ? row.columns[idx]
+                                                  : duckdb::Value());
+        }
+        out.columns.assign(std::move(vals));
+        projected.push_back(std::move(out));
+        ws.push_back(w);
+      }
+      for (const auto &r : projected) {
+        rows.push_back(&r);
+      }
+    } else {
+      for (const auto &[row, w] : delta) {
+        rows.push_back(&row);
+        ws.push_back(w);
+      }
+    }
+    std::vector<DuckDBRow> keys(rows.size());
+    std::vector<char> valid(rows.size(), 1);
+    if (key_eval && key_eval->expr_count() > 0) {
+      size_t base = 0;
+      while (base < rows.size()) {
+        const duckdb::idx_t chunk = static_cast<duckdb::idx_t>(
+            std::min<size_t>(BatchEvaluator::kBatch, rows.size() - base));
+        key_eval->fill(rows.data() + base, chunk);
+        std::vector<std::vector<duckdb::Value>> kv(chunk);
+        for (size_t k = 0; k < key_eval->expr_count(); k++) {
+          duckdb::Vector &v = key_eval->execute(k);
+          const auto &type = key_eval->return_type(k);
+          for (duckdb::idx_t i = 0; i < chunk; i++) {
+            duckdb::Value val = BatchEvaluator::read_result(v, type, i);
+            if (val.IsNull() && !null_safe) {
+              valid[base + i] = 0;
+            }
+            kv[i].push_back(std::move(val));
+          }
+        }
+        for (duckdb::idx_t i = 0; i < chunk; i++) {
+          keys[base + i].columns.assign(std::move(kv[i]));
+        }
+        base += chunk;
+      }
+    }
+    for (size_t i = 0; i < rows.size(); i++) {
+      const DuckDBRow &row = *rows[i];
+      const int64_t w = ws[i];
+      if (track_weights) {
+        int64_t &t = weights[row];
+        t += w;
+        if (t == 0) {
+          weights.erase(row);
+        }
+      }
+      if (track_counters) {
+        total += w;
+        if (!valid[i]) {
+          nulls += w;
+        }
+      }
+      if (!valid[i]) {
+        continue;
+      }
+      auto &bucket = index[keys[i]];
+      int64_t &weight = bucket[row];
+      weight += w;
+      if (weight == 0) {
+        bucket.erase(row);
+        if (bucket.empty()) {
+          index.erase(keys[i]);
+        }
+      }
+    }
+  }
+};
+
+// A join side's request to consume a shared arrangement; collected during
+// circuit construction, resolved by CDCManager after sources are tracked
+struct ArrangementRequest {
+  std::string fingerprint;
+  std::string table;
+  bool left_side = false;
+  bool null_safe = false;
+  bool track_weights = false;
+  bool track_counters = false;
+  std::vector<const duckdb::Expression *> key_exprs;
+  duckdb::vector<duckdb::LogicalType> side_types;
+  bool project = false; // side is MAP_COLS(SOURCE): project before indexing
+  std::vector<duckdb::idx_t> column_idxs;
+  std::shared_ptr<PlanKeepAlive> keep_alive; // pins exprs for the arrangement
+  class PlanJoinNode *node = nullptr;
+};
+
 class PlanJoinNode : public dbsp::Node {
 public:
   using InputFn = std::function<const DuckDBZSet &()>;
@@ -893,12 +1047,33 @@ public:
     if (marks_) {
       // MARK join is left-preserving: every left row appears exactly once
       // with a three-valued match mark — no bilinear emission at all
-      const bool was_nonempty = right_total_ > 0;
-      const bool had_nulls = right_null_ > 0;
-      integrate(materialize_keys(dl, /*left=*/true), /*left=*/true);
-      integrate(materialize_keys(dr, /*left=*/false), /*left=*/false);
+      // Category detection needs the BEFORE counters. A shared right side
+      // is already post-delta (updated before views step): derive before =
+      // after − this step's contribution. A local right side is pre-delta:
+      // read, then integrate.
+      bool was_nonempty, had_nulls;
+      if (shared_right_) {
+        DeltaKeys kr_probe = materialize_keys(dr, /*left=*/false);
+        int64_t d_total = 0, d_nulls = 0;
+        for (size_t i = 0; i < kr_probe.rows.size(); i++) {
+          d_total += kr_probe.weights[i];
+          if (!kr_probe.valid[i]) {
+            d_nulls += kr_probe.weights[i];
+          }
+        }
+        was_nonempty = (shared_right_->total - d_total) > 0;
+        had_nulls = (shared_right_->nulls - d_nulls) > 0;
+      } else {
+        was_nonempty = right_total_ > 0;
+        had_nulls = right_null_ > 0;
+        integrate(materialize_keys(dr, /*left=*/false), /*left=*/false);
+      }
+      if (!shared_left_) {
+        integrate(materialize_keys(dl, /*left=*/true), /*left=*/true);
+      }
       const bool category_changed =
-          was_nonempty != (right_total_ > 0) || had_nulls != (right_null_ > 0);
+          was_nonempty != (mark_right_total() > 0) ||
+          had_nulls != (mark_right_null() > 0);
       reconcile_marks(dl, dr, category_changed);
       has_output_ = !output_.empty();
       return;
@@ -909,13 +1084,17 @@ public:
     DeltaKeys kl = materialize_keys(dl, /*left=*/true);
     DeltaKeys kr = materialize_keys(dr, /*left=*/false);
 
-    // Δl ⋈ R_old
+    // Δl ⋈ R (local sides: OLD state — integration runs after the
+    // passes; a shared side: NEW state — the arrangement was updated
+    // before views stepped, and the Δl⋈Δr term is dropped to compensate:
+    // Δl⋈R_new + L_old⋈Δr == Δl⋈R_old + L_old⋈Δr + Δl⋈Δr)
+    const Index &right_probe = side_index(/*left=*/false);
     for (size_t i = 0; i < kl.rows.size(); i++) {
       if (!kl.valid[i]) {
         continue;
       }
-      auto it = right_index_.find(kl.keys[i]);
-      if (it == right_index_.end()) {
+      auto it = right_probe.find(kl.keys[i]);
+      if (it == right_probe.end()) {
         continue;
       }
       for (const auto &[rrow, rw] : it->second) {
@@ -923,13 +1102,14 @@ public:
       }
     }
 
-    // L_old ⋈ Δr
+    // L ⋈ Δr
+    const Index &left_probe = side_index(/*left=*/true);
     for (size_t i = 0; i < kr.rows.size(); i++) {
       if (!kr.valid[i]) {
         continue;
       }
-      auto it = left_index_.find(kr.keys[i]);
-      if (it == left_index_.end()) {
+      auto it = left_probe.find(kr.keys[i]);
+      if (it == left_probe.end()) {
         continue;
       }
       for (const auto &[lrow, lw] : it->second) {
@@ -937,8 +1117,10 @@ public:
       }
     }
 
-    // Δl ⋈ Δr (both sides changed in the same step, e.g. self-joins)
-    if (!kl.rows.empty() && !kr.rows.empty()) {
+    // Δl ⋈ Δr (both sides changed in the same step, e.g. self-joins) —
+    // dropped when a shared side already exposes post-delta state
+    const bool any_shared = shared_left_ || shared_right_;
+    if (!any_shared && !kl.rows.empty() && !kr.rows.empty()) {
       Index dr_index;
       for (size_t i = 0; i < kr.rows.size(); i++) {
         if (kr.valid[i]) {
@@ -959,10 +1141,14 @@ public:
       }
     }
 
-    // Integrate deltas into the side indexes (and, for outer joins, the
-    // per-row weight maps that include NULL-key rows)
-    integrate(kl, /*left=*/true);
-    integrate(kr, /*left=*/false);
+    // Integrate deltas into the LOCAL side indexes (shared sides are
+    // maintained by the CDC layer)
+    if (!shared_left_) {
+      integrate(kl, /*left=*/true);
+    }
+    if (!shared_right_) {
+      integrate(kr, /*left=*/false);
+    }
 
     // Outer-join NULL padding: reconcile the pad of every row whose match
     // count may have changed. Desired pad weight = the row's total weight
@@ -994,9 +1180,24 @@ public:
 
   const DuckDBZSet &output() const { return output_; }
 
+  void set_shared_arrangement(bool left,
+                              std::shared_ptr<const SharedArrangement> arr) {
+    (left ? shared_left_ : shared_right_) = std::move(arr);
+  }
+
 private:
   using RowWeights = std::unordered_map<DuckDBRow, int64_t, DuckDBRowHash>;
   using Index = std::unordered_map<DuckDBRow, RowWeights, DuckDBRowHash>;
+
+  const Index &side_index(bool left) const {
+    if (left && shared_left_) {
+      return shared_left_->index;
+    }
+    if (!left && shared_right_) {
+      return shared_right_->index;
+    }
+    return left ? left_index_ : right_index_;
+  }
 
   // Returns false when any key value is NULL (row can never match) —
   // unless keys are null-safe (IS NOT DISTINCT FROM, DELIM joins), where
@@ -1173,7 +1374,7 @@ private:
     if (!eval_key(row, left, key)) {
       return 0;
     }
-    const Index &other = left ? right_index_ : left_index_;
+    const Index &other = side_index(!left);
     auto it = other.find(key);
     if (it == other.end()) {
       return 0;
@@ -1218,7 +1419,7 @@ private:
       affected.emplace(row, 0);
     }
     if (!other_delta.empty()) {
-      const Index &own_index = left ? left_index_ : right_index_;
+      const Index &own_index = side_index(left);
       std::unordered_map<DuckDBRow, char, DuckDBRowHash> seen_keys;
       for (const auto &[orow, ow] : other_delta) {
         DuckDBRow key;
@@ -1238,7 +1439,10 @@ private:
       }
     }
 
-    RowWeights &weights = left ? left_weights_ : right_weights_;
+    const RowWeights &weights =
+        (left && shared_left_)    ? shared_left_->weights
+        : (!left && shared_right_) ? shared_right_->weights
+        : (left ? left_weights_ : right_weights_);
     RowWeights &pads = left ? left_pad_ : right_pad_;
     for (const auto &[row, unused] : affected) {
       auto wit = weights.find(row);
@@ -1263,15 +1467,22 @@ private:
   // match exists; FALSE when the subquery side is empty (even for NULL
   // probes); otherwise NULL when the probe key is NULL or the subquery
   // side contains a NULL key; else FALSE.
+  int64_t mark_right_total() const {
+    return shared_right_ ? shared_right_->total : right_total_;
+  }
+  int64_t mark_right_null() const {
+    return shared_right_ ? shared_right_->nulls : right_null_;
+  }
+
   duckdb::Value mark_value(const DuckDBRow &row) {
     if (match_count(row, /*left=*/true) > 0) {
       return duckdb::Value::BOOLEAN(true);
     }
-    if (right_total_ <= 0) {
+    if (mark_right_total() <= 0) {
       return duckdb::Value::BOOLEAN(false);
     }
     DuckDBRow key;
-    if (!eval_key(row, /*left=*/true, key) || right_null_ > 0) {
+    if (!eval_key(row, /*left=*/true, key) || mark_right_null() > 0) {
       return duckdb::Value(duckdb::LogicalType::BOOLEAN);
     }
     return duckdb::Value::BOOLEAN(false);
@@ -1282,7 +1493,8 @@ private:
     std::unordered_map<DuckDBRow, char, DuckDBRowHash> affected;
     if (category_changed) {
       // Emptiness or NULL-presence flipped: every unmatched mark changes
-      for (const auto &[row, w] : left_weights_) {
+      for (const auto &[row, w] :
+           (shared_left_ ? shared_left_->weights : left_weights_)) {
         affected.emplace(row, 0);
       }
       for (const auto &[row, entry] : mark_state_) {
@@ -1302,8 +1514,9 @@ private:
           if (!seen_keys.emplace(key, 0).second) {
             continue;
           }
-          auto it = left_index_.find(key);
-          if (it == left_index_.end()) {
+          const Index &lidx = side_index(/*left=*/true);
+          auto it = lidx.find(key);
+          if (it == lidx.end()) {
             continue;
           }
           for (const auto &[row, w] : it->second) {
@@ -1313,9 +1526,11 @@ private:
       }
     }
 
+    const RowWeights &lw =
+        shared_left_ ? shared_left_->weights : left_weights_;
     for (const auto &[row, unused] : affected) {
-      auto wit = left_weights_.find(row);
-      const int64_t weight = wit == left_weights_.end() ? 0 : wit->second;
+      auto wit = lw.find(row);
+      const int64_t weight = wit == lw.end() ? 0 : wit->second;
       duckdb::Value mark =
           weight > 0 ? mark_value(row) : duckdb::Value::BOOLEAN(false);
 
@@ -1351,6 +1566,9 @@ private:
   bool marks_ = false;
   bool null_safe_keys_ = false;
   std::unique_ptr<BatchEvaluator> batch_left_keys_, batch_right_keys_;
+  // I1: at most one side reads a shared, CDC-maintained arrangement
+  // (updated BEFORE views step, so it is post-delta for the current step)
+  std::shared_ptr<const SharedArrangement> shared_left_, shared_right_;
   Index left_index_, right_index_;
   RowWeights left_weights_, right_weights_;   // incl. NULL-key rows
   RowWeights left_pad_, right_pad_;           // currently emitted pad weight
@@ -1863,8 +2081,10 @@ public:
                      const TableSchema &result_schema,
                      std::shared_ptr<PlanKeepAlive> keep_alive,
                      const PlanOpSpec &root)
-      : NativeMaterializedView(name, sql), schema_(result_schema) {
+      : NativeMaterializedView(name, sql), schema_(result_schema),
+        keep_alive_(keep_alive) {
     schema_.table_name = name;
+    count_sources(root);
     OutputFn out = build(root, keep_alive);
     sink_ = circuit_.add_node(std::make_unique<RowSink>(
         circuit_.next_node_id(), std::move(out), name_ + "_sink"));
@@ -1900,6 +2120,21 @@ public:
   // Circuit size; used by IR-optimizer tests to prove rewrites fired
   size_t node_count() const { return circuit_.node_count(); }
 
+  // I1 shared arrangements: join sides eligible for a shared, CDC-owned
+  // arrangement (resolved by CDCManager after sources are tracked)
+  const std::vector<ArrangementRequest> &arrangement_requests() const {
+    return arrangement_requests_;
+  }
+  // Tables whose state must NOT be replayed at view initialization: their
+  // only consumer is a shared join side whose arrangement is already
+  // populated (replaying would double-count through Δl⋈R_arr)
+  const std::unordered_set<std::string> &shared_init_skip() const {
+    return shared_init_skip_;
+  }
+  void mark_shared_init_skip(const std::string &table) {
+    shared_init_skip_.insert(table);
+  }
+
   void reset() override {
     circuit_.reset();
     version_ = 0;
@@ -1917,6 +2152,98 @@ public:
   }
 
 private:
+  void count_sources(const PlanOpSpec &spec) {
+    if (spec.kind == PlanOpSpec::Kind::SOURCE) {
+      source_refs_[spec.table]++;
+    }
+    for (const auto &child : spec.children) {
+      count_sources(*child);
+    }
+  }
+
+  // v1 eligibility: side is a bare SOURCE referenced exactly once in the
+  // whole plan (so init replay can skip that table wholesale) and no more
+  // than one side per join shares (keeps init = plain local-side replay).
+  // Prefer the right side (conventionally the bigger build side).
+  void record_arrangement_request(
+      const PlanOpSpec &spec, PlanJoinNode *node,
+      const std::vector<const duckdb::Expression *> &lkeys,
+      const std::vector<const duckdb::Expression *> &rkeys) {
+    // A shared side must be a pure probe target. A side that pads or
+    // marks ITSELF (right of RIGHT/FULL, left of LEFT/FULL/MARK) cannot
+    // share: init replay skips its table, so its unmatched rows would
+    // never be visited and their NULL pads / marks never emitted.
+    auto self_padding = [&](bool left) {
+      if (left) {
+        return spec.join_type == duckdb::JoinType::LEFT ||
+               spec.join_type == duckdb::JoinType::OUTER ||
+               spec.join_type == duckdb::JoinType::MARK;
+      }
+      return spec.join_type == duckdb::JoinType::RIGHT ||
+             spec.join_type == duckdb::JoinType::OUTER;
+    };
+    // A side qualifies as a bare scan when it is SOURCE or
+    // MAP_COLS(SOURCE) — the projection is folded into the arrangement
+    auto scan_of = [](const PlanOpSpec &c) -> const PlanOpSpec * {
+      if (c.kind == PlanOpSpec::Kind::SOURCE) {
+        return &c;
+      }
+      if (c.kind == PlanOpSpec::Kind::MAP_COLS &&
+          c.children[0]->kind == PlanOpSpec::Kind::SOURCE) {
+        return c.children[0].get();
+      }
+      return nullptr;
+    };
+    auto eligible = [&](size_t child) {
+      const PlanOpSpec *src = scan_of(*spec.children[child]);
+      return src && source_refs_[src->table] == 1 &&
+             !self_padding(child == 0);
+    };
+    const bool right_ok = eligible(1);
+    const bool left_ok = !right_ok && eligible(0);
+    if (!right_ok && !left_ok) {
+      return;
+    }
+    const bool left_side = left_ok;
+    const PlanOpSpec &side = *spec.children[left_side ? 0 : 1];
+    const auto &key_exprs = left_side ? lkeys : rkeys;
+
+    ArrangementRequest req;
+    req.table = scan_of(side)->table;
+    if (side.kind == PlanOpSpec::Kind::MAP_COLS) {
+      req.project = true;
+      req.column_idxs = side.column_idxs;
+    }
+    req.left_side = left_side;
+    req.null_safe = spec.null_safe_keys;
+    // Probe-target sides never need per-row weights (those serve
+    // self-pads/marks, excluded above); marks on a shared RIGHT side
+    // still need the total/null-key counters
+    req.track_weights = false;
+    req.track_counters =
+        !left_side && spec.join_type == duckdb::JoinType::MARK;
+    req.key_exprs = key_exprs;
+    req.side_types = left_side ? spec.left_types : spec.right_types;
+    req.keep_alive = keep_alive_;
+    req.node = node;
+
+    std::string fp = req.table;
+    fp += req.null_safe ? "|ns1" : "|ns0";
+    fp += req.track_weights ? "|w1" : "|w0";
+    fp += req.track_counters ? "|c1" : "|c0";
+    fp += "|p";
+    for (auto idx : req.column_idxs) {
+      fp += std::to_string(idx);
+      fp += ",";
+    }
+    for (const auto *e : key_exprs) {
+      fp += "|";
+      fp += e->ToString();
+    }
+    req.fingerprint = std::move(fp);
+    arrangement_requests_.push_back(std::move(req));
+  }
+
   OutputFn build(const PlanOpSpec &spec,
                  const std::shared_ptr<PlanKeepAlive> &keep_alive) {
     switch (spec.kind) {
@@ -2015,11 +2342,14 @@ private:
         lkeys.push_back(cond.left);
         rkeys.push_back(cond.right);
       }
+      auto lkeys_copy = lkeys;
+      auto rkeys_copy = rkeys;
       auto *node = circuit_.add_node(std::make_unique<PlanJoinNode>(
           circuit_.next_node_id(), std::move(left), std::move(right),
           std::move(keys), std::move(residuals), spec.join_type,
           spec.left_types, spec.right_types, spec.null_safe_keys,
           keep_alive, std::move(lkeys), std::move(rkeys)));
+      record_arrangement_request(spec, node, lkeys_copy, rkeys_copy);
       return [node]() -> const DuckDBZSet & { return node->output(); };
     }
     case PlanOpSpec::Kind::DISTINCT: {
@@ -2208,6 +2538,10 @@ private:
   std::vector<std::string> source_order_;
   std::unordered_map<duckdb::idx_t, OutputFn> cte_outputs_;
   std::vector<OutputFn> delim_stack_; // enclosing DELIM joins' key outputs
+  std::shared_ptr<PlanKeepAlive> keep_alive_;
+  std::unordered_map<std::string, int> source_refs_; // SOURCE count per table
+  std::vector<ArrangementRequest> arrangement_requests_;
+  std::unordered_set<std::string> shared_init_skip_;
   RowSink *sink_ = nullptr;
   // Embedded sort/limit view at the plan root; owned by its EmbeddedViewNode
   NativeMaterializedView *ordered_view_ = nullptr;

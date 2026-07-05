@@ -1,5 +1,23 @@
 # Changelog
 
+## Phase I: Shared join arrangements - Jul 2026
+
+- I1 shared join arrangements (one-side v1): join sides that are bare
+  table scans (SOURCE or MAP_COLS(SOURCE), referenced once in the view)
+  read a CDC-owned `SharedArrangement` instead of integrating a private
+  index copy. One arrangement per (table, projection, key-exprs, flags)
+  fingerprint serves every matching join side across views: N views over
+  the same table cost one index update per delta instead of N, and one
+  index in memory instead of N. Arrangements are updated before views
+  step (the join drops its Δl⋈Δr term to compensate: Δl⋈R_new =
+  Δl⋈R_old + Δl⋈Δr), and view initialization skips replaying a shared
+  table (Δother ⋈ full arrangement reproduces the full join). Self-padding
+  sides (right of RIGHT/FULL, left of LEFT/FULL/MARK) are excluded — init
+  replay skip would lose their unmatched-row pads. Registry holds weak
+  refs; consuming join nodes own the arrangement, so dropping the last
+  view frees it. Bench: 8 views, 2k-row delta into a 20k-row probe side —
+  55.0ms/sync shared vs 68.5ms with 8 private arrangements.
+
 ## Phase H: Sync scoping, dense Z-sets, batch keys - Jul 2026
 
 - H1 touched-table sync scoping: auto-sync commits sync only the tables

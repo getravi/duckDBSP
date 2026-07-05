@@ -229,3 +229,57 @@ TEST_CASE("Benchmark: cascaded view sync cost", "[benchmark][cascade_bench]") {
             << "/20 via fast path; bare txn floor "
             << (floor_us / 20.0) << " us)\n";
 }
+
+// I1: N views probing the same table — shared arrangement means ONE index
+// update per delta instead of N. Contrast identical views (1 arrangement)
+// against distinct-projection views (N arrangements, the pre-I1 cost shape).
+TEST_CASE("Benchmark: shared vs private join arrangements",
+          "[benchmark][arrangement_bench]") {
+  constexpr int kViews = 8;
+  constexpr int kBase = 20000;
+  constexpr int kDelta = 2000;
+  auto &mgr = dbsp_native::get_cdc_manager();
+
+  auto run = [&](bool shared) -> double {
+    DuckDBTestHarness db;
+    db.exec("CREATE TABLE l (id INT, val INT)");
+    db.exec("CREATE TABLE r (id INT, a INT, b INT, c INT, d INT, e INT, "
+            "f INT, g INT, h INT)");
+    db.exec("INSERT INTO r SELECT i, i, i, i, i, i, i, i, i FROM "
+            "range(" + std::to_string(kBase) + ") s(i)");
+    db.exec("INSERT INTO l SELECT i, i FROM range(100) s(i)");
+    db.exec("SELECT * FROM dbsp_track('l')");
+    db.exec("SELECT * FROM dbsp_track('r')");
+    db.exec("SELECT * FROM dbsp_sync('l')");
+    db.exec("SELECT * FROM dbsp_sync('r')");
+
+    const char cols[] = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'};
+    for (int v = 0; v < kViews; v++) {
+      // shared: all views need the same r columns → one fingerprint;
+      // private: each view projects a different column → N fingerprints
+      std::string rcol(1, shared ? 'a' : cols[v]);
+      std::string sql = "SELECT l.id, l.val, r." + rcol +
+                        " FROM l JOIN r ON l.id = r.id";
+      db.exec("SELECT * FROM dbsp_create_view('bv" + std::to_string(v) +
+              "', '" + sql + "')");
+    }
+    const size_t arrs = mgr.shared_arrangement_count();
+    REQUIRE(arrs == (shared ? 1u : static_cast<size_t>(kViews)));
+
+    db.exec("INSERT INTO r SELECT i, i, i, i, i, i, i, i, i FROM range(" +
+            std::to_string(kBase) + ", " +
+            std::to_string(kBase + kDelta) + ") s(i)");
+    auto t0 = high_resolution_clock::now();
+    db.exec("SELECT * FROM dbsp_sync('r')");
+    auto t1 = high_resolution_clock::now();
+    return static_cast<double>(
+        duration_cast<microseconds>(t1 - t0).count());
+  };
+
+  double shared_us = run(true);
+  double private_us = run(false);
+  std::cout << "[bench] " << kViews << " views, " << kDelta
+            << "-row delta into " << kBase << "-row probe side: shared=1 "
+            "arrangement " << shared_us << " us; private=" << kViews
+            << " arrangements " << private_us << " us\n";
+}
