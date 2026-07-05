@@ -8,12 +8,15 @@
 // LogicalOperator tree is walked and mapped onto circuit nodes; bound
 // expressions are evaluated row-at-a-time through ExpressionExecutor.
 //
-// Current scope (B1+B2): single-table LOGICAL_GET -> LOGICAL_FILTER ->
-// LOGICAL_PROJECTION chains plus LOGICAL_AGGREGATE_AND_GROUP_BY (multiple
-// aggregates per GROUP BY, expression keys; HAVING arrives as a FILTER above
-// the aggregate and needs no special handling). Any other operator yields a
-// DBSP-E110 error naming the operator; CDCManager::create_view falls back to
-// the bespoke parser transparently.
+// Current scope (B1-B3):
+//   B1: LOGICAL_GET -> LOGICAL_FILTER -> LOGICAL_PROJECTION chains
+//   B2: LOGICAL_AGGREGATE_AND_GROUP_BY (multi-aggregate, expression keys;
+//       HAVING arrives as a FILTER above the aggregate — no special code)
+//   B3: LOGICAL_COMPARISON_JOIN (inner equi + residual comparisons),
+//       LOGICAL_CROSS_PRODUCT, LOGICAL_DISTINCT, LOGICAL_UNION /
+//       LOGICAL_INTERSECT / LOGICAL_EXCEPT (ALL and DISTINCT)
+// Any other operator yields a DBSP-E110 error naming the operator;
+// CDCManager::create_view falls back to the bespoke parser transparently.
 //
 // Caller contract: PlanTranslator::translate issues queries on an internal
 // connection, so the caller must hold an InternalQueryGuard (dbsp_cdc.hpp)
@@ -26,17 +29,21 @@
 
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/enum_util.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
-
-#include <set>
+#include "duckdb/planner/operator/logical_set_operation.hpp"
 
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -92,7 +99,7 @@ private:
   duckdb::DataChunk chunk_;
 };
 
-// One aggregate within an AGGREGATE step (B2)
+// One aggregate within an AGGREGATE spec (B2)
 struct PlanAggSpec {
   enum class Fn { COUNT_STAR, COUNT, SUM, AVG, MIN, MAX };
 
@@ -102,20 +109,42 @@ struct PlanAggSpec {
   duckdb::LogicalType return_type;
 };
 
-// One translated plan operator, in source-to-root order.
-struct PlanStep {
+// One translated plan operator. Forms a tree mirroring the logical plan;
+// unary operators have one child, JOIN has two, SET_OP has two or more.
+struct PlanOpSpec {
   enum class Kind {
-    FILTER_EXPR, // FilterNode over one bound predicate expression
-    MAP_EXPR,    // MapNode evaluating projection expressions
+    SOURCE,      // base table scan feeding a SourceNode
     MAP_COLS,    // MapNode selecting columns by index (GET column_ids)
-    AGGREGATE    // PlanAggregateNode (exprs = group keys)
+    FILTER_EXPR, // FilterNode over bound predicate expressions (AND)
+    MAP_EXPR,    // MapNode evaluating projection expressions
+    AGGREGATE,   // PlanAggregateNode (exprs = group keys)
+    JOIN,        // PlanJoinNode (inner equi + residual comparisons)
+    DISTINCT,    // PlanDistinctNode
+    SET_OP       // PlanSetOpNode
   };
 
+  // Comparison between a left-side and a right-side bound expression
+  struct JoinCond {
+    const duckdb::Expression *left;
+    const duckdb::Expression *right;
+    duckdb::ExpressionType cmp;
+  };
+
+  enum class SetOp { UNION_ALL, UNION, INTERSECT, INTERSECT_ALL, EXCEPT,
+                     EXCEPT_ALL };
+
   Kind kind;
-  std::vector<const duckdb::Expression *> exprs;    // FILTER_EXPR / MAP_EXPR
-  duckdb::vector<duckdb::LogicalType> input_types; // child operator's types
+  std::vector<std::unique_ptr<PlanOpSpec>> children;
+
+  std::string table;                             // SOURCE
   std::vector<duckdb::idx_t> column_idxs;        // MAP_COLS
+  std::vector<const duckdb::Expression *> exprs; // FILTER/MAP/group keys
+  duckdb::vector<duckdb::LogicalType> input_types; // unary: child's types
   std::vector<PlanAggSpec> agg_specs;            // AGGREGATE
+  std::vector<JoinCond> equi_conds;              // JOIN: EQUAL conditions
+  std::vector<JoinCond> residual_conds;          // JOIN: other comparisons
+  duckdb::vector<duckdb::LogicalType> left_types, right_types; // JOIN
+  SetOp set_op = SetOp::UNION_ALL;               // SET_OP
 };
 
 // Incremental GROUP BY aggregation over bound expressions: retracts the old
@@ -317,102 +346,571 @@ private:
   bool global_emitted_ = false;
 };
 
-// Circuit view built from a translated plan: Source -> steps -> Sink.
-class PlannedCircuitView : public SingleSourceCircuitView {
+// Incremental inner join (B3). Bilinear delta rule per step:
+//   Δout = Δl ⋈ R_old + L_old ⋈ Δr + Δl ⋈ Δr
+// Each side is indexed by its equi-key values; rows with a NULL key are
+// never indexed (SQL: NULL never matches). Residual (non-equality)
+// conditions are checked per candidate pair via Value comparison. With no
+// conditions at all this degenerates to a cross product (single bucket).
+// Output row = left columns followed by right columns (LogicalJoin layout).
+class PlanJoinNode : public dbsp::Node {
 public:
+  using InputFn = std::function<const DuckDBZSet &()>;
+
+  struct KeyPair {
+    std::unique_ptr<RowExprEval> left, right;
+  };
+  struct Residual {
+    std::unique_ptr<RowExprEval> left, right;
+    duckdb::ExpressionType cmp;
+  };
+
+  PlanJoinNode(dbsp::NodeId id, InputFn left_fn, InputFn right_fn,
+               std::vector<KeyPair> keys, std::vector<Residual> residuals,
+               std::string name = "plan_join")
+      : dbsp::Node(id, std::move(name)), left_fn_(std::move(left_fn)),
+        right_fn_(std::move(right_fn)), keys_(std::move(keys)),
+        residuals_(std::move(residuals)) {}
+
+  void step() override {
+    output_.clear();
+    has_output_ = false;
+    const DuckDBZSet &dl = left_fn_();
+    const DuckDBZSet &dr = right_fn_();
+    if (dl.empty() && dr.empty()) {
+      return;
+    }
+
+    // Δl ⋈ R_old
+    for (const auto &[lrow, lw] : dl) {
+      DuckDBRow key;
+      if (!eval_key(lrow, /*left=*/true, key)) {
+        continue;
+      }
+      auto it = right_index_.find(key);
+      if (it == right_index_.end()) {
+        continue;
+      }
+      for (const auto &[rrow, rw] : it->second) {
+        try_emit(lrow, rrow, lw * rw);
+      }
+    }
+
+    // L_old ⋈ Δr
+    for (const auto &[rrow, rw] : dr) {
+      DuckDBRow key;
+      if (!eval_key(rrow, /*left=*/false, key)) {
+        continue;
+      }
+      auto it = left_index_.find(key);
+      if (it == left_index_.end()) {
+        continue;
+      }
+      for (const auto &[lrow, lw] : it->second) {
+        try_emit(lrow, rrow, lw * rw);
+      }
+    }
+
+    // Δl ⋈ Δr (both sides changed in the same step, e.g. self-joins)
+    if (!dl.empty() && !dr.empty()) {
+      Index dr_index;
+      for (const auto &[rrow, rw] : dr) {
+        DuckDBRow key;
+        if (eval_key(rrow, /*left=*/false, key)) {
+          dr_index[key][rrow] += rw;
+        }
+      }
+      for (const auto &[lrow, lw] : dl) {
+        DuckDBRow key;
+        if (!eval_key(lrow, /*left=*/true, key)) {
+          continue;
+        }
+        auto it = dr_index.find(key);
+        if (it == dr_index.end()) {
+          continue;
+        }
+        for (const auto &[rrow, rw] : it->second) {
+          try_emit(lrow, rrow, lw * rw);
+        }
+      }
+    }
+
+    // Integrate deltas into the side indexes
+    integrate(dl, /*left=*/true);
+    integrate(dr, /*left=*/false);
+    has_output_ = !output_.empty();
+  }
+
+  void reset() override {
+    left_index_.clear();
+    right_index_.clear();
+    output_.clear();
+    has_output_ = false;
+  }
+
+  bool has_output() const override { return has_output_; }
+
+  const DuckDBZSet &output() const { return output_; }
+
+private:
+  using RowWeights = std::unordered_map<DuckDBRow, int64_t, DuckDBRowHash>;
+  using Index = std::unordered_map<DuckDBRow, RowWeights, DuckDBRowHash>;
+
+  // Returns false when any key value is NULL (row can never match)
+  bool eval_key(const DuckDBRow &row, bool left, DuckDBRow &key) {
+    key.columns.reserve(keys_.size());
+    for (auto &k : keys_) {
+      duckdb::Value v = left ? k.left->eval(row) : k.right->eval(row);
+      if (v.IsNull()) {
+        return false;
+      }
+      key.columns.push_back(v);
+    }
+    return true;
+  }
+
+  bool residuals_pass(const DuckDBRow &lrow, const DuckDBRow &rrow) {
+    for (auto &res : residuals_) {
+      duckdb::Value lv = res.left->eval(lrow);
+      duckdb::Value rv = res.right->eval(rrow);
+      if (lv.IsNull() || rv.IsNull()) {
+        return false;
+      }
+      bool pass = false;
+      switch (res.cmp) {
+      case duckdb::ExpressionType::COMPARE_GREATERTHAN:
+        pass = rv < lv;
+        break;
+      case duckdb::ExpressionType::COMPARE_LESSTHAN:
+        pass = lv < rv;
+        break;
+      case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+        pass = !(lv < rv);
+        break;
+      case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
+        pass = !(rv < lv);
+        break;
+      case duckdb::ExpressionType::COMPARE_NOTEQUAL:
+        pass = lv != rv;
+        break;
+      case duckdb::ExpressionType::COMPARE_EQUAL:
+        pass = lv == rv;
+        break;
+      default:
+        return false;
+      }
+      if (!pass) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void try_emit(const DuckDBRow &lrow, const DuckDBRow &rrow,
+                int64_t weight) {
+    if (weight == 0 || !residuals_pass(lrow, rrow)) {
+      return;
+    }
+    DuckDBRow combined;
+    combined.columns.reserve(lrow.columns.size() + rrow.columns.size());
+    combined.columns = lrow.columns;
+    combined.columns.insert(combined.columns.end(), rrow.columns.begin(),
+                            rrow.columns.end());
+    output_.insert(combined, weight);
+  }
+
+  void integrate(const DuckDBZSet &delta, bool left) {
+    Index &index = left ? left_index_ : right_index_;
+    for (const auto &[row, w] : delta) {
+      DuckDBRow key;
+      if (!eval_key(row, left, key)) {
+        continue;
+      }
+      auto &rows = index[key];
+      int64_t &weight = rows[row];
+      weight += w;
+      if (weight == 0) {
+        rows.erase(row);
+        if (rows.empty()) {
+          index.erase(key);
+        }
+      }
+    }
+  }
+
+  InputFn left_fn_, right_fn_;
+  std::vector<KeyPair> keys_;
+  std::vector<Residual> residuals_;
+  Index left_index_, right_index_;
+  DuckDBZSet output_;
+  bool has_output_ = false;
+};
+
+// Incremental DISTINCT (B3): tracks integrated multiplicity per row; emits
+// +1 when a row's count crosses 0 -> positive, -1 when it drops to 0.
+class PlanDistinctNode : public dbsp::Node {
+public:
+  using InputFn = std::function<const DuckDBZSet &()>;
+
+  PlanDistinctNode(dbsp::NodeId id, InputFn input_fn,
+                   std::string name = "plan_distinct")
+      : dbsp::Node(id, std::move(name)), input_fn_(std::move(input_fn)) {}
+
+  void step() override {
+    output_.clear();
+    has_output_ = false;
+    const DuckDBZSet &changes = input_fn_();
+    for (const auto &[row, w] : changes) {
+      int64_t &count = counts_[row];
+      int64_t old_count = count;
+      count += w;
+      if (old_count <= 0 && count > 0) {
+        output_.insert(row, 1);
+      } else if (old_count > 0 && count <= 0) {
+        output_.insert(row, -1);
+      }
+      if (count == 0) {
+        counts_.erase(row);
+      }
+    }
+    has_output_ = !output_.empty();
+  }
+
+  void reset() override {
+    counts_.clear();
+    output_.clear();
+    has_output_ = false;
+  }
+
+  bool has_output() const override { return has_output_; }
+
+  const DuckDBZSet &output() const { return output_; }
+
+private:
+  InputFn input_fn_;
+  std::unordered_map<DuckDBRow, int64_t, DuckDBRowHash> counts_;
+  DuckDBZSet output_;
+  bool has_output_ = false;
+};
+
+// Incremental set operation (B3). Tracks integrated per-input multiplicity
+// for every row and emits the change in output multiplicity:
+//   UNION ALL      Σ counts             (stateless in principle, but kept
+//                                        uniform for simplicity)
+//   UNION          Σ counts > 0 ? 1 : 0
+//   INTERSECT ALL  min(counts)          (2 inputs)
+//   INTERSECT      all counts > 0 ? 1:0 (2 inputs)
+//   EXCEPT ALL     max(a - b, 0)        (2 inputs)
+//   EXCEPT         a > 0 && b == 0 ?1:0 (2 inputs)
+class PlanSetOpNode : public dbsp::Node {
+public:
+  using InputFn = std::function<const DuckDBZSet &()>;
+  using SetOp = PlanOpSpec::SetOp;
+
+  PlanSetOpNode(dbsp::NodeId id, std::vector<InputFn> inputs, SetOp op,
+                std::string name = "plan_setop")
+      : dbsp::Node(id, std::move(name)), inputs_(std::move(inputs)), op_(op) {}
+
+  void step() override {
+    output_.clear();
+    has_output_ = false;
+
+    // Collect changed rows and apply deltas per input
+    std::unordered_map<DuckDBRow, std::vector<int64_t>, DuckDBRowHash>
+        old_counts;
+    for (size_t i = 0; i < inputs_.size(); i++) {
+      const DuckDBZSet &delta = inputs_[i]();
+      for (const auto &[row, w] : delta) {
+        auto &counts = counts_[row];
+        counts.resize(inputs_.size(), 0);
+        if (!old_counts.count(row)) {
+          old_counts[row] = counts;
+        }
+        counts[i] += w;
+      }
+    }
+
+    for (const auto &[row, old] : old_counts) {
+      auto it = counts_.find(row);
+      const std::vector<int64_t> &now = it->second;
+      int64_t delta = multiplicity(now) - multiplicity(old);
+      if (delta != 0) {
+        output_.insert(row, delta);
+      }
+      bool all_zero = true;
+      for (int64_t c : now) {
+        if (c != 0) {
+          all_zero = false;
+          break;
+        }
+      }
+      if (all_zero) {
+        counts_.erase(it);
+      }
+    }
+    has_output_ = !output_.empty();
+  }
+
+  void reset() override {
+    counts_.clear();
+    output_.clear();
+    has_output_ = false;
+  }
+
+  bool has_output() const override { return has_output_; }
+
+  const DuckDBZSet &output() const { return output_; }
+
+private:
+  int64_t multiplicity(const std::vector<int64_t> &counts) const {
+    auto at = [&](size_t i) {
+      return i < counts.size() ? std::max<int64_t>(counts[i], 0) : 0;
+    };
+    switch (op_) {
+    case SetOp::UNION_ALL: {
+      int64_t total = 0;
+      for (size_t i = 0; i < counts.size(); i++) {
+        total += at(i);
+      }
+      return total;
+    }
+    case SetOp::UNION: {
+      for (size_t i = 0; i < counts.size(); i++) {
+        if (at(i) > 0) {
+          return 1;
+        }
+      }
+      return 0;
+    }
+    case SetOp::INTERSECT_ALL:
+      return std::min(at(0), at(1));
+    case SetOp::INTERSECT:
+      return at(0) > 0 && at(1) > 0 ? 1 : 0;
+    case SetOp::EXCEPT_ALL:
+      return std::max<int64_t>(at(0) - at(1), 0);
+    case SetOp::EXCEPT:
+      return at(0) > 0 && at(1) == 0 ? 1 : 0;
+    }
+    return 0;
+  }
+
+  std::vector<InputFn> inputs_;
+  SetOp op_;
+  std::unordered_map<DuckDBRow, std::vector<int64_t>, DuckDBRowHash> counts_;
+  DuckDBZSet output_;
+  bool has_output_ = false;
+};
+
+// Circuit view built from a translated plan tree. One SourceNode per base
+// table (shared across subtrees, e.g. self-joins); apply_changes pushes the
+// delta into the matching source and steps the whole circuit once.
+class PlannedCircuitView : public NativeMaterializedView {
+public:
+  using RowSource = dbsp::SourceNode<DuckDBRow, DuckDBRowHash>;
+  using RowSink = dbsp::SinkNode<DuckDBRow, DuckDBRowHash>;
   using RowFilter = dbsp::FilterNode<DuckDBRow, DuckDBRowHash>;
   using RowMap =
       dbsp::MapNode<DuckDBRow, DuckDBRow, DuckDBRowHash, DuckDBRowHash>;
+  using OutputFn = std::function<const DuckDBZSet &()>;
 
   PlannedCircuitView(const std::string &name, const std::string &sql,
-                     const std::string &source_table,
                      const TableSchema &result_schema,
                      std::shared_ptr<PlanKeepAlive> keep_alive,
-                     const std::vector<PlanStep> &steps)
-      : SingleSourceCircuitView(name, sql, source_table, result_schema) {
-    OutputFn prev = [this]() -> const DuckDBZSet & { return source_output(); };
-    for (const auto &step : steps) {
-      switch (step.kind) {
-      case PlanStep::Kind::FILTER_EXPR: {
-        auto eval = std::make_shared<RowExprEval>(keep_alive, *step.exprs[0],
-                                                  step.input_types);
-        auto *node = circuit_.add_node(std::make_unique<RowFilter>(
-            circuit_.next_node_id(), prev,
-            [eval](const DuckDBRow &row) {
-              duckdb::Value v = eval->eval(row);
-              return !v.IsNull() && v.GetValue<bool>();
-            },
-            "plan_filter"));
-        prev = [node]() -> const DuckDBZSet & { return node->output(); };
-        break;
-      }
-      case PlanStep::Kind::MAP_EXPR: {
-        auto evals =
-            std::make_shared<std::vector<std::unique_ptr<RowExprEval>>>();
-        for (const auto *expr : step.exprs) {
-          evals->push_back(std::make_unique<RowExprEval>(keep_alive, *expr,
-                                                         step.input_types));
-        }
-        auto *node = circuit_.add_node(std::make_unique<RowMap>(
-            circuit_.next_node_id(), prev,
-            [evals](const DuckDBRow &row) {
-              DuckDBRow out;
-              out.columns.reserve(evals->size());
-              for (auto &eval : *evals) {
-                out.columns.push_back(eval->eval(row));
-              }
-              return out;
-            },
-            "plan_project"));
-        prev = [node]() -> const DuckDBZSet & { return node->output(); };
-        break;
-      }
-      case PlanStep::Kind::MAP_COLS: {
-        auto idxs = step.column_idxs;
-        auto *node = circuit_.add_node(std::make_unique<RowMap>(
-            circuit_.next_node_id(), prev,
-            [idxs](const DuckDBRow &row) {
-              DuckDBRow out;
-              out.columns.reserve(idxs.size());
-              for (auto idx : idxs) {
-                out.columns.push_back(idx < row.columns.size()
-                                          ? row.columns[idx]
-                                          : duckdb::Value());
-              }
-              return out;
-            },
-            "plan_scan_cols"));
-        prev = [node]() -> const DuckDBZSet & { return node->output(); };
-        break;
-      }
-      case PlanStep::Kind::AGGREGATE: {
-        std::vector<std::unique_ptr<RowExprEval>> group_evals;
-        for (const auto *expr : step.exprs) {
-          group_evals.push_back(std::make_unique<RowExprEval>(
-              keep_alive, *expr, step.input_types));
-        }
-        std::vector<PlanAggregateNode::AggInstance> aggs;
-        for (const auto &spec : step.agg_specs) {
-          PlanAggregateNode::AggInstance inst;
-          inst.fn = spec.fn;
-          inst.integer_arg = spec.integer_arg;
-          inst.return_type = spec.return_type;
-          if (spec.arg) {
-            inst.arg = std::make_unique<RowExprEval>(keep_alive, *spec.arg,
-                                                     step.input_types);
-          }
-          aggs.push_back(std::move(inst));
-        }
-        auto *node = circuit_.add_node(std::make_unique<PlanAggregateNode>(
-            circuit_.next_node_id(), prev, std::move(group_evals),
-            std::move(aggs)));
-        prev = [node]() -> const DuckDBZSet & { return node->output(); };
-        break;
-      }
-      }
-    }
-    finish(std::move(prev));
+                     const PlanOpSpec &root)
+      : NativeMaterializedView(name, sql), schema_(result_schema) {
+    schema_.table_name = name;
+    OutputFn out = build(root, keep_alive);
+    sink_ = circuit_.add_node(std::make_unique<RowSink>(
+        circuit_.next_node_id(), std::move(out), name_ + "_sink"));
   }
+
+  void apply_changes(const std::string &table_name,
+                     const DuckDBZSet &changes) override {
+    auto it = sources_.find(table_name);
+    if (it != sources_.end()) {
+      it->second->push(changes);
+    }
+    circuit_.step();
+    ++version_;
+  }
+
+  const DuckDBZSet &get_result() const override {
+    return sink_->materialized();
+  }
+
+  void set_result(const DuckDBZSet &result) override {
+    sink_->set_materialized(result);
+    version_++;
+  }
+
+  const DuckDBZSet &get_delta() const override { return sink_->delta(); }
+
+  const TableSchema &result_schema() const override { return schema_; }
+
+  std::vector<std::string> source_tables() const override {
+    return source_order_;
+  }
+
+  void reset() override {
+    circuit_.reset();
+    version_ = 0;
+  }
+
+private:
+  OutputFn build(const PlanOpSpec &spec,
+                 const std::shared_ptr<PlanKeepAlive> &keep_alive) {
+    switch (spec.kind) {
+    case PlanOpSpec::Kind::SOURCE: {
+      auto it = sources_.find(spec.table);
+      RowSource *src;
+      if (it != sources_.end()) {
+        src = it->second;
+      } else {
+        src = circuit_.add_node(
+            std::make_unique<RowSource>(circuit_.next_node_id(), spec.table));
+        sources_[spec.table] = src;
+        source_order_.push_back(spec.table);
+      }
+      return [src]() -> const DuckDBZSet & { return src->output(); };
+    }
+    case PlanOpSpec::Kind::MAP_COLS: {
+      OutputFn child = build(*spec.children[0], keep_alive);
+      auto idxs = spec.column_idxs;
+      auto *node = circuit_.add_node(std::make_unique<RowMap>(
+          circuit_.next_node_id(), std::move(child),
+          [idxs](const DuckDBRow &row) {
+            DuckDBRow out;
+            out.columns.reserve(idxs.size());
+            for (auto idx : idxs) {
+              out.columns.push_back(idx < row.columns.size()
+                                        ? row.columns[idx]
+                                        : duckdb::Value());
+            }
+            return out;
+          },
+          "plan_scan_cols"));
+      return [node]() -> const DuckDBZSet & { return node->output(); };
+    }
+    case PlanOpSpec::Kind::FILTER_EXPR: {
+      OutputFn child = build(*spec.children[0], keep_alive);
+      auto evals =
+          std::make_shared<std::vector<std::unique_ptr<RowExprEval>>>();
+      for (const auto *expr : spec.exprs) {
+        evals->push_back(std::make_unique<RowExprEval>(keep_alive, *expr,
+                                                       spec.input_types));
+      }
+      auto *node = circuit_.add_node(std::make_unique<RowFilter>(
+          circuit_.next_node_id(), std::move(child),
+          [evals](const DuckDBRow &row) {
+            for (auto &eval : *evals) {
+              duckdb::Value v = eval->eval(row);
+              if (v.IsNull() || !v.GetValue<bool>()) {
+                return false;
+              }
+            }
+            return true;
+          },
+          "plan_filter"));
+      return [node]() -> const DuckDBZSet & { return node->output(); };
+    }
+    case PlanOpSpec::Kind::MAP_EXPR: {
+      OutputFn child = build(*spec.children[0], keep_alive);
+      auto evals =
+          std::make_shared<std::vector<std::unique_ptr<RowExprEval>>>();
+      for (const auto *expr : spec.exprs) {
+        evals->push_back(std::make_unique<RowExprEval>(keep_alive, *expr,
+                                                       spec.input_types));
+      }
+      auto *node = circuit_.add_node(std::make_unique<RowMap>(
+          circuit_.next_node_id(), std::move(child),
+          [evals](const DuckDBRow &row) {
+            DuckDBRow out;
+            out.columns.reserve(evals->size());
+            for (auto &eval : *evals) {
+              out.columns.push_back(eval->eval(row));
+            }
+            return out;
+          },
+          "plan_project"));
+      return [node]() -> const DuckDBZSet & { return node->output(); };
+    }
+    case PlanOpSpec::Kind::AGGREGATE: {
+      OutputFn child = build(*spec.children[0], keep_alive);
+      std::vector<std::unique_ptr<RowExprEval>> group_evals;
+      for (const auto *expr : spec.exprs) {
+        group_evals.push_back(std::make_unique<RowExprEval>(
+            keep_alive, *expr, spec.input_types));
+      }
+      std::vector<PlanAggregateNode::AggInstance> aggs;
+      for (const auto &agg_spec : spec.agg_specs) {
+        PlanAggregateNode::AggInstance inst;
+        inst.fn = agg_spec.fn;
+        inst.integer_arg = agg_spec.integer_arg;
+        inst.return_type = agg_spec.return_type;
+        if (agg_spec.arg) {
+          inst.arg = std::make_unique<RowExprEval>(keep_alive, *agg_spec.arg,
+                                                   spec.input_types);
+        }
+        aggs.push_back(std::move(inst));
+      }
+      auto *node = circuit_.add_node(std::make_unique<PlanAggregateNode>(
+          circuit_.next_node_id(), std::move(child), std::move(group_evals),
+          std::move(aggs)));
+      return [node]() -> const DuckDBZSet & { return node->output(); };
+    }
+    case PlanOpSpec::Kind::JOIN: {
+      OutputFn left = build(*spec.children[0], keep_alive);
+      OutputFn right = build(*spec.children[1], keep_alive);
+      std::vector<PlanJoinNode::KeyPair> keys;
+      for (const auto &cond : spec.equi_conds) {
+        PlanJoinNode::KeyPair kp;
+        kp.left = std::make_unique<RowExprEval>(keep_alive, *cond.left,
+                                                spec.left_types);
+        kp.right = std::make_unique<RowExprEval>(keep_alive, *cond.right,
+                                                 spec.right_types);
+        keys.push_back(std::move(kp));
+      }
+      std::vector<PlanJoinNode::Residual> residuals;
+      for (const auto &cond : spec.residual_conds) {
+        PlanJoinNode::Residual res;
+        res.left = std::make_unique<RowExprEval>(keep_alive, *cond.left,
+                                                 spec.left_types);
+        res.right = std::make_unique<RowExprEval>(keep_alive, *cond.right,
+                                                  spec.right_types);
+        res.cmp = cond.cmp;
+        residuals.push_back(std::move(res));
+      }
+      auto *node = circuit_.add_node(std::make_unique<PlanJoinNode>(
+          circuit_.next_node_id(), std::move(left), std::move(right),
+          std::move(keys), std::move(residuals)));
+      return [node]() -> const DuckDBZSet & { return node->output(); };
+    }
+    case PlanOpSpec::Kind::DISTINCT: {
+      OutputFn child = build(*spec.children[0], keep_alive);
+      auto *node = circuit_.add_node(std::make_unique<PlanDistinctNode>(
+          circuit_.next_node_id(), std::move(child)));
+      return [node]() -> const DuckDBZSet & { return node->output(); };
+    }
+    case PlanOpSpec::Kind::SET_OP: {
+      std::vector<PlanSetOpNode::InputFn> inputs;
+      for (const auto &child : spec.children) {
+        inputs.push_back(build(*child, keep_alive));
+      }
+      auto *node = circuit_.add_node(std::make_unique<PlanSetOpNode>(
+          circuit_.next_node_id(), std::move(inputs), spec.set_op));
+      return [node]() -> const DuckDBZSet & { return node->output(); };
+    }
+    }
+    // Unreachable; keeps compilers happy
+    static DuckDBZSet empty;
+    return []() -> const DuckDBZSet & { return empty; };
+  }
+
+  dbsp::Circuit circuit_;
+  TableSchema schema_;
+  std::unordered_map<std::string, RowSource *> sources_;
+  std::vector<std::string> source_order_;
+  RowSink *sink_ = nullptr;
 };
 
 class PlanTranslator {
@@ -441,34 +939,43 @@ public:
     }
 
     Walker walker;
-    if (!walker.visit(*keep_alive->plan)) {
+    auto root = walker.visit(*keep_alive->plan);
+    if (!root) {
       return {nullptr, walker.error};
     }
 
     TableSchema schema;
     schema.table_name = view_name;
     schema.columns = walker.columns;
+    // Deduplicate column names (e.g. t.val and u.val in a join): repeated
+    // names would make the result unqueryable through dbsp_query
+    std::unordered_map<std::string, int> seen;
+    for (auto &col : schema.columns) {
+      int &n = seen[col.name];
+      if (n++ > 0) {
+        col.name += "_" + std::to_string(n - 1);
+      }
+    }
 
     auto view = std::make_unique<PlannedCircuitView>(
-        view_name, sql, walker.source_table, schema, std::move(keep_alive),
-        walker.steps);
+        view_name, sql, schema, std::move(keep_alive), *root);
     return {std::move(view), ""};
   }
 
 private:
   struct Walker {
-    std::vector<PlanStep> steps;
-    std::string source_table;
     std::vector<ColumnInfo> columns; // schema of current operator's output
     std::string error;
 
-    bool unsupported(const std::string &what) {
+    using SpecPtr = std::unique_ptr<PlanOpSpec>;
+
+    SpecPtr unsupported(const std::string &what) {
       error = format_error_code(ErrorCode::PLAN_OPERATOR_NOT_SUPPORTED) +
               ": unsupported in planner frontend: " + what;
-      return false;
+      return nullptr;
     }
 
-    bool visit(duckdb::LogicalOperator &op) {
+    SpecPtr visit(duckdb::LogicalOperator &op) {
       switch (op.type) {
       case duckdb::LogicalOperatorType::LOGICAL_PROJECTION:
         return visit_projection(op.Cast<duckdb::LogicalProjection>());
@@ -478,64 +985,77 @@ private:
         return visit_get(op.Cast<duckdb::LogicalGet>());
       case duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
         return visit_aggregate(op.Cast<duckdb::LogicalAggregate>());
+      case duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+        return visit_join(op.Cast<duckdb::LogicalComparisonJoin>());
+      case duckdb::LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
+        return visit_cross_product(op);
+      case duckdb::LogicalOperatorType::LOGICAL_DISTINCT:
+        return visit_distinct(op.Cast<duckdb::LogicalDistinct>());
+      case duckdb::LogicalOperatorType::LOGICAL_UNION:
+      case duckdb::LogicalOperatorType::LOGICAL_INTERSECT:
+      case duckdb::LogicalOperatorType::LOGICAL_EXCEPT:
+        return visit_set_operation(op.Cast<duckdb::LogicalSetOperation>());
       default:
         return unsupported("logical operator " + op.GetName());
       }
     }
 
-    bool visit_projection(duckdb::LogicalProjection &op) {
-      if (!visit(*op.children[0])) {
-        return false;
+    SpecPtr visit_projection(duckdb::LogicalProjection &op) {
+      auto child = visit(*op.children[0]);
+      if (!child) {
+        return nullptr;
       }
-      PlanStep step;
-      step.kind = PlanStep::Kind::MAP_EXPR;
-      step.input_types = op.children[0]->types;
+      auto spec = std::make_unique<PlanOpSpec>();
+      spec->kind = PlanOpSpec::Kind::MAP_EXPR;
+      spec->input_types = op.children[0]->types;
       for (const auto &expr : op.expressions) {
-        step.exprs.push_back(expr.get());
+        spec->exprs.push_back(expr.get());
       }
-      steps.push_back(std::move(step));
+      spec->children.push_back(std::move(child));
 
       columns.clear();
       for (duckdb::idx_t i = 0; i < op.expressions.size(); i++) {
         columns.push_back({op.expressions[i]->GetName(), op.types[i]});
       }
-      return true;
+      return spec;
     }
 
-    bool visit_filter(duckdb::LogicalFilter &op) {
+    SpecPtr visit_filter(duckdb::LogicalFilter &op) {
       if (!op.projection_map.empty()) {
         return unsupported("FILTER with projection map");
       }
-      if (!visit(*op.children[0])) {
-        return false;
+      auto child = visit(*op.children[0]);
+      if (!child) {
+        return nullptr;
       }
+      auto spec = std::make_unique<PlanOpSpec>();
+      spec->kind = PlanOpSpec::Kind::FILTER_EXPR;
+      spec->input_types = op.children[0]->types;
       for (const auto &expr : op.expressions) {
-        PlanStep step;
-        step.kind = PlanStep::Kind::FILTER_EXPR;
-        step.input_types = op.children[0]->types;
-        step.exprs.push_back(expr.get());
-        steps.push_back(std::move(step));
+        spec->exprs.push_back(expr.get());
       }
+      spec->children.push_back(std::move(child));
       // Filter passes rows through unchanged; columns stay as-is
-      return true;
+      return spec;
     }
 
-    bool visit_aggregate(duckdb::LogicalAggregate &op) {
+    SpecPtr visit_aggregate(duckdb::LogicalAggregate &op) {
       if (!op.grouping_functions.empty()) {
         return unsupported("GROUPING function");
       }
       if (op.grouping_sets.size() > 1) {
         return unsupported("ROLLUP/CUBE/GROUPING SETS");
       }
-      if (!visit(*op.children[0])) {
-        return false;
+      auto child = visit(*op.children[0]);
+      if (!child) {
+        return nullptr;
       }
 
-      PlanStep step;
-      step.kind = PlanStep::Kind::AGGREGATE;
-      step.input_types = op.children[0]->types;
+      auto spec = std::make_unique<PlanOpSpec>();
+      spec->kind = PlanOpSpec::Kind::AGGREGATE;
+      spec->input_types = op.children[0]->types;
       for (const auto &group : op.groups) {
-        step.exprs.push_back(group.get());
+        spec->exprs.push_back(group.get());
       }
       for (const auto &expr : op.expressions) {
         if (expr->GetExpressionClass() !=
@@ -553,35 +1073,35 @@ private:
           return unsupported("ORDER BY in aggregate");
         }
 
-        PlanAggSpec spec;
-        spec.return_type = agg.return_type;
+        PlanAggSpec agg_spec;
+        agg_spec.return_type = agg.return_type;
         const std::string &fn = agg.function.name;
         if (fn == "count_star") {
-          spec.fn = PlanAggSpec::Fn::COUNT_STAR;
+          agg_spec.fn = PlanAggSpec::Fn::COUNT_STAR;
         } else if (fn == "count") {
-          spec.fn = PlanAggSpec::Fn::COUNT;
+          agg_spec.fn = PlanAggSpec::Fn::COUNT;
         } else if (fn == "sum" || fn == "sum_no_overflow") {
-          spec.fn = PlanAggSpec::Fn::SUM;
+          agg_spec.fn = PlanAggSpec::Fn::SUM;
         } else if (fn == "avg") {
-          spec.fn = PlanAggSpec::Fn::AVG;
+          agg_spec.fn = PlanAggSpec::Fn::AVG;
         } else if (fn == "min") {
-          spec.fn = PlanAggSpec::Fn::MIN;
+          agg_spec.fn = PlanAggSpec::Fn::MIN;
         } else if (fn == "max") {
-          spec.fn = PlanAggSpec::Fn::MAX;
+          agg_spec.fn = PlanAggSpec::Fn::MAX;
         } else {
           return unsupported("aggregate function " + fn);
         }
 
-        if (spec.fn != PlanAggSpec::Fn::COUNT_STAR) {
+        if (agg_spec.fn != PlanAggSpec::Fn::COUNT_STAR) {
           if (agg.children.size() != 1) {
             return unsupported("aggregate with " +
                                std::to_string(agg.children.size()) +
                                " arguments (" + fn + ")");
           }
-          spec.arg = agg.children[0].get();
-          if (spec.fn == PlanAggSpec::Fn::SUM ||
-              spec.fn == PlanAggSpec::Fn::AVG) {
-            switch (spec.arg->return_type.id()) {
+          agg_spec.arg = agg.children[0].get();
+          if (agg_spec.fn == PlanAggSpec::Fn::SUM ||
+              agg_spec.fn == PlanAggSpec::Fn::AVG) {
+            switch (agg_spec.arg->return_type.id()) {
             case duckdb::LogicalTypeId::TINYINT:
             case duckdb::LogicalTypeId::SMALLINT:
             case duckdb::LogicalTypeId::INTEGER:
@@ -589,21 +1109,21 @@ private:
             case duckdb::LogicalTypeId::UTINYINT:
             case duckdb::LogicalTypeId::USMALLINT:
             case duckdb::LogicalTypeId::UINTEGER:
-              spec.integer_arg = true;
+              agg_spec.integer_arg = true;
               break;
             case duckdb::LogicalTypeId::FLOAT:
             case duckdb::LogicalTypeId::DOUBLE:
-              spec.integer_arg = false;
+              agg_spec.integer_arg = false;
               break;
             default:
               return unsupported(fn + " over " +
-                                 spec.arg->return_type.ToString());
+                                 agg_spec.arg->return_type.ToString());
             }
           }
         }
-        step.agg_specs.push_back(std::move(spec));
+        spec->agg_specs.push_back(std::move(agg_spec));
       }
-      steps.push_back(std::move(step));
+      spec->children.push_back(std::move(child));
 
       // Output layout: group values first, then aggregate values
       columns.clear();
@@ -614,10 +1134,164 @@ private:
         columns.push_back(
             {op.expressions[i]->GetName(), op.types[op.groups.size() + i]});
       }
-      return true;
+      return spec;
     }
 
-    bool visit_get(duckdb::LogicalGet &op) {
+    SpecPtr visit_join(duckdb::LogicalComparisonJoin &op) {
+      if (op.join_type != duckdb::JoinType::INNER) {
+        return unsupported("join type " +
+                           duckdb::EnumUtil::ToString(op.join_type));
+      }
+      if (!op.duplicate_eliminated_columns.empty()) {
+        return unsupported("duplicate-eliminated (DELIM) join");
+      }
+      if (op.predicate) {
+        return unsupported("join with single-sided ON predicate");
+      }
+      if (!op.left_projection_map.empty() ||
+          !op.right_projection_map.empty()) {
+        return unsupported("join with projection maps");
+      }
+
+      auto spec = std::make_unique<PlanOpSpec>();
+      spec->kind = PlanOpSpec::Kind::JOIN;
+      for (const auto &cond : op.conditions) {
+        PlanOpSpec::JoinCond jc{cond.left.get(), cond.right.get(),
+                                cond.comparison};
+        switch (cond.comparison) {
+        case duckdb::ExpressionType::COMPARE_EQUAL:
+          spec->equi_conds.push_back(jc);
+          break;
+        case duckdb::ExpressionType::COMPARE_GREATERTHAN:
+        case duckdb::ExpressionType::COMPARE_LESSTHAN:
+        case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+        case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
+        case duckdb::ExpressionType::COMPARE_NOTEQUAL:
+          spec->residual_conds.push_back(jc);
+          break;
+        default:
+          return unsupported(
+              "join comparison " +
+              duckdb::EnumUtil::ToString(cond.comparison));
+        }
+      }
+
+      auto left = visit(*op.children[0]);
+      if (!left) {
+        return nullptr;
+      }
+      std::vector<ColumnInfo> left_columns = columns;
+      auto right = visit(*op.children[1]);
+      if (!right) {
+        return nullptr;
+      }
+
+      spec->left_types = op.children[0]->types;
+      spec->right_types = op.children[1]->types;
+      spec->children.push_back(std::move(left));
+      spec->children.push_back(std::move(right));
+
+      // Output: left columns then right columns
+      std::vector<ColumnInfo> combined = std::move(left_columns);
+      combined.insert(combined.end(), columns.begin(), columns.end());
+      columns = std::move(combined);
+      return spec;
+    }
+
+    SpecPtr visit_cross_product(duckdb::LogicalOperator &op) {
+      auto spec = std::make_unique<PlanOpSpec>();
+      spec->kind = PlanOpSpec::Kind::JOIN; // no conditions = cross product
+
+      auto left = visit(*op.children[0]);
+      if (!left) {
+        return nullptr;
+      }
+      std::vector<ColumnInfo> left_columns = columns;
+      auto right = visit(*op.children[1]);
+      if (!right) {
+        return nullptr;
+      }
+
+      spec->left_types = op.children[0]->types;
+      spec->right_types = op.children[1]->types;
+      spec->children.push_back(std::move(left));
+      spec->children.push_back(std::move(right));
+
+      std::vector<ColumnInfo> combined = std::move(left_columns);
+      combined.insert(combined.end(), columns.begin(), columns.end());
+      columns = std::move(combined);
+      return spec;
+    }
+
+    SpecPtr visit_distinct(duckdb::LogicalDistinct &op) {
+      if (op.distinct_type != duckdb::DistinctType::DISTINCT) {
+        return unsupported("DISTINCT ON");
+      }
+      // Plain DISTINCT deduplicates whole rows; targets must be the full
+      // identity column list, otherwise semantics differ
+      const auto &child_types = op.children[0]->types;
+      if (op.distinct_targets.size() != child_types.size()) {
+        return unsupported("DISTINCT over a subset of columns");
+      }
+      for (duckdb::idx_t i = 0; i < op.distinct_targets.size(); i++) {
+        auto &target = op.distinct_targets[i];
+        if (target->GetExpressionClass() !=
+            duckdb::ExpressionClass::BOUND_REF) {
+          return unsupported("DISTINCT over computed targets");
+        }
+        if (target->Cast<duckdb::BoundReferenceExpression>().index != i) {
+          return unsupported("DISTINCT with reordered targets");
+        }
+      }
+      auto child = visit(*op.children[0]);
+      if (!child) {
+        return nullptr;
+      }
+      auto spec = std::make_unique<PlanOpSpec>();
+      spec->kind = PlanOpSpec::Kind::DISTINCT;
+      spec->children.push_back(std::move(child));
+      // Row shape unchanged; columns stay as-is
+      return spec;
+    }
+
+    SpecPtr visit_set_operation(duckdb::LogicalSetOperation &op) {
+      bool is_union =
+          op.type == duckdb::LogicalOperatorType::LOGICAL_UNION;
+      if (!is_union && op.children.size() != 2) {
+        return unsupported("n-ary INTERSECT/EXCEPT");
+      }
+
+      auto spec = std::make_unique<PlanOpSpec>();
+      spec->kind = PlanOpSpec::Kind::SET_OP;
+      if (is_union) {
+        spec->set_op = op.setop_all ? PlanOpSpec::SetOp::UNION_ALL
+                                    : PlanOpSpec::SetOp::UNION;
+      } else if (op.type ==
+                 duckdb::LogicalOperatorType::LOGICAL_INTERSECT) {
+        spec->set_op = op.setop_all ? PlanOpSpec::SetOp::INTERSECT_ALL
+                                    : PlanOpSpec::SetOp::INTERSECT;
+      } else {
+        spec->set_op = op.setop_all ? PlanOpSpec::SetOp::EXCEPT_ALL
+                                    : PlanOpSpec::SetOp::EXCEPT;
+      }
+
+      std::vector<ColumnInfo> first_columns;
+      for (size_t i = 0; i < op.children.size(); i++) {
+        auto child = visit(*op.children[i]);
+        if (!child) {
+          return nullptr;
+        }
+        if (i == 0) {
+          first_columns = columns;
+        }
+        spec->children.push_back(std::move(child));
+      }
+      // Set operation output takes the first child's column names
+      columns = std::move(first_columns);
+      return spec;
+    }
+
+    SpecPtr visit_get(duckdb::LogicalGet &op) {
       auto table_entry = op.GetTable();
       if (!table_entry) {
         return unsupported("non-table scan (" + op.function.name + ")");
@@ -628,7 +1302,10 @@ private:
       if (!op.projection_ids.empty()) {
         return unsupported("GET with projection ids");
       }
-      source_table = table_entry->name;
+
+      auto source = std::make_unique<PlanOpSpec>();
+      source->kind = PlanOpSpec::Kind::SOURCE;
+      source->table = table_entry->name;
 
       // CDC rows carry ALL table columns in declared order; GET's output is
       // column_ids order. Emit an index-selection map unless it's identity.
@@ -650,13 +1327,14 @@ private:
       for (auto idx : idxs) {
         columns.push_back({op.names[idx], op.returned_types[idx]});
       }
-      if (!identity) {
-        PlanStep step;
-        step.kind = PlanStep::Kind::MAP_COLS;
-        step.column_idxs = std::move(idxs);
-        steps.push_back(std::move(step));
+      if (identity) {
+        return source;
       }
-      return true;
+      auto select = std::make_unique<PlanOpSpec>();
+      select->kind = PlanOpSpec::Kind::MAP_COLS;
+      select->column_idxs = std::move(idxs);
+      select->children.push_back(std::move(source));
+      return select;
     }
   };
 };

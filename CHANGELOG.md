@@ -1,5 +1,27 @@
 # Changelog
 
+## Phase B3: Planner Frontend Joins, Distinct, Set Ops - Jul 2026
+
+### B3: Multi-source plans through the planner (Jul 4, 2026)
+- `PlannedCircuitView` generalized from a linear single-source pipeline to a
+  multi-source operator tree: one SourceNode per base table, shared across
+  subtrees (self-joins work), translated recursively from the logical plan.
+- `PlanJoinNode`: incremental inner join, bilinear delta rule
+  (Δl⋈R + L⋈Δr + Δl⋈Δr). Equi-keys from EQUAL join conditions (expression
+  keys included), residual comparisons (>, <, >=, <=, <>) checked per
+  candidate pair, NULL keys never match, no conditions = cross product.
+- `PlanDistinctNode`: multiplicity tracking, emits ±1 on 0↔positive edges.
+- `PlanSetOpNode`: UNION ALL / UNION (n-ary) and INTERSECT [ALL] /
+  EXCEPT [ALL] (binary) via per-input multiplicity state.
+- View schema column names deduplicated (t.val + u.val → val, val_1) so
+  join results stay queryable through dbsp_query.
+- Not translated (falls back): outer/semi/anti/mark joins, DELIM joins,
+  ORDER BY / LIMIT (deliberate — parser path already handles them; wrapping
+  presentation nodes adds no user value before B5).
+- Differential tests: equi-join, residual join, join+aggregate, cross join,
+  DISTINCT, all four set ops, randomized two-table mutation rounds.
+  37/37 tests green.
+
 ## Phase B2: Planner Frontend Aggregation - Jul 2026
 
 ### B2: Aggregation through the planner (Jul 4, 2026)

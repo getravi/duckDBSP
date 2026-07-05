@@ -82,11 +82,16 @@ for MIN/MAX; DECIMAL SUM/AVG and DISTINCT/FILTER/ORDER-BY aggregates fall
 back. Bonus: global aggregates keep one row on empty input (matches DuckDB;
 parser path never did). 37/37 green.
 
-**B3 — Join, distinct, set ops, order/limit (1–1.5 wk)**
-- LOGICAL_COMPARISON_JOIN: equi-key extraction + residual predicate via
-  ExpressionExecutor; map to existing join state machine as a node
-- LOGICAL_DISTINCT → DistinctNode; set ops → combinator; ORDER BY/LIMIT →
-  presentation nodes
+**B3 — Join, distinct, set ops, order/limit (1–1.5 wk) — COMPLETE (2026-07-04)**
+Delivered with two deviations: (1) new `PlanJoinNode` (bilinear delta rule,
+incl. Δl⋈Δr for self-joins) instead of wrapping the existing join state
+machine — the planner gives bound per-side expressions, which map naturally
+onto a fresh node; (2) ORDER BY / LIMIT deliberately NOT translated — they
+fall back to the parser path, which already handles them; presentation nodes
+add no user value until B5 removes the parser. PlannedCircuitView is now a
+multi-source operator tree (one shared SourceNode per table). Set ops via
+`PlanSetOpNode` per-input multiplicity state (UNION [ALL] n-ary,
+INTERSECT/EXCEPT [ALL] binary). 37/37 green.
 
 **B4 — Window + CTEs (1 wk)**
 - LOGICAL_WINDOW → wrapped window node

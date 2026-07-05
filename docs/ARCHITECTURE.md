@@ -119,15 +119,22 @@ scans). The bound `LogicalOperator` tree is walked and mapped onto circuit
 nodes; bound expressions are evaluated row-at-a-time through
 `ExpressionExecutor`.
 
-Current scope (B1+B2): single-table `LOGICAL_GET → LOGICAL_FILTER →
-LOGICAL_PROJECTION` chains plus `LOGICAL_AGGREGATE_AND_GROUP_BY`
-(`PlannedCircuitView` + `PlanAggregateNode`). This covers arbitrary
-expressions, function calls, mixed AND/OR predicates, multi-aggregate
-GROUP BY, expression group keys, and HAVING (arrives as a FILTER above the
-aggregate). Global aggregates keep exactly one row, even on empty input.
-Any other operator yields a DBSP-E110 error internally and `create_view`
-falls back to the SQL parser transparently. Later milestones (B3–B4) extend
-the operator coverage; B5 makes the planner the default.
+Current scope (B1–B3): `PlannedCircuitView` builds a multi-source operator
+tree (one shared SourceNode per base table) from the logical plan:
+
+- GET / FILTER / PROJECTION — arbitrary expressions, function calls, mixed
+  AND/OR predicates (B1)
+- AGGREGATE — multi-aggregate GROUP BY, expression keys, HAVING (a FILTER
+  above the aggregate); global aggregates keep exactly one row, even on
+  empty input (`PlanAggregateNode`, B2)
+- COMPARISON_JOIN (inner; equi keys + residual comparisons, bilinear delta
+  rule incl. the Δl⋈Δr self-join term), CROSS_PRODUCT, DISTINCT, and
+  UNION [ALL] / INTERSECT [ALL] / EXCEPT [ALL] (`PlanJoinNode`,
+  `PlanDistinctNode`, `PlanSetOpNode`, B3)
+
+Any other operator (outer joins, window functions, ORDER BY/LIMIT, CTEs)
+yields a DBSP-E110 error internally and `create_view` falls back to the SQL
+parser transparently. B4 extends coverage; B5 makes the planner the default.
 
 ### 3b. SQL Parser (`src/dbsp_sql_parser.hpp`)
 
