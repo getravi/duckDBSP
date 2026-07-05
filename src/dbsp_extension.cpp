@@ -854,6 +854,68 @@ void AutoSyncFunc(ClientContext &context, TableFunctionInput &input,
 }
 
 // ============================================================================
+// dbsp_use_planner - Enable/disable the planner frontend (Phase B)
+// Usage: SELECT * FROM dbsp_use_planner(true);   -- Enable
+//        SELECT * FROM dbsp_use_planner(false);  -- Disable
+//        SELECT * FROM dbsp_use_planner();       -- Query status
+// ============================================================================
+
+struct UsePlannerBindData : public TableFunctionData {
+  bool enable = false;
+  bool query_only = false;
+  bool done = false;
+};
+
+unique_ptr<FunctionData> UsePlannerBind(ClientContext &context,
+                                        TableFunctionBindInput &input,
+                                        vector<LogicalType> &return_types,
+                                        vector<string> &names) {
+  auto data = make_uniq<UsePlannerBindData>();
+
+  if (input.inputs.empty()) {
+    data->query_only = true;
+  } else {
+    data->enable = input.inputs[0].GetValue<bool>();
+  }
+
+  return_types.push_back(LogicalType::VARCHAR);
+  names.push_back("result");
+  return std::move(data);
+}
+
+void UsePlannerFunc(ClientContext &context, TableFunctionInput &input,
+                    DataChunk &output) {
+  EnsureContextState(context);
+  auto &data = input.bind_data->CastNoConst<UsePlannerBindData>();
+  if (data.done)
+    return;
+
+  auto &manager = dbsp_native::get_cdc_manager();
+
+  if (data.query_only) {
+    bool enabled = manager.is_planner_enabled();
+    output.SetCardinality(1);
+    output.SetValue(0, 0,
+                    Value(string("Planner frontend is ") +
+                          (enabled ? "ENABLED" : "DISABLED")));
+  } else {
+    if (data.enable) {
+      manager.enable_planner();
+      output.SetCardinality(1);
+      output.SetValue(0, 0,
+                      Value("Planner frontend ENABLED: views translate "
+                            "through DuckDB's planner when supported"));
+    } else {
+      manager.disable_planner();
+      output.SetCardinality(1);
+      output.SetValue(
+          0, 0, Value("Planner frontend DISABLED: using bespoke parser"));
+    }
+  }
+  data.done = true;
+}
+
+// ============================================================================
 // Materialized View DDL - CREATE MATERIALIZED VIEW
 // ============================================================================
 
@@ -1235,6 +1297,11 @@ static void LoadInternal(ExtensionLoader &loader) {
                                AutoSyncBind);
   auto_sync_func.varargs = LogicalType::BOOLEAN;
   loader.RegisterFunction(auto_sync_func);
+
+  TableFunction use_planner_func("dbsp_use_planner", {}, UsePlannerFunc,
+                                 UsePlannerBind);
+  use_planner_func.varargs = LogicalType::BOOLEAN;
+  loader.RegisterFunction(use_planner_func);
 
   // Register scalar functions
   CreateScalarFunctionInfo drop_func_info(

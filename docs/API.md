@@ -147,6 +147,28 @@ SELECT * FROM dbsp_create_view('vip_totals',
 
 ---
 
+### dbsp_use_planner(enable)
+
+Toggle the planner frontend (Phase B). When enabled, `dbsp_create_view`
+first translates view SQL through DuckDB's own binder/planner instead of the
+bespoke parser. Currently covers single-table scan/filter/projection plans
+(arbitrary expressions, function calls, mixed AND/OR predicates); anything
+else falls back to the bespoke parser transparently.
+
+```sql
+SELECT * FROM dbsp_use_planner(true);   -- Enable
+SELECT * FROM dbsp_use_planner(false);  -- Disable (default)
+SELECT * FROM dbsp_use_planner();       -- Query status
+```
+
+**Parameters:**
+- `enable` (BOOLEAN, optional): Enable or disable. Omit to query status.
+
+**Returns:**
+- `result` (VARCHAR): Confirmation or current status
+
+---
+
 ### dbsp_create_view(name, table, type, spec)
 
 Alternative syntax for simple views without SQL parsing.

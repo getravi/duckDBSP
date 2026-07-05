@@ -19,12 +19,16 @@ Internal design of the DBSP DuckDB extension.
 │  │  - Change Propagation - Persistence                         ││
 │  └─────────────────────────────────────────────────────────────┘│
 │                              │                                   │
-│  ┌─────────────────────────────────────────────────────────────┐│
-│  │                     SQL Parser                               ││
-│  │  - Uses DuckDB's parser                                     ││
-│  │  - Extracts: tables, columns, predicates, aggregates        ││
-│  │  - Creates view definitions                                  ││
-│  └─────────────────────────────────────────────────────────────┘│
+│  ┌──────────────────────────────┬──────────────────────────────┐│
+│  │  Planner Frontend (Phase B)  │        SQL Parser            ││
+│  │  dbsp_use_planner(true)      │  (default / fallback)        ││
+│  │  - Connection::ExtractPlan   │  - Uses DuckDB's parser      ││
+│  │    (optimizer disabled)      │  - Extracts tables, columns, ││
+│  │  - Translates GET/FILTER/    │    predicates, aggregates    ││
+│  │    PROJECTION → circuit nodes│  - Creates view definitions  ││
+│  │  - ExpressionExecutor rows   │                              ││
+│  │  - Unsupported plan → falls back to SQL Parser ─────────►   ││
+│  └──────────────────────────────┴──────────────────────────────┘│
 │                              │                                   │
 │  ┌─────────────────────────────────────────────────────────────┐│
 │  │             Materialized Views (circuit-backed)              ││
@@ -105,7 +109,24 @@ struct DuckDBRowHash {
 using DuckDBZSet = ZSet<DuckDBRow, DuckDBRowHash>;
 ```
 
-### 3. SQL Parser (`src/dbsp_sql_parser.hpp`)
+### 3. Planner Frontend (`include/dbsp_plan_translator.hpp`, Phase B)
+
+Opt-in alternative to the bespoke SQL parser (`SELECT * FROM
+dbsp_use_planner(true)`). View SQL is parsed, bound, and planned by DuckDB
+itself via `Connection::ExtractPlan` on an internal connection with the
+optimizer disabled (keeps plan shapes canonical — no filter pushdown into
+scans). The bound `LogicalOperator` tree is walked and mapped onto circuit
+nodes; bound expressions are evaluated row-at-a-time through
+`ExpressionExecutor`.
+
+B1 scope: single-table `LOGICAL_GET → LOGICAL_FILTER → LOGICAL_PROJECTION`
+chains (`PlannedCircuitView`). This covers arbitrary expressions, function
+calls, and mixed AND/OR predicates the bespoke parser cannot represent. Any
+other operator yields a DBSP-E110 error internally and `create_view` falls
+back to the SQL parser transparently. Later milestones (B2–B4) extend the
+operator coverage; B5 makes the planner the default.
+
+### 3b. SQL Parser (`src/dbsp_sql_parser.hpp`)
 
 Uses DuckDB's parser to extract query structure.
 

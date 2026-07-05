@@ -1,5 +1,23 @@
 # Changelog
 
+## Phase B1: Planner Frontend Skeleton - Jul 2026
+
+### B1: DuckDB Planner as Frontend — scan/filter/project (Jul 4, 2026)
+- New `dbsp_plan_translator.hpp`: view SQL parsed/bound/planned by DuckDB
+  itself (`Connection::ExtractPlan` on an internal connection, optimizer
+  disabled for canonical plan shapes). `LOGICAL_GET → LOGICAL_FILTER →
+  LOGICAL_PROJECTION` chains translate to circuit nodes
+  (`PlannedCircuitView`); bound expressions evaluate row-at-a-time via
+  `ExpressionExecutor` — arbitrary expressions, function calls, and mixed
+  AND/OR predicates now work (the bespoke parser silently dropped OR
+  filters).
+- Feature flag `dbsp_use_planner(true/false)` (default OFF). Unsupported
+  plans yield DBSP-E110 internally and fall back to the bespoke parser
+  transparently.
+- Differential test harness (`test/integration/test_planner_frontend.cpp`):
+  view result == direct DuckDB query result after every delta batch across
+  randomized insert/delete sequences. 37/37 tests green.
+
 ## DuckDB 1.5.4 Upgrade, Deadlock Fix & Phase A Start - Jul 2026
 
 ### Engine Upgrade & v2 Extension API (Jul 4, 2026)

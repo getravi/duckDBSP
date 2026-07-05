@@ -88,6 +88,7 @@ function(add_dbsp_integration_test TEST_NAME SOURCE)
 endfunction()
 
 add_dbsp_integration_test(extension_basic integration/test_extension_basic.cpp)
+add_dbsp_integration_test(planner_frontend integration/test_planner_frontend.cpp)
 add_dbsp_integration_test(extension_cdc integration/test_extension_cdc.cpp)
 add_dbsp_integration_test(cascading_views integration/test_cascading_views.cpp)
 add_dbsp_integration_test(join_complex integration/test_join_complex.cpp)

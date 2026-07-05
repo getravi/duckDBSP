@@ -6,6 +6,7 @@
 
 #include "dbsp_duckdb_types.hpp"
 #include "dbsp_optimizer.hpp"
+#include "dbsp_plan_translator.hpp"
 #include "dbsp_sql_parser.hpp"
 
 #include "duckdb.hpp"
@@ -348,6 +349,7 @@ public:
     dep_graph_ = DependencyGraph();
     last_error_.clear();
     auto_sync_enabled_ = false;
+    use_planner_ = false;
   }
 
   // Auto-sync (automatic CDC) control. Flag is atomic so transaction hooks
@@ -358,6 +360,15 @@ public:
   void disable_auto_sync() { auto_sync_enabled_ = false; }
 
   bool is_auto_sync_enabled() const { return auto_sync_enabled_; }
+
+  // Planner frontend (Phase B) control: when enabled, create_view first
+  // tries translating the SQL via DuckDB's binder/planner; on unsupported
+  // plans it falls back to the bespoke parser transparently.
+  void enable_planner() { use_planner_ = true; }
+
+  void disable_planner() { use_planner_ = false; }
+
+  bool is_planner_enabled() const { return use_planner_; }
 
   // Auto-sync all tracked tables (called from TransactionCommit hook)
   void auto_sync_all(duckdb::ClientContext &context,
@@ -430,70 +441,85 @@ public:
     }
 
 #if 1 // SQL parser re-enabled for DuckDB 1.4.0
+    // Planner frontend (Phase B): when enabled, translate via DuckDB's
+    // binder/planner first. Unsupported plans (or any translation failure)
+    // fall back to the bespoke parser below transparently.
+    std::unique_ptr<NativeMaterializedView> view;
+    if (use_planner_) {
+      InternalQueryGuard guard;
+      auto translated = PlanTranslator::translate(context, view_name, sql);
+      view = std::move(translated.view);
+    }
+
     DBSPSqlParser parser;
-    auto result = parser.parse(sql, view_name);
+    DBSPSqlParser::ParseResult result;
+    if (!view) {
+      result = parser.parse(sql, view_name);
 
-    if (!result.success) {
-      last_error_ = result.error;
-      return false;
-    }
+      if (!result.success) {
+        last_error_ = result.error;
+        return false;
+      }
 
-    // optimizing parsed view definition
-    DBSPOptimizer optimizer;
-    result.view_def = optimizer.optimize(result.view_def);
+      // optimizing parsed view definition
+      DBSPOptimizer optimizer;
+      result.view_def = optimizer.optimize(result.view_def);
 
-    // Handle non-recursive CTEs: create intermediate views
-    for (const auto &cte : result.view_def.ctes) {
-      std::string cte_view_name = "_cte_" + view_name + "_" + cte.cte_name;
-      // Only create if not already existing
-      if (!views_.count(cte_view_name)) {
-        // Temporarily unlock to call create_view recursively
-        struct_lock.unlock();
-        bool cte_ok = create_view(context, cte_view_name, cte.cte_sql);
-        struct_lock.lock();
-        if (!cte_ok) {
-          last_error_ =
-              "Failed to create CTE '" + cte.cte_name + "': " + last_error_;
-          return false;
+      // Handle non-recursive CTEs: create intermediate views
+      for (const auto &cte : result.view_def.ctes) {
+        std::string cte_view_name = "_cte_" + view_name + "_" + cte.cte_name;
+        // Only create if not already existing
+        if (!views_.count(cte_view_name)) {
+          // Temporarily unlock to call create_view recursively
+          struct_lock.unlock();
+          bool cte_ok = create_view(context, cte_view_name, cte.cte_sql);
+          struct_lock.lock();
+          if (!cte_ok) {
+            last_error_ =
+                "Failed to create CTE '" + cte.cte_name + "': " + last_error_;
+            return false;
+          }
         }
-      }
-      // Replace CTE name references in source tables with the internal view
-      auto &sources = result.view_def.source_tables;
-      for (auto &src : sources) {
-        if (src == cte.cte_name) {
-          src = cte_view_name;
+        // Replace CTE name references in source tables with the internal view
+        auto &sources = result.view_def.source_tables;
+        for (auto &src : sources) {
+          if (src == cte.cte_name) {
+            src = cte_view_name;
+          }
         }
+        // Update table aliases
+        result.view_def.table_aliases[cte.cte_name] = cte_view_name;
       }
-      // Update table aliases
-      result.view_def.table_aliases[cte.cte_name] = cte_view_name;
-    }
 
-    // Handle derived tables (subqueries in FROM): create intermediate views
-    for (const auto &dt : result.view_def.derived_tables) {
-      std::string dt_view_name = "_derived_" + view_name + "_" + dt.alias;
-      if (!views_.count(dt_view_name)) {
-        struct_lock.unlock();
-        bool dt_ok = create_view(context, dt_view_name, dt.subquery_sql);
-        struct_lock.lock();
-        if (!dt_ok) {
-          last_error_ = "Failed to create derived table '" + dt.alias +
-                        "': " + last_error_;
-          return false;
+      // Handle derived tables (subqueries in FROM): create intermediate views
+      for (const auto &dt : result.view_def.derived_tables) {
+        std::string dt_view_name = "_derived_" + view_name + "_" + dt.alias;
+        if (!views_.count(dt_view_name)) {
+          struct_lock.unlock();
+          bool dt_ok = create_view(context, dt_view_name, dt.subquery_sql);
+          struct_lock.lock();
+          if (!dt_ok) {
+            last_error_ = "Failed to create derived table '" + dt.alias +
+                          "': " + last_error_;
+            return false;
+          }
         }
-      }
-      // Replace alias references in source tables
-      auto &sources = result.view_def.source_tables;
-      for (auto &src : sources) {
-        if (src == dt.alias) {
-          src = dt_view_name;
+        // Replace alias references in source tables
+        auto &sources = result.view_def.source_tables;
+        for (auto &src : sources) {
+          if (src == dt.alias) {
+            src = dt_view_name;
+          }
         }
+        result.view_def.table_aliases[dt.alias] = dt_view_name;
       }
-      result.view_def.table_aliases[dt.alias] = dt_view_name;
     }
 
     // Resolve sources - can be tables or other views
+    const std::vector<std::string> requested_sources =
+        view ? view->source_tables() : result.view_def.source_tables;
     std::vector<std::string> resolved_sources;
-    for (const auto &source : result.view_def.source_tables) {
+    for (const auto &source : requested_sources) {
       // Check for cycles
       if (dep_graph_.would_create_cycle(view_name, source)) {
         last_error_ =
@@ -519,11 +545,13 @@ public:
       }
     }
 
-    // Create the view
-    auto view = ViewFactory::create_view(result.view_def, table_schemas_);
+    // Create the view (parser path; planner path already built it)
     if (!view) {
-      last_error_ = "Could not create view from SQL";
-      return false;
+      view = ViewFactory::create_view(result.view_def, table_schemas_);
+      if (!view) {
+        last_error_ = "Could not create view from SQL";
+        return false;
+      }
     }
 
     // Add dependencies
@@ -1966,6 +1994,7 @@ private:
   DependencyGraph dep_graph_;
   std::string last_error_;
   std::atomic<bool> auto_sync_enabled_{false};
+  std::atomic<bool> use_planner_{false};
   bool use_parallel_sync_ = false;
 };
 

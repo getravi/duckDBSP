@@ -21,6 +21,7 @@ enum class ErrorCode {
   INTERSECT_NOT_SUPPORTED = 107,
   EXCEPT_NOT_SUPPORTED = 108,
   CTE_NOT_SUPPORTED = 109,
+  PLAN_OPERATOR_NOT_SUPPORTED = 110,
 
   // Validation errors (E2xx) - Invalid input
   INVALID_IDENTIFIER = 201,
@@ -88,6 +89,8 @@ inline std::string get_message(ErrorCode code) {
       {ErrorCode::INTERSECT_NOT_SUPPORTED, "INTERSECT not supported"},
       {ErrorCode::EXCEPT_NOT_SUPPORTED, "EXCEPT not supported"},
       {ErrorCode::CTE_NOT_SUPPORTED, "Non-recursive CTEs not supported"},
+      {ErrorCode::PLAN_OPERATOR_NOT_SUPPORTED,
+       "Logical plan operator not supported by planner frontend"},
       // Validation errors (E2xx)
       {ErrorCode::INVALID_IDENTIFIER, "Invalid identifier name"},
       {ErrorCode::PATH_TRAVERSAL, "Path traversal detected"},

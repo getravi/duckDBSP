@@ -234,6 +234,13 @@ See [Error Handling Guide](docs/ERROR_HANDLING.md) for details.
 - NULL-aware operations (SQL semantics for GROUP BY, JOINs, aggregates)
 - Incremental recursive query evaluation
 
+**Planner Frontend (Phase B, experimental — `dbsp_use_planner(true)`):**
+- View SQL planned by DuckDB's own binder/planner instead of the bespoke
+  parser; single-table scan/filter/projection plans translate directly to
+  circuit nodes with full DuckDB expression coverage (function calls, mixed
+  AND/OR predicates). Unsupported plans fall back to the parser
+  transparently. Default OFF.
+
 ### 📋 Planned (Phase 4+)
 
 - `ORDER BY` / `LIMIT` (anti-pattern - degrades to O(n), deferred)
@@ -286,6 +293,7 @@ duckDBSP/
 │   └── dbsp_extension.cpp     # Extension entry point
 │   ├── dbsp_duckdb_types.hpp  # Native DuckDB type integration
 │   ├── dbsp_sql_parser.hpp    # SQL parsing
+│   ├── dbsp_plan_translator.hpp # Planner frontend (Phase B)
 │   ├── dbsp_cdc.hpp           # CDC manager
 ├── build.sh                   # Build script
 ├── test/                      # Unit tests

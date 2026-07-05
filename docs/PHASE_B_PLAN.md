@@ -57,7 +57,12 @@ separate perf milestone at the end (B6, optional / Phase E overlap).
 
 Each milestone: suite green + differential tests green before the next.
 
-**B1 — Skeleton + scan/filter/project (1–1.5 wk)**
+**B1 — Skeleton + scan/filter/project (1–1.5 wk) — COMPLETE (2026-07-04)**
+Delivered as planned, one deviation: instead of handling table_filters or
+per-optimizer disabling, the internal connection sets
+`config.enable_optimizer = false` before ExtractPlan — plans stay canonical
+(no pushdown, no projection collapse) and B1 handles GET `column_ids`
+reordering with an index-selection map node. 37/37 tests green.
 - `dbsp_plan_translator.hpp`: ExtractPlan via guarded internal connection,
   binding resolution, translate GET → FILTER → PROJECTION chains
 - Row-wise ExpressionExecutor adapter
