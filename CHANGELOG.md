@@ -1,5 +1,18 @@
 # Changelog
 
+## Phase I2: Parallel view propagation - Jul 2026
+
+- Same-level views step concurrently: propagate_changes groups the
+  topological order into dependency levels; views within a level share no
+  path, so their circuits run on threads (opt-in via dbsp_parallel(true),
+  which also controls parallel multi-table sync). Everything a stepping
+  view reads is frozen for the level — pending deltas from earlier
+  levels, shared arrangements (updated before views step and between
+  levels), and its own private state. Results publish sequentially in
+  stable order. Levels with under 256 input rows stay sequential (thread
+  spawn would cost more than it saves). New dbsp_parallel() table
+  function exposes the toggle. TSAN-clean.
+
 ## Phase I: Shared join arrangements - Jul 2026
 
 - I1b both-sides sharing: a join may now share BOTH sides. With both

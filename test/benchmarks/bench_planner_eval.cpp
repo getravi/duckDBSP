@@ -240,7 +240,8 @@ TEST_CASE("Benchmark: shared vs private join arrangements",
   constexpr int kDelta = 2000;
   auto &mgr = dbsp_native::get_cdc_manager();
 
-  auto run = [&](bool shared) -> double {
+  auto run = [&](bool shared, bool parallel = false) -> double {
+    mgr.set_parallel_sync(parallel);
     DuckDBTestHarness db;
     db.exec("CREATE TABLE l (id INT, val INT)");
     db.exec("CREATE TABLE r (id INT, a INT, b INT, c INT, d INT, e INT, "
@@ -281,8 +282,11 @@ TEST_CASE("Benchmark: shared vs private join arrangements",
 
   double shared_us = run(true);
   double private_us = run(false);
+  double parallel_us = run(true, /*parallel=*/true);
+  mgr.set_parallel_sync(false);
   std::cout << "[bench] " << kViews << " views, " << kDelta
             << "-row delta into " << kBase << "-row probe side: shared (2 "
             "arrangements) " << shared_us << " us; private (" << kViews
-            << "+1 arrangements) " << private_us << " us\n";
+            << "+1 arrangements) " << private_us << " us; shared+parallel "
+            << parallel_us << " us\n";
 }

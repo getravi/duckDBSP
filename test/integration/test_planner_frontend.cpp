@@ -1281,3 +1281,51 @@ TEST_CASE("planner I1b: both-sides-shared join bootstraps from one replay",
   db.exec("SELECT * FROM dbsp_sync('u')");
   requireViewMatchesQuery(db, "v_both", sql);
 }
+
+TEST_CASE("planner: parallel level propagation matches sequential",
+          "[integration][planner][parallel]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  setupTableU(db);
+  // Toggle through the SQL surface so the function is covered too
+  auto status = db.query("SELECT * FROM dbsp_parallel(true)");
+  REQUIRE_FALSE(status->HasError());
+  REQUIRE(status->GetValue(0, 0).ToString().find("ENABLED") !=
+          std::string::npos);
+
+  // Four sibling views (one level, stepped concurrently) plus a diamond
+  // union on top (next level, must see BOTH parents' deltas)
+  const std::string s1 = "SELECT id, val FROM t WHERE val > 30";
+  const std::string s2 = "SELECT id, val FROM t WHERE val <= 30";
+  const std::string s3 =
+      "SELECT t.id, t.val, u.val FROM t JOIN u ON t.id = u.id";
+  const std::string s4 = "SELECT tag, SUM(val) FROM t GROUP BY tag";
+  const std::string s5 =
+      "SELECT * FROM dbsp_query('vp1') UNION ALL "
+      "SELECT * FROM dbsp_query('vp2')";
+  db.exec("SELECT * FROM dbsp_create_view('vp1', '" + s1 + "')");
+  db.exec("SELECT * FROM dbsp_create_view('vp2', '" + s2 + "')");
+  db.exec("SELECT * FROM dbsp_create_view('vp3', '" + s3 + "')");
+  db.exec("SELECT * FROM dbsp_create_view('vp4', '" + s4 + "')");
+  db.exec("SELECT * FROM dbsp_create_view('vp5', "
+          "'SELECT id, val FROM vp1 UNION ALL SELECT id, val FROM vp2')");
+
+  // Deltas above the 256-row parallel threshold so threads actually spawn
+  for (int round = 0; round < 4; round++) {
+    db.exec("INSERT INTO t SELECT i, i % 97, chr(CAST(97 + i % 3 AS INT)) "
+            "FROM range(" + std::to_string(round * 500) + ", " +
+            std::to_string(round * 500 + 500) + ") s(i)");
+    db.exec("DELETE FROM t WHERE id % 7 = " + std::to_string(round));
+    db.exec("SELECT * FROM dbsp_sync('t')");
+    db.exec("SELECT * FROM dbsp_sync('u')");
+    requireViewMatchesQuery(db, "vp1", s1);
+    requireViewMatchesQuery(db, "vp2", s2);
+    requireViewMatchesQuery(db, "vp3", s3);
+    requireViewMatchesQuery(db, "vp4", s4);
+    requireViewMatchesQuery(
+        db, "vp5",
+        "SELECT id, val FROM (" + s1 + ") UNION ALL SELECT id, val FROM (" +
+            s2 + ")");
+  }
+  db.exec("SELECT * FROM dbsp_parallel(false)");
+}

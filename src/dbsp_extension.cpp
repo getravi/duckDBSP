@@ -855,6 +855,60 @@ void AutoSyncFunc(ClientContext &context, TableFunctionInput &input,
 }
 
 // ============================================================================
+// dbsp_parallel - Enable/disable parallel sync + parallel view propagation
+// Usage: SELECT * FROM dbsp_parallel(true);   -- Enable
+//        SELECT * FROM dbsp_parallel(false);  -- Disable
+//        SELECT * FROM dbsp_parallel();       -- Query status
+// ============================================================================
+
+struct ParallelBindData : public TableFunctionData {
+  bool enable = false;
+  bool query_only = false;
+  bool done = false;
+};
+
+unique_ptr<FunctionData> ParallelBind(ClientContext &context,
+                                      TableFunctionBindInput &input,
+                                      vector<LogicalType> &return_types,
+                                      vector<string> &names) {
+  auto data = make_uniq<ParallelBindData>();
+  if (input.inputs.empty()) {
+    data->query_only = true;
+  } else {
+    data->enable = input.inputs[0].GetValue<bool>();
+  }
+  return_types.push_back(LogicalType::VARCHAR);
+  names.push_back("result");
+  return std::move(data);
+}
+
+void ParallelFunc(ClientContext &context, TableFunctionInput &input,
+                  DataChunk &output) {
+  auto &data = input.bind_data->CastNoConst<ParallelBindData>();
+  if (data.done)
+    return;
+  auto &manager = dbsp_native::get_cdc_manager();
+  if (data.query_only) {
+    bool enabled = manager.get_parallel_sync();
+    output.SetCardinality(1);
+    output.SetValue(0, 0,
+                    Value(string("Parallel mode is ") +
+                          (enabled ? "ENABLED" : "DISABLED")));
+  } else {
+    manager.set_parallel_sync(data.enable);
+    output.SetCardinality(1);
+    output.SetValue(
+        0, 0,
+        Value(data.enable
+                  ? "Parallel mode ENABLED: multi-table syncs and same-level "
+                    "view propagation run on threads"
+                  : "Parallel mode DISABLED: syncs and propagation run "
+                    "sequentially"));
+  }
+  data.done = true;
+}
+
+// ============================================================================
 // dbsp_use_planner - Enable/disable the planner frontend (Phase B)
 // Usage: SELECT * FROM dbsp_use_planner(true);   -- Enable
 //        SELECT * FROM dbsp_use_planner(false);  -- Disable
@@ -1286,6 +1340,11 @@ static void LoadInternal(ExtensionLoader &loader) {
                                  UsePlannerBind);
   use_planner_func.varargs = LogicalType::BOOLEAN;
   loader.RegisterFunction(use_planner_func);
+
+  TableFunction parallel_func("dbsp_parallel", {}, ParallelFunc,
+                              ParallelBind);
+  parallel_func.varargs = LogicalType::BOOLEAN;
+  loader.RegisterFunction(parallel_func);
 
   // Register scalar functions
   CreateScalarFunctionInfo drop_func_info(

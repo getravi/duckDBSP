@@ -35,6 +35,7 @@
 #include <optional>
 #include <queue>
 #include <shared_mutex>
+#include <thread>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -1999,45 +2000,127 @@ private:
     // Δl⋈Δr term to compensate (Δl⋈R_new = Δl⋈R_old + Δl⋈Δr)
     apply_to_arrangements(source_name, delta);
 
-    for (const auto &view_name : dep_graph_.topological_order(source_name)) {
+    // Group the topological order into levels: views in the same level
+    // share no dependency path, so their circuits may step concurrently.
+    // Everything they read while stepping is frozen for the level —
+    // pending deltas from earlier levels, shared arrangements (updated
+    // before views step / between levels), and their own private state.
+    const std::vector<std::string> topo =
+        dep_graph_.topological_order(source_name);
+    std::unordered_map<std::string, size_t> level_of;
+    level_of[source_name] = 0;
+    std::vector<std::vector<std::string>> levels;
+    for (const auto &view_name : topo) {
       auto it = views_.find(view_name);
       if (it == views_.end())
         continue;
+      size_t lvl = 1;
+      for (const auto &src : it->second->source_tables()) {
+        auto l = level_of.find(src);
+        if (l != level_of.end()) {
+          lvl = std::max(lvl, l->second + 1);
+        }
+      }
+      level_of[view_name] = lvl;
+      if (levels.size() < lvl) {
+        levels.resize(lvl);
+      }
+      levels[lvl - 1].push_back(view_name);
+    }
 
-      NativeMaterializedView &view = *it->second;
-      const DuckDBZSet *single_delta = nullptr;
-      DuckDBZSet accumulated;
+    struct StepResult {
+      std::string view_name;
+      const DuckDBZSet *single_delta = nullptr; // borrows view state
+      DuckDBZSet accumulated;                   // owned multi-source union
       size_t applied = 0;
+    };
+    auto step_view = [&](const std::string &view_name) -> StepResult {
+      StepResult r;
+      r.view_name = view_name;
+      NativeMaterializedView &view = *views_.at(view_name);
       for (const auto &src : view.source_tables()) {
         auto p = pending.find(src);
         if (p == pending.end() || p->second->empty())
           continue;
         view.apply_changes(src, *p->second);
-        applied++;
-        if (applied == 1) {
-          single_delta = &view.get_delta();
+        r.applied++;
+        if (r.applied == 1) {
+          r.single_delta = &view.get_delta();
         } else {
-          if (applied == 2 && single_delta) {
-            accumulated = *single_delta; // upgrade borrow to owned union
-            single_delta = nullptr;
+          if (r.applied == 2 && r.single_delta) {
+            r.accumulated = *r.single_delta; // upgrade borrow to owned
+            r.single_delta = nullptr;
           }
           for (const auto &[row, w] : view.get_delta()) {
-            accumulated.insert(row, w);
+            r.accumulated.insert(row, w);
           }
         }
       }
+      return r;
+    };
 
-      if (applied == 0)
-        continue;
-      if (single_delta) {
-        if (!single_delta->empty()) {
-          pending[view_name] = single_delta;
-          apply_to_arrangements(view_name, *single_delta);
+    for (const auto &level : levels) {
+      std::vector<StepResult> results;
+      results.reserve(level.size());
+      // Thread spawn costs ~10µs each — only worth it when the level has
+      // real work (tiny deltas stay on the sequential path)
+      size_t level_input_rows = 0;
+      if (use_parallel_sync_ && level.size() > 1) {
+        for (const auto &view_name : level) {
+          for (const auto &src : views_.at(view_name)->source_tables()) {
+            auto p = pending.find(src);
+            if (p != pending.end()) {
+              level_input_rows += p->second->size();
+            }
+          }
         }
-      } else if (!accumulated.empty()) {
-        arena.push_back(std::move(accumulated));
-        pending[view_name] = &arena.back();
-        apply_to_arrangements(view_name, arena.back());
+      }
+      if (use_parallel_sync_ && level.size() > 1 &&
+          level_input_rows >= 256) {
+        results.resize(level.size());
+        std::vector<std::thread> threads;
+        threads.reserve(level.size());
+        std::exception_ptr first_error;
+        std::mutex error_mutex;
+        for (size_t i = 0; i < level.size(); i++) {
+          threads.emplace_back([&, i]() {
+            try {
+              results[i] = step_view(level[i]);
+            } catch (...) {
+              std::lock_guard<std::mutex> g(error_mutex);
+              if (!first_error) {
+                first_error = std::current_exception();
+              }
+            }
+          });
+        }
+        for (auto &t : threads) {
+          t.join();
+        }
+        if (first_error) {
+          std::rethrow_exception(first_error);
+        }
+      } else {
+        for (const auto &view_name : level) {
+          results.push_back(step_view(view_name));
+        }
+      }
+
+      // Publish results sequentially (stable order): pending map for the
+      // next level, arrangement updates for MV-sourced joins
+      for (auto &r : results) {
+        if (r.applied == 0)
+          continue;
+        if (r.single_delta) {
+          if (!r.single_delta->empty()) {
+            pending[r.view_name] = r.single_delta;
+            apply_to_arrangements(r.view_name, *r.single_delta);
+          }
+        } else if (!r.accumulated.empty()) {
+          arena.push_back(std::move(r.accumulated));
+          pending[r.view_name] = &arena.back();
+          apply_to_arrangements(r.view_name, arena.back());
+        }
       }
     }
   }

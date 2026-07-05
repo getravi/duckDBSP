@@ -17,6 +17,7 @@ Internal design of the DBSP DuckDB extension.
 │  │  - Tracked Tables     - View Registry                       ││
 │  │  - Change Detection   - Dependency Graph                    ││
 │  │  - Incremental cascade: one topological pass, deltas only   ││
+│  │    (same-level views step in parallel with dbsp_parallel)   ││
 │  │  - Shared join arrangements: one index per (table, keys)    ││
 │  │    fingerprint, probed by matching joins across all views   ││
 │  └─────────────────────────────────────────────────────────────┘│
@@ -379,6 +380,10 @@ State after:
 - Single global CDCManager instance (singleton)
 - **Reader-writer locks** (`std::shared_mutex`) for concurrent queries
 - Readers (queries) can run in parallel
+- With `dbsp_parallel(true)`: multi-table syncs scan on threads, and
+  views at the same dependency level step concurrently during
+  propagation (each level's inputs are frozen; results publish in
+  stable order; levels under 256 input rows stay sequential)
 - Writers (sync, create_view, drop) acquire exclusive locks
 - Lock held during:
   - Table tracking (write)
