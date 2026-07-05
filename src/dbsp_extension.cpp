@@ -386,15 +386,13 @@ unique_ptr<FunctionData> QueryBind(ClientContext &context,
   data->view_name = input.inputs[0].GetValue<string>();
 
   auto &manager = dbsp_native::get_cdc_manager();
-  const auto *view = manager.get_view(data->view_name);
   const auto *schema = manager.get_view_schema(data->view_name);
 
-  if (!view) {
-    throw InvalidInputException("View not found: " + data->view_name);
-  }
-
-  // Collect rows using scan (supports ordered iteration for sort/limit views)
-  view->scan(
+  // Collect rows via scan_view: holds the read locks for the whole
+  // traversal, so a concurrent sync/propagate cannot mutate view state
+  // mid-scan. scan preserves ordered iteration for sort/limit views.
+  bool found = manager.scan_view(
+      data->view_name,
       [&](const dbsp_native::DuckDBRow &row, dbsp_native::Weight weight) {
         if (weight > 0) {
           for (int64_t i = 0; i < weight; i++) {
@@ -402,6 +400,9 @@ unique_ptr<FunctionData> QueryBind(ClientContext &context,
           }
         }
       });
+  if (!found) {
+    throw InvalidInputException("View not found: " + data->view_name);
+  }
 
   // Build return schema
   if (schema && !schema->columns.empty()) {

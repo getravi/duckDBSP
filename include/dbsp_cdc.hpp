@@ -1274,6 +1274,10 @@ public:
     return &it->second->get_result();
   }
 
+  // NOTE: the returned pointer is only lock-protected during this lookup.
+  // Callers that read view state (scan, get_result) while writers may be
+  // active must use scan_view() instead — it holds the read locks for the
+  // whole traversal. get_view() remains for single-threaded use (tests).
   const NativeMaterializedView *get_view(const std::string &view_name) {
     std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
     std::shared_lock<std::shared_mutex> view_lock(view_mutex_);
@@ -1282,6 +1286,21 @@ public:
       return nullptr;
     }
     return it->second.get();
+  }
+
+  // Scan a view's rows under shared locks: safe against concurrent
+  // propagate_changes/create_view, which take view_mutex_ exclusively.
+  // Returns false if the view does not exist.
+  bool scan_view(const std::string &view_name,
+                 const std::function<void(const DuckDBRow &, Weight)> &cb) {
+    std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    std::shared_lock<std::shared_mutex> view_lock(view_mutex_);
+    auto it = views_.find(view_name);
+    if (it == views_.end()) {
+      return false;
+    }
+    it->second->scan(cb);
+    return true;
   }
 
   const TableSchema *get_view_schema(const std::string &view_name) {

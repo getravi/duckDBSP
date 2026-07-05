@@ -345,3 +345,71 @@ TEST_CASE("Auto-sync and parallel-sync flag concurrency", "[thread_safety][flags
   manager.disable_auto_sync();
   manager.set_parallel_sync(false);
 }
+
+TEST_CASE("Concurrent scan_view during change propagation",
+          "[thread_safety][scan]") {
+  // dbsp_query reads views through scan_view, which must hold the read
+  // locks for the whole traversal: a writer mutating view state mid-scan
+  // is undefined behavior (the pre-fix code scanned via an unlocked
+  // get_view pointer). Readers hammer scan_view while a writer pushes
+  // deltas through propagate_changes-equivalent syncs.
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection conn(db);
+  auto &context = *conn.context;
+
+  conn.Query("CREATE TABLE scan_t (id INTEGER, val INTEGER)");
+  conn.Query("INSERT INTO scan_t VALUES (1, 10), (2, 20)");
+
+  CDCManager &manager = get_cdc_manager();
+  manager.reset();
+
+  conn.BeginTransaction();
+  REQUIRE(manager.track_table(context, "scan_t"));
+  REQUIRE(manager.create_view(context, "scan_v",
+                              "SELECT id, val FROM scan_t WHERE val > 0"));
+  conn.Commit();
+  conn.BeginTransaction();
+  REQUIRE(manager.sync_table(context, "scan_t"));
+  conn.Commit();
+
+  std::atomic<bool> stop{false};
+  std::atomic<int> scan_errors{0};
+
+  std::vector<std::thread> readers;
+  for (int r = 0; r < 4; r++) {
+    readers.emplace_back([&]() {
+      while (!stop.load()) {
+        size_t rows = 0;
+        bool ok = manager.scan_view(
+            "scan_v", [&](const DuckDBRow &row, Weight w) {
+              // Row must be internally consistent (2 columns, sane weight)
+              if (row.columns.size() != 2 || w == 0) {
+                scan_errors.fetch_add(1);
+              }
+              rows += static_cast<size_t>(w > 0 ? w : 0);
+            });
+        if (!ok) {
+          scan_errors.fetch_add(1);
+        }
+      }
+    });
+  }
+
+  // Writer: keep mutating the table and syncing deltas through the view
+  for (int i = 3; i < 200; i++) {
+    conn.Query("INSERT INTO scan_t VALUES (" + std::to_string(i) + ", " +
+               std::to_string(i * 10) + ")");
+    if (i % 3 == 0) {
+      conn.Query("DELETE FROM scan_t WHERE id = " + std::to_string(i - 2));
+    }
+    conn.BeginTransaction();
+    manager.sync_table(context, "scan_t");
+    conn.Commit();
+  }
+  stop.store(true);
+  for (auto &t : readers) {
+    t.join();
+  }
+
+  REQUIRE(scan_errors.load() == 0);
+}
