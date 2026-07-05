@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>duckDBSP — How it works, in plain words</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&family=Lora:ital,wght@0,400;0,500;1,400&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --paper: #E9F0EE;
+    --paper-deep: #DCE7E4;
+    --pond: #0E3A3F;
+    --pond-soft: #17545B;
+    --ink: #122B2E;
+    --reed: #4E8577;
+    --bill: #F2A93B;   /* +1 : a row arrives */
+    --bill-soft: #FBE9C8;
+    --rust: #D4553F;   /* -1 : a row leaves */
+    --rust-soft: #F6DAD3;
+    --card: #F7FAF9;
+    --line: #B9CCC7;
+    --display: "Bricolage Grotesque", "Avenir Next", "Trebuchet MS", sans-serif;
+    --body: "Lora", Georgia, serif;
+    --mono: "IBM Plex Mono", "SF Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+  }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--body);
+    font-size: 1.06rem;
+    line-height: 1.65;
+  }
+  a { color: var(--pond-soft); }
+  :focus-visible { outline: 3px solid var(--bill); outline-offset: 3px; border-radius: 4px; }
+
+  .wrap { max-width: 880px; margin: 0 auto; padding: 0 24px; }
+
+  /* ---------- weight chips: the page's shared vocabulary ---------- */
+  .chip {
+    display: inline-flex; align-items: center; gap: .45em;
+    font-family: var(--mono); font-size: .82rem; font-weight: 600;
+    padding: .28em .7em; border-radius: 999px; white-space: nowrap;
+  }
+  .chip.plus  { background: var(--bill-soft); color: #7A4E07; border: 1.5px solid var(--bill); }
+  .chip.minus { background: var(--rust-soft); color: #8C2B1A; border: 1.5px solid var(--rust); }
+  .chip .w { font-weight: 600; }
+  .chip.plus .w::before  { content: "+1"; }
+  .chip.minus .w::before { content: "\2212 1"; }
+
+  /* ---------- hero ---------- */
+  header {
+    background: var(--pond); color: var(--paper);
+    padding: 84px 0 72px;
+    position: relative; overflow: hidden;
+  }
+  .eyebrow {
+    font-family: var(--mono); font-size: .78rem; letter-spacing: .18em;
+    text-transform: uppercase; opacity: .75;
+  }
+  header .eyebrow { color: var(--bill); opacity: 1; }
+  h1 {
+    font-family: var(--display); font-weight: 800;
+    font-size: clamp(2.4rem, 6vw, 4.2rem);
+    line-height: 1.04; letter-spacing: -.015em;
+    margin: 18px 0 22px; max-width: 15ch;
+  }
+  header p.lede { font-size: 1.18rem; max-width: 52ch; opacity: .92; }
+  header p.lede strong { color: var(--bill); font-weight: 500; }
+  .hero-chips {
+    margin-top: 34px; display: flex; gap: 10px; flex-wrap: wrap;
+  }
+  .hero-chips .chip { font-size: .88rem; }
+  .hero-chips .chip.plus { background: rgba(242,169,59,.16); color: var(--bill); }
+  .hero-chips .chip.minus { background: rgba(212,85,63,.16); color: #F0937F; }
+
+  /* faint tally strokes in hero corner */
+  .tally {
+    position: absolute; right: -20px; top: 20px; opacity: .12;
+    font-family: var(--mono); font-size: 9rem; letter-spacing: -.08em;
+    user-select: none; pointer-events: none; line-height: 1;
+  }
+
+  /* ---------- sections ---------- */
+  section { padding: 72px 0; }
+  section.alt { background: var(--paper-deep); }
+  h2 {
+    font-family: var(--display); font-weight: 800;
+    font-size: clamp(1.7rem, 3.6vw, 2.5rem); line-height: 1.12;
+    letter-spacing: -.01em; margin: 12px 0 18px; max-width: 24ch;
+  }
+  section > .wrap > p { max-width: 62ch; margin-bottom: 16px; }
+  .note {
+    font-size: .92rem; color: #3E5A57; border-left: 3px solid var(--reed);
+    padding-left: 14px; max-width: 58ch; margin-top: 22px;
+  }
+  code.inline { font-family: var(--mono); font-size: .88em; background: var(--card); border: 1px solid var(--line); border-radius: 4px; padding: .08em .35em; }
+
+  /* ---------- recount vs receipt panels ---------- */
+  .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 32px; }
+  @media (max-width: 700px) { .compare { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--card); border: 1.5px solid var(--line); border-radius: 14px;
+    padding: 26px 24px;
+  }
+  .panel h3 { font-family: var(--display); font-weight: 600; font-size: 1.12rem; margin-bottom: 6px; }
+  .panel p { font-size: .96rem; color: #2E4A47; }
+  .panel .verdict { font-family: var(--mono); font-size: .78rem; letter-spacing: .12em; text-transform: uppercase; margin-top: 16px; display: block; }
+  .panel.slow .verdict { color: var(--rust); }
+  .panel.fast .verdict { color: #7A4E07; }
+  .boxes { display: grid; grid-template-columns: repeat(20, 1fr); gap: 3px; margin: 18px 0 4px; }
+  .boxes i { display: block; aspect-ratio: 1; background: var(--line); border-radius: 2px; }
+  .boxes i.hot { background: var(--rust); }
+  .one-box { display: flex; align-items: center; gap: 12px; margin: 18px 0 4px; min-height: 64px; }
+
+  /* ---------- ledger ---------- */
+  .ledger {
+    margin-top: 30px; background: var(--card); border: 1.5px solid var(--line);
+    border-radius: 14px; overflow: hidden; max-width: 560px;
+  }
+  .ledger .row {
+    display: grid; grid-template-columns: 1fr auto; align-items: center;
+    padding: 13px 20px; border-top: 1px solid var(--line);
+    font-family: var(--mono); font-size: .92rem;
+  }
+  .ledger .row:first-child { border-top: none; background: var(--pond); color: var(--paper); font-family: var(--display); font-weight: 600; font-size: .95rem; }
+
+  /* ---------- layer stack (the architecture) ---------- */
+  .stack { margin-top: 34px; display: flex; flex-direction: column; gap: 10px; }
+  .layer {
+    background: var(--card); border: 1.5px solid var(--line); border-radius: 12px;
+    width: 100%; text-align: left; cursor: pointer; font-family: inherit;
+    padding: 0; overflow: hidden; transition: border-color .15s ease;
+  }
+  .layer:hover { border-color: var(--pond-soft); }
+  .layer .head {
+    display: grid; grid-template-columns: auto 1fr auto; align-items: center;
+    gap: 16px; padding: 16px 20px;
+  }
+  .layer .role {
+    font-family: var(--mono); font-size: .72rem; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--paper);
+    background: var(--pond-soft); border-radius: 6px; padding: .35em .6em;
+    min-width: 108px; text-align: center;
+  }
+  .layer.split .role { background: var(--reed); }
+  .layer .name { font-family: var(--display); font-weight: 600; font-size: 1.05rem; }
+  .layer .caret { font-family: var(--mono); color: var(--reed); transition: transform .2s ease; }
+  .layer[aria-expanded="true"] .caret { transform: rotate(90deg); }
+  .layer .detail {
+    display: none; padding: 0 20px 18px; font-size: .96rem; color: #2E4A47;
+    max-width: 62ch;
+  }
+  .layer[aria-expanded="true"] .detail { display: block; }
+  .layer .detail .tech { font-family: var(--mono); font-size: .78rem; color: #557; color: #4E6B67; margin-top: 8px; display: block; }
+  .stack-arrow { text-align: center; color: var(--reed); font-size: .9rem; font-family: var(--mono); }
+
+  /* ---------- the assembly line demo (signature) ---------- */
+  .demo {
+    margin-top: 36px; background: var(--pond); border-radius: 18px;
+    padding: 30px 26px 26px; color: var(--paper);
+  }
+  .demo .controls { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 26px; }
+  .btn {
+    font-family: var(--display); font-weight: 600; font-size: .95rem;
+    border: none; border-radius: 10px; padding: 12px 20px; cursor: pointer;
+    transition: transform .1s ease, opacity .15s ease;
+  }
+  .btn:active { transform: scale(.97); }
+  .btn:disabled { opacity: .45; cursor: default; }
+  .btn.add { background: var(--bill); color: #3D2703; }
+  .btn.remove { background: var(--rust-soft); color: #8C2B1A; }
+  .btn.reset { background: transparent; color: var(--paper); border: 1.5px solid rgba(233,240,238,.4); }
+
+  .line { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; gap: 6px; align-items: stretch; }
+  @media (max-width: 700px) { .line { grid-template-columns: 1fr; } .line .flow { transform: rotate(90deg); margin: 2px auto; } }
+  .station {
+    background: rgba(233,240,238,.07); border: 1.5px solid rgba(233,240,238,.22);
+    border-radius: 12px; padding: 16px 16px 14px; min-height: 158px;
+    transition: border-color .25s ease, background .25s ease;
+  }
+  .station.active { border-color: var(--bill); background: rgba(242,169,59,.1); }
+  .station .st-label { font-family: var(--mono); font-size: .7rem; letter-spacing: .14em; text-transform: uppercase; opacity: .7; }
+  .station h4 { font-family: var(--display); font-weight: 600; font-size: 1.02rem; margin: 6px 0 10px; }
+  .station .slot { min-height: 34px; display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+  .flow { align-self: center; color: rgba(233,240,238,.5); font-size: 1.2rem; }
+
+  .demo .chip { opacity: 0; transform: translateY(6px); }
+  .demo .chip.show { opacity: 1; transform: translateY(0); transition: opacity .35s ease, transform .35s ease; }
+  .demo .chip.plus  { background: rgba(242,169,59,.18); color: var(--bill); }
+  .demo .chip.minus { background: rgba(212,85,63,.2); color: #F0937F; }
+  .demo .chip.dead { opacity: .3; text-decoration: line-through; }
+
+  .result-card {
+    margin-top: 22px; background: var(--card); color: var(--ink);
+    border-radius: 12px; padding: 18px 22px; display: flex; align-items: center;
+    justify-content: space-between; gap: 16px; flex-wrap: wrap;
+  }
+  .result-card .rc-label { font-family: var(--mono); font-size: .72rem; letter-spacing: .14em; text-transform: uppercase; color: var(--reed); }
+  .result-card .total { font-family: var(--display); font-weight: 800; font-size: 2rem; }
+  .result-card .total.bump { animation: bump .5s ease; }
+  @keyframes bump { 40% { transform: scale(1.12); color: #7A4E07; } }
+  .narrate {
+    margin-top: 14px; min-height: 3.2em; font-size: .95rem; opacity: .85;
+    font-style: italic;
+  }
+
+  /* ---------- cascade ---------- */
+  .cascade { margin-top: 30px; display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  .cnode {
+    background: var(--card); border: 1.5px solid var(--line); border-radius: 10px;
+    padding: 10px 22px; font-family: var(--display); font-weight: 600; text-align: center;
+  }
+  .cnode small { display: block; font-family: var(--body); font-weight: 400; font-size: .82rem; color: #3E5A57; }
+  .cnode.root { background: var(--pond); color: var(--paper); border-color: var(--pond); }
+  .cnode.root small { color: rgba(233,240,238,.7); }
+  .cascade .down { color: var(--reed); font-family: var(--mono); }
+
+  /* ---------- fact grid ---------- */
+  .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 16px; margin-top: 30px; }
+  .fact { background: var(--card); border: 1.5px solid var(--line); border-radius: 12px; padding: 20px; }
+  .fact h3 { font-family: var(--display); font-weight: 600; font-size: 1rem; margin-bottom: 6px; }
+  .fact p { font-size: .9rem; color: #2E4A47; }
+
+  /* ---------- glossary + footer ---------- */
+  .gloss { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 26px; }
+  .gloss dt {
+    font-family: var(--mono); font-size: .8rem; font-weight: 600;
+    background: var(--pond); color: var(--paper); border-radius: 8px 8px 0 0;
+    padding: 6px 12px 4px; display: inline-block;
+  }
+  .gloss > div { background: var(--card); border: 1.5px solid var(--line); border-radius: 10px; padding: 0; flex: 1 1 240px; overflow: hidden; }
+  .gloss dd { padding: 10px 14px 14px; font-size: .9rem; color: #2E4A47; }
+  footer { background: var(--pond); color: rgba(233,240,238,.75); padding: 36px 0; font-size: .9rem; }
+  footer a { color: var(--bill); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="tally" aria-hidden="true">卌卌</div>
+  <div class="wrap">
+    <span class="eyebrow">duckDBSP &middot; a DuckDB extension, explained without the jargon</span>
+    <h1>Answers that update themselves.</h1>
+    <p class="lede">duckDBSP keeps live answers — running totals, filtered lists,
+    joined reports — inside the DuckDB database. When your data changes, it
+    <strong>doesn't recompute the answer from scratch</strong>. It reads only the
+    change, and nudges the answer.</p>
+    <div class="hero-chips" aria-hidden="true">
+      <span class="chip plus"><span class="w"></span> Alice ordered $100</span>
+      <span class="chip minus"><span class="w"></span> Bob cancelled $40</span>
+      <span class="chip plus"><span class="w"></span> Cara ordered $75</span>
+    </div>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <span class="eyebrow">The problem</span>
+    <h2>Recounting the warehouse vs. reading the receipt</h2>
+    <p>Say you run a shop and keep a board on the wall: <em>“Total sales per
+    customer.”</em> A new order arrives. How do you update the board?</p>
+    <div class="compare">
+      <div class="panel slow">
+        <h3>The usual way</h3>
+        <div class="boxes" aria-hidden="true"></div>
+        <p>Walk through <strong>every order ever placed</strong>, add them all
+        up again, rewrite the board. Fine for ten orders. Painful for ten
+        million — and you redo it after <em>every single change</em>.</p>
+        <span class="verdict">Work grows with your history</span>
+      </div>
+      <div class="panel fast">
+        <h3>The duckDBSP way</h3>
+        <div class="one-box"><span class="chip plus"><span class="w"></span> Alice, $100</span></div>
+        <p>Look at <strong>just the new receipt</strong>. Alice's line on the
+        board goes up by $100. Done. Nobody re-reads the old orders — they were
+        already counted.</p>
+        <span class="verdict">Work grows only with the change</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <span class="eyebrow">The trick</span>
+    <h2>Every change is a ledger entry with a sign</h2>
+    <p>Inside duckDBSP, data never moves around as big tables. It moves as tiny
+    ledger entries: a row, plus a sign. <span class="chip plus"><span class="w"></span></span>
+    means “this row arrived.” <span class="chip minus"><span class="w"></span></span>
+    means “this row left.” An edit is simply both at once — the old row leaves,
+    the new one arrives.</p>
+    <p>That's the whole secret. Deletes aren't special, edits aren't special;
+    everything is arrivals and departures flowing through the same machine.
+    (Researchers call this a <em>Z-set</em>; you can call it a signed ledger.)</p>
+    <div class="ledger" role="table" aria-label="Example ledger of changes">
+      <div class="row" role="row"><span>Today's changes</span><span>sign</span></div>
+      <div class="row" role="row"><span>Alice &middot; $100 order</span><span class="chip plus"><span class="w"></span></span></div>
+      <div class="row" role="row"><span>Bob &middot; $40 order (cancelled)</span><span class="chip minus"><span class="w"></span></span></div>
+      <div class="row" role="row"><span>Cara &middot; $75 order</span><span class="chip plus"><span class="w"></span></span></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <span class="eyebrow">The machine</span>
+    <h2>Six floors, one job each</h2>
+    <p>The architecture is a small building. A change enters at the top floor
+    and rides down; each floor does exactly one job. Tap a floor to see what
+    happens inside.</p>
+    <div class="stack">
+      <button class="layer" aria-expanded="false">
+        <span class="head"><span class="role">Front desk</span>
+        <span class="name">Commands you type</span><span class="caret">&#9656;</span></span>
+        <span class="detail">You talk to duckDBSP with a handful of simple commands:
+        “watch this table,” “keep this answer live,” “show me the answer.”
+        <span class="tech">table functions: dbsp_track, dbsp_create_view, dbsp_query, dbsp_sync</span></span>
+      </button>
+      <div class="stack-arrow" aria-hidden="true">&#9660;</div>
+      <button class="layer" aria-expanded="false">
+        <span class="head"><span class="role">Dispatcher</span>
+        <span class="name">The change tracker</span><span class="caret">&#9656;</span></span>
+        <span class="detail">Watches your tables, notices what changed since last
+        time, writes those changes as signed ledger entries, and delivers them to
+        every live answer that cares — in the right order, so answers built on
+        other answers stay consistent.
+        <span class="tech">CDC Manager: tracked tables, dependency graph, change propagation</span></span>
+      </button>
+      <div class="stack-arrow" aria-hidden="true">&#9660;</div>
+      <button class="layer split" aria-expanded="false">
+        <span class="head"><span class="role">Translators</span>
+        <span class="name">Two readers of your SQL</span><span class="caret">&#9656;</span></span>
+        <span class="detail">Your question (“total per customer”) is written in SQL.
+        Two translators can turn it into a blueprint for the assembly line below:
+        a new one that borrows DuckDB's own query brain (more fluent, opt-in), and
+        the original in-house one. If the new translator meets a phrase it doesn't
+        know yet, the in-house one quietly takes over — nothing breaks.
+        <span class="tech">Planner Frontend (Phase B, dbsp_use_planner) with transparent fallback to the SQL Parser</span></span>
+      </button>
+      <div class="stack-arrow" aria-hidden="true">&#9660;</div>
+      <button class="layer" aria-expanded="false">
+        <span class="head"><span class="role">Live answers</span>
+        <span class="name">Materialized views</span><span class="caret">&#9656;</span></span>
+        <span class="detail">Each live answer you asked for — a filter, a running
+        total, a join of two tables — lives here as a small machine that knows how
+        to nudge itself when ledger entries arrive.
+        <span class="tech">circuit-backed views: filter, project, aggregate, join, distinct, set ops, recursive</span></span>
+      </button>
+      <div class="stack-arrow" aria-hidden="true">&#9660;</div>
+      <button class="layer" aria-expanded="false">
+        <span class="head"><span class="role">Assembly line</span>
+        <span class="name">The circuit</span><span class="caret">&#9656;</span></span>
+        <span class="detail">Inside every live answer is a little assembly line:
+        an inbox where entries arrive, work stations that filter, reshape or tally
+        them, and an outbox holding the current answer. One delivery = one pass
+        down the line.
+        <span class="tech">Circuit IR: SourceNode &rarr; operator nodes &rarr; SinkNode, one step per delta</span></span>
+      </button>
+      <div class="stack-arrow" aria-hidden="true">&#9660;</div>
+      <button class="layer" aria-expanded="false">
+        <span class="head"><span class="role">Foundation</span>
+        <span class="name">The signed-ledger math</span><span class="caret">&#9656;</span></span>
+        <span class="detail">At the bottom sits a small math library that makes
+        signed ledgers add, subtract and combine correctly — the reason a
+        departure really does cancel an arrival, every time.
+        <span class="tech">core DBSP library: Z-sets, stream operators (integrate, differentiate, delay)</span></span>
+      </button>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <span class="eyebrow">Watch it happen</span>
+    <h2>One change walks the line</h2>
+    <p>This is the live answer <em>“total sales for Alice, counting only orders
+    over $10.”</em> The board currently says <strong>$200</strong> from two old
+    orders. Press a button and watch a single change ride the assembly line.</p>
+
+    <div class="demo">
+      <div class="controls">
+        <button class="btn add" id="btnAdd">Add Alice's $100 order</button>
+        <button class="btn remove" id="btnRemove">Cancel a $100 order</button>
+        <button class="btn reset" id="btnReset">Start over</button>
+      </div>
+      <div class="line">
+        <div class="station" id="st1">
+          <span class="st-label">Station 1 &middot; inbox</span>
+          <h4>Change arrives</h4>
+          <div class="slot" id="slot1"></div>
+        </div>
+        <span class="flow" aria-hidden="true">&#9654;</span>
+        <div class="station" id="st2">
+          <span class="st-label">Station 2 &middot; filter</span>
+          <h4>Over $10?</h4>
+          <div class="slot" id="slot2"></div>
+        </div>
+        <span class="flow" aria-hidden="true">&#9654;</span>
+        <div class="station" id="st3">
+          <span class="st-label">Station 3 &middot; tally</span>
+          <h4>Nudge the total</h4>
+          <div class="slot" id="slot3"></div>
+        </div>
+      </div>
+      <div class="result-card">
+        <div>
+          <span class="rc-label">The board &middot; alice's total</span>
+          <div class="total" id="total">$200</div>
+        </div>
+        <span class="chip plus" style="opacity:1;transform:none"><span class="w"></span> 2 orders counted so far</span>
+      </div>
+      <p class="narrate" id="narrate">The line is idle. Two of Alice's old orders were counted long ago — they will never be re-read.</p>
+    </div>
+
+    <p class="note">Notice what the tally station does: it never re-adds the old
+    orders. It removes the old board line
+    (<span class="chip minus"><span class="w"></span> Alice&nbsp;$200</span>) and posts the new one
+    (<span class="chip plus"><span class="w"></span> Alice&nbsp;$300</span>) — two ledger entries, same
+    trick as everywhere else in the machine.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <span class="eyebrow">It stacks</span>
+    <h2>Answers built on answers</h2>
+    <p>Live answers can feed other live answers. When the orders table changes,
+    the dispatcher delivers changes downhill in dependency order — each level
+    nudges the next, and nothing is ever recomputed from scratch.</p>
+    <div class="cascade" aria-label="Dependency cascade example">
+      <div class="cnode root">orders <small>your real table</small></div>
+      <span class="down" aria-hidden="true">&#9660; changes flow down</span>
+      <div class="cnode">big_orders <small>only orders over $100</small></div>
+      <span class="down" aria-hidden="true">&#9660;</span>
+      <div class="cnode">totals <small>total per customer</small></div>
+      <span class="down" aria-hidden="true">&#9660;</span>
+      <div class="cnode">vip_customers <small>customers past $1,000</small></div>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <span class="eyebrow">Good to know</span>
+    <h2>The fine print, kept short</h2>
+    <div class="facts">
+      <div class="fact">
+        <h3>Reads don't wait</h3>
+        <p>Many people can read the live answers at the same time. Only changes
+        (new data, new views) take a brief exclusive turn.</p>
+      </div>
+      <div class="fact">
+        <h3>It lives in memory</h3>
+        <p>Live answers are kept in RAM for speed. The <em>definitions</em> are
+        saved; after a restart, answers are rebuilt from your tables.</p>
+      </div>
+      <div class="fact">
+        <h3>It can follow chains</h3>
+        <p>“Who's connected to whom, through any number of hops?” Recursive
+        questions are answered by looping until nothing new appears.</p>
+      </div>
+      <div class="fact">
+        <h3>It tidies the line first</h3>
+        <p>Before building an assembly line, an optimizer rearranges it —
+        filtering early, dropping unused columns — so less data rides through.</p>
+      </div>
+    </div>
+    <dl class="gloss">
+      <div><dt>Z-set</dt><dd>A signed ledger: rows with +1 (arrived) or &minus;1 (left) marks.</dd></div>
+      <div><dt>delta (&Delta;)</dt><dd>The batch of ledger entries describing “what just changed.”</dd></div>
+      <div><dt>materialized view</dt><dd>A live answer that's stored and kept current, not recomputed per question.</dd></div>
+      <div><dt>circuit</dt><dd>The assembly line of stations a change rides through inside each live answer.</dd></div>
+    </dl>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    Built on the DBSP theory of incremental computation, running inside DuckDB v1.5.
+    Engineers wanted the full detail? It lives in
+    <a href="ARCHITECTURE.md">docs/ARCHITECTURE.md</a>.
+  </div>
+</footer>
+
+<script>
+(function () {
+  // warehouse boxes: 100 boxes, all "re-touched"
+  var boxes = document.querySelector(".boxes");
+  for (var i = 0; i < 100; i++) {
+    var b = document.createElement("i");
+    if (i % 7 === 3) b.className = "hot";
+    boxes.appendChild(b);
+  }
+
+  // layer accordion
+  document.querySelectorAll(".layer").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var open = btn.getAttribute("aria-expanded") === "true";
+      btn.setAttribute("aria-expanded", open ? "false" : "true");
+    });
+  });
+
+  // ------- assembly line demo -------
+  var reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var total = 200, orders = 2, busy = false;
+  var elTotal = document.getElementById("total");
+  var narrate = document.getElementById("narrate");
+  var slots = [document.getElementById("slot1"), document.getElementById("slot2"), document.getElementById("slot3")];
+  var stations = [document.getElementById("st1"), document.getElementById("st2"), document.getElementById("st3")];
+  var btnAdd = document.getElementById("btnAdd");
+  var btnRemove = document.getElementById("btnRemove");
+  var btnReset = document.getElementById("btnReset");
+
+  function chip(kind, text) {
+    var s = document.createElement("span");
+    s.className = "chip " + kind;
+    s.innerHTML = '<span class="w"></span> ' + text;
+    return s;
+  }
+  function show(el) {
+    requestAnimationFrame(function () {
+      requestAnimationFrame(function () { el.classList.add("show"); });
+    });
+  }
+  function wait(ms) {
+    return new Promise(function (r) { setTimeout(r, reduced ? 0 : ms); });
+  }
+  function clearLine() {
+    slots.forEach(function (s) { s.innerHTML = ""; });
+    stations.forEach(function (s) { s.classList.remove("active"); });
+  }
+  function setButtons(disabled) {
+    btnAdd.disabled = disabled;
+    btnRemove.disabled = disabled || orders === 0;
+  }
+  function fmt(n) { return "$" + n; }
+
+  async function run(sign) {
+    if (busy) return;
+    if (sign < 0 && orders === 0) return;
+    busy = true; setButtons(true);
+    clearLine();
+    var kind = sign > 0 ? "plus" : "minus";
+    var label = "Alice, $100";
+
+    stations[0].classList.add("active");
+    var c1 = chip(kind, label); slots[0].appendChild(c1); show(c1);
+    narrate.textContent = sign > 0
+      ? "A new receipt enters the inbox: Alice's $100 order, marked +1."
+      : "A cancellation enters the inbox: the same $100 order, marked −1. Deletes ride the same line.";
+    await wait(1100);
+
+    stations[0].classList.remove("active");
+    stations[1].classList.add("active");
+    var c2 = chip(kind, label + " ✓"); slots[1].appendChild(c2); show(c2);
+    narrate.textContent = "The filter station checks the one entry: $100 is over $10, so it passes. Old orders are not re-checked.";
+    await wait(1100);
+
+    stations[1].classList.remove("active");
+    stations[2].classList.add("active");
+    var oldT = total;
+    total += sign * 100; orders += sign;
+    var cOut = chip("minus", "Alice " + fmt(oldT)); slots[2].appendChild(cOut); show(cOut);
+    await wait(550);
+    var cIn = chip("plus", "Alice " + fmt(total)); slots[2].appendChild(cIn); show(cIn);
+    narrate.textContent = "The tally retracts the old board line (" + fmt(oldT) +
+      ", −1) and posts the new one (" + fmt(total) + ", +1).";
+    await wait(700);
+
+    elTotal.textContent = fmt(total);
+    elTotal.classList.remove("bump"); void elTotal.offsetWidth;
+    if (!reduced) elTotal.classList.add("bump");
+    document.querySelector(".result-card .chip .w").nextSibling.textContent =
+      " " + orders + (orders === 1 ? " order" : " orders") + " counted so far";
+    await wait(600);
+    stations[2].classList.remove("active");
+    narrate.textContent = "Done. Total work: one entry examined, one board line swapped — no matter how many old orders exist.";
+    busy = false; setButtons(false);
+  }
+
+  btnAdd.addEventListener("click", function () { run(+1); });
+  btnRemove.addEventListener("click", function () { run(-1); });
+  btnReset.addEventListener("click", function () {
+    if (busy) return;
+    total = 200; orders = 2; clearLine();
+    elTotal.textContent = fmt(total);
+    document.querySelector(".result-card .chip .w").nextSibling.textContent = " 2 orders counted so far";
+    narrate.textContent = "The line is idle. Two of Alice's old orders were counted long ago — they will never be re-read.";
+    setButtons(false);
+  });
+  setButtons(false);
+})();
+</script>
+</body>
+</html>
