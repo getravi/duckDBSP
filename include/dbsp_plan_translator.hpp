@@ -560,25 +560,40 @@ public:
 
   struct AggInstance {
     PlanAggSpec::Fn fn;
-    std::unique_ptr<RowExprEval> arg; // null for COUNT_STAR
+    int arg_idx = -1; // index into the batch evaluator; -1 for COUNT_STAR
     bool integer_arg;
     bool decimal_arg = false;
     uint8_t decimal_scale = 0;
     duckdb::LogicalType return_type;
   };
 
+  // exprs layout in the shared batch evaluator: group keys first, then
+  // aggregate arguments (H4: keys/args evaluate per 2048-row chunk instead
+  // of per row through a 1-row executor)
   PlanAggregateNode(dbsp::NodeId id, InputFn input_fn,
-                    std::vector<std::unique_ptr<RowExprEval>> group_evals,
+                    std::shared_ptr<PlanKeepAlive> keep_alive,
+                    std::vector<const duckdb::Expression *> group_exprs,
+                    std::vector<const duckdb::Expression *> arg_exprs,
                     std::vector<AggInstance> aggs,
+                    duckdb::vector<duckdb::LogicalType> input_types,
                     std::string name = "plan_aggregate")
       : dbsp::Node(id, std::move(name)), input_fn_(std::move(input_fn)),
-        group_evals_(std::move(group_evals)), aggs_(std::move(aggs)) {}
+        num_groups_(group_exprs.size()), aggs_(std::move(aggs)) {
+    for (const auto *e : arg_exprs) {
+      group_exprs.push_back(e);
+    }
+    if (!group_exprs.empty()) {
+      eval_ = std::make_unique<BatchEvaluator>(
+          std::move(keep_alive), std::move(group_exprs),
+          std::move(input_types));
+    }
+  }
 
   void step() override {
     output_.clear();
     has_output_ = false;
     const DuckDBZSet &changes = input_fn_();
-    bool global = group_evals_.empty();
+    bool global = num_groups_ == 0;
 
     if (changes.empty()) {
       if (global && !global_emitted_) {
@@ -589,27 +604,72 @@ public:
       return;
     }
 
-    // Bucket incoming deltas by group key
-    std::unordered_map<DuckDBRow, std::vector<std::pair<DuckDBRow, int64_t>>,
-                       DuckDBRowHash>
+    // Batch-evaluate group keys and aggregate args, then bucket the
+    // pre-evaluated (args, weight) pairs by key
+    using Contribution = std::pair<std::vector<duckdb::Value>, int64_t>;
+    std::unordered_map<DuckDBRow, std::vector<Contribution>, DuckDBRowHash>
         buckets;
-    for (const auto &[row, weight] : changes) {
-      DuckDBRow key;
-      key.columns.reserve(group_evals_.size());
-      for (auto &g : group_evals_) {
-        key.columns.push_back(g->eval(row));
-      }
-      buckets[key].emplace_back(row, weight);
-    }
 
-    for (auto &[key, rows] : buckets) {
+    std::vector<const DuckDBRow *> rows;
+    std::vector<int64_t> weights;
+    rows.reserve(BatchEvaluator::kBatch);
+    weights.reserve(BatchEvaluator::kBatch);
+    const size_t num_args = eval_ ? eval_->expr_count() - num_groups_ : 0;
+
+    auto flush = [&]() {
+      if (rows.empty()) {
+        return;
+      }
+      const duckdb::idx_t n = rows.size();
+      std::vector<DuckDBRow> keys(n);
+      if (eval_) {
+        eval_->fill(rows.data(), n);
+        for (size_t g = 0; g < num_groups_; g++) {
+          duckdb::Vector &v = eval_->execute(g);
+          const auto &type = eval_->return_type(g);
+          for (duckdb::idx_t i = 0; i < n; i++) {
+            keys[i].columns.push_back(BatchEvaluator::read_result(v, type, i));
+          }
+        }
+        std::vector<std::vector<duckdb::Value>> args(n);
+        for (size_t a = 0; a < num_args; a++) {
+          const size_t e = num_groups_ + a;
+          duckdb::Vector &v = eval_->execute(e);
+          const auto &type = eval_->return_type(e);
+          for (duckdb::idx_t i = 0; i < n; i++) {
+            args[i].push_back(BatchEvaluator::read_result(v, type, i));
+          }
+        }
+        for (duckdb::idx_t i = 0; i < n; i++) {
+          buckets[std::move(keys[i])].emplace_back(std::move(args[i]),
+                                                   weights[i]);
+        }
+      } else {
+        for (duckdb::idx_t i = 0; i < n; i++) {
+          buckets[DuckDBRow{}].emplace_back(std::vector<duckdb::Value>{},
+                                            weights[i]);
+        }
+      }
+      rows.clear();
+      weights.clear();
+    };
+    for (const auto &[row, weight] : changes) {
+      rows.push_back(&row);
+      weights.push_back(weight);
+      if (rows.size() == BatchEvaluator::kBatch) {
+        flush();
+      }
+    }
+    flush();
+
+    for (auto &[key, contributions] : buckets) {
       auto &state = states_[key];
       bool had_row = global ? global_emitted_ : state.row_weight > 0;
       if (had_row) {
         output_.insert(result_row(key, state), -1);
       }
-      for (const auto &[row, weight] : rows) {
-        apply(state, row, weight);
+      for (const auto &[args, weight] : contributions) {
+        apply(state, args, weight);
       }
       if (global || state.row_weight > 0) {
         output_.insert(result_row(key, state), 1);
@@ -649,7 +709,8 @@ private:
     std::vector<AggState> aggs;
   };
 
-  void apply(GroupState &state, const DuckDBRow &row, int64_t weight) {
+  void apply(GroupState &state, const std::vector<duckdb::Value> &args,
+             int64_t weight) {
     state.row_weight += weight;
     state.aggs.resize(aggs_.size());
     for (size_t i = 0; i < aggs_.size(); i++) {
@@ -659,7 +720,7 @@ private:
         s.count += weight;
         continue;
       }
-      duckdb::Value v = spec.arg->eval(row);
+      const duckdb::Value &v = args[static_cast<size_t>(spec.arg_idx)];
       if (v.IsNull()) {
         continue; // SQL: NULL arguments are ignored
       }
@@ -752,7 +813,8 @@ private:
   }
 
   InputFn input_fn_;
-  std::vector<std::unique_ptr<RowExprEval>> group_evals_;
+  size_t num_groups_;
+  std::unique_ptr<BatchEvaluator> eval_;
   std::vector<AggInstance> aggs_;
   std::unordered_map<DuckDBRow, GroupState, DuckDBRowHash> states_;
   DuckDBZSet output_;
@@ -785,6 +847,9 @@ public:
                duckdb::vector<duckdb::LogicalType> left_types = {},
                duckdb::vector<duckdb::LogicalType> right_types = {},
                bool null_safe_keys = false,
+               std::shared_ptr<PlanKeepAlive> keep_alive = nullptr,
+               std::vector<const duckdb::Expression *> left_key_exprs = {},
+               std::vector<const duckdb::Expression *> right_key_exprs = {},
                std::string name = "plan_join")
       : dbsp::Node(id, std::move(name)), left_fn_(std::move(left_fn)),
         right_fn_(std::move(right_fn)), keys_(std::move(keys)),
@@ -792,6 +857,14 @@ public:
         left_types_(std::move(left_types)),
         right_types_(std::move(right_types)),
         null_safe_keys_(null_safe_keys) {
+    // H4: whole-delta key extraction runs batched; the per-row KeyPair
+    // evals stay for point lookups (match counts, pads, marks)
+    if (keep_alive && !left_key_exprs.empty()) {
+      batch_left_keys_ = std::make_unique<BatchEvaluator>(
+          keep_alive, std::move(left_key_exprs), left_types_);
+      batch_right_keys_ = std::make_unique<BatchEvaluator>(
+          keep_alive, std::move(right_key_exprs), right_types_);
+    }
     pads_left_ = join_type_ == duckdb::JoinType::LEFT ||
                  join_type_ == duckdb::JoinType::OUTER;
     pads_right_ = join_type_ == duckdb::JoinType::RIGHT ||
@@ -813,8 +886,8 @@ public:
       // with a three-valued match mark — no bilinear emission at all
       const bool was_nonempty = right_total_ > 0;
       const bool had_nulls = right_null_ > 0;
-      integrate(dl, /*left=*/true);
-      integrate(dr, /*left=*/false);
+      integrate(materialize_keys(dl, /*left=*/true), /*left=*/true);
+      integrate(materialize_keys(dr, /*left=*/false), /*left=*/false);
       const bool category_changed =
           was_nonempty != (right_total_ > 0) || had_nulls != (right_null_ > 0);
       reconcile_marks(dl, dr, category_changed);
@@ -822,64 +895,65 @@ public:
       return;
     }
 
+    // Materialize both deltas once with batch-evaluated keys; every pass
+    // below (probe passes AND integration) reuses them
+    DeltaKeys kl = materialize_keys(dl, /*left=*/true);
+    DeltaKeys kr = materialize_keys(dr, /*left=*/false);
+
     // Δl ⋈ R_old
-    for (const auto &[lrow, lw] : dl) {
-      DuckDBRow key;
-      if (!eval_key(lrow, /*left=*/true, key)) {
+    for (size_t i = 0; i < kl.rows.size(); i++) {
+      if (!kl.valid[i]) {
         continue;
       }
-      auto it = right_index_.find(key);
+      auto it = right_index_.find(kl.keys[i]);
       if (it == right_index_.end()) {
         continue;
       }
       for (const auto &[rrow, rw] : it->second) {
-        try_emit(lrow, rrow, lw * rw);
+        try_emit(*kl.rows[i], rrow, kl.weights[i] * rw);
       }
     }
 
     // L_old ⋈ Δr
-    for (const auto &[rrow, rw] : dr) {
-      DuckDBRow key;
-      if (!eval_key(rrow, /*left=*/false, key)) {
+    for (size_t i = 0; i < kr.rows.size(); i++) {
+      if (!kr.valid[i]) {
         continue;
       }
-      auto it = left_index_.find(key);
+      auto it = left_index_.find(kr.keys[i]);
       if (it == left_index_.end()) {
         continue;
       }
       for (const auto &[lrow, lw] : it->second) {
-        try_emit(lrow, rrow, lw * rw);
+        try_emit(lrow, *kr.rows[i], lw * kr.weights[i]);
       }
     }
 
     // Δl ⋈ Δr (both sides changed in the same step, e.g. self-joins)
-    if (!dl.empty() && !dr.empty()) {
+    if (!kl.rows.empty() && !kr.rows.empty()) {
       Index dr_index;
-      for (const auto &[rrow, rw] : dr) {
-        DuckDBRow key;
-        if (eval_key(rrow, /*left=*/false, key)) {
-          dr_index[key][rrow] += rw;
+      for (size_t i = 0; i < kr.rows.size(); i++) {
+        if (kr.valid[i]) {
+          dr_index[kr.keys[i]][*kr.rows[i]] += kr.weights[i];
         }
       }
-      for (const auto &[lrow, lw] : dl) {
-        DuckDBRow key;
-        if (!eval_key(lrow, /*left=*/true, key)) {
+      for (size_t i = 0; i < kl.rows.size(); i++) {
+        if (!kl.valid[i]) {
           continue;
         }
-        auto it = dr_index.find(key);
+        auto it = dr_index.find(kl.keys[i]);
         if (it == dr_index.end()) {
           continue;
         }
         for (const auto &[rrow, rw] : it->second) {
-          try_emit(lrow, rrow, lw * rw);
+          try_emit(*kl.rows[i], rrow, kl.weights[i] * rw);
         }
       }
     }
 
     // Integrate deltas into the side indexes (and, for outer joins, the
     // per-row weight maps that include NULL-key rows)
-    integrate(dl, /*left=*/true);
-    integrate(dr, /*left=*/false);
+    integrate(kl, /*left=*/true);
+    integrate(kr, /*left=*/false);
 
     // Outer-join NULL padding: reconcile the pad of every row whose match
     // count may have changed. Desired pad weight = the row's total weight
@@ -980,11 +1054,72 @@ private:
     output_.insert(combined, weight);
   }
 
-  void integrate(const DuckDBZSet &delta, bool left) {
+  // One side's delta with batch-evaluated keys. valid[i] == false means a
+  // NULL key column under non-null-safe semantics (row can never match);
+  // with null-safe keys every row is valid and NULLs are key values.
+  struct DeltaKeys {
+    std::vector<const DuckDBRow *> rows;
+    std::vector<int64_t> weights;
+    std::vector<DuckDBRow> keys;
+    std::vector<char> valid;
+  };
+
+  DeltaKeys materialize_keys(const DuckDBZSet &delta, bool left) {
+    DeltaKeys out;
+    const size_t n = delta.size();
+    out.rows.reserve(n);
+    out.weights.reserve(n);
+    out.keys.resize(n);
+    out.valid.assign(n, 1);
+    for (const auto &[row, w] : delta) {
+      out.rows.push_back(&row);
+      out.weights.push_back(w);
+    }
+    if (keys_.empty()) {
+      return out; // keyless join: single empty key, all valid
+    }
+    BatchEvaluator *be =
+        left ? batch_left_keys_.get() : batch_right_keys_.get();
+    if (!be) {
+      // No batch evaluators wired (unit-constructed node): per-row path
+      for (size_t i = 0; i < out.rows.size(); i++) {
+        DuckDBRow key;
+        if (eval_key(*out.rows[i], left, key)) {
+          out.keys[i] = std::move(key);
+        } else {
+          out.valid[i] = 0;
+        }
+      }
+      return out;
+    }
+    size_t base = 0;
+    while (base < out.rows.size()) {
+      const duckdb::idx_t chunk = static_cast<duckdb::idx_t>(
+          std::min<size_t>(BatchEvaluator::kBatch, out.rows.size() - base));
+      be->fill(out.rows.data() + base, chunk);
+      for (size_t k = 0; k < be->expr_count(); k++) {
+        duckdb::Vector &v = be->execute(k);
+        const auto &type = be->return_type(k);
+        for (duckdb::idx_t i = 0; i < chunk; i++) {
+          duckdb::Value val = BatchEvaluator::read_result(v, type, i);
+          if (val.IsNull() && !null_safe_keys_) {
+            out.valid[base + i] = 0;
+          }
+          out.keys[base + i].columns.push_back(std::move(val));
+        }
+      }
+      base += chunk;
+    }
+    return out;
+  }
+
+  void integrate(const DeltaKeys &dk, bool left) {
     Index &index = left ? left_index_ : right_index_;
     const bool track_weights = left ? (pads_left_ || marks_) : pads_right_;
     RowWeights &weights = left ? left_weights_ : right_weights_;
-    for (const auto &[row, w] : delta) {
+    for (size_t i = 0; i < dk.rows.size(); i++) {
+      const DuckDBRow &row = *dk.rows[i];
+      const int64_t w = dk.weights[i];
       if (track_weights) {
         int64_t &total = weights[row];
         total += w;
@@ -992,8 +1127,7 @@ private:
           weights.erase(row);
         }
       }
-      DuckDBRow key;
-      if (!eval_key(row, left, key)) {
+      if (!dk.valid[i]) {
         if (!left && marks_) {
           right_total_ += w;
           right_null_ += w; // NULL key on the subquery side
@@ -1003,13 +1137,13 @@ private:
       if (!left && marks_) {
         right_total_ += w;
       }
-      auto &rows = index[key];
+      auto &rows = index[dk.keys[i]];
       int64_t &weight = rows[row];
       weight += w;
       if (weight == 0) {
         rows.erase(row);
         if (rows.empty()) {
-          index.erase(key);
+          index.erase(dk.keys[i]);
         }
       }
     }
@@ -1199,6 +1333,7 @@ private:
   bool pads_left_ = false, pads_right_ = false;
   bool marks_ = false;
   bool null_safe_keys_ = false;
+  std::unique_ptr<BatchEvaluator> batch_left_keys_, batch_right_keys_;
   Index left_index_, right_index_;
   RowWeights left_weights_, right_weights_;   // incl. NULL-key rows
   RowWeights left_pad_, right_pad_;           // currently emitted pad weight
@@ -1814,11 +1949,7 @@ private:
     }
     case PlanOpSpec::Kind::AGGREGATE: {
       OutputFn child = build(*spec.children[0], keep_alive);
-      std::vector<std::unique_ptr<RowExprEval>> group_evals;
-      for (const auto *expr : spec.exprs) {
-        group_evals.push_back(std::make_unique<RowExprEval>(
-            keep_alive, *expr, spec.input_types));
-      }
+      std::vector<const duckdb::Expression *> arg_exprs;
       std::vector<PlanAggregateNode::AggInstance> aggs;
       for (const auto &agg_spec : spec.agg_specs) {
         PlanAggregateNode::AggInstance inst;
@@ -1828,14 +1959,14 @@ private:
         inst.decimal_scale = agg_spec.decimal_scale;
         inst.return_type = agg_spec.return_type;
         if (agg_spec.arg) {
-          inst.arg = std::make_unique<RowExprEval>(keep_alive, *agg_spec.arg,
-                                                   spec.input_types);
+          inst.arg_idx = static_cast<int>(arg_exprs.size());
+          arg_exprs.push_back(agg_spec.arg);
         }
         aggs.push_back(std::move(inst));
       }
       auto *node = circuit_.add_node(std::make_unique<PlanAggregateNode>(
-          circuit_.next_node_id(), std::move(child), std::move(group_evals),
-          std::move(aggs)));
+          circuit_.next_node_id(), std::move(child), keep_alive, spec.exprs,
+          std::move(arg_exprs), std::move(aggs), spec.input_types));
       return [node]() -> const DuckDBZSet & { return node->output(); };
     }
     case PlanOpSpec::Kind::JOIN: {
@@ -1860,10 +1991,16 @@ private:
         res.cmp = cond.cmp;
         residuals.push_back(std::move(res));
       }
+      std::vector<const duckdb::Expression *> lkeys, rkeys;
+      for (const auto &cond : spec.equi_conds) {
+        lkeys.push_back(cond.left);
+        rkeys.push_back(cond.right);
+      }
       auto *node = circuit_.add_node(std::make_unique<PlanJoinNode>(
           circuit_.next_node_id(), std::move(left), std::move(right),
           std::move(keys), std::move(residuals), spec.join_type,
-          spec.left_types, spec.right_types, spec.null_safe_keys));
+          spec.left_types, spec.right_types, spec.null_safe_keys,
+          keep_alive, std::move(lkeys), std::move(rkeys)));
       return [node]() -> const DuckDBZSet & { return node->output(); };
     }
     case PlanOpSpec::Kind::DISTINCT: {
@@ -1941,11 +2078,17 @@ private:
                                                  spec.right_types);
         keys.push_back(std::move(kp));
       }
+      std::vector<const duckdb::Expression *> lkeys, rkeys;
+      for (const auto &cond : spec.equi_conds) {
+        lkeys.push_back(cond.left);
+        rkeys.push_back(cond.right);
+      }
       auto *node = circuit_.add_node(std::make_unique<PlanJoinNode>(
           circuit_.next_node_id(), std::move(left), std::move(right),
           std::move(keys), std::vector<PlanJoinNode::Residual>{},
           spec.join_type, spec.left_types, spec.right_types,
-          spec.null_safe_keys, "plan_delim_join"));
+          spec.null_safe_keys, keep_alive, std::move(lkeys),
+          std::move(rkeys), "plan_delim_join"));
       return [node]() -> const DuckDBZSet & { return node->output(); };
     }
     case PlanOpSpec::Kind::DELIM_REF:
