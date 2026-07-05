@@ -30,6 +30,9 @@
 //       point (self-reference = sentinel source). Multi-table recursive
 //       steps work; USING KEY is rejected; deletions are ignored inside the
 //       fixed point (documented parity with the old parser path).
+//   C3: DISTINCT ON via NativeDistinctOnView in an EmbeddedViewNode
+//       (column-ref targets; winner-pick order from the DISTINCT node's own
+//       order_by modifier — the ORDER_BY above is presentation, see C1).
 // Any other operator yields a DBSP-E110 error naming the operator;
 // CDCManager::create_view falls back to the bespoke parser transparently.
 //
@@ -40,6 +43,7 @@
 #pragma once
 
 #include "dbsp_circuit_views.hpp"
+#include "dbsp_distinct_on.hpp"
 #include "dbsp_errors.hpp"
 #include "dbsp_window_view.hpp"
 
@@ -149,7 +153,8 @@ struct PlanOpSpec {
     CTE,         // materialized CTE: children = {definition, main query}
     CTE_REF,     // reads the shared output of a CTE definition
     SORT_LIMIT,  // NativeSortView/NativeLimitView in an EmbeddedViewNode
-    REC_CTE      // WITH RECURSIVE: children = {anchor, recursive step}
+    REC_CTE,     // WITH RECURSIVE: children = {anchor, recursive step}
+    DISTINCT_ON  // NativeDistinctOnView in an EmbeddedViewNode
   };
 
   // Comparison between a left-side and a right-side bound expression
@@ -179,6 +184,10 @@ struct PlanOpSpec {
   std::vector<ColumnInfo> window_result_cols;             // WINDOW
   duckdb::idx_t cte_index = 0;                   // CTE / CTE_REF
 
+  // DISTINCT_ON: column_idxs = partition keys; sort_columns = winner-pick
+  // order from the DISTINCT node's own order_by modifier (not the
+  // presentation ORDER_BY above it). Output keeps the full child row layout.
+  //
   // SORT_LIMIT: ORDER BY / LIMIT / OFFSET folded into one embedded view.
   // project_idxs is a trailing pure-column-ref projection folded in so sort
   // keys dropped from the output still order it. presentation_root marks the
@@ -1100,6 +1109,27 @@ private:
     }
     case PlanOpSpec::Kind::CTE_REF:
       return cte_outputs_.at(spec.cte_index);
+    case PlanOpSpec::Kind::DISTINCT_ON: {
+      OutputFn child = build(*spec.children[0], keep_alive);
+      TableSchema vschema;
+      vschema.table_name = name_ + "_distinct_on";
+      std::vector<size_t> keys;
+      keys.reserve(spec.column_idxs.size());
+      for (auto idx : spec.column_idxs) {
+        keys.push_back(static_cast<size_t>(idx));
+      }
+      std::vector<NativeDistinctOnView::SortColumn> order;
+      order.reserve(spec.sort_columns.size());
+      for (const auto &sc : spec.sort_columns) {
+        order.push_back({sc.column_idx, sc.ascending, sc.nulls_first});
+      }
+      auto view = std::make_unique<NativeDistinctOnView>(
+          name_ + "_distinct_on", "", EmbeddedViewNode::kInputName, vschema,
+          std::move(keys), std::move(order));
+      auto *node = circuit_.add_node(std::make_unique<EmbeddedViewNode>(
+          circuit_.next_node_id(), std::move(child), std::move(view)));
+      return [node]() -> const DuckDBZSet & { return node->output(); };
+    }
     case PlanOpSpec::Kind::REC_CTE: {
       OutputFn anchor = build(*spec.children[0], keep_alive);
       std::string sentinel =
@@ -1602,8 +1632,11 @@ private:
     }
 
     SpecPtr visit_distinct(duckdb::LogicalDistinct &op) {
+      if (op.distinct_type == duckdb::DistinctType::DISTINCT_ON) {
+        return visit_distinct_on(op);
+      }
       if (op.distinct_type != duckdb::DistinctType::DISTINCT) {
-        return unsupported("DISTINCT ON");
+        return unsupported("DISTINCT variant");
       }
       // Plain DISTINCT deduplicates whole rows; targets must be the full
       // identity column list, otherwise semantics differ
@@ -1629,6 +1662,45 @@ private:
       spec->kind = PlanOpSpec::Kind::DISTINCT;
       spec->children.push_back(std::move(child));
       // Row shape unchanged; columns stay as-is
+      return spec;
+    }
+
+    SpecPtr visit_distinct_on(duckdb::LogicalDistinct &op) {
+      auto spec = std::make_unique<PlanOpSpec>();
+      spec->kind = PlanOpSpec::Kind::DISTINCT_ON;
+      for (const auto &target : op.distinct_targets) {
+        if (target->GetExpressionClass() !=
+            duckdb::ExpressionClass::BOUND_REF) {
+          return unsupported("DISTINCT ON computed expression "
+                             "(use a plain column)");
+        }
+        spec->column_idxs.push_back(
+            target->Cast<duckdb::BoundReferenceExpression>().index);
+      }
+      // Winner-pick order (which row survives per key) rides on the DISTINCT
+      // node itself; the ORDER_BY operator above is presentation only
+      if (op.order_by) {
+        for (const auto &o : op.order_by->orders) {
+          if (o.expression->GetExpressionClass() !=
+              duckdb::ExpressionClass::BOUND_REF) {
+            return unsupported("DISTINCT ON ORDER BY expression "
+                               "(use a plain column)");
+          }
+          auto &ref = o.expression->Cast<duckdb::BoundReferenceExpression>();
+          NativeSortView::SortColumn sc;
+          sc.column_idx = static_cast<size_t>(ref.index);
+          sc.ascending = o.type != duckdb::OrderType::DESCENDING;
+          sc.nulls_first =
+              o.null_order == duckdb::OrderByNullType::NULLS_FIRST;
+          spec->sort_columns.push_back(sc);
+        }
+      }
+      auto child = visit(*op.children[0]);
+      if (!child) {
+        return nullptr;
+      }
+      spec->children.push_back(std::move(child));
+      // Output keeps the full child row layout; columns stay as-is
       return spec;
     }
 

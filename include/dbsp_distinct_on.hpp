@@ -123,10 +123,7 @@ private:
         const auto &val_a = a.columns[col.column_idx];
         const auto &val_b = b.columns[col.column_idx];
 
-        if (val_a == val_b)
-          continue;
-
-        // Handle NULLs
+        // NULLs first: duckdb::Value comparison operators throw on NULLs
         bool a_null = val_a.IsNull();
         bool b_null = val_b.IsNull();
 
@@ -135,6 +132,9 @@ private:
         if (!a_null && b_null)
           return !col.nulls_first;
         if (a_null && b_null)
+          continue;
+
+        if (val_a == val_b)
           continue;
 
         bool less = val_a < val_b;

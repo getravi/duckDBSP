@@ -643,3 +643,53 @@ TEST_CASE("planner C2: recursive CTE joining a second table",
   db.exec("SELECT * FROM dbsp_sync('edges')");
   db.assertViewRowCount("v_reach", 4); // + (1,5)
 }
+
+// ===== Phase C3: DISTINCT ON through the planner =====
+
+TEST_CASE("planner C3: DISTINCT ON keeps winner per key",
+          "[integration][planner][distinct_on]") {
+  DuckDBTestHarness db;
+  db.createTable("dt", "id INT, val INT, tag VARCHAR",
+                 {"(1, 10, 'a')", "(2, 30, 'a')", "(3, 20, 'b')"});
+  db.exec("SELECT * FROM dbsp_track('dt')");
+  db.exec("SELECT * FROM dbsp_sync('dt')");
+  db.exec("SELECT * FROM dbsp_use_planner(true)");
+
+  const std::string sql = "SELECT DISTINCT ON (tag) id, val FROM dt "
+                          "ORDER BY tag, val DESC";
+  db.exec("SELECT * FROM dbsp_create_view('v_don', '" + sql + "')");
+  REQUIRE(plannerBuilt("v_don"));
+
+  // One winner per tag, scanned in tag order: 'a' -> id 2 (val 30 wins),
+  // 'b' -> id 3
+  REQUIRE(scanColumn0(db, "v_don") == std::vector<int64_t>{2, 3});
+
+  // New max for 'a' displaces the old winner
+  db.exec("INSERT INTO dt VALUES (4, 40, 'a')");
+  db.exec("SELECT * FROM dbsp_sync('dt')");
+  REQUIRE(scanColumn0(db, "v_don") == std::vector<int64_t>{4, 3});
+
+  // Deleting the winner falls back to the runner-up
+  db.exec("DELETE FROM dt WHERE id = 4");
+  db.exec("SELECT * FROM dbsp_sync('dt')");
+  REQUIRE(scanColumn0(db, "v_don") == std::vector<int64_t>{2, 3});
+
+  // Deleting a whole partition removes its row
+  db.exec("DELETE FROM dt WHERE tag = 'b'");
+  db.exec("SELECT * FROM dbsp_sync('dt')");
+  REQUIRE(scanColumn0(db, "v_don") == std::vector<int64_t>{2});
+}
+
+TEST_CASE("planner C3: DISTINCT ON differential",
+          "[integration][planner][distinct_on]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+
+  // Deterministic winner per tag: highest val, id as tiebreak
+  const std::string sql = "SELECT DISTINCT ON (tag) tag, val, id FROM t "
+                          "ORDER BY tag, val DESC, id";
+  db.exec("SELECT * FROM dbsp_create_view('v_don_diff', '" + sql + "')");
+  REQUIRE(plannerBuilt("v_don_diff"));
+  requireViewMatchesQuery(db, "v_don_diff", sql);
+  runDifferential(db, "v_don_diff", sql, 83);
+}
