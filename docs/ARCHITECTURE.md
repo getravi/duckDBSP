@@ -16,7 +16,7 @@ Internal design of the DBSP DuckDB extension.
 │  │                      CDC Manager                             ││
 │  │  - Tracked Tables     - View Registry                       ││
 │  │  - Change Detection   - Dependency Graph                    ││
-│  │  - Change Propagation - Persistence                         ││
+│  │  - Incremental cascade: one topological pass, deltas only   ││
 │  └─────────────────────────────────────────────────────────────┘│
 │                              │                                   │
 │  ┌─────────────────────────────────────────────────────────────┐│

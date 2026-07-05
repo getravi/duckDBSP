@@ -25,6 +25,7 @@
 #include "duckdb/transaction/meta_transaction.hpp"
 
 #include <algorithm>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <atomic>
@@ -1782,6 +1783,10 @@ private:
   // IMPORTANT: Must be called with struct_mutex_ already held (shared or
   // exclusive) by the caller. Do NOT re-acquire struct_mutex_ here.
   // Acquires view_mutex_ exclusively for writing view Z-set state.
+  // Incremental cascade (E1): one topological pass over every transitive
+  // dependent. Each view applies the pending delta of each updated source;
+  // its own resulting delta joins the pending map for its dependents.
+  // O(Δ) end to end — no view is ever reset or recomputed from full state.
   void propagate_changes(const std::string &source_name,
                          const DuckDBZSet &delta) {
     if (delta.empty())
@@ -1791,47 +1796,52 @@ private:
     // Lock ordering: struct_mutex_ (held by caller) → view_mutex_ (acquired here).
     std::unique_lock<std::shared_mutex> view_lock(view_mutex_);
 
-    // Get topological order of dependent views
-    auto update_order = dep_graph_.topological_order(source_name);
+    // Pending deltas by source name. Values either borrow a view's
+    // get_delta() (valid until that view's next apply — topological order
+    // guarantees the read happens first) or point into the arena below
+    // when a view consumed deltas from multiple sources (each apply clears
+    // the previous delta, so dependents need the accumulated union).
+    std::unordered_map<std::string, const DuckDBZSet *> pending;
+    std::deque<DuckDBZSet> arena;
+    pending[source_name] = &delta;
 
-    // First, apply to direct dependents of the source
-    for (auto &[view_name, view] : views_) {
-      auto sources = view->source_tables();
-      for (const auto &src : sources) {
-        if (src == source_name) {
-          view->apply_changes(source_name, delta);
-          break;
-        }
-      }
-    }
-
-    // Then propagate through the graph in topological order
-    for (const auto &view_name : update_order) {
+    for (const auto &view_name : dep_graph_.topological_order(source_name)) {
       auto it = views_.find(view_name);
       if (it == views_.end())
         continue;
 
-      // Get the view's sources that are also views
-      auto sources = it->second->source_tables();
-      bool depends_on_views = false;
-      for (const auto &src : sources) {
-        if (views_.count(src)) {
-          depends_on_views = true;
-          break;
+      NativeMaterializedView &view = *it->second;
+      const DuckDBZSet *single_delta = nullptr;
+      DuckDBZSet accumulated;
+      size_t applied = 0;
+      for (const auto &src : view.source_tables()) {
+        auto p = pending.find(src);
+        if (p == pending.end() || p->second->empty())
+          continue;
+        view.apply_changes(src, *p->second);
+        applied++;
+        if (applied == 1) {
+          single_delta = &view.get_delta();
+        } else {
+          if (applied == 2 && single_delta) {
+            accumulated = *single_delta; // upgrade borrow to owned union
+            single_delta = nullptr;
+          }
+          for (const auto &[row, w] : view.get_delta()) {
+            accumulated.insert(row, w);
+          }
         }
       }
 
-      if (depends_on_views) {
-        // Reset the view and re-apply full state from all sources
-        it->second->reset();
-        for (const auto &src : sources) {
-          if (views_.count(src)) {
-            it->second->apply_changes(src, views_[src]->get_result());
-          } else if (tracked_tables_.count(src)) {
-            it->second->apply_changes(src,
-                                      tracked_tables_[src]->current_state());
-          }
+      if (applied == 0)
+        continue;
+      if (single_delta) {
+        if (!single_delta->empty()) {
+          pending[view_name] = single_delta;
         }
+      } else if (!accumulated.empty()) {
+        arena.push_back(std::move(accumulated));
+        pending[view_name] = &arena.back();
       }
     }
   }

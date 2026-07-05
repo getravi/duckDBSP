@@ -987,3 +987,93 @@ TEST_CASE("planner D3: IN over emptied subquery flips marks in bulk",
   db.exec("SELECT * FROM dbsp_sync('ms')");
   db.assertViewRowCount("v_bulk", 0);
 }
+
+// ===== Phase E1: incremental view-on-view cascades =====
+
+TEST_CASE("planner E1: three-level cascade differential",
+          "[integration][planner][cascade]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  setupTableU(db);
+
+  // base tables -> join view -> aggregate view -> sort/limit view.
+  // Every level must stay equal to DuckDB's answer for its own SQL under
+  // delete-heavy churn — this exercises delta propagation between views,
+  // not just table-to-view.
+  const std::string sql_j =
+      "SELECT t.id AS tid, t.val AS tval, u.val AS uval, t.tag AS ttag "
+      "FROM t LEFT JOIN u ON t.id = u.id";
+  const std::string sql_a =
+      "SELECT ttag, COUNT(*) AS n, SUM(tval) AS s FROM v_e1_j GROUP BY ttag";
+  const std::string sql_a_direct =
+      "SELECT ttag, COUNT(*) AS n, SUM(tval) AS s FROM (" + sql_j +
+      ") GROUP BY ttag";
+  const std::string sql_s = "SELECT ttag, s FROM v_e1_a ORDER BY s DESC, ttag";
+  const std::string sql_s_direct =
+      "SELECT ttag, s FROM (" + sql_a_direct + ") ORDER BY s DESC, ttag";
+
+  db.exec("SELECT * FROM dbsp_create_view('v_e1_j', '" + sql_j + "')");
+  db.exec("SELECT * FROM dbsp_create_view('v_e1_a', '" + sql_a + "')");
+  db.exec("SELECT * FROM dbsp_create_view('v_e1_s', '" + sql_s + "')");
+  REQUIRE(plannerBuilt("v_e1_j"));
+  REQUIRE(plannerBuilt("v_e1_a"));
+  REQUIRE(plannerBuilt("v_e1_s"));
+
+  std::mt19937 rng(811);
+  std::vector<std::pair<std::string, int>> live;
+  for (int round = 0; round < 20; round++) {
+    int inserts = static_cast<int>(rng() % 5) + 1;
+    for (int i = 0; i < inserts; i++) {
+      std::string table = rng() % 2 ? "t" : "u";
+      int id = static_cast<int>(rng() % 8);
+      std::string val = rng() % 10 == 0 ? "NULL" : std::to_string(rng() % 60);
+      char tag = static_cast<char>('a' + rng() % 3);
+      db.exec("INSERT INTO " + table + " VALUES (" + std::to_string(id) +
+              ", " + val + ", '" + std::string(1, tag) + "')");
+      live.push_back({table, id});
+    }
+    int deletes = live.empty() ? 0 : static_cast<int>(rng() % 4);
+    for (int i = 0; i < deletes && !live.empty(); i++) {
+      size_t idx = rng() % live.size();
+      db.exec("DELETE FROM " + live[idx].first + " WHERE rowid = (SELECT "
+              "rowid FROM " + live[idx].first + " WHERE id = " +
+              std::to_string(live[idx].second) + " LIMIT 1)");
+      live.erase(live.begin() + static_cast<long>(idx));
+    }
+    db.exec("SELECT * FROM dbsp_sync('t')");
+    db.exec("SELECT * FROM dbsp_sync('u')");
+    requireViewMatchesQuery(db, "v_e1_j", sql_j);
+    requireViewMatchesQuery(db, "v_e1_a", sql_a_direct);
+    requireViewMatchesQuery(db, "v_e1_s", sql_s_direct);
+  }
+}
+
+TEST_CASE("planner E1: diamond dependency applies both parent deltas",
+          "[integration][planner][cascade]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+
+  // t -> v_hi and v_lo -> v_union(v_hi, v_lo): the union view receives
+  // deltas from BOTH parents in one propagation round; missing either one
+  // (e.g. a second apply clearing the first delta) corrupts the union
+  const std::string sql_hi = "SELECT id, val FROM t WHERE val >= 50";
+  const std::string sql_lo = "SELECT id, val FROM t WHERE val < 50";
+  const std::string sql_u = "SELECT * FROM v_e1_hi UNION ALL SELECT * FROM v_e1_lo";
+  const std::string sql_u_direct =
+      "SELECT * FROM (" + sql_hi + ") UNION ALL SELECT * FROM (" + sql_lo + ")";
+
+  db.exec("SELECT * FROM dbsp_create_view('v_e1_hi', '" + sql_hi + "')");
+  db.exec("SELECT * FROM dbsp_create_view('v_e1_lo', '" + sql_lo + "')");
+  db.exec("SELECT * FROM dbsp_create_view('v_e1_u', '" + sql_u + "')");
+  REQUIRE(plannerBuilt("v_e1_u"));
+  requireViewMatchesQuery(db, "v_e1_u", sql_u_direct);
+
+  // One insert lands in exactly one parent; a mixed batch lands in both
+  db.exec("INSERT INTO t VALUES (100, 80, 'z'), (101, 10, 'z')");
+  db.exec("SELECT * FROM dbsp_sync('t')");
+  requireViewMatchesQuery(db, "v_e1_u", sql_u_direct);
+
+  db.exec("DELETE FROM t WHERE id IN (100, 101)");
+  db.exec("SELECT * FROM dbsp_sync('t')");
+  requireViewMatchesQuery(db, "v_e1_u", sql_u_direct);
+}

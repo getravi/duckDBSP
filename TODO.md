@@ -17,6 +17,11 @@ subsystem, bespoke parser, standalone Z-set spilling).
 
 ## Performance
 
+- **Scan-and-diff sync is now the dominant cost**: dbsp_sync full-scans
+  the table to compute the delta (~173ms on 50k rows) while propagating
+  that delta through a 3-level view chain costs ~29µs. Row-level CDC
+  (on_insert/on_delete already exist; auto-CDC hooks feed them) is the
+  path to O(Δ) end-to-end.
 - Phase D1 vectorized filter/map/fused evaluation + zero-copy circuit
   deltas: fused filter 259k→644k rows/s, aggregate 770k→1.88M, join delta
   140k→265k. Remaining ~2.4× gap vs a hand-written lambda is Z-set insert

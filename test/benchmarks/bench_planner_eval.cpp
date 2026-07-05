@@ -148,3 +148,51 @@ TEST_CASE("Benchmark: planner join delta throughput",
             << rows_per_sec(join_us) << " rows/s)\n";
 }
 
+
+TEST_CASE("Benchmark: cascaded view sync cost", "[benchmark][cascade_bench]") {
+  // 50k-row base, 3-level chain (filter -> aggregate -> sort). Time 20
+  // single-row syncs: with reset+recompute cascades this is O(base size)
+  // per sync; with delta propagation it must be O(delta).
+  DuckDBTestHarness db;
+  db.exec("CREATE TABLE big (id INT, val INT, tag VARCHAR)");
+  db.exec("INSERT INTO big SELECT range, range % 100, chr(CAST(97 + range % 3 AS INT)) "
+          "FROM range(50000)");
+  db.exec("SELECT * FROM dbsp_track('big')");
+  db.exec("SELECT * FROM dbsp_sync('big')");
+  db.exec("SELECT * FROM dbsp_use_planner(true)");
+
+  db.exec("SELECT * FROM dbsp_create_view('cb_f', "
+          "'SELECT id, val, tag FROM big WHERE val > 10')");
+  db.exec("SELECT * FROM dbsp_create_view('cb_a', "
+          "'SELECT tag, COUNT(*) AS n, SUM(val) AS s FROM cb_f GROUP BY tag')");
+  db.exec("SELECT * FROM dbsp_create_view('cb_s', "
+          "'SELECT tag, s FROM cb_a ORDER BY s DESC')");
+
+  double total_us = measure_us([&]() {
+    for (int i = 0; i < 20; i++) {
+      db.exec("INSERT INTO big VALUES (" + std::to_string(100000 + i) +
+              ", 42, 'a')");
+      db.exec("SELECT * FROM dbsp_sync('big')");
+    }
+  });
+  auto rows = db.query("SELECT * FROM dbsp_query('cb_s')");
+  REQUIRE_FALSE(rows->HasError());
+  REQUIRE(rows->RowCount() == 3);
+
+  // Isolate cascade cost from the scan-and-diff sync cost: on_insert
+  // feeds a single-row delta straight into propagate_changes (no table
+  // scan). 1000 rows through the whole 3-level chain.
+  auto &manager = dbsp_native::get_cdc_manager();
+  double prop_us = measure_us([&]() {
+    for (int i = 0; i < 1000; i++) {
+      dbsp_native::DuckDBRow row;
+      row.columns = {duckdb::Value::INTEGER(300000 + i),
+                     duckdb::Value::INTEGER(42), duckdb::Value("a")};
+      manager.on_insert("big", row);
+    }
+  });
+
+  std::cout << "[bench] 3-level chain, full sync (scan-dominated): "
+            << (total_us / 20.0) << " us/row; propagate-only (on_insert): "
+            << (prop_us / 1000.0) << " us/row through the whole chain\n";
+}
