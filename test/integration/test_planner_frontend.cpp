@@ -576,3 +576,70 @@ TEST_CASE("planner C1: ORDER BY + LIMIT differential",
   requireViewMatchesQuery(db, "v_topk", sql);
   runDifferential(db, "v_topk", sql, 71);
 }
+
+// ===== Phase C2: recursive CTEs through the planner =====
+
+TEST_CASE("planner C2: recursive CTE UNION ALL",
+          "[integration][planner][recursive]") {
+  DuckDBTestHarness db;
+  db.createTable("seed", "id INT", {"(1)"});
+  db.exec("SELECT * FROM dbsp_track('seed')");
+  db.exec("SELECT * FROM dbsp_sync('seed')");
+  db.exec("SELECT * FROM dbsp_use_planner(true)");
+
+  const std::string sql =
+      "WITH RECURSIVE r AS (SELECT id FROM seed UNION ALL "
+      "SELECT id+1 FROM r WHERE id < 5) SELECT * FROM r";
+  db.exec("SELECT * FROM dbsp_create_view('v_rec_all', '" + sql + "')");
+  REQUIRE(plannerBuilt("v_rec_all"));
+  db.assertViewRowCount("v_rec_all", 5); // 1..5
+
+  db.exec("INSERT INTO seed VALUES (4)");
+  db.exec("SELECT * FROM dbsp_sync('seed')");
+  db.assertViewRowCount("v_rec_all", 7); // + {4,5}
+}
+
+TEST_CASE("planner C2: recursive CTE UNION dedups across deltas",
+          "[integration][planner][recursive]") {
+  DuckDBTestHarness db;
+  db.createTable("seed2", "id INT", {"(1)"});
+  db.exec("SELECT * FROM dbsp_track('seed2')");
+  db.exec("SELECT * FROM dbsp_sync('seed2')");
+  db.exec("SELECT * FROM dbsp_use_planner(true)");
+
+  const std::string sql =
+      "WITH RECURSIVE r AS (SELECT id FROM seed2 UNION "
+      "SELECT id+1 FROM r WHERE id < 5) SELECT * FROM r";
+  db.exec("SELECT * FROM dbsp_create_view('v_rec_u', '" + sql + "')");
+  REQUIRE(plannerBuilt("v_rec_u"));
+  db.assertViewRowCount("v_rec_u", 5); // 1..5
+
+  // 3,4,5 are already reachable: UNION must not double-count them even
+  // though they arrive in a LATER delta than the original fixed point
+  db.exec("INSERT INTO seed2 VALUES (3)");
+  db.exec("SELECT * FROM dbsp_sync('seed2')");
+  db.assertViewRowCount("v_rec_u", 5);
+}
+
+TEST_CASE("planner C2: recursive CTE joining a second table",
+          "[integration][planner][recursive]") {
+  DuckDBTestHarness db;
+  // Transitive closure over an edge table — the recursive step JOINs a base
+  // table, which the parser path never supported (single-source recursion)
+  db.createTable("edges", "src INT, dst INT", {"(1, 2)", "(2, 3)", "(3, 4)"});
+  db.exec("SELECT * FROM dbsp_track('edges')");
+  db.exec("SELECT * FROM dbsp_sync('edges')");
+  db.exec("SELECT * FROM dbsp_use_planner(true)");
+
+  const std::string sql =
+      "WITH RECURSIVE reach AS (SELECT src, dst FROM edges WHERE src = 1 "
+      "UNION SELECT r.src, e.dst FROM reach r JOIN edges e ON r.dst = e.src) "
+      "SELECT * FROM reach";
+  db.exec("SELECT * FROM dbsp_create_view('v_reach', '" + sql + "')");
+  REQUIRE(plannerBuilt("v_reach"));
+  db.assertViewRowCount("v_reach", 3); // (1,2) (1,3) (1,4)
+
+  db.exec("INSERT INTO edges VALUES (4, 5)");
+  db.exec("SELECT * FROM dbsp_sync('edges')");
+  db.assertViewRowCount("v_reach", 4); // + (1,5)
+}

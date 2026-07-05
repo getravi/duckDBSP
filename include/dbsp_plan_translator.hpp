@@ -25,6 +25,11 @@
 //       NativeSortView/NativeLimitView behind an EmbeddedViewNode. When the
 //       sort/limit is the plan root, PlannedCircuitView::scan delegates to it
 //       so dbsp_query returns rows in ORDER BY order.
+//   C2: LOGICAL_RECURSIVE_CTE via PlanRecursiveNode: anchor inline, the
+//       recursive step as a nested PlannedCircuitView driven to a fixed
+//       point (self-reference = sentinel source). Multi-table recursive
+//       steps work; USING KEY is rejected; deletions are ignored inside the
+//       fixed point (documented parity with the old parser path).
 // Any other operator yields a DBSP-E110 error naming the operator;
 // CDCManager::create_view falls back to the bespoke parser transparently.
 //
@@ -57,6 +62,7 @@
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/operator/logical_recursive_cte.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "duckdb/planner/operator/logical_window.hpp"
 
@@ -142,7 +148,8 @@ struct PlanOpSpec {
     WINDOW,      // NativeWindowView wrapped in an EmbeddedViewNode
     CTE,         // materialized CTE: children = {definition, main query}
     CTE_REF,     // reads the shared output of a CTE definition
-    SORT_LIMIT   // NativeSortView/NativeLimitView in an EmbeddedViewNode
+    SORT_LIMIT,  // NativeSortView/NativeLimitView in an EmbeddedViewNode
+    REC_CTE      // WITH RECURSIVE: children = {anchor, recursive step}
   };
 
   // Comparison between a left-side and a right-side bound expression
@@ -770,6 +777,97 @@ private:
   std::unique_ptr<NativeMaterializedView> view_;
 };
 
+// Fixed-point driver for WITH RECURSIVE. The anchor is computed inline in
+// the outer circuit; the recursive step runs as an inner view (a nested
+// PlannedCircuitView) whose self-reference is a source named `sentinel`.
+// Each step: feed base-table deltas to the inner view, seed the frontier
+// with the anchor delta plus the step's reaction, then iterate the step on
+// the frontier until it stops producing new rows. UNION dedup state
+// persists across calls, so later deltas cannot double-count rows.
+// Deletions (negative weights) are ignored inside the fixed point — parity
+// with the parser-path NativeRecursiveView this replaces.
+class PlanRecursiveNode : public dbsp::Node {
+public:
+  using InputFn = std::function<const DuckDBZSet &()>;
+
+  PlanRecursiveNode(dbsp::NodeId id, InputFn anchor,
+                    std::unique_ptr<NativeMaterializedView> step_view,
+                    std::string sentinel, bool union_all,
+                    std::vector<std::pair<std::string, InputFn>> base_inputs,
+                    size_t max_iterations = 1000)
+      : dbsp::Node(id, "plan_recursive"), anchor_(std::move(anchor)),
+        step_view_(std::move(step_view)), sentinel_(std::move(sentinel)),
+        union_all_(union_all), base_inputs_(std::move(base_inputs)),
+        max_iterations_(max_iterations) {}
+
+  void step() override {
+    output_.clear();
+    DuckDBZSet seed = anchor_();
+    for (auto &[table, fn] : base_inputs_) {
+      const DuckDBZSet &d = fn();
+      if (d.empty()) {
+        continue;
+      }
+      step_view_->apply_changes(table, d);
+      for (const auto &[row, w] : step_view_->get_delta()) {
+        seed.insert(row, w);
+      }
+    }
+    DuckDBZSet frontier;
+    for (const auto &[row, w] : seed) {
+      if (w > 0) {
+        admit(row, w, frontier);
+      }
+    }
+    size_t iter = 0;
+    while (!frontier.empty() && iter++ < max_iterations_) {
+      step_view_->apply_changes(sentinel_, frontier);
+      DuckDBZSet next;
+      for (const auto &[row, w] : step_view_->get_delta()) {
+        if (w > 0) {
+          admit(row, w, next);
+        }
+      }
+      frontier = std::move(next);
+    }
+    has_output_ = !output_.empty();
+  }
+
+  void reset() override {
+    accumulated_.clear();
+    output_.clear();
+    has_output_ = false;
+    step_view_->reset();
+  }
+
+  bool has_output() const override { return has_output_; }
+
+  const DuckDBZSet &output() const { return output_; }
+
+private:
+  void admit(const DuckDBRow &row, int64_t w, DuckDBZSet &frontier) {
+    if (union_all_) {
+      accumulated_.insert(row, w);
+      output_.insert(row, w);
+      frontier.insert(row, w);
+    } else if (accumulated_.get(row) == 0) {
+      accumulated_.insert(row, 1);
+      output_.insert(row, 1);
+      frontier.insert(row, 1);
+    }
+  }
+
+  InputFn anchor_;
+  std::unique_ptr<NativeMaterializedView> step_view_;
+  std::string sentinel_;
+  bool union_all_;
+  std::vector<std::pair<std::string, InputFn>> base_inputs_;
+  size_t max_iterations_;
+  DuckDBZSet accumulated_;
+  DuckDBZSet output_;
+  bool has_output_ = false;
+};
+
 // Circuit view built from a translated plan tree. One SourceNode per base
 // table (shared across subtrees, e.g. self-joins); apply_changes pushes the
 // delta into the matching source and steps the whole circuit once.
@@ -1002,6 +1100,35 @@ private:
     }
     case PlanOpSpec::Kind::CTE_REF:
       return cte_outputs_.at(spec.cte_index);
+    case PlanOpSpec::Kind::REC_CTE: {
+      OutputFn anchor = build(*spec.children[0], keep_alive);
+      std::string sentinel =
+          "__rec_cte_" + std::to_string(spec.cte_index) + "__";
+      TableSchema step_schema;
+      step_schema.table_name = name_ + "_rec_step";
+      auto step_view = std::make_unique<PlannedCircuitView>(
+          name_ + "_rec_step", "", step_schema, keep_alive,
+          *spec.children[1]);
+      // The inner view routes by source name; the outer circuit must own a
+      // SourceNode for every base table the step reads (CDC pushes deltas
+      // into outer sources only). The sentinel stays internal.
+      std::vector<std::pair<std::string, PlanRecursiveNode::InputFn>>
+          base_inputs;
+      for (const auto &t : step_view->source_tables()) {
+        if (t == sentinel) {
+          continue;
+        }
+        PlanOpSpec src;
+        src.kind = PlanOpSpec::Kind::SOURCE;
+        src.table = t;
+        base_inputs.emplace_back(t, build(src, keep_alive));
+      }
+      bool union_all = spec.set_op == PlanOpSpec::SetOp::UNION_ALL;
+      auto *node = circuit_.add_node(std::make_unique<PlanRecursiveNode>(
+          circuit_.next_node_id(), std::move(anchor), std::move(step_view),
+          sentinel, union_all, std::move(base_inputs)));
+      return [node]() -> const DuckDBZSet & { return node->output(); };
+    }
     case PlanOpSpec::Kind::SORT_LIMIT: {
       OutputFn child = build(*spec.children[0], keep_alive);
       TableSchema vschema;
@@ -1156,8 +1283,7 @@ private:
             "correlated subquery (DELIM_JOIN) — rewrite as a JOIN "
             "or create an intermediate view");
       case duckdb::LogicalOperatorType::LOGICAL_RECURSIVE_CTE:
-        return unsupported(
-            "recursive CTE — handled by the parser frontend");
+        return visit_recursive_cte(op.Cast<duckdb::LogicalRecursiveCTE>());
       default:
         return unsupported("logical operator " + op.GetName());
       }
@@ -1774,7 +1900,59 @@ private:
       return spec;
     }
 
+    // WITH RECURSIVE: the step's self-reference becomes a SOURCE with a
+    // sentinel table name routed inside the PlanRecursiveNode's inner view
+    std::set<duckdb::idx_t> recursive_cte_indexes;
+
+    static std::string rec_cte_sentinel(duckdb::idx_t index) {
+      return "__rec_cte_" + std::to_string(index) + "__";
+    }
+
+    SpecPtr visit_recursive_cte(duckdb::LogicalRecursiveCTE &op) {
+      if (!op.key_targets.empty()) {
+        return unsupported("recursive CTE USING KEY");
+      }
+      recursive_cte_indexes.insert(op.table_index);
+      auto anchor = visit(*op.children[0]);
+      if (!anchor) {
+        return nullptr;
+      }
+      // Output layout = anchor layout (ResolveTypes: types = children[0])
+      auto anchor_cols = columns;
+      cte_columns[op.table_index] = anchor_cols; // step's CTE_SCAN resolves
+      auto step = visit(*op.children[1]);
+      if (!step) {
+        return nullptr;
+      }
+      columns = std::move(anchor_cols);
+      auto spec = std::make_unique<PlanOpSpec>();
+      spec->kind = PlanOpSpec::Kind::REC_CTE;
+      spec->set_op = op.union_all ? PlanOpSpec::SetOp::UNION_ALL
+                                  : PlanOpSpec::SetOp::UNION;
+      spec->cte_index = op.table_index;
+      spec->children.push_back(std::move(anchor));
+      spec->children.push_back(std::move(step));
+      return spec;
+    }
+
     SpecPtr visit_cte_ref(duckdb::LogicalCTERef &op) {
+      if (recursive_cte_indexes.count(op.cte_index)) {
+        auto rec_it = cte_columns.find(op.cte_index);
+        if (rec_it == cte_columns.end()) {
+          return unsupported("self-reference outside its recursive CTE");
+        }
+        auto spec = std::make_unique<PlanOpSpec>();
+        spec->kind = PlanOpSpec::Kind::SOURCE;
+        spec->table = rec_cte_sentinel(op.cte_index);
+        columns.clear();
+        for (duckdb::idx_t i = 0; i < op.chunk_types.size(); i++) {
+          std::string name = i < op.bound_columns.size()
+                                 ? op.bound_columns[i]
+                                 : rec_it->second[i].name;
+          columns.push_back({name, op.chunk_types[i]});
+        }
+        return spec;
+      }
       auto it = cte_columns.find(op.cte_index);
       if (it == cte_columns.end()) {
         return unsupported("reference to an untranslated CTE");
