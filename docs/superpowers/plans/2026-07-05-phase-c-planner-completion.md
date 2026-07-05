@@ -1,5 +1,14 @@
 # Phase C: Planner Completion & Parser Retirement — Implementation Plan
 
+> **STATUS: COMPLETE (2026-07-05).** All tasks executed; see CHANGELOG.md
+> Phase C entries. Notable deviations: the IR optimizer lives in
+> `dbsp_plan_translator.hpp` (`plan_ir` namespace) rather than a separate
+> header (avoids a header cycle around PlanOpSpec); rewritten pushdown
+> expressions live in `PlanKeepAlive::rewritten_exprs`, not spec-local
+> storage (lifetime). The C5 inventory gate found three unplanned gaps —
+> views-on-views binding, COUNT(*) rowid scans, DECIMAL SUM — all closed
+> before deletion.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Close the planner frontend's remaining gaps (ORDER BY/LIMIT, recursive CTEs, DISTINCT ON), port the optimizer to circuit-IR rewrites, then delete the bespoke SQL parser.
