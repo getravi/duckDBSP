@@ -16,18 +16,17 @@ subsystem, bespoke parser, standalone Z-set spilling).
 
 ## Performance
 
-- **Scan-and-diff sync dominates end-to-end** (~119ms on 50k rows after
-  the F1 constant-factor pass — typed chunk extraction, baseline swap-in,
-  change-log removal — vs ~25µs to propagate the delta through a 3-level
-  chain). The remaining floor is two O(n) hash passes (build scanned
-  state + diff), gated on the row-hash refactor below. True O(Δ) sync =
-  capture transaction-local changes in the TransactionCommit hook, which
-  fires BEFORE DuckTransaction::Finalize since DuckDB 1.5 (see the
-  comment in sync_table_scan_and_consume) — appends live in the
-  transaction's LocalStorage at that point. Full design task: extraction
-  from LocalStorage/version info, auto-CDC rewrite, fallback scan-diff
-  for anything uncapturable. on_insert/on_delete already provide the
-  row-level entry points.
+- **O(Δ) sync exists for the batch-append pattern** (G2): explicit
+  transactions containing only INSERTs into tracked tables commit via
+  captured deltas (~0.6ms/commit incl. the COUNT(*) guard vs ~47ms
+  scan-diff on a 50k-row chain — 74×). Wrap streaming appends in
+  BEGIN/COMMIT to get it. Autocommit statements cannot be captured (the
+  transaction is destroyed before any extension hook fires — probed
+  empirically; TransactionCommit sees a gutted DuckTransaction, and
+  QueryEnd sees no transaction) and fall back to scan-diff (~47ms on 50k
+  after F1+G1). DELETE/UPDATE/upsert transactions also fall back by
+  design. Extending capture to deletes/updates needs DuckDB version-info
+  access that 1.5.4 does not expose to extensions.
 - Phase D1 vectorized filter/map/fused evaluation + zero-copy circuit
   deltas: fused filter 259k→644k rows/s, aggregate 770k→1.88M, join delta
   140k→265k. Remaining ~2.4× gap vs a hand-written lambda is Z-set insert
@@ -35,10 +34,9 @@ subsystem, bespoke parser, standalone Z-set spilling).
   hashes. See test/benchmarks/bench_planner_eval.cpp.
 - Aggregate keys/args, join keys, and residuals still evaluate per-row
   (RowExprEval); batch if profiles demand.
-- Row-hash caching (the ~2.4× insert-hashing gap) requires encapsulating
-  DuckDBRow::columns behind const/mutating accessors (~350 call sites,
-  compiler-enforced) so a cached hash can never go stale — do as a
-  dedicated mechanical refactor, not alongside feature work.
+- Row-hash caching: DONE (G1, ColumnVec). Remaining eval gap vs a raw
+  lambda is Value copies and Z-set bucket churn; revisit only with
+  profiles.
 - Deletions through recursive views trigger a full fixed-point recompute
   (correct but non-incremental).
 

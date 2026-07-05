@@ -248,6 +248,16 @@ public:
     pending_changes_.insert(new_row, 1);
   }
 
+  // Apply an externally computed delta to the baseline (captured-delta
+  // sync: the delta is propagated by the caller, so pending_changes_ is
+  // not involved)
+  void apply_delta(const DuckDBZSet &delta) {
+    for (const auto &[row, w] : delta) {
+      current_state_.insert(row, w);
+    }
+    sequence_++;
+  }
+
   // Replace the whole baseline in one move (scan-based sync: the delta is
   // computed against the old state by the caller, so re-applying it row by
   // row through insert()/remove() would just repeat n hash operations)

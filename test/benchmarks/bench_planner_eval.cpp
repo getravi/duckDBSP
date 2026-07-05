@@ -192,7 +192,25 @@ TEST_CASE("Benchmark: cascaded view sync cost", "[benchmark][cascade_bench]") {
     }
   });
 
+  // G2 captured-delta path: explicit-txn single-row inserts with auto-sync
+  db.exec("SELECT * FROM dbsp_auto_sync(true)");
+  auto &mgr2 = dbsp_native::get_cdc_manager();
+  const uint64_t cap_before = mgr2.captured_delta_syncs();
+  double cap_us = measure_us([&]() {
+    for (int i = 0; i < 20; i++) {
+      db.exec("BEGIN");
+      db.exec("INSERT INTO big VALUES (" + std::to_string(400000 + i) +
+              ", 42, 'a')");
+      db.exec("COMMIT");
+    }
+  });
+  db.exec("SELECT * FROM dbsp_auto_sync(false)");
+  const uint64_t captured = mgr2.captured_delta_syncs() - cap_before;
+
   std::cout << "[bench] 3-level chain, full sync (scan-dominated): "
             << (total_us / 20.0) << " us/row; propagate-only (on_insert): "
-            << (prop_us / 1000.0) << " us/row through the whole chain\n";
+            << (prop_us / 1000.0)
+            << " us/row; captured-delta commit (explicit txn): "
+            << (cap_us / 20.0) << " us/commit (" << captured
+            << "/20 via fast path)\n";
 }

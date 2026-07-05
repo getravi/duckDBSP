@@ -1342,6 +1342,51 @@ public:
     return views_.find(view_name) != views_.end();
   }
 
+  // Total weight (row multiplicity included) of the tracked baseline —
+  // comparable against COUNT(*) of the real table
+  int64_t tracked_total_weight(const std::string &table_name) const {
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
+    auto it = tracked_tables_.find(table_name);
+    if (it == tracked_tables_.end()) {
+      return -1;
+    }
+    int64_t total = 0;
+    for (const auto &[row, w] : it->second->current_state()) {
+      total += w;
+    }
+    return total;
+  }
+
+  // Apply a delta captured from a transaction's local storage (G2 fast
+  // path): O(delta) — no table scan, no diff. The caller has already
+  // validated the delta against the committed table (count guard).
+  bool apply_captured_delta(const std::string &table_name,
+                            const DuckDBZSet &delta) {
+    if (delta.empty()) {
+      return true;
+    }
+    std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    auto it = tracked_tables_.find(table_name);
+    if (it == tracked_tables_.end()) {
+      return false;
+    }
+    auto lock_it = table_locks_.find(table_name);
+    if (lock_it == table_locks_.end()) {
+      return false;
+    }
+    {
+      std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
+      it->second->apply_delta(delta);
+    }
+    propagate_changes(table_name, delta);
+    captured_delta_syncs_++;
+    return true;
+  }
+
+  // Number of commits served by captured deltas instead of scan-and-diff
+  // (observable so tests can prove the fast path actually ran)
+  uint64_t captured_delta_syncs() const { return captured_delta_syncs_; }
+
   size_t get_tracked_table_count(const std::string &table_name) const {
     std::shared_lock<std::shared_mutex> lock(struct_mutex_);
     auto it = tracked_tables_.find(table_name);
@@ -2016,6 +2061,7 @@ private:
   DependencyGraph dep_graph_;
   std::string last_error_;
   std::atomic<bool> auto_sync_enabled_{false};
+  std::atomic<uint64_t> captured_delta_syncs_{0};
   bool use_parallel_sync_ = false;
 };
 

@@ -1,5 +1,29 @@
 # Changelog
 
+## Phase G: Row-hash caching & transaction capture - Jul 2026
+
+### G2: Captured-delta sync for explicit-transaction appends (Jul 5, 2026)
+- Pure-INSERT explicit transactions on tracked tables sync in O(delta):
+  QueryEnd (transaction still alive) classifies each statement via the
+  parser and scans the transaction's LocalStorage for rows appended since
+  the last statement (AddedRows watermark); at commit a COUNT(*) guard
+  validates captured vs committed and the deltas feed straight into
+  propagation. 636us/commit vs 47ms scan-diff on a 50k-row 3-level chain
+  (74x); the bench shows 20/20 commits on the fast path.
+- Everything uncapturable falls back to scan-and-diff by construction:
+  autocommit (probed: the transaction object is already gutted at every
+  extension hook), DELETE/UPDATE/upsert/multi-statement/unparseable
+  statements (transaction poisoned), guard mismatches, capture
+  exceptions. Correctness never depends on capture; a randomized churn
+  test mixes clean commits, poisoned commits, and rollbacks.
+
+### G1: Cached row hashes via ColumnVec (Jul 5, 2026)
+- DuckDBRow::columns is now ColumnVec: const API passes through, every
+  mutating operation invalidates a lazily cached hash, copies keep it —
+  a row hashed once carries its hash through every Z-set and index. The
+  entire codebase compiled unchanged. Full sync 119ms -> 52.6ms; join
+  delta 265k -> 306k rows/s; fused filter 644k -> 732k rows/s.
+
 ## Phase F (started): Sync-path cost - Jul 2026
 
 ### F1: Scan-and-diff sync constant factors (Jul 5, 2026)
