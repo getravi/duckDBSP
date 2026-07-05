@@ -28,8 +28,151 @@ struct PairHash {
 template <typename T, typename Hash = std::hash<T>>
 class ZSet;
 
-template <typename K, typename V, typename KHash = std::hash<K>>
-class IndexedZSet;
+// Dense weight map (H3): live entries stay contiguous in a vector (so
+// iteration — the hottest Z-set operation — is a cache-friendly O(size)
+// array walk) with an open-addressing index of (hash -> entry position)
+// on the side. clear() is O(1) via generation stamps; erase is
+// swap-remove plus backward-shift index repair. Replaces
+// std::unordered_map as Z-set storage: no per-entry node allocations and
+// no O(bucket_count) iteration of mostly-empty tables after a set shrinks.
+// Key hashes are cheap to recompute (DuckDBRow caches its hash, G1).
+template <typename T, typename Hash>
+class FlatWeightMap {
+public:
+    // Named first/second so structured bindings and ->second match the
+    // std::unordered_map value_type this replaces
+    struct Slot {
+        T first;
+        int64_t second;
+    };
+    using const_iterator = typename std::vector<Slot>::const_iterator;
+
+    FlatWeightMap() = default;
+
+    size_t size() const { return entries_.size(); }
+    bool empty() const { return entries_.empty(); }
+
+    void clear() {
+        entries_.clear(); // keeps capacity
+        generation_++;    // O(1): every index slot becomes stale
+    }
+
+    const_iterator begin() const { return entries_.begin(); }
+    const_iterator end() const { return entries_.end(); }
+
+    const_iterator find(const T &key) const {
+        if (entries_.empty()) {
+            return entries_.end();
+        }
+        const size_t i = probe(key);
+        if (!live(i)) {
+            return entries_.end();
+        }
+        return entries_.begin() +
+               static_cast<std::ptrdiff_t>(index_[i].pos);
+    }
+
+    size_t count(const T &key) const {
+        return !entries_.empty() && live(probe(key)) ? 1 : 0;
+    }
+
+    int64_t &operator[](const T &key) { return slot_for(key, nullptr); }
+    int64_t &operator[](T &&key) { return slot_for(key, &key); }
+
+    void erase(const T &key) {
+        if (entries_.empty()) {
+            return;
+        }
+        const size_t i = probe(key);
+        if (!live(i)) {
+            return;
+        }
+        const size_t pos = index_[i].pos;
+        // Remove from the index with backward-shift to keep chains gapless
+        index_[i].gen = 0;
+        size_t gap = i;
+        size_t k = (i + 1) & mask_;
+        while (live(k)) {
+            const size_t ideal = hasher_(entries_[index_[k].pos].first) & mask_;
+            if (((k - ideal) & mask_) >= ((k - gap) & mask_)) {
+                index_[gap] = index_[k];
+                index_[k].gen = 0;
+                gap = k;
+            }
+            k = (k + 1) & mask_;
+        }
+        // Swap-remove from the dense array; repair the moved entry's index
+        // slot by POSITION (pos == last), not by key equality — the
+        // moved-from slot at entries_[last] is in a valid-but-unspecified
+        // state until pop_back, and key-probing past it is fragile
+        const size_t last = entries_.size() - 1;
+        if (pos != last) {
+            entries_[pos] = std::move(entries_[last]);
+            size_t j = hasher_(entries_[pos].first) & mask_;
+            while (!(live(j) && index_[j].pos == last)) {
+                j = (j + 1) & mask_;
+            }
+            index_[j].pos = pos;
+        }
+        entries_.pop_back();
+    }
+
+private:
+    struct IndexSlot {
+        size_t pos = 0;
+        uint64_t gen = 0; // matches generation_ when live
+    };
+
+    bool live(size_t i) const { return index_[i].gen == generation_; }
+
+    // First index slot whose entry's key equals `key`, or the first stale
+    // slot in its probe chain
+    size_t probe(const T &key) const {
+        size_t i = hasher_(key) & mask_;
+        while (live(i) && !(entries_[index_[i].pos].first == key)) {
+            i = (i + 1) & mask_;
+        }
+        return i;
+    }
+
+    int64_t &slot_for(const T &key, T *movable) {
+        if (capacity_ == 0 ||
+            (entries_.size() + 1) * 10 >= capacity_ * 7) { // 0.7 load
+            rehash(capacity_ == 0 ? 16 : capacity_ * 2);
+        }
+        const size_t i = probe(key);
+        if (live(i)) {
+            return entries_[index_[i].pos].second;
+        }
+        index_[i].pos = entries_.size();
+        index_[i].gen = generation_;
+        entries_.push_back(
+            movable ? Slot{std::move(*movable), 0} : Slot{key, 0});
+        return entries_.back().second;
+    }
+
+    void rehash(size_t new_cap) {
+        capacity_ = new_cap;
+        mask_ = new_cap - 1;
+        generation_++;
+        index_.assign(new_cap, IndexSlot{});
+        for (size_t pos = 0; pos < entries_.size(); pos++) {
+            size_t i = hasher_(entries_[pos].first) & mask_;
+            while (live(i)) {
+                i = (i + 1) & mask_;
+            }
+            index_[i].pos = pos;
+            index_[i].gen = generation_;
+        }
+    }
+
+    std::vector<Slot> entries_;
+    std::vector<IndexSlot> index_;
+    size_t capacity_ = 0;
+    size_t mask_ = 0;
+    uint64_t generation_ = 1; // index starts empty (slots default gen 0)
+    Hash hasher_;
+};
 
 // Weight type - using int64_t to handle large multiplicities
 using Weight = int64_t;
@@ -41,7 +184,7 @@ template <typename T, typename Hash>
 class ZSet {
 public:
     using ElementType = T;
-    using MapType = std::unordered_map<T, Weight, Hash>;
+    using MapType = FlatWeightMap<T, Hash>;
     using Iterator = typename MapType::const_iterator;
     using iterator = Iterator;
     using const_iterator = Iterator;

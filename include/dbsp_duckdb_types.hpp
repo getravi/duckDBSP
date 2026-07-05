@@ -31,6 +31,23 @@ public:
 
   ColumnVec() = default;
   ColumnVec(std::initializer_list<duckdb::Value> init) : v_(init) {}
+  ColumnVec(const ColumnVec &) = default;
+  ColumnVec &operator=(const ColumnVec &) = default;
+  // Moves must invalidate the SOURCE's cache: its vector is emptied but a
+  // defaulted move would leave hash_valid_=true over the empty contents —
+  // a stale "valid" hash, the one state this class exists to prevent
+  ColumnVec(ColumnVec &&other) noexcept
+      : v_(std::move(other.v_)), hash_(other.hash_),
+        hash_valid_(other.hash_valid_) {
+    other.hash_valid_ = false;
+  }
+  ColumnVec &operator=(ColumnVec &&other) noexcept {
+    v_ = std::move(other.v_);
+    hash_ = other.hash_;
+    hash_valid_ = other.hash_valid_;
+    other.hash_valid_ = false;
+    return *this;
+  }
 
   // --- const API (cache untouched) ---
   size_t size() const { return v_.size(); }

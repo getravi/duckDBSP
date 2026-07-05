@@ -1,6 +1,7 @@
 #include "catch.hpp"
 #include "include/dbsp_zset.hpp"
 #include "include/dbsp_stream.hpp"
+#include "include/dbsp_duckdb_types.hpp"
 
 using namespace dbsp;
 
@@ -165,4 +166,93 @@ TEST_CASE("Stream operators", "[stream]") {
         auto result3 = distinct.process(delta3);
         REQUIRE(result3[1] == -1);
     }
+}
+
+// ===== H3: FlatWeightMap property tests =====
+// These patterns found the two H3 bugs: a moved-from ColumnVec keeping a
+// stale "valid" hash cache, and erase() repairing the moved entry's index
+// slot by key equality instead of position.
+
+TEST_CASE("FlatWeightMap matches an oracle under churn", "[zset][flatmap]") {
+  struct BadHash {
+    size_t operator()(int) const { return 0; } // all keys share one chain
+  };
+  std::mt19937 rng(3);
+  for (int trial = 0; trial < 50; trial++) {
+    dbsp::FlatWeightMap<int, BadHash> m;
+    std::unordered_map<int, int64_t> o;
+    for (int op = 0; op < 2000; op++) {
+      int k = static_cast<int>(rng() % 12);
+      switch (rng() % 4) {
+      case 0:
+      case 1:
+        m[k] += 1;
+        o[k] += 1;
+        break;
+      case 2:
+        m.erase(k);
+        o.erase(k);
+        break;
+      default: {
+        auto it = m.find(k);
+        auto oit = o.find(k);
+        REQUIRE((it == m.end()) == (oit == o.end()));
+        break;
+      }
+      }
+      REQUIRE(m.size() == o.size());
+    }
+  }
+}
+
+TEST_CASE("ZSet with row keys survives copy/move/mutate reinsertion",
+          "[zset][flatmap]") {
+  using dbsp_native::DuckDBRow;
+  using dbsp_native::DuckDBZSet;
+  std::mt19937 rng(99);
+  auto make_row = [&]() {
+    DuckDBRow r;
+    r.columns.push_back(duckdb::Value::INTEGER(static_cast<int>(rng() % 20)));
+    r.columns.push_back(rng() % 8 == 0
+                            ? duckdb::Value(duckdb::LogicalType::INTEGER)
+                            : duckdb::Value::INTEGER(static_cast<int>(rng() % 10)));
+    r.columns.push_back(duckdb::Value(std::string(1, 'a' + rng() % 3)));
+    return r;
+  };
+  for (int trial = 0; trial < 20; trial++) {
+    DuckDBZSet z;
+    for (int op = 0; op < 1500; op++) {
+      DuckDBRow r = make_row();
+      int64_t w = (rng() % 2) ? 1 : -1;
+      switch (rng() % 4) {
+      case 0:
+        if (!z.empty()) { // copy an existing entry and reinsert it
+          auto it = z.begin();
+          for (size_t s = rng() % z.size(); s > 0; s--) ++it;
+          DuckDBRow copy = it->first;
+          z.insert(copy, w);
+          break;
+        }
+        [[fallthrough]];
+      case 1:
+        z.insert(std::move(r), w);
+        break;
+      case 2:
+        if (!z.empty()) { // copy-then-mutate (mark/pad row pattern)
+          DuckDBRow copy = z.begin()->first;
+          copy.columns.push_back(duckdb::Value::BOOLEAN(true));
+          z.insert(copy, w);
+          break;
+        }
+        [[fallthrough]];
+      default:
+        z.insert(r, w);
+        break;
+      }
+      // Invariant: every stored row is findable with its stored weight
+      for (const auto &[row, wgt] : z) {
+        REQUIRE(z.get(row) == wgt);
+      }
+    }
+  }
 }
