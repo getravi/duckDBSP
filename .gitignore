@@ -4,6 +4,7 @@ build_test/
 cmake-build-*/
 
 # IDE files
+.DS_Store
 .idea/
 .vscode/
 *.swp
