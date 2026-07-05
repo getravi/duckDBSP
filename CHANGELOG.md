@@ -2,6 +2,13 @@
 
 ## Phase I: Shared join arrangements - Jul 2026
 
+- I1b both-sides sharing: a join may now share BOTH sides. With both
+  arrangements post-delta when the node steps, the delta rule becomes
+  Δl⋈R_new + L_new⋈Δr − Δl⋈Δr (the cross term flips sign instead of
+  dropping). Initialization skips only the RIGHT side's replay: the left
+  side's full replay joined against the backfilled right arrangement
+  bootstraps the complete join, so no double-count is possible. Self-
+  padding exclusions and single-reference rules unchanged.
 - I1 shared join arrangements (one-side v1): join sides that are bare
   table scans (SOURCE or MAP_COLS(SOURCE), referenced once in the view)
   read a CDC-owned `SharedArrangement` instead of integrating a private

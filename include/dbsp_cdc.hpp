@@ -652,7 +652,9 @@ public:
         arrangements_by_table_[req.table].push_back(arr);
       }
       req.node->set_shared_arrangement(req.left_side, arr);
-      pview.mark_shared_init_skip(req.table);
+      if (req.init_skip) {
+        pview.mark_shared_init_skip(req.table);
+      }
     }
   }
 

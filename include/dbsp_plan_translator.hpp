@@ -988,6 +988,10 @@ struct ArrangementRequest {
   duckdb::vector<duckdb::LogicalType> side_types;
   bool project = false; // side is MAP_COLS(SOURCE): project before indexing
   std::vector<duckdb::idx_t> column_idxs;
+  // Skip this table's init replay (the arrangement already holds full
+  // state). For a both-sides-shared join only ONE side is skipped: the
+  // other side's replay ⋈ this arrangement bootstraps the full join.
+  bool init_skip = true;
   std::shared_ptr<PlanKeepAlive> keep_alive; // pins exprs for the arrangement
   class PlanJoinNode *node = nullptr;
 };
@@ -1117,10 +1121,16 @@ public:
       }
     }
 
-    // Δl ⋈ Δr (both sides changed in the same step, e.g. self-joins) —
-    // dropped when a shared side already exposes post-delta state
+    // Δl ⋈ Δr (both sides changed in the same step, e.g. self-joins).
+    // Shared sides expose POST-delta state, which shifts this term:
+    //   no side shared:   Δl⋈R_old + L_old⋈Δr + Δl⋈Δr  → emit it (+)
+    //   one side shared:  Δl⋈R_new + L_old⋈Δr           → drop it
+    //   both shared:      Δl⋈R_new + L_new⋈Δr − Δl⋈Δr  → emit it (−)
+    const bool both_shared = shared_left_ && shared_right_;
     const bool any_shared = shared_left_ || shared_right_;
-    if (!any_shared && !kl.rows.empty() && !kr.rows.empty()) {
+    if ((!any_shared || both_shared) && !kl.rows.empty() &&
+        !kr.rows.empty()) {
+      const int64_t sign = both_shared ? -1 : 1;
       Index dr_index;
       for (size_t i = 0; i < kr.rows.size(); i++) {
         if (kr.valid[i]) {
@@ -1136,7 +1146,7 @@ public:
           continue;
         }
         for (const auto &[rrow, rw] : it->second) {
-          try_emit(*kl.rows[i], rrow, kl.weights[i] * rw);
+          try_emit(*kl.rows[i], rrow, sign * kl.weights[i] * rw);
         }
       }
     }
@@ -2200,33 +2210,45 @@ private:
              !self_padding(child == 0);
     };
     const bool right_ok = eligible(1);
-    const bool left_ok = !right_ok && eligible(0);
+    const bool left_ok = eligible(0);
     if (!right_ok && !left_ok) {
       return;
     }
-    const bool left_side = left_ok;
-    const PlanOpSpec &side = *spec.children[left_side ? 0 : 1];
-    const auto &key_exprs = left_side ? lkeys : rkeys;
+    // Both sides shareable: skip only the RIGHT side's init replay — the
+    // left side's full replay ⋈ right arrangement bootstraps the join
+    // (skipping both would leave the view empty at init)
+    for (const bool left_side : {false, true}) {
+      if (left_side ? !left_ok : !right_ok) {
+        continue;
+      }
+      const PlanOpSpec &side = *spec.children[left_side ? 0 : 1];
+      const auto &key_exprs = left_side ? lkeys : rkeys;
 
-    ArrangementRequest req;
-    req.table = scan_of(side)->table;
-    if (side.kind == PlanOpSpec::Kind::MAP_COLS) {
-      req.project = true;
-      req.column_idxs = side.column_idxs;
+      ArrangementRequest req;
+      req.table = scan_of(side)->table;
+      if (side.kind == PlanOpSpec::Kind::MAP_COLS) {
+        req.project = true;
+        req.column_idxs = side.column_idxs;
+      }
+      req.left_side = left_side;
+      req.init_skip = !(left_side && right_ok);
+      req.null_safe = spec.null_safe_keys;
+      // Probe-target sides never need per-row weights (those serve
+      // self-pads/marks, excluded above); marks on a shared RIGHT side
+      // still need the total/null-key counters
+      req.track_weights = false;
+      req.track_counters =
+          !left_side && spec.join_type == duckdb::JoinType::MARK;
+      req.key_exprs = key_exprs;
+      req.side_types = left_side ? spec.left_types : spec.right_types;
+      req.keep_alive = keep_alive_;
+      req.node = node;
+      finish_request(std::move(req));
     }
-    req.left_side = left_side;
-    req.null_safe = spec.null_safe_keys;
-    // Probe-target sides never need per-row weights (those serve
-    // self-pads/marks, excluded above); marks on a shared RIGHT side
-    // still need the total/null-key counters
-    req.track_weights = false;
-    req.track_counters =
-        !left_side && spec.join_type == duckdb::JoinType::MARK;
-    req.key_exprs = key_exprs;
-    req.side_types = left_side ? spec.left_types : spec.right_types;
-    req.keep_alive = keep_alive_;
-    req.node = node;
+  }
 
+  void finish_request(ArrangementRequest req) {
+    const auto &key_exprs = req.key_exprs;
     std::string fp = req.table;
     fp += req.null_safe ? "|ns1" : "|ns0";
     fp += req.track_weights ? "|w1" : "|w0";
@@ -2243,6 +2265,7 @@ private:
     req.fingerprint = std::move(fp);
     arrangement_requests_.push_back(std::move(req));
   }
+
 
   OutputFn build(const PlanOpSpec &spec,
                  const std::shared_ptr<PlanKeepAlive> &keep_alive) {

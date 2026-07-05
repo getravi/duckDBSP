@@ -263,8 +263,11 @@ TEST_CASE("Benchmark: shared vs private join arrangements",
       db.exec("SELECT * FROM dbsp_create_view('bv" + std::to_string(v) +
               "', '" + sql + "')");
     }
+    // Both join sides share since I1b: identical views hold l + r
+    // arrangements (2); distinct projections split only the r side
+    // (kViews r-side + 1 shared l-side)
     const size_t arrs = mgr.shared_arrangement_count();
-    REQUIRE(arrs == (shared ? 1u : static_cast<size_t>(kViews)));
+    REQUIRE(arrs == (shared ? 2u : static_cast<size_t>(kViews) + 1));
 
     db.exec("INSERT INTO r SELECT i, i, i, i, i, i, i, i, i FROM range(" +
             std::to_string(kBase) + ", " +
@@ -279,7 +282,7 @@ TEST_CASE("Benchmark: shared vs private join arrangements",
   double shared_us = run(true);
   double private_us = run(false);
   std::cout << "[bench] " << kViews << " views, " << kDelta
-            << "-row delta into " << kBase << "-row probe side: shared=1 "
-            "arrangement " << shared_us << " us; private=" << kViews
-            << " arrangements " << private_us << " us\n";
+            << "-row delta into " << kBase << "-row probe side: shared (2 "
+            "arrangements) " << shared_us << " us; private (" << kViews
+            << "+1 arrangements) " << private_us << " us\n";
 }

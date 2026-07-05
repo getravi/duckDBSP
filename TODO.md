@@ -41,13 +41,12 @@ subsystem, bespoke parser, standalone Z-set spilling).
   profiles show payload allocation itself dominating.
 - Join residual predicates still evaluate per candidate pair (RowExprEval);
   batch only if residual-heavy joins show up in profiles.
-- Shared join arrangements (I1) are one-side-per-join v1: both-sides
-  sharing needs an init strategy that avoids double-counting (neither
-  side's replay can bootstrap the other's arrangement-probe output), and
-  self-padding sides (right of RIGHT/FULL, left of LEFT/FULL/MARK) stay
-  private because init-replay skip would lose their unmatched-row pads.
-  Fingerprints include the side's column projection, so views needing
-  different column subsets of the same table do not share.
+- Shared join arrangements: self-padding sides (right of RIGHT/FULL,
+  left of LEFT/FULL/MARK) stay private because init-replay skip would
+  lose their unmatched-row pads. Fingerprints include the side's column
+  projection, so views needing different column subsets of the same
+  table do not share (a maximal-columns arrangement + per-consumer
+  projection could lift this).
 - Deletions through recursive views trigger a full fixed-point recompute
   (correct but non-incremental).
 

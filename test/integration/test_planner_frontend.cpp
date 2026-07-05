@@ -1143,20 +1143,22 @@ TEST_CASE("planner I1: identical join sides share one arrangement",
   auto &mgr = dbsp_native::get_cdc_manager();
   const size_t base = mgr.shared_arrangement_count();
 
-  // Identical SQL → identical plan → identical fingerprint: one
-  // arrangement serves both views
+  // Identical SQL → identical plan → identical fingerprints: an inner
+  // join shares BOTH sides (I1b), so two identical views hold the same
+  // two arrangements (t side + u side)
   const std::string sql1 =
       "SELECT t.id, t.val, u.val FROM t JOIN u ON t.id = u.id";
   db.exec("SELECT * FROM dbsp_create_view('v_arr1', '" + sql1 + "')");
   db.exec("SELECT * FROM dbsp_create_view('v_arr2', '" + sql1 + "')");
-  REQUIRE(mgr.shared_arrangement_count() == base + 1);
+  REQUIRE(mgr.shared_arrangement_count() == base + 2);
 
-  // Different column needs → different projected row shape → a separate
-  // arrangement (fingerprint includes the side's column projection)
+  // Different column needs → different projected row shapes → separate
+  // arrangements on both sides (fingerprint includes the side's column
+  // projection)
   const std::string sql3 =
       "SELECT t.tag, u.tag FROM t JOIN u ON t.id = u.id WHERE t.val > 20";
   db.exec("SELECT * FROM dbsp_create_view('v_arr3', '" + sql3 + "')");
-  REQUIRE(mgr.shared_arrangement_count() == base + 2);
+  REQUIRE(mgr.shared_arrangement_count() == base + 4);
 
   requireViewMatchesQuery(db, "v_arr1", sql1);
   requireViewMatchesQuery(db, "v_arr2", sql1);
@@ -1180,11 +1182,11 @@ TEST_CASE("planner I1: arrangement survives dropping one of two views",
       "SELECT t.id, u.val FROM t JOIN u ON t.id = u.id";
   db.exec("SELECT * FROM dbsp_create_view('v_keep', '" + sql + "')");
   db.exec("SELECT * FROM dbsp_create_view('v_drop', '" + sql + "')");
-  REQUIRE(mgr.shared_arrangement_count() == base + 1);
+  REQUIRE(mgr.shared_arrangement_count() == base + 2);
 
   db.exec("SELECT dbsp_drop('v_drop')");
-  // Survivor still owns the arrangement and stays correct
-  REQUIRE(mgr.shared_arrangement_count() == base + 1);
+  // Survivor still owns both arrangements and stays correct
+  REQUIRE(mgr.shared_arrangement_count() == base + 2);
   runDifferentialTwoTables(db, "v_keep", sql, 103);
 
   db.exec("SELECT dbsp_drop('v_keep')");
@@ -1244,4 +1246,38 @@ TEST_CASE("planner I1: self-padding sides refuse to share",
   REQUIRE(mgr.shared_arrangement_count() == base);
   requireViewMatchesQuery(db, "v_arr_full", sql);
   runDifferentialTwoTables(db, "v_arr_full", sql, 113);
+}
+
+TEST_CASE("planner I1b: both-sides-shared join bootstraps from one replay",
+          "[integration][planner][arrangement]") {
+  DuckDBTestHarness db;
+  // Both tables preloaded BEFORE view creation: init pushes only the
+  // left replay against the backfilled right arrangement — output must
+  // still be the complete join
+  setupTable(db);
+  setupTableU(db);
+  db.exec("INSERT INTO t VALUES (4, 40, 'c'), (5, 55, 'b')");
+  db.exec("INSERT INTO u VALUES (5, 15, 'a'), (3, 25, 'c')");
+  db.exec("SELECT * FROM dbsp_sync('t')");
+  db.exec("SELECT * FROM dbsp_sync('u')");
+
+  const std::string sql =
+      "SELECT t.id, t.val, u.val FROM t JOIN u ON t.id = u.id";
+  db.exec("SELECT * FROM dbsp_create_view('v_both', '" + sql + "')");
+
+  auto &mgr = dbsp_native::get_cdc_manager();
+  REQUIRE(mgr.shared_arrangement_count() == 2);
+  requireViewMatchesQuery(db, "v_both", sql);
+
+  // Deltas to EACH side flow through the post-delta arrangement algebra
+  runDifferentialTwoTables(db, "v_both", sql, 127);
+
+  // Empty one side completely, then refill: weight bookkeeping must
+  // survive the round trip on both arrangements
+  db.exec("DELETE FROM u");
+  db.exec("SELECT * FROM dbsp_sync('u')");
+  requireViewMatchesQuery(db, "v_both", sql);
+  db.exec("INSERT INTO u VALUES (1, 7, 'z'), (4, 9, 'z')");
+  db.exec("SELECT * FROM dbsp_sync('u')");
+  requireViewMatchesQuery(db, "v_both", sql);
 }
