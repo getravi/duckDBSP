@@ -140,7 +140,6 @@ bool DBSPRecoveryManager::load_views(duckdb::ClientContext &context) {
       }
     }
 
-    std::cout << "Recovered " << view_count << " views from persistence" << std::endl;
     return true;
 
   } catch (const std::exception &e) {
@@ -169,7 +168,6 @@ bool DBSPRecoveryManager::resync_tracked_tables(duckdb::ClientContext &context) 
       }
     }
 
-    std::cout << "Resynced " << table_count << " tracked tables" << std::endl;
     return true;
 
   } catch (const std::exception &e) {
@@ -204,14 +202,10 @@ bool DBSPRecoveryManager::recover_from_crash(duckdb::ClientContext &context,
   // Determine final recovery path
   recovery_path_ = determine_recovery_path(db_path);
 
-  std::cout << "DBSP Recovery: Using recovery path: " << recovery_path_ << std::endl;
-
   // Step 1: Check for crash markers
   bool crashed = check_crash_markers();
   if (crashed) {
     std::cout << "DBSP Recovery: Previous session crashed, starting recovery..." << std::endl;
-  } else {
-    std::cout << "DBSP Recovery: Clean startup (no crash detected)" << std::endl;
   }
 
   // Step 2: Initialize persistence infrastructure
@@ -254,10 +248,8 @@ bool DBSPRecoveryManager::recover_from_crash(duckdb::ClientContext &context,
   mark_session_start();
 
   if (crashed) {
-    std::cout << "DBSP Recovery: Recovery complete!" << std::endl;
-  } else {
-    std::cout << "DBSP Recovery: Initialization complete!" << std::endl;
-  }
+      } else {
+      }
 
   return true;
 }

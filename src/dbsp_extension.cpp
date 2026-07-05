@@ -60,8 +60,7 @@ static void EnsureContextState(ClientContext &context) {
   auto params = context.registered_state->Get<dbsp_native::DBSPContextState>(
       "dbsp_cdc_state");
   if (!params) {
-    std::cerr << "DBSP: Lazily attaching ContextState to " << &context << "\n";
-    context.registered_state->GetOrCreate<dbsp_native::DBSPContextState>(
+        context.registered_state->GetOrCreate<dbsp_native::DBSPContextState>(
         "dbsp_cdc_state");
   }
 }
@@ -1171,9 +1170,7 @@ using namespace duckdb;
 class DBSPExtensionCallback : public ExtensionCallback {
 public:
   void OnConnectionOpened(ClientContext &context) override {
-    std::cerr << "DBSP: OnConnectionOpened called (context: " << &context
-              << ")\n";
-
+    
     // First-time initialization: recover from crash if needed.
     // Skip for DBSP's own helper connections (recovery itself opens
     // connections; recursing here would re-enter recovery).
@@ -1208,8 +1205,7 @@ public:
     context.registered_state->GetOrCreate<dbsp_native::DBSPContextState>(
         "dbsp_cdc_state");
 
-    std::cerr << "DBSP: ContextState registered via registered_state\n";
-  }
+      }
 };
 
 static void LoadInternal(ExtensionLoader &loader) {

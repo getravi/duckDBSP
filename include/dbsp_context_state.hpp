@@ -14,8 +14,6 @@ public:
     if (internal_query_depth > 0) {
       return;
     }
-    std::cerr << "DBSP: TransactionBegin hook called (context: " << &context
-              << ")\n";
   }
 
   void TransactionCommit(duckdb::MetaTransaction &transaction,
@@ -25,17 +23,13 @@ public:
     if (internal_query_depth > 0) {
       return;
     }
-    std::cerr << "DBSP: TransactionCommit hook called (context: " << &context
-              << ")\n";
 
     // Only run auto-sync if enabled
     auto &manager = get_cdc_manager();
     if (!manager.is_auto_sync_enabled()) {
-      std::cerr << "DBSP: Auto-sync disabled, skipping\n";
       return;
     }
 
-    std::cerr << "DBSP: Auto-sync enabled, running sync_all\n";
     try {
       // The transaction has already committed successfully at this point.
       // We can safely read the post-commit state and pass the transaction
