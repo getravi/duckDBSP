@@ -236,10 +236,11 @@ See [Error Handling Guide](docs/ERROR_HANDLING.md) for details.
 
 **Planner Frontend (Phase B, experimental — `dbsp_use_planner(true)`):**
 - View SQL planned by DuckDB's own binder/planner instead of the bespoke
-  parser; single-table scan/filter/projection plans translate directly to
-  circuit nodes with full DuckDB expression coverage (function calls, mixed
-  AND/OR predicates). Unsupported plans fall back to the parser
-  transparently. Default OFF.
+  parser; single-table scan/filter/projection and GROUP BY aggregation plans
+  translate directly to circuit nodes with full DuckDB expression coverage
+  (function calls, mixed AND/OR predicates, multi-aggregate GROUP BY,
+  expression group keys, HAVING, global aggregates). Unsupported plans fall
+  back to the parser transparently. Default OFF.
 
 ### 📋 Planned (Phase 4+)
 

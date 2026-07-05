@@ -8,9 +8,12 @@
 // LogicalOperator tree is walked and mapped onto circuit nodes; bound
 // expressions are evaluated row-at-a-time through ExpressionExecutor.
 //
-// B1 scope: single-table LOGICAL_GET -> LOGICAL_FILTER -> LOGICAL_PROJECTION
-// chains. Any other operator yields a DBSP-E110 error naming the operator;
-// CDCManager::create_view falls back to the bespoke parser transparently.
+// Current scope (B1+B2): single-table LOGICAL_GET -> LOGICAL_FILTER ->
+// LOGICAL_PROJECTION chains plus LOGICAL_AGGREGATE_AND_GROUP_BY (multiple
+// aggregates per GROUP BY, expression keys; HAVING arrives as a FILTER above
+// the aggregate and needs no special handling). Any other operator yields a
+// DBSP-E110 error naming the operator; CDCManager::create_view falls back to
+// the bespoke parser transparently.
 //
 // Caller contract: PlanTranslator::translate issues queries on an internal
 // connection, so the caller must hold an InternalQueryGuard (dbsp_cdc.hpp)
@@ -25,9 +28,13 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+
+#include <set>
 
 #include <memory>
 #include <string>
@@ -85,18 +92,229 @@ private:
   duckdb::DataChunk chunk_;
 };
 
+// One aggregate within an AGGREGATE step (B2)
+struct PlanAggSpec {
+  enum class Fn { COUNT_STAR, COUNT, SUM, AVG, MIN, MAX };
+
+  Fn fn;
+  const duckdb::Expression *arg = nullptr; // null for COUNT_STAR
+  bool integer_arg = false;                // SUM/AVG: int64 vs double sum
+  duckdb::LogicalType return_type;
+};
+
 // One translated plan operator, in source-to-root order.
 struct PlanStep {
   enum class Kind {
     FILTER_EXPR, // FilterNode over one bound predicate expression
     MAP_EXPR,    // MapNode evaluating projection expressions
-    MAP_COLS     // MapNode selecting columns by index (GET column_ids)
+    MAP_COLS,    // MapNode selecting columns by index (GET column_ids)
+    AGGREGATE    // PlanAggregateNode (exprs = group keys)
   };
 
   Kind kind;
   std::vector<const duckdb::Expression *> exprs;    // FILTER_EXPR / MAP_EXPR
   duckdb::vector<duckdb::LogicalType> input_types; // child operator's types
   std::vector<duckdb::idx_t> column_idxs;        // MAP_COLS
+  std::vector<PlanAggSpec> agg_specs;            // AGGREGATE
+};
+
+// Incremental GROUP BY aggregation over bound expressions: retracts the old
+// group row, applies weighted deltas to per-group accumulators, emits the new
+// group row; the downstream sink integrates. Output row layout matches
+// LogicalAggregate: group values first, then aggregate values.
+//
+// Global aggregates (no GROUP BY) always have exactly one output row, even
+// for an empty input (COUNT=0, SUM/AVG/MIN/MAX=NULL) — the row is emitted on
+// the first circuit step and retracted/re-emitted on every change.
+class PlanAggregateNode : public dbsp::Node {
+public:
+  using InputFn = std::function<const DuckDBZSet &()>;
+
+  struct AggInstance {
+    PlanAggSpec::Fn fn;
+    std::unique_ptr<RowExprEval> arg; // null for COUNT_STAR
+    bool integer_arg;
+    duckdb::LogicalType return_type;
+  };
+
+  PlanAggregateNode(dbsp::NodeId id, InputFn input_fn,
+                    std::vector<std::unique_ptr<RowExprEval>> group_evals,
+                    std::vector<AggInstance> aggs,
+                    std::string name = "plan_aggregate")
+      : dbsp::Node(id, std::move(name)), input_fn_(std::move(input_fn)),
+        group_evals_(std::move(group_evals)), aggs_(std::move(aggs)) {}
+
+  void step() override {
+    output_.clear();
+    has_output_ = false;
+    const DuckDBZSet &changes = input_fn_();
+    bool global = group_evals_.empty();
+
+    if (changes.empty()) {
+      if (global && !global_emitted_) {
+        output_.insert(result_row(DuckDBRow{}, states_[DuckDBRow{}]), 1);
+        global_emitted_ = true;
+        has_output_ = true;
+      }
+      return;
+    }
+
+    // Bucket incoming deltas by group key
+    std::unordered_map<DuckDBRow, std::vector<std::pair<DuckDBRow, int64_t>>,
+                       DuckDBRowHash>
+        buckets;
+    for (const auto &[row, weight] : changes) {
+      DuckDBRow key;
+      key.columns.reserve(group_evals_.size());
+      for (auto &g : group_evals_) {
+        key.columns.push_back(g->eval(row));
+      }
+      buckets[key].emplace_back(row, weight);
+    }
+
+    for (auto &[key, rows] : buckets) {
+      auto &state = states_[key];
+      bool had_row = global ? global_emitted_ : state.row_weight > 0;
+      if (had_row) {
+        output_.insert(result_row(key, state), -1);
+      }
+      for (const auto &[row, weight] : rows) {
+        apply(state, row, weight);
+      }
+      if (global || state.row_weight > 0) {
+        output_.insert(result_row(key, state), 1);
+      }
+      if (!global && state.row_weight <= 0) {
+        states_.erase(key);
+      }
+      if (global) {
+        global_emitted_ = true;
+      }
+    }
+    has_output_ = !output_.empty();
+  }
+
+  void reset() override {
+    states_.clear();
+    output_.clear();
+    has_output_ = false;
+    global_emitted_ = false;
+  }
+
+  bool has_output() const override { return has_output_; }
+
+  const DuckDBZSet &output() const { return output_; }
+
+private:
+  struct AggState {
+    int64_t count = 0; // non-NULL argument count (rows for COUNT(*))
+    int64_t isum = 0;
+    double dsum = 0;
+    std::multiset<duckdb::Value> values; // MIN/MAX
+  };
+
+  struct GroupState {
+    int64_t row_weight = 0; // total weight of rows in the group
+    std::vector<AggState> aggs;
+  };
+
+  void apply(GroupState &state, const DuckDBRow &row, int64_t weight) {
+    state.row_weight += weight;
+    state.aggs.resize(aggs_.size());
+    for (size_t i = 0; i < aggs_.size(); i++) {
+      auto &spec = aggs_[i];
+      auto &s = state.aggs[i];
+      if (spec.fn == PlanAggSpec::Fn::COUNT_STAR) {
+        s.count += weight;
+        continue;
+      }
+      duckdb::Value v = spec.arg->eval(row);
+      if (v.IsNull()) {
+        continue; // SQL: NULL arguments are ignored
+      }
+      s.count += weight;
+      switch (spec.fn) {
+      case PlanAggSpec::Fn::COUNT:
+        break;
+      case PlanAggSpec::Fn::SUM:
+      case PlanAggSpec::Fn::AVG:
+        if (spec.integer_arg) {
+          s.isum += v.GetValue<int64_t>() * weight;
+        } else {
+          s.dsum += v.GetValue<double>() * weight;
+        }
+        break;
+      case PlanAggSpec::Fn::MIN:
+      case PlanAggSpec::Fn::MAX:
+        if (weight > 0) {
+          for (int64_t w = 0; w < weight; w++) {
+            s.values.insert(v);
+          }
+        } else {
+          for (int64_t w = 0; w < -weight; w++) {
+            auto it = s.values.find(v);
+            if (it != s.values.end()) {
+              s.values.erase(it);
+            }
+          }
+        }
+        break;
+      default:
+        break;
+      }
+    }
+  }
+
+  duckdb::Value agg_value(const AggInstance &spec, const AggState &s) const {
+    switch (spec.fn) {
+    case PlanAggSpec::Fn::COUNT_STAR:
+    case PlanAggSpec::Fn::COUNT:
+      return duckdb::Value::BIGINT(s.count);
+    case PlanAggSpec::Fn::SUM:
+      if (s.count == 0) {
+        return duckdb::Value(spec.return_type);
+      }
+      if (spec.integer_arg) {
+        return duckdb::Value::Numeric(spec.return_type, s.isum);
+      }
+      return duckdb::Value(s.dsum).DefaultCastAs(spec.return_type);
+    case PlanAggSpec::Fn::AVG: {
+      if (s.count == 0) {
+        return duckdb::Value(spec.return_type);
+      }
+      double sum = spec.integer_arg ? static_cast<double>(s.isum) : s.dsum;
+      return duckdb::Value(sum / static_cast<double>(s.count))
+          .DefaultCastAs(spec.return_type);
+    }
+    case PlanAggSpec::Fn::MIN:
+      return s.values.empty() ? duckdb::Value(spec.return_type)
+                              : *s.values.begin();
+    case PlanAggSpec::Fn::MAX:
+      return s.values.empty() ? duckdb::Value(spec.return_type)
+                              : *s.values.rbegin();
+    }
+    return duckdb::Value(spec.return_type);
+  }
+
+  DuckDBRow result_row(const DuckDBRow &key, const GroupState &state) const {
+    DuckDBRow result;
+    result.columns = key.columns;
+    result.columns.reserve(key.columns.size() + aggs_.size());
+    for (size_t i = 0; i < aggs_.size(); i++) {
+      static const AggState kEmpty;
+      const AggState &s = i < state.aggs.size() ? state.aggs[i] : kEmpty;
+      result.columns.push_back(agg_value(aggs_[i], s));
+    }
+    return result;
+  }
+
+  InputFn input_fn_;
+  std::vector<std::unique_ptr<RowExprEval>> group_evals_;
+  std::vector<AggInstance> aggs_;
+  std::unordered_map<DuckDBRow, GroupState, DuckDBRowHash> states_;
+  DuckDBZSet output_;
+  bool has_output_ = false;
+  bool global_emitted_ = false;
 };
 
 // Circuit view built from a translated plan: Source -> steps -> Sink.
@@ -167,6 +385,30 @@ public:
         prev = [node]() -> const DuckDBZSet & { return node->output(); };
         break;
       }
+      case PlanStep::Kind::AGGREGATE: {
+        std::vector<std::unique_ptr<RowExprEval>> group_evals;
+        for (const auto *expr : step.exprs) {
+          group_evals.push_back(std::make_unique<RowExprEval>(
+              keep_alive, *expr, step.input_types));
+        }
+        std::vector<PlanAggregateNode::AggInstance> aggs;
+        for (const auto &spec : step.agg_specs) {
+          PlanAggregateNode::AggInstance inst;
+          inst.fn = spec.fn;
+          inst.integer_arg = spec.integer_arg;
+          inst.return_type = spec.return_type;
+          if (spec.arg) {
+            inst.arg = std::make_unique<RowExprEval>(keep_alive, *spec.arg,
+                                                     step.input_types);
+          }
+          aggs.push_back(std::move(inst));
+        }
+        auto *node = circuit_.add_node(std::make_unique<PlanAggregateNode>(
+            circuit_.next_node_id(), prev, std::move(group_evals),
+            std::move(aggs)));
+        prev = [node]() -> const DuckDBZSet & { return node->output(); };
+        break;
+      }
       }
     }
     finish(std::move(prev));
@@ -234,6 +476,8 @@ private:
         return visit_filter(op.Cast<duckdb::LogicalFilter>());
       case duckdb::LogicalOperatorType::LOGICAL_GET:
         return visit_get(op.Cast<duckdb::LogicalGet>());
+      case duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+        return visit_aggregate(op.Cast<duckdb::LogicalAggregate>());
       default:
         return unsupported("logical operator " + op.GetName());
       }
@@ -273,6 +517,103 @@ private:
         steps.push_back(std::move(step));
       }
       // Filter passes rows through unchanged; columns stay as-is
+      return true;
+    }
+
+    bool visit_aggregate(duckdb::LogicalAggregate &op) {
+      if (!op.grouping_functions.empty()) {
+        return unsupported("GROUPING function");
+      }
+      if (op.grouping_sets.size() > 1) {
+        return unsupported("ROLLUP/CUBE/GROUPING SETS");
+      }
+      if (!visit(*op.children[0])) {
+        return false;
+      }
+
+      PlanStep step;
+      step.kind = PlanStep::Kind::AGGREGATE;
+      step.input_types = op.children[0]->types;
+      for (const auto &group : op.groups) {
+        step.exprs.push_back(group.get());
+      }
+      for (const auto &expr : op.expressions) {
+        if (expr->GetExpressionClass() !=
+            duckdb::ExpressionClass::BOUND_AGGREGATE) {
+          return unsupported("non-aggregate expression in AGGREGATE");
+        }
+        auto &agg = expr->Cast<duckdb::BoundAggregateExpression>();
+        if (agg.IsDistinct()) {
+          return unsupported("DISTINCT aggregate");
+        }
+        if (agg.filter) {
+          return unsupported("FILTER clause on aggregate");
+        }
+        if (agg.order_bys) {
+          return unsupported("ORDER BY in aggregate");
+        }
+
+        PlanAggSpec spec;
+        spec.return_type = agg.return_type;
+        const std::string &fn = agg.function.name;
+        if (fn == "count_star") {
+          spec.fn = PlanAggSpec::Fn::COUNT_STAR;
+        } else if (fn == "count") {
+          spec.fn = PlanAggSpec::Fn::COUNT;
+        } else if (fn == "sum" || fn == "sum_no_overflow") {
+          spec.fn = PlanAggSpec::Fn::SUM;
+        } else if (fn == "avg") {
+          spec.fn = PlanAggSpec::Fn::AVG;
+        } else if (fn == "min") {
+          spec.fn = PlanAggSpec::Fn::MIN;
+        } else if (fn == "max") {
+          spec.fn = PlanAggSpec::Fn::MAX;
+        } else {
+          return unsupported("aggregate function " + fn);
+        }
+
+        if (spec.fn != PlanAggSpec::Fn::COUNT_STAR) {
+          if (agg.children.size() != 1) {
+            return unsupported("aggregate with " +
+                               std::to_string(agg.children.size()) +
+                               " arguments (" + fn + ")");
+          }
+          spec.arg = agg.children[0].get();
+          if (spec.fn == PlanAggSpec::Fn::SUM ||
+              spec.fn == PlanAggSpec::Fn::AVG) {
+            switch (spec.arg->return_type.id()) {
+            case duckdb::LogicalTypeId::TINYINT:
+            case duckdb::LogicalTypeId::SMALLINT:
+            case duckdb::LogicalTypeId::INTEGER:
+            case duckdb::LogicalTypeId::BIGINT:
+            case duckdb::LogicalTypeId::UTINYINT:
+            case duckdb::LogicalTypeId::USMALLINT:
+            case duckdb::LogicalTypeId::UINTEGER:
+              spec.integer_arg = true;
+              break;
+            case duckdb::LogicalTypeId::FLOAT:
+            case duckdb::LogicalTypeId::DOUBLE:
+              spec.integer_arg = false;
+              break;
+            default:
+              return unsupported(fn + " over " +
+                                 spec.arg->return_type.ToString());
+            }
+          }
+        }
+        step.agg_specs.push_back(std::move(spec));
+      }
+      steps.push_back(std::move(step));
+
+      // Output layout: group values first, then aggregate values
+      columns.clear();
+      for (duckdb::idx_t i = 0; i < op.groups.size(); i++) {
+        columns.push_back({op.groups[i]->GetName(), op.types[i]});
+      }
+      for (duckdb::idx_t i = 0; i < op.expressions.size(); i++) {
+        columns.push_back(
+            {op.expressions[i]->GetName(), op.types[op.groups.size() + i]});
+      }
       return true;
     }
 

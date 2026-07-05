@@ -73,10 +73,14 @@ reordering with an index-selection map node. 37/37 tests green.
   translated-view result == direct DuckDB query result, checked after every
   delta batch, across randomized insert/delete sequences
 
-**B2 — Aggregation (1 wk)**
-- Extend RowAggregateNode: multiple aggregates per GROUP BY, expression keys,
-  HAVING (planner emits it as a FILTER above the aggregate — comes free)
-- Aggregate value types beyond int64 where DuckDB Value allows cheaply
+**B2 — Aggregation (1 wk) — COMPLETE (2026-07-04)**
+Delivered via a new `PlanAggregateNode` (not by extending RowAggregateNode —
+that stays for the parser path until B5): multiple aggregates per GROUP BY,
+expression keys, expression aggregate args. HAVING came free as planned
+(FILTER above aggregate). Value types: int64/double sums, any orderable type
+for MIN/MAX; DECIMAL SUM/AVG and DISTINCT/FILTER/ORDER-BY aggregates fall
+back. Bonus: global aggregates keep one row on empty input (matches DuckDB;
+parser path never did). 37/37 green.
 
 **B3 — Join, distinct, set ops, order/limit (1–1.5 wk)**
 - LOGICAL_COMPARISON_JOIN: equi-key extraction + residual predicate via

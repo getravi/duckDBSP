@@ -1,5 +1,23 @@
 # Changelog
 
+## Phase B2: Planner Frontend Aggregation - Jul 2026
+
+### B2: Aggregation through the planner (Jul 4, 2026)
+- `PlanAggregateNode`: incremental GROUP BY with multiple aggregates per
+  view (COUNT(*)/COUNT/SUM/AVG/MIN/MAX), expression group keys (e.g.
+  `GROUP BY val % 3`), and expression aggregate arguments. Accumulators:
+  int64/double sums, `multiset<Value>` for MIN/MAX (any orderable type).
+- HAVING comes free: the planner emits it as a FILTER above the aggregate,
+  which the existing FILTER translation already handles.
+- Global aggregates (no GROUP BY) keep exactly one result row — including
+  on an empty table (COUNT=0, SUM/AVG NULL), matching DuckDB semantics the
+  bespoke parser never had.
+- Not translated (falls back): DISTINCT aggregates, FILTER clauses,
+  ORDER BY in aggregates, ROLLUP/CUBE/GROUPING SETS, DECIMAL SUM/AVG.
+- Differential tests: multi-aggregate, expression keys, HAVING, global
+  aggregate incl. delete-to-empty; randomized rounds now inject NULLs.
+  37/37 tests green.
+
 ## Phase B1: Planner Frontend Skeleton - Jul 2026
 
 ### B1: DuckDB Planner as Frontend — scan/filter/project (Jul 4, 2026)

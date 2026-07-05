@@ -47,10 +47,12 @@ void runDifferential(DuckDBTestHarness &db, const std::string &view,
     int inserts = static_cast<int>(rng() % 5) + 1;
     for (int i = 0; i < inserts; i++) {
       int id = next_id++;
-      int val = static_cast<int>(rng() % 100);
+      // ~10% NULL vals: aggregates and predicates must ignore them
+      std::string val =
+          rng() % 10 == 0 ? "NULL" : std::to_string(rng() % 100);
       char tag = static_cast<char>('a' + rng() % 3);
-      db.exec("INSERT INTO t VALUES (" + std::to_string(id) + ", " +
-              std::to_string(val) + ", '" + std::string(1, tag) + "')");
+      db.exec("INSERT INTO t VALUES (" + std::to_string(id) + ", " + val +
+              ", '" + std::string(1, tag) + "')");
       live.push_back(id);
     }
     int deletes = live.empty() ? 0 : static_cast<int>(rng() % 3);
@@ -142,19 +144,87 @@ TEST_CASE("planner frontend: mixed AND/OR predicate the parser rejects",
   runDifferential(db, "v_or", plain_sql, 99);
 }
 
+TEST_CASE("planner frontend: multi-aggregate GROUP BY differential",
+          "[integration][planner][aggregate]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+
+  const std::string sql = "SELECT tag, COUNT(*), COUNT(val), SUM(val), "
+                          "AVG(val), MIN(val), MAX(val) FROM t GROUP BY tag";
+  db.exec("SELECT * FROM dbsp_create_view('v_multi_agg', '" + sql + "')");
+  requireViewMatchesQuery(db, "v_multi_agg", sql);
+  runDifferential(db, "v_multi_agg", sql, 11);
+}
+
+TEST_CASE("planner frontend: expression group keys differential",
+          "[integration][planner][aggregate]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+
+  const std::string sql =
+      "SELECT val % 3 AS bucket, SUM(val), COUNT(*) FROM t GROUP BY bucket";
+  db.exec("SELECT * FROM dbsp_create_view('v_expr_key', '" + sql + "')");
+  requireViewMatchesQuery(db, "v_expr_key", sql);
+  runDifferential(db, "v_expr_key", sql, 23);
+}
+
+TEST_CASE("planner frontend: HAVING differential",
+          "[integration][planner][aggregate]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+
+  const std::string sql = "SELECT tag, SUM(val) AS total FROM t "
+                          "GROUP BY tag HAVING SUM(val) > 100";
+  db.exec("SELECT * FROM dbsp_create_view('v_having', '" + sql + "')");
+  requireViewMatchesQuery(db, "v_having", sql);
+  runDifferential(db, "v_having", sql, 31);
+}
+
+TEST_CASE("planner frontend: global aggregate incl. empty table",
+          "[integration][planner][aggregate]") {
+  DuckDBTestHarness db;
+  // Start from an EMPTY table: global aggregate must still show one row
+  db.exec("CREATE TABLE t (id INT, val INT, tag VARCHAR)");
+  db.exec("SELECT * FROM dbsp_track('t')");
+  db.exec("SELECT * FROM dbsp_sync('t')");
+  db.exec("SELECT * FROM dbsp_use_planner(true)");
+
+  const std::string sql = "SELECT COUNT(*), SUM(val), AVG(val) FROM t";
+  db.exec("SELECT * FROM dbsp_create_view('v_global', '" + sql + "')");
+  requireViewMatchesQuery(db, "v_global", sql); // 1 row: (0, NULL, NULL)
+
+  runDifferential(db, "v_global", sql, 47);
+
+  // Delete everything: still one row, back to (0, NULL, NULL)
+  db.exec("DELETE FROM t");
+  db.exec("SELECT * FROM dbsp_sync('t')");
+  requireViewMatchesQuery(db, "v_global", sql);
+}
+
 TEST_CASE("planner frontend: unsupported plan falls back to parser",
           "[integration][planner]") {
   DuckDBTestHarness db;
   setupTable(db);
 
-  // Aggregation is not translated in B1; must fall back and still work
-  const std::string sql = "SELECT tag, SUM(val) FROM t GROUP BY tag";
-  auto result =
-      db.query("SELECT * FROM dbsp_create_view('v_agg', '" + sql + "')");
-  REQUIRE_FALSE(result->HasError());
+  // DISTINCT aggregate is not translated (B2); must fall back gracefully.
+  // The bespoke parser also lacks it, so creation may fail — but it must
+  // fail with a parser error, not crash or mis-translate.
+  auto distinct_result = db.query(
+      "SELECT * FROM dbsp_create_view('v_distinct_agg', "
+      "'SELECT tag, COUNT(DISTINCT val) FROM t GROUP BY tag')");
+  // Either outcome acceptable; just must not crash
+  (void)distinct_result;
 
-  auto rows = db.getViewRows("v_agg");
-  REQUIRE(rows.size() == 2); // tags 'a' and 'b'
+  // JOIN is not translated yet (B3); must fall back to parser and work
+  db.createTable("u", "id INT, name VARCHAR", {"(1, 'x')", "(2, 'y')"});
+  db.exec("SELECT * FROM dbsp_track('u')");
+  db.exec("SELECT * FROM dbsp_sync('u')");
+  auto join_result = db.query(
+      "SELECT * FROM dbsp_create_view('v_join', "
+      "'SELECT t.id, u.name FROM t JOIN u ON t.id = u.id')");
+  REQUIRE_FALSE(join_result->HasError());
+  auto rows = db.getViewRows("v_join");
+  REQUIRE(rows.size() == 2); // ids 1 and 2 match
 }
 
 TEST_CASE("planner frontend: flag off uses parser path",

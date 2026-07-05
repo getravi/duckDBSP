@@ -152,8 +152,9 @@ SELECT * FROM dbsp_create_view('vip_totals',
 Toggle the planner frontend (Phase B). When enabled, `dbsp_create_view`
 first translates view SQL through DuckDB's own binder/planner instead of the
 bespoke parser. Currently covers single-table scan/filter/projection plans
-(arbitrary expressions, function calls, mixed AND/OR predicates); anything
-else falls back to the bespoke parser transparently.
+(arbitrary expressions, function calls, mixed AND/OR predicates) and
+GROUP BY aggregation (multiple aggregates, expression keys, HAVING, global
+aggregates); anything else falls back to the bespoke parser transparently.
 
 ```sql
 SELECT * FROM dbsp_use_planner(true);   -- Enable
