@@ -624,12 +624,19 @@ public:
       std::vector<DuckDBRow> keys(n);
       if (eval_) {
         eval_->fill(rows.data(), n);
+        std::vector<std::vector<duckdb::Value>> key_vals(n);
+        for (auto &kv : key_vals) {
+          kv.reserve(num_groups_);
+        }
         for (size_t g = 0; g < num_groups_; g++) {
           duckdb::Vector &v = eval_->execute(g);
           const auto &type = eval_->return_type(g);
           for (duckdb::idx_t i = 0; i < n; i++) {
-            keys[i].columns.push_back(BatchEvaluator::read_result(v, type, i));
+            key_vals[i].push_back(BatchEvaluator::read_result(v, type, i));
           }
+        }
+        for (duckdb::idx_t i = 0; i < n; i++) {
+          keys[i].columns.assign(std::move(key_vals[i]));
         }
         std::vector<std::vector<duckdb::Value>> args(n);
         for (size_t a = 0; a < num_args; a++) {
@@ -801,14 +808,16 @@ private:
   }
 
   DuckDBRow result_row(const DuckDBRow &key, const GroupState &state) const {
-    DuckDBRow result;
-    result.columns = key.columns;
-    result.columns.reserve(key.columns.size() + aggs_.size());
+    std::vector<duckdb::Value> vals;
+    vals.reserve(key.columns.size() + aggs_.size());
+    vals.insert(vals.end(), key.columns.begin(), key.columns.end());
     for (size_t i = 0; i < aggs_.size(); i++) {
       static const AggState kEmpty;
       const AggState &s = i < state.aggs.size() ? state.aggs[i] : kEmpty;
-      result.columns.push_back(agg_value(aggs_[i], s));
+      vals.push_back(agg_value(aggs_[i], s));
     }
+    DuckDBRow result;
+    result.columns.assign(std::move(vals));
     return result;
   }
 
@@ -1046,12 +1055,13 @@ private:
     if (weight == 0 || !residuals_pass(lrow, rrow)) {
       return;
     }
+    std::vector<duckdb::Value> vals;
+    vals.reserve(lrow.columns.size() + rrow.columns.size());
+    vals.insert(vals.end(), lrow.columns.begin(), lrow.columns.end());
+    vals.insert(vals.end(), rrow.columns.begin(), rrow.columns.end());
     DuckDBRow combined;
-    combined.columns.reserve(lrow.columns.size() + rrow.columns.size());
-    combined.columns = lrow.columns;
-    combined.columns.insert(combined.columns.end(), rrow.columns.begin(),
-                            rrow.columns.end());
-    output_.insert(combined, weight);
+    combined.columns.assign(std::move(vals));
+    output_.insert(std::move(combined), weight);
   }
 
   // One side's delta with batch-evaluated keys. valid[i] == false means a
@@ -1097,6 +1107,10 @@ private:
       const duckdb::idx_t chunk = static_cast<duckdb::idx_t>(
           std::min<size_t>(BatchEvaluator::kBatch, out.rows.size() - base));
       be->fill(out.rows.data() + base, chunk);
+      std::vector<std::vector<duckdb::Value>> key_vals(chunk);
+      for (auto &kv : key_vals) {
+        kv.reserve(be->expr_count());
+      }
       for (size_t k = 0; k < be->expr_count(); k++) {
         duckdb::Vector &v = be->execute(k);
         const auto &type = be->return_type(k);
@@ -1105,8 +1119,11 @@ private:
           if (val.IsNull() && !null_safe_keys_) {
             out.valid[base + i] = 0;
           }
-          out.keys[base + i].columns.push_back(std::move(val));
+          key_vals[i].push_back(std::move(val));
         }
+      }
+      for (duckdb::idx_t i = 0; i < chunk; i++) {
+        out.keys[base + i].columns.assign(std::move(key_vals[i]));
       }
       base += chunk;
     }
@@ -1615,20 +1632,22 @@ public:
         if (m < n) {
           eval_->slice(sel, m);
         }
-        std::vector<DuckDBRow> out(m);
-        for (auto &row : out) {
-          row.columns.reserve(num_projs);
+        std::vector<std::vector<duckdb::Value>> out(m);
+        for (auto &vals : out) {
+          vals.reserve(num_projs);
         }
         for (size_t p = 0; p < num_projs; p++) {
           const size_t e = num_filters_ + p;
           duckdb::Vector &v = eval_->execute(e);
           const auto &type = eval_->return_type(e);
           for (duckdb::idx_t i = 0; i < m; i++) {
-            out[i].columns.push_back(BatchEvaluator::read_result(v, type, i));
+            out[i].push_back(BatchEvaluator::read_result(v, type, i));
           }
         }
         for (duckdb::idx_t i = 0; i < m; i++) {
-          output_.insert(std::move(out[i]), weights[sel.get_index(i)]);
+          DuckDBRow row;
+          row.columns.assign(std::move(out[i]));
+          output_.insert(std::move(row), weights[sel.get_index(i)]);
         }
       }
 

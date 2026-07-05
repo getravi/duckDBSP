@@ -9,6 +9,7 @@
 #include "duckdb/common/types/vector.hpp"
 
 #include <functional>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -30,91 +31,132 @@ public:
   static constexpr size_t kNullHash = 0x9e3779b97f4a7c15ULL;
 
   ColumnVec() = default;
-  ColumnVec(std::initializer_list<duckdb::Value> init) : v_(init) {}
+  ColumnVec(std::initializer_list<duckdb::Value> init)
+      : p_(std::make_shared<Payload>()) {
+    p_->v.assign(init);
+  }
+  // Copies share the payload (H6: a row copied between Z-sets, indexes and
+  // sinks costs one refcount bump instead of N Value copies); mutation
+  // clones a shared payload first, so shared payloads are immutable
   ColumnVec(const ColumnVec &) = default;
   ColumnVec &operator=(const ColumnVec &) = default;
-  // Moves must invalidate the SOURCE's cache: its vector is emptied but a
-  // defaulted move would leave hash_valid_=true over the empty contents —
-  // a stale "valid" hash, the one state this class exists to prevent
-  ColumnVec(ColumnVec &&other) noexcept
-      : v_(std::move(other.v_)), hash_(other.hash_),
-        hash_valid_(other.hash_valid_) {
-    other.hash_valid_ = false;
-  }
-  ColumnVec &operator=(ColumnVec &&other) noexcept {
-    v_ = std::move(other.v_);
-    hash_ = other.hash_;
-    hash_valid_ = other.hash_valid_;
-    other.hash_valid_ = false;
-    return *this;
-  }
+  ColumnVec(ColumnVec &&) noexcept = default;
+  ColumnVec &operator=(ColumnVec &&) noexcept = default;
 
-  // --- const API (cache untouched) ---
-  size_t size() const { return v_.size(); }
-  bool empty() const { return v_.empty(); }
-  const duckdb::Value &operator[](size_t i) const { return v_[i]; }
-  const duckdb::Value &back() const { return v_.back(); }
+  // --- const API ---
+  size_t size() const { return p_ ? p_->v.size() : 0; }
+  bool empty() const { return !p_ || p_->v.empty(); }
+  const duckdb::Value &operator[](size_t i) const { return p_->v[i]; }
+  const duckdb::Value &back() const { return p_->v.back(); }
   std::vector<duckdb::Value>::const_iterator begin() const {
-    return v_.begin();
+    return p_ ? p_->v.begin() : empty_vec().begin();
   }
-  std::vector<duckdb::Value>::const_iterator end() const { return v_.end(); }
-  const std::vector<duckdb::Value> &raw() const { return v_; }
+  std::vector<duckdb::Value>::const_iterator end() const {
+    return p_ ? p_->v.end() : empty_vec().end();
+  }
+  std::vector<duckdb::Value>::const_iterator cbegin() const {
+    return begin();
+  }
+  const std::vector<duckdb::Value> &raw() const {
+    return p_ ? p_->v : empty_vec();
+  }
+  // Identity of the shared payload: equal identities => equal contents
+  const void *payload_id() const { return p_.get(); }
 
+  // Cached hash. Stored atomically (0 = not yet computed) because shared
+  // payloads may be hashed concurrently by readers; a content hash of
+  // exactly 0 is simply recomputed each time.
   size_t hash() const {
-    if (!hash_valid_) {
-      size_t h = 0;
-      for (const auto &col : v_) {
+    if (!p_) {
+      return 0;
+    }
+    size_t h = p_->hash.load(std::memory_order_relaxed);
+    if (h == 0) {
+      for (const auto &col : p_->v) {
         size_t col_hash = col.IsNull() ? kNullHash : col.Hash();
         h ^= col_hash + 0x9e3779b9 + (h << 6) + (h >> 2);
       }
-      hash_ = h;
-      hash_valid_ = true;
+      p_->hash.store(h, std::memory_order_relaxed);
     }
-    return hash_;
+    return h;
   }
-  bool hash_valid() const { return hash_valid_; }
+  bool hash_valid() const {
+    return !p_ || p_->hash.load(std::memory_order_relaxed) != 0;
+  }
 
-  // --- mutating API (invalidates the cache) ---
-  void push_back(const duckdb::Value &v) {
-    hash_valid_ = false;
-    v_.push_back(v);
+  // One-shot construction: move a finished column vector in (single
+  // payload allocation, none of the per-push mutate checks) — the hot row
+  // builders use this
+  void assign(std::vector<duckdb::Value> &&v) {
+    p_ = std::make_shared<Payload>();
+    p_->v = std::move(v);
   }
-  void push_back(duckdb::Value &&v) {
-    hash_valid_ = false;
-    v_.push_back(std::move(v));
-  }
+
+  // --- mutating API (clones a shared payload, invalidates the cache) ---
+  void push_back(const duckdb::Value &v) { mutate().push_back(v); }
+  void push_back(duckdb::Value &&v) { mutate().push_back(std::move(v)); }
   template <typename... Args> void emplace_back(Args &&...args) {
-    hash_valid_ = false;
-    v_.emplace_back(std::forward<Args>(args)...);
+    mutate().emplace_back(std::forward<Args>(args)...);
   }
-  void reserve(size_t n) { v_.reserve(n); } // capacity only, content intact
+  void reserve(size_t n) { mutate_keep_hash().reserve(n); }
   void clear() {
-    hash_valid_ = false;
-    v_.clear();
+    if (p_) {
+      if (p_.use_count() > 1) {
+        p_.reset();
+      } else {
+        p_->v.clear();
+        p_->hash.store(0, std::memory_order_relaxed);
+      }
+    }
   }
-  duckdb::Value &operator[](size_t i) { // may be written through
-    hash_valid_ = false;
-    return v_[i];
-  }
+  duckdb::Value &operator[](size_t i) { return mutate()[i]; }
   ColumnVec &operator=(std::initializer_list<duckdb::Value> init) {
-    hash_valid_ = false;
-    v_ = init;
+    if (!p_ || p_.use_count() > 1) {
+      p_ = std::make_shared<Payload>();
+    }
+    p_->v.assign(init);
+    p_->hash.store(0, std::memory_order_relaxed);
     return *this;
   }
   void insert(std::vector<duckdb::Value>::const_iterator pos,
               std::vector<duckdb::Value>::const_iterator first,
               std::vector<duckdb::Value>::const_iterator last) {
-    hash_valid_ = false;
-    v_.insert(v_.begin() + (pos - v_.cbegin()), first, last);
-  }
-  std::vector<duckdb::Value>::const_iterator cbegin() const {
-    return v_.cbegin();
+    const auto offset = pos - raw().cbegin();
+    auto &v = mutate();
+    v.insert(v.begin() + offset, first, last);
   }
 
 private:
-  std::vector<duckdb::Value> v_;
-  mutable size_t hash_ = 0;
-  mutable bool hash_valid_ = false;
+  struct Payload {
+    Payload() = default;
+    Payload(const Payload &other) : v(other.v) {
+      hash.store(other.hash.load(std::memory_order_relaxed),
+                 std::memory_order_relaxed);
+    }
+    std::vector<duckdb::Value> v;
+    mutable std::atomic<size_t> hash{0};
+  };
+
+  static const std::vector<duckdb::Value> &empty_vec() {
+    static const std::vector<duckdb::Value> kEmpty;
+    return kEmpty;
+  }
+
+  std::vector<duckdb::Value> &mutate() {
+    auto &v = mutate_keep_hash();
+    p_->hash.store(0, std::memory_order_relaxed);
+    return v;
+  }
+  std::vector<duckdb::Value> &mutate_keep_hash() {
+    if (!p_) {
+      p_ = std::make_shared<Payload>();
+    } else if (p_.use_count() > 1) {
+      p_ = std::make_shared<Payload>(*p_);
+    }
+    return p_->v;
+  }
+
+  std::shared_ptr<Payload> p_;
 };
 
 struct DuckDBRow {
@@ -123,6 +165,8 @@ struct DuckDBRow {
   // Default equality: NULL-aware for GROUP BY/DISTINCT semantics
   // In GROUP BY and DISTINCT: NULL == NULL (same group)
   bool operator==(const DuckDBRow &other) const {
+    if (columns.payload_id() == other.columns.payload_id())
+      return true; // same shared payload: identical by construction
     if (columns.hash_valid() && other.columns.hash_valid() &&
         columns.hash() != other.columns.hash())
       return false; // cheap negative: different hashes cannot be equal

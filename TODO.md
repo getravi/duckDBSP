@@ -35,11 +35,10 @@ subsystem, bespoke parser, standalone Z-set spilling).
 - Aggregate keys/args, join keys, and residuals still evaluate per-row
   (RowExprEval); batch if profiles demand.
 - Row-hash caching: DONE (G1, ColumnVec; H3 dense-map storage on top).
-- Compact row encoding (H6, DEFERRED): encode rows as contiguous bytes
-  behind the ColumnVec seam (types known per view schema) — memcmp
-  equality, byte hashing, single-allocation copies; Values materialize
-  only at expression-eval chunk boundaries. Est. 2-4x on remaining Z-set
-  costs; dedicated multi-session refactor.
+- Compact row encoding: SUPERSEDED by H6' copy-on-write payloads (row
+  copies are refcount bumps now). Byte encoding would additionally need
+  order-preserving encodings for every typed comparator — revisit only if
+  profiles show payload allocation itself dominating.
 - Join residual predicates still evaluate per candidate pair (RowExprEval);
   batch only if residual-heavy joins show up in profiles.
 - Deletions through recursive views trigger a full fixed-point recompute

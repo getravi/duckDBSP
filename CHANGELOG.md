@@ -21,11 +21,21 @@
   every key); aggregates batch keys/args. Join delta +21%.
 - H5 streaming sync scans: SendQuery instead of materializing the whole
   table per scan-diff sync.
-- H6 compact row encoding: DEFERRED (dedicated multi-session refactor;
-  design in TODO.md).
-- Cumulative since the 173ms start: scan sync 42.6ms (4х), captured
-  commit 0.62ms, join 140k->439k rows/s, filter 259k->932k, aggregate
-  770k->2.25M.
+- H6' copy-on-write rows: ColumnVec holds a shared payload — copying a
+  row between Z-sets, indexes and sinks is a refcount bump instead of N
+  Value copies; mutation clones shared payloads (immutable-once-shared);
+  the hash cache is an atomic in the payload (0 = unknown), shared by all
+  copies and safe under concurrent readers; row equality gets a
+  payload-identity shortcut. Hot row builders construct plain vectors and
+  assign() them in one shot (the first COW attempt regressed build-heavy
+  paths through per-push mutate checks). Filter 932k -> 1.05M rows/s,
+  join 439k -> 487k, sync 42.6 -> 40.9ms, copy-heavy baseline 3.5x.
+  This supersedes the byte-encoding H6 design: typed-Value consumers
+  (sort comparators, pads, keys) made bytes-first storage a
+  materialize-everywhere trap; sharing beats re-encoding here.
+- Cumulative since the 173ms start: scan sync 40.9ms (4.2x), captured
+  commit 0.62ms, join 140k->487k rows/s, filter 259k->1.05M, aggregate
+  770k->2.27M.
 
 
 ## Phase G: Row-hash caching & transaction capture - Jul 2026

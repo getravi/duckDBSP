@@ -1625,9 +1625,9 @@ private:
           chunk.Flatten();
           const idx_t n = chunk.size();
           const idx_t ncols = chunk.ColumnCount();
-          std::vector<DuckDBRow> rows(n);
-          for (auto &r : rows) {
-            r.columns.reserve(ncols);
+          std::vector<std::vector<duckdb::Value>> vals(n);
+          for (auto &r : vals) {
+            r.reserve(ncols);
           }
           for (idx_t c = 0; c < ncols; c++) {
             auto &vec = chunk.data[c];
@@ -1637,7 +1637,7 @@ private:
             case duckdb::LogicalTypeId::INTEGER: {
               auto data = duckdb::FlatVector::GetData<int32_t>(vec);
               for (idx_t i = 0; i < n; i++) {
-                rows[i].columns.push_back(
+                vals[i].push_back(
                     validity.RowIsValid(i) ? duckdb::Value::INTEGER(data[i])
                                            : duckdb::Value(type));
               }
@@ -1646,7 +1646,7 @@ private:
             case duckdb::LogicalTypeId::BIGINT: {
               auto data = duckdb::FlatVector::GetData<int64_t>(vec);
               for (idx_t i = 0; i < n; i++) {
-                rows[i].columns.push_back(
+                vals[i].push_back(
                     validity.RowIsValid(i) ? duckdb::Value::BIGINT(data[i])
                                            : duckdb::Value(type));
               }
@@ -1655,7 +1655,7 @@ private:
             case duckdb::LogicalTypeId::DOUBLE: {
               auto data = duckdb::FlatVector::GetData<double>(vec);
               for (idx_t i = 0; i < n; i++) {
-                rows[i].columns.push_back(
+                vals[i].push_back(
                     validity.RowIsValid(i) ? duckdb::Value::DOUBLE(data[i])
                                            : duckdb::Value(type));
               }
@@ -1664,7 +1664,7 @@ private:
             case duckdb::LogicalTypeId::VARCHAR: {
               auto data = duckdb::FlatVector::GetData<duckdb::string_t>(vec);
               for (idx_t i = 0; i < n; i++) {
-                rows[i].columns.push_back(
+                vals[i].push_back(
                     validity.RowIsValid(i)
                         ? duckdb::Value(data[i].GetString())
                         : duckdb::Value(type));
@@ -1673,13 +1673,15 @@ private:
             }
             default:
               for (idx_t i = 0; i < n; i++) {
-                rows[i].columns.push_back(chunk.GetValue(c, i));
+                vals[i].push_back(chunk.GetValue(c, i));
               }
               break;
             }
           }
           for (idx_t i = 0; i < n; i++) {
-            new_state.insert(std::move(rows[i]), 1);
+            DuckDBRow row;
+            row.columns.assign(std::move(vals[i]));
+            new_state.insert(std::move(row), 1);
           }
         }
       }
