@@ -28,12 +28,18 @@ Internal design of the DBSP DuckDB extension.
 │                              │                                   │
 │  ┌─────────────────────────────────────────────────────────────┐│
 │  │                  Materialized Views                          ││
-│  │  FilterView, ProjectView, AggregateView, JoinView, ...      ││
+│  │  CircuitFilterView (via circuit IR) │ ProjectView,          ││
+│  │  AggregateView, JoinView, ... (direct; migrating to IR)     ││
+│  └─────────────────────────────────────────────────────────────┘│
+│                              │                                   │
+│  ┌─────────────────────────────────────────────────────────────┐│
+│  │              Circuit IR (dbsp::Circuit)                      ││
+│  │  SourceNode → operator nodes → SinkNode; one step per delta ││
 │  └─────────────────────────────────────────────────────────────┘│
 │                              │                                   │
 │  ┌─────────────────────────────────────────────────────────────┐│
 │  │                    Core DBSP Library                         ││
-│  │  ZSet, DuckDBRow, Stream Operators                          ││
+│  │  ZSet (DuckDBZSet = ZSet<DuckDBRow>), Stream Operators      ││
 │  └─────────────────────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────────────────┘
 ```

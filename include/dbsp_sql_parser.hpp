@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "dbsp_circuit_views.hpp"
 #include "dbsp_distinct_on.hpp"
 #include "dbsp_duckdb_types.hpp"
 #include "dbsp_errors.hpp"
@@ -1389,8 +1390,9 @@ private:
       return true;
     };
 
-    return std::make_unique<NativeFilterView>(def.view_name, def.sql, table,
-                                              schema, predicate);
+    // Phase A: filter views execute through the circuit IR
+    return std::make_unique<CircuitFilterView>(def.view_name, def.sql, table,
+                                               schema, predicate);
   }
 
   // Fused filter+project: applies filter then projects in a single pass

@@ -139,6 +139,13 @@ public:
     // Get the integrated (materialized) result
     const ZSetType& materialized() const { return integrated_; }
 
+    // Overwrite the integrated state (checkpoint restore)
+    void set_materialized(const ZSetType& state) {
+        integrated_ = state;
+        delta_.clear();
+        has_output_ = false;
+    }
+
 private:
     InputFn input_fn_;
     ZSetType integrated_;

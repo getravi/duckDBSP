@@ -1,5 +1,33 @@
 # Changelog
 
+## DuckDB 1.5.4 Upgrade, Deadlock Fix & Phase A Start - Jul 2026
+
+### Engine Upgrade & v2 Extension API (Jul 4, 2026)
+- DuckDB pinned v1.4.0 → v1.5.4; entry point via `DUCKDB_CPP_EXTENSION_ENTRY`,
+  registration via `ExtensionLoader` (legacy `dbsp_init`/`dbsp_version` removed).
+- Adapted to 1.5 API: n-ary `SetOperationNode`, `ParserExtension::Register`,
+  `ExtensionCallback::Register`, split `duckdb_generated_extension_loader` link.
+
+### Integration Test Deadlock Fixed (Jul 4, 2026)
+- Root cause: same-thread `struct_mutex_` relock — internal helper connection
+  triggered first-time recovery from inside a sync holding the lock.
+- `InternalQueryGuard` (thread-local) marks internal queries; hooks and
+  recovery skip them. `auto_sync_enabled_` now atomic. Nested `context.Query()`
+  replaced with fresh connections.
+- Commit-hook sync scans committed state via fresh connection (raw storage
+  scan with the just-committed transaction sees no rows in 1.5).
+- Result: 36/36 tests green in ~4s (previously 10 tests hung at 120s timeouts
+  since February). Also fixed: recursive subquery detection, stale ORDER BY
+  error test, checkpoint tests saving while recovery disabled.
+
+### Phase A: Circuit IR Unification - Started (Jul 4, 2026)
+- `DuckDBZSet` unified with generic `dbsp::ZSet<DuckDBRow, DuckDBRowHash>` —
+  circuit nodes operate on production rows with no boundary conversion.
+- New `dbsp_circuit_views.hpp`: `CircuitFilterView` executes filter views
+  through `dbsp::Circuit` (Source → Filter → Sink); ViewFactory emits it for
+  `ViewType::FILTER`. Remaining view types migrate incrementally.
+- `SinkNode::set_materialized` added for checkpoint restore.
+
 ## Phase 5: Advanced SQL & Automation - Completed Feb 2026
 
 ### P5.3: Subqueries & Non-recursive CTEs

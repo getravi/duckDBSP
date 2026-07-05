@@ -43,6 +43,8 @@ public:
     using ElementType = T;
     using MapType = std::unordered_map<T, Weight, Hash>;
     using Iterator = typename MapType::const_iterator;
+    using iterator = Iterator;
+    using const_iterator = Iterator;
 
     ZSet() = default;
     ZSet(const ZSet&) = default;
@@ -81,8 +83,14 @@ public:
         return data_.count(elem) > 0;
     }
 
+    // Get the weight of an element (0 if not present); alias of operator[]
+    Weight get(const T& elem) const { return (*this)[elem]; }
+
     // Get the support (elements with non-zero weight)
     size_t support_size() const { return data_.size(); }
+
+    // Alias of support_size(), for container-style callers
+    size_t size() const { return data_.size(); }
 
     // Check if the Z-set is empty (all weights are zero)
     bool empty() const { return data_.empty(); }

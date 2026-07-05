@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "dbsp_zset.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/vector.hpp"
@@ -122,66 +123,10 @@ struct DuckDBValueHash {
 };
 
 // Z-Set using DuckDB native types
-class DuckDBZSet {
-public:
-  using DataMap = std::unordered_map<DuckDBRow, Weight, DuckDBRowHash>;
-  using iterator = DataMap::iterator;
-  using const_iterator = DataMap::const_iterator;
-
-  void insert(const DuckDBRow &row, Weight weight = 1) {
-    if (weight == 0)
-      return;
-    auto &w = data_[row];
-    w += weight;
-    if (w == 0) {
-      data_.erase(row);
-    }
-  }
-
-  void insert(DuckDBRow &&row, Weight weight = 1) {
-    if (weight == 0)
-      return;
-    auto &w = data_[std::move(row)];
-    w += weight;
-    if (w == 0) {
-      data_.erase(row);
-    }
-  }
-
-  Weight get(const DuckDBRow &row) const {
-    auto it = data_.find(row);
-    return it != data_.end() ? it->second : 0;
-  }
-
-  void clear() { data_.clear(); }
-  bool empty() const { return data_.empty(); }
-  size_t size() const { return data_.size(); }
-
-  iterator begin() { return data_.begin(); }
-  iterator end() { return data_.end(); }
-  const_iterator begin() const { return data_.begin(); }
-  const_iterator end() const { return data_.end(); }
-
-  // Z-Set operations
-  DuckDBZSet operator+(const DuckDBZSet &other) const {
-    DuckDBZSet result = *this;
-    for (const auto &[row, weight] : other.data_) {
-      result.insert(row, weight);
-    }
-    return result;
-  }
-
-  DuckDBZSet operator-() const {
-    DuckDBZSet result;
-    for (const auto &[row, weight] : data_) {
-      result.insert(row, -weight);
-    }
-    return result;
-  }
-
-private:
-  DataMap data_;
-};
+// DuckDBZSet is the generic circuit Z-set specialized for DuckDB rows.
+// This makes the dbsp:: circuit nodes (dbsp_circuit.hpp) operate directly on
+// production data with no conversion at the boundary.
+using DuckDBZSet = dbsp::ZSet<DuckDBRow, DuckDBRowHash>;
 
 // Column metadata for tracked tables
 struct ColumnInfo {

@@ -3,7 +3,7 @@
 Real-time incrementally maintained materialized views for DuckDB, based on [Database Stream Processing (DBSP)](https://www.feldera.com/blog/what-is-dbsp) theory.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![DuckDB](https://img.shields.io/badge/DuckDB-v1.0+-blue.svg)](https://duckdb.org/)
+[![DuckDB](https://img.shields.io/badge/DuckDB-v1.5.4-blue.svg)](https://duckdb.org/)
 
 ## Overview
 
