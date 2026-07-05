@@ -1,5 +1,33 @@
 # Changelog
 
+## Phase H: Sync scoping, dense Z-sets, batch keys - Jul 2026
+
+- H1 touched-table sync scoping: auto-sync commits sync only the tables
+  the transaction wrote (statement classification at QueryBegin covers
+  autocommit; Appender/multi-statement/unparseable fall back to full
+  sync; read-only commits skip sync entirely). Sync cost now scales with
+  touched tables, not tracked tables.
+- H2 guard statement cache: captured-commit COUNT(*) via cached prepared
+  statements. Finding: the guard was not the cost — a captured commit is
+  ~620us against a ~180us bare-transaction floor.
+- H3 dense flat-map Z-set storage: contiguous live entries (O(size)
+  iteration), generation-stamped index (O(1) clear), swap-remove erase
+  with position-based index repair. Found and fixed a latent G1 bug:
+  ColumnVec's implicit move left moved-from objects with a stale "valid"
+  hash cache. Property tests joined the suite. Filter +27%, aggregate
+  +27%, join +19%.
+- H4 batch key extraction: joins materialize each delta's keys once per
+  step (probes + integration reuse them; integration used to re-evaluate
+  every key); aggregates batch keys/args. Join delta +21%.
+- H5 streaming sync scans: SendQuery instead of materializing the whole
+  table per scan-diff sync.
+- H6 compact row encoding: DEFERRED (dedicated multi-session refactor;
+  design in TODO.md).
+- Cumulative since the 173ms start: scan sync 42.6ms (4х), captured
+  commit 0.62ms, join 140k->439k rows/s, filter 259k->932k, aggregate
+  770k->2.25M.
+
+
 ## Phase G: Row-hash caching & transaction capture - Jul 2026
 
 ### G2: Captured-delta sync for explicit-transaction appends (Jul 5, 2026)
