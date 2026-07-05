@@ -915,3 +915,75 @@ TEST_CASE("planner D2: LEFT JOIN with residual predicate differential",
   requireViewMatchesQuery(db, "v_ljr", sql);
   runDifferentialTwoTables(db, "v_ljr", sql, 619);
 }
+
+// ===== Phase D3: MARK joins + FIRST (IN / NOT IN / scalar subqueries) =====
+
+TEST_CASE("planner D3: IN subquery differential",
+          "[integration][planner][subquery]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  setupTableU(db);
+
+  const std::string sql = "SELECT id, val FROM t WHERE id IN (SELECT id FROM u)";
+  db.exec("SELECT * FROM dbsp_create_view('v_in', '" + sql + "')");
+  REQUIRE(plannerBuilt("v_in"));
+  requireViewMatchesQuery(db, "v_in", sql);
+  runDifferentialTwoTables(db, "v_in", sql, 701);
+}
+
+TEST_CASE("planner D3: NOT IN with NULLs is three-valued",
+          "[integration][planner][subquery]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  setupTableU(db);
+
+  // u.val goes NULL ~10% of rounds: NOT IN must yield NULL (row filtered)
+  // for every left row once the subquery side contains a NULL
+  const std::string sql =
+      "SELECT id, val FROM t WHERE val NOT IN (SELECT val FROM u)";
+  db.exec("SELECT * FROM dbsp_create_view('v_notin', '" + sql + "')");
+  REQUIRE(plannerBuilt("v_notin"));
+  requireViewMatchesQuery(db, "v_notin", sql);
+  runDifferentialTwoTables(db, "v_notin", sql, 703);
+}
+
+TEST_CASE("planner D3: scalar subquery comparison differential",
+          "[integration][planner][subquery]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  setupTableU(db);
+
+  const std::string sql =
+      "SELECT id, val FROM t WHERE val > (SELECT AVG(val) FROM u)";
+  db.exec("SELECT * FROM dbsp_create_view('v_scalar', '" + sql + "')");
+  REQUIRE(plannerBuilt("v_scalar"));
+  requireViewMatchesQuery(db, "v_scalar", sql);
+  runDifferentialTwoTables(db, "v_scalar", sql, 709);
+}
+
+TEST_CASE("planner D3: IN over emptied subquery flips marks in bulk",
+          "[integration][planner][subquery]") {
+  DuckDBTestHarness db;
+  db.createTable("mt", "id INT", {"(1)", "(2)", "(3)"});
+  db.exec("SELECT * FROM dbsp_track('mt')");
+  db.exec("SELECT * FROM dbsp_sync('mt')");
+  db.createTable("ms", "id INT", {"(2)"});
+  db.exec("SELECT * FROM dbsp_track('ms')");
+  db.exec("SELECT * FROM dbsp_sync('ms')");
+  db.exec("SELECT * FROM dbsp_use_planner(true)");
+
+  const std::string sql = "SELECT id FROM mt WHERE id NOT IN (SELECT id FROM ms)";
+  db.exec("SELECT * FROM dbsp_create_view('v_bulk', '" + sql + "')");
+  REQUIRE(plannerBuilt("v_bulk"));
+  db.assertViewRowCount("v_bulk", 2); // 1, 3
+
+  // Emptying the subquery side: NOT IN over empty set = TRUE for all
+  db.exec("DELETE FROM ms");
+  db.exec("SELECT * FROM dbsp_sync('ms')");
+  db.assertViewRowCount("v_bulk", 3);
+
+  // First NULL arriving on the subquery side: NOT IN = NULL for all
+  db.exec("INSERT INTO ms VALUES (NULL)");
+  db.exec("SELECT * FROM dbsp_sync('ms')");
+  db.assertViewRowCount("v_bulk", 0);
+}

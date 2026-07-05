@@ -315,7 +315,7 @@ private:
 
 // One aggregate within an AGGREGATE spec (B2)
 struct PlanAggSpec {
-  enum class Fn { COUNT_STAR, COUNT, SUM, AVG, MIN, MAX };
+  enum class Fn { COUNT_STAR, COUNT, SUM, AVG, MIN, MAX, FIRST };
 
   Fn fn;
   const duckdb::Expression *arg = nullptr; // null for COUNT_STAR
@@ -671,6 +671,7 @@ private:
         break;
       case PlanAggSpec::Fn::MIN:
       case PlanAggSpec::Fn::MAX:
+      case PlanAggSpec::Fn::FIRST:
         if (weight > 0) {
           for (int64_t w = 0; w < weight; w++) {
             s.values.insert(v);
@@ -716,6 +717,7 @@ private:
           .DefaultCastAs(spec.return_type);
     }
     case PlanAggSpec::Fn::MIN:
+    case PlanAggSpec::Fn::FIRST:
       return s.values.empty() ? duckdb::Value(spec.return_type)
                               : *s.values.begin();
     case PlanAggSpec::Fn::MAX:
@@ -780,6 +782,7 @@ public:
                  join_type_ == duckdb::JoinType::OUTER;
     pads_right_ = join_type_ == duckdb::JoinType::RIGHT ||
                   join_type_ == duckdb::JoinType::OUTER;
+    marks_ = join_type_ == duckdb::JoinType::MARK;
   }
 
   void step() override {
@@ -788,6 +791,20 @@ public:
     const DuckDBZSet &dl = left_fn_();
     const DuckDBZSet &dr = right_fn_();
     if (dl.empty() && dr.empty()) {
+      return;
+    }
+
+    if (marks_) {
+      // MARK join is left-preserving: every left row appears exactly once
+      // with a three-valued match mark — no bilinear emission at all
+      const bool was_nonempty = right_total_ > 0;
+      const bool had_nulls = right_null_ > 0;
+      integrate(dl, /*left=*/true);
+      integrate(dr, /*left=*/false);
+      const bool category_changed =
+          was_nonempty != (right_total_ > 0) || had_nulls != (right_null_ > 0);
+      reconcile_marks(dl, dr, category_changed);
+      has_output_ = !output_.empty();
       return;
     }
 
@@ -869,6 +886,9 @@ public:
     right_weights_.clear();
     left_pad_.clear();
     right_pad_.clear();
+    mark_state_.clear();
+    right_total_ = 0;
+    right_null_ = 0;
     output_.clear();
     has_output_ = false;
   }
@@ -946,7 +966,7 @@ private:
 
   void integrate(const DuckDBZSet &delta, bool left) {
     Index &index = left ? left_index_ : right_index_;
-    const bool track_weights = left ? pads_left_ : pads_right_;
+    const bool track_weights = left ? (pads_left_ || marks_) : pads_right_;
     RowWeights &weights = left ? left_weights_ : right_weights_;
     for (const auto &[row, w] : delta) {
       if (track_weights) {
@@ -958,7 +978,14 @@ private:
       }
       DuckDBRow key;
       if (!eval_key(row, left, key)) {
+        if (!left && marks_) {
+          right_total_ += w;
+          right_null_ += w; // NULL key on the subquery side
+        }
         continue;
+      }
+      if (!left && marks_) {
+        right_total_ += w;
       }
       auto &rows = index[key];
       int64_t &weight = rows[row];
@@ -1065,15 +1092,103 @@ private:
     }
   }
 
+  // Three-valued mark per SQL IN semantics: TRUE when a residual-passing
+  // match exists; FALSE when the subquery side is empty (even for NULL
+  // probes); otherwise NULL when the probe key is NULL or the subquery
+  // side contains a NULL key; else FALSE.
+  duckdb::Value mark_value(const DuckDBRow &row) {
+    if (match_count(row, /*left=*/true) > 0) {
+      return duckdb::Value::BOOLEAN(true);
+    }
+    if (right_total_ <= 0) {
+      return duckdb::Value::BOOLEAN(false);
+    }
+    DuckDBRow key;
+    if (!eval_key(row, /*left=*/true, key) || right_null_ > 0) {
+      return duckdb::Value(duckdb::LogicalType::BOOLEAN);
+    }
+    return duckdb::Value::BOOLEAN(false);
+  }
+
+  void reconcile_marks(const DuckDBZSet &dl, const DuckDBZSet &dr,
+                       bool category_changed) {
+    std::unordered_map<DuckDBRow, char, DuckDBRowHash> affected;
+    if (category_changed) {
+      // Emptiness or NULL-presence flipped: every unmatched mark changes
+      for (const auto &[row, w] : left_weights_) {
+        affected.emplace(row, 0);
+      }
+      for (const auto &[row, entry] : mark_state_) {
+        affected.emplace(row, 0); // rows whose weight just went to 0
+      }
+    } else {
+      for (const auto &[row, w] : dl) {
+        affected.emplace(row, 0);
+      }
+      if (!dr.empty()) {
+        std::unordered_map<DuckDBRow, char, DuckDBRowHash> seen_keys;
+        for (const auto &[orow, ow] : dr) {
+          DuckDBRow key;
+          if (!eval_key(orow, /*left=*/false, key)) {
+            continue;
+          }
+          if (!seen_keys.emplace(key, 0).second) {
+            continue;
+          }
+          auto it = left_index_.find(key);
+          if (it == left_index_.end()) {
+            continue;
+          }
+          for (const auto &[row, w] : it->second) {
+            affected.emplace(row, 0);
+          }
+        }
+      }
+    }
+
+    for (const auto &[row, unused] : affected) {
+      auto wit = left_weights_.find(row);
+      const int64_t weight = wit == left_weights_.end() ? 0 : wit->second;
+      duckdb::Value mark =
+          weight > 0 ? mark_value(row) : duckdb::Value::BOOLEAN(false);
+
+      auto sit = mark_state_.find(row);
+      if (sit != mark_state_.end()) {
+        const auto &[old_mark, old_w] = sit->second;
+        if (weight > 0 && old_w == weight &&
+            old_mark.IsNull() == mark.IsNull() &&
+            (old_mark.IsNull() ||
+             old_mark.GetValue<bool>() == mark.GetValue<bool>())) {
+          continue; // unchanged
+        }
+        DuckDBRow old_row = row;
+        old_row.columns.push_back(old_mark);
+        output_.insert(old_row, -old_w);
+        mark_state_.erase(sit);
+      }
+      if (weight > 0) {
+        DuckDBRow new_row = row;
+        new_row.columns.push_back(mark);
+        output_.insert(new_row, weight);
+        mark_state_.emplace(row, std::make_pair(mark, weight));
+      }
+    }
+  }
+
   InputFn left_fn_, right_fn_;
   std::vector<KeyPair> keys_;
   std::vector<Residual> residuals_;
   duckdb::JoinType join_type_;
   duckdb::vector<duckdb::LogicalType> left_types_, right_types_;
   bool pads_left_ = false, pads_right_ = false;
+  bool marks_ = false;
   Index left_index_, right_index_;
   RowWeights left_weights_, right_weights_;   // incl. NULL-key rows
   RowWeights left_pad_, right_pad_;           // currently emitted pad weight
+  int64_t right_total_ = 0, right_null_ = 0;  // MARK: subquery-side stats
+  std::unordered_map<DuckDBRow, std::pair<duckdb::Value, int64_t>,
+                     DuckDBRowHash>
+      mark_state_; // MARK: emitted (mark, weight) per left row
   DuckDBZSet output_;
   bool has_output_ = false;
 };
@@ -2192,6 +2307,11 @@ private:
           agg_spec.fn = PlanAggSpec::Fn::MIN;
         } else if (fn == "max") {
           agg_spec.fn = PlanAggSpec::Fn::MAX;
+        } else if (fn == "first" || fn == "arbitrary") {
+          // Scalar-subquery plans wrap the inner aggregate in first();
+          // the input there is a single row, so any deterministic pick
+          // (smallest value) is exact
+          agg_spec.fn = PlanAggSpec::Fn::FIRST;
         } else {
           return unsupported("aggregate function " + fn);
         }
@@ -2258,6 +2378,7 @@ private:
       case duckdb::JoinType::LEFT:
       case duckdb::JoinType::RIGHT:
       case duckdb::JoinType::OUTER:
+      case duckdb::JoinType::MARK:
         break;
       default:
         return unsupported("join type " +
@@ -2313,6 +2434,12 @@ private:
       spec->children.push_back(std::move(left));
       spec->children.push_back(std::move(right));
 
+      if (op.join_type == duckdb::JoinType::MARK) {
+        // MARK output: left columns plus one three-valued match column
+        columns = std::move(left_columns);
+        columns.push_back({"mark", duckdb::LogicalType::BOOLEAN});
+        return spec;
+      }
       // Output: left columns then right columns
       std::vector<ColumnInfo> combined = std::move(left_columns);
       combined.insert(combined.end(), columns.begin(), columns.end());

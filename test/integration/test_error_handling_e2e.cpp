@@ -22,12 +22,16 @@ TEST_CASE("End-to-end error handling", "[e2e][errors]") {
     db.exec("CREATE TABLE orders (id INT, customer_id INT, amount INT)");
     db.exec("SELECT * FROM dbsp_track('orders')");
 
-    // Subquery in WHERE: the planner frontend rejects the plan shape with a
-    // DBSP error code that names what it could not translate — the user
-    // must be able to tell WHY creation failed and what to change
-    auto result = db.query("SELECT * FROM dbsp_create_view('sub_view', "
-                           "'SELECT customer_id, amount FROM orders "
-                           "WHERE amount > (SELECT AVG(amount) FROM orders)')");
+    // CORRELATED subquery in WHERE (plans as DELIM_JOIN): the planner
+    // frontend rejects the plan shape with a DBSP error code that names
+    // what it could not translate — the user must be able to tell WHY
+    // creation failed and what to change. (Uncorrelated scalar subqueries
+    // and IN translate since Phase D3.)
+    auto result = db.query(
+        "SELECT * FROM dbsp_create_view('sub_view', "
+        "'SELECT customer_id, amount FROM orders o "
+        "WHERE amount > (SELECT AVG(amount) FROM orders o2 "
+        "WHERE o2.customer_id = o.customer_id)')");
 
     REQUIRE(result->HasError());
     std::string error = result->GetError();
