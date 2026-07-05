@@ -11,16 +11,11 @@
 namespace dbsp_native {
 
 enum class ErrorCode {
-  // Parser errors (E1xx) - Unsupported SQL features
-  HAVING_NOT_SUPPORTED = 101,
-  ORDER_BY_NOT_SUPPORTED = 102,
-  LIMIT_NOT_SUPPORTED = 103,
-  WINDOW_FUNCTIONS_NOT_SUPPORTED = 104,
-  SUBQUERY_NOT_SUPPORTED = 105,
-  UNION_NOT_SUPPORTED = 106,
-  INTERSECT_NOT_SUPPORTED = 107,
-  EXCEPT_NOT_SUPPORTED = 108,
-  CTE_NOT_SUPPORTED = 109,
+  // Unsupported SQL (E1xx). E101–E109 were parser-era codes for features
+  // the planner frontend now supports (HAVING, ORDER BY/LIMIT, windows,
+  // set operations, CTEs, subqueries-as-views); they were retired with the
+  // parser. E110 is the single "cannot translate this plan" code and names
+  // the offending operator in its message.
   PLAN_OPERATOR_NOT_SUPPORTED = 110,
 
   // Validation errors (E2xx) - Invalid input
@@ -78,17 +73,7 @@ inline std::string get_doc_link(ErrorCode code) {
 // Get brief error message for error code
 inline std::string get_message(ErrorCode code) {
   static const std::unordered_map<ErrorCode, std::string> messages = {
-      // Parser errors (E1xx)
-      {ErrorCode::HAVING_NOT_SUPPORTED, "HAVING clause not supported"},
-      {ErrorCode::ORDER_BY_NOT_SUPPORTED, "ORDER BY not supported in views"},
-      {ErrorCode::LIMIT_NOT_SUPPORTED, "LIMIT not supported in views"},
-      {ErrorCode::WINDOW_FUNCTIONS_NOT_SUPPORTED,
-       "Window functions not supported"},
-      {ErrorCode::SUBQUERY_NOT_SUPPORTED, "Subqueries not supported"},
-      {ErrorCode::UNION_NOT_SUPPORTED, "UNION not supported in views"},
-      {ErrorCode::INTERSECT_NOT_SUPPORTED, "INTERSECT not supported"},
-      {ErrorCode::EXCEPT_NOT_SUPPORTED, "EXCEPT not supported"},
-      {ErrorCode::CTE_NOT_SUPPORTED, "Non-recursive CTEs not supported"},
+      // Unsupported SQL (E1xx)
       {ErrorCode::PLAN_OPERATOR_NOT_SUPPORTED,
        "Logical plan operator not supported by planner frontend"},
       // Validation errors (E2xx)
@@ -120,35 +105,11 @@ inline std::string get_message(ErrorCode code) {
 // Get workaround suggestion for error code
 inline std::string get_workaround(ErrorCode code) {
   static const std::unordered_map<ErrorCode, std::string> workarounds = {
-      // Parser errors (E1xx)
-      {ErrorCode::HAVING_NOT_SUPPORTED,
-       "HAVING is now supported. Update to the latest version if you see "
-       "this error."},
-      {ErrorCode::ORDER_BY_NOT_SUPPORTED,
-       "ORDER BY is not supported in materialized views. Query the view "
-       "and sort results in the outer query: "
-       "SELECT * FROM view ORDER BY col;"},
-      {ErrorCode::LIMIT_NOT_SUPPORTED,
-       "LIMIT is not supported in materialized views. Apply LIMIT when "
-       "querying the view: SELECT * FROM view LIMIT 10;"},
-      {ErrorCode::WINDOW_FUNCTIONS_NOT_SUPPORTED,
-       "Window functions (ROW_NUMBER, RANK, etc.) are not yet supported. "
-       "Consider using GROUP BY with aggregates instead."},
-      {ErrorCode::SUBQUERY_NOT_SUPPORTED,
-       "Rewrite subqueries as JOINs or create intermediate views."},
-      {ErrorCode::UNION_NOT_SUPPORTED,
-       "Create separate views and use UNION when querying: "
-       "SELECT * FROM view1 UNION SELECT * FROM view2;"},
-      {ErrorCode::INTERSECT_NOT_SUPPORTED,
-       "Use JOIN to find common rows: "
-       "SELECT a.* FROM view1 a JOIN view2 b ON a.id = b.id;"},
-      {ErrorCode::EXCEPT_NOT_SUPPORTED,
-       "Use LEFT JOIN with NULL check: "
-       "SELECT a.* FROM view1 a LEFT JOIN view2 b ON a.id = b.id "
-       "WHERE b.id IS NULL;"},
-      {ErrorCode::CTE_NOT_SUPPORTED,
-       "WITH RECURSIVE is now supported for recursive queries. "
-       "Non-recursive CTEs can be rewritten as views."},
+      // Unsupported SQL (E1xx)
+      {ErrorCode::PLAN_OPERATOR_NOT_SUPPORTED,
+       "Rewrite the query to avoid the named operator — e.g. turn a "
+       "correlated subquery into a JOIN or an intermediate view. See "
+       "docs/errors/E1xx/DBSP-E110.md for supported SQL."},
 
       // Validation errors (E2xx)
       {ErrorCode::INVALID_IDENTIFIER,
