@@ -66,6 +66,15 @@ public:
         has_pending_ = true;
     }
 
+    // Zero-copy push: borrow the caller's Z-set for the NEXT step only.
+    // The caller must keep `delta` alive until that step() returns (true
+    // for the synchronous apply_changes -> circuit.step() flow). Mixing
+    // with push()/insert() in the same step falls back to a merge copy.
+    void push_borrowed(const ZSetType& delta) {
+        borrowed_ = &delta;
+        has_pending_ = true;
+    }
+
     // Insert a single element
     void insert(const T& elem, Weight weight = 1) {
         pending_delta_.insert(elem, weight);
@@ -74,12 +83,22 @@ public:
 
     void step() override {
         if (has_pending_) {
-            current_output_ = std::move(pending_delta_);
+            if (borrowed_ && pending_delta_.empty()) {
+                external_output_ = borrowed_;
+            } else {
+                if (borrowed_) {
+                    pending_delta_ += *borrowed_;
+                }
+                current_output_ = std::move(pending_delta_);
+                external_output_ = nullptr;
+            }
+            borrowed_ = nullptr;
             pending_delta_.clear();
             has_pending_ = false;
             has_output_ = true;
         } else {
             current_output_.clear();
+            external_output_ = nullptr;
             has_output_ = false;
         }
     }
@@ -87,17 +106,23 @@ public:
     void reset() override {
         pending_delta_.clear();
         current_output_.clear();
+        borrowed_ = nullptr;
+        external_output_ = nullptr;
         has_pending_ = false;
         has_output_ = false;
     }
 
     bool has_output() const override { return has_output_; }
 
-    const ZSetType& output() const { return current_output_; }
+    const ZSetType& output() const {
+        return external_output_ ? *external_output_ : current_output_;
+    }
 
 private:
     ZSetType pending_delta_;
     ZSetType current_output_;
+    const ZSetType* borrowed_ = nullptr;        // valid during one step
+    const ZSetType* external_output_ = nullptr; // set by step() from borrowed_
     bool has_pending_ = false;
     bool has_output_ = false;
 };
@@ -113,43 +138,48 @@ public:
         : Node(id, std::move(name)), input_fn_(std::move(input_fn)) {}
 
     void step() override {
-        // Accumulate the input delta into our integrated state
+        // Accumulate the input delta into our integrated state. The delta
+        // is borrowed, not copied: upstream node outputs stay alive until
+        // that node's next step(), which cannot happen before ours.
         const ZSetType& delta = input_fn_();
         if (!delta.empty()) {
-            delta_ = delta;
+            delta_ref_ = &delta;
             integrated_ += delta;
             has_output_ = true;
         } else {
-            delta_.clear();
+            delta_ref_ = nullptr;
             has_output_ = false;
         }
     }
 
     void reset() override {
         integrated_.clear();
-        delta_.clear();
+        delta_ref_ = nullptr;
         has_output_ = false;
     }
 
     bool has_output() const override { return has_output_; }
 
-    // Get the latest delta
-    const ZSetType& delta() const { return delta_; }
+    // Get the latest delta (borrowed from the upstream node)
+    const ZSetType& delta() const {
+        static const ZSetType kEmpty;
+        return delta_ref_ ? *delta_ref_ : kEmpty;
+    }
 
     // Get the integrated (materialized) result
     const ZSetType& materialized() const { return integrated_; }
 
-    // Overwrite the integrated state (checkpoint restore)
+    // Overwrite the integrated state (used by tests/legacy restore paths)
     void set_materialized(const ZSetType& state) {
         integrated_ = state;
-        delta_.clear();
+        delta_ref_ = nullptr;
         has_output_ = false;
     }
 
 private:
     InputFn input_fn_;
     ZSetType integrated_;
-    ZSetType delta_;
+    const ZSetType* delta_ref_ = nullptr;
     bool has_output_ = false;
 };
 

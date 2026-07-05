@@ -40,7 +40,7 @@ public:
       circuit_.step();
       return;
     }
-    source_->push(changes);
+    source_->push_borrowed(changes);
     circuit_.step();
     ++version_;
   }

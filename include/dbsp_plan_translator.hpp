@@ -36,7 +36,7 @@
 //       order_by modifier — the ORDER_BY above is presentation, see C1).
 //   C4: circuit-IR optimizer (plan_ir::optimize, g_plan_ir_optimize flag):
 //       combine adjacent filters, push single-side filters below joins,
-//       fuse MAP(FILTER(x)) into one PlanFilterMapNode. Successor of the
+//       fuse MAP(FILTER(x)) into one batched node. Successor of the
 //       ParsedViewDef-based DBSPOptimizer.
 // Any other operator yields a DBSP-E110 error naming the operator;
 // CDCManager::create_view falls back to the bespoke parser transparently.
@@ -136,6 +136,181 @@ private:
   duckdb::vector<duckdb::LogicalType> input_types_;
   duckdb::ExpressionExecutor executor_;
   duckdb::DataChunk chunk_;
+};
+
+// Batched adapter over ExpressionExecutor: fills a DataChunk with up to
+// STANDARD_VECTOR_SIZE rows and evaluates one bound expression over the
+// whole chunk. Amortizes the executor overhead RowExprEval pays per row
+// (~4.6x on the filter path, see bench_planner_eval).
+class BatchEvaluator {
+public:
+  BatchEvaluator(std::shared_ptr<PlanKeepAlive> keep_alive,
+                 std::vector<const duckdb::Expression *> exprs,
+                 duckdb::vector<duckdb::LogicalType> input_types)
+      : keep_alive_(std::move(keep_alive)),
+        context_(*keep_alive_->connection->context), exprs_(std::move(exprs)),
+        input_types_(std::move(input_types)) {
+    if (!input_types_.empty()) {
+      chunk_.Initialize(duckdb::Allocator::Get(context_), input_types_);
+    }
+    for (const auto *expr : exprs_) {
+      executors_.push_back(
+          std::make_unique<duckdb::ExpressionExecutor>(context_, *expr));
+      results_.emplace_back(expr->return_type);
+    }
+  }
+
+  static constexpr duckdb::idx_t kBatch = STANDARD_VECTOR_SIZE;
+
+  size_t expr_count() const { return exprs_.size(); }
+
+  const duckdb::LogicalType &return_type(size_t e) const {
+    return exprs_[e]->return_type;
+  }
+
+  // Fill the shared input chunk once per batch (count <= kBatch)
+  void fill(const DuckDBRow *const *rows, duckdb::idx_t count) {
+    chunk_.Reset();
+    for (duckdb::idx_t c = 0; c < input_types_.size(); c++) {
+      fill_column(chunk_.data[c], input_types_[c], rows, count, c);
+    }
+    chunk_.SetCardinality(count);
+    count_ = count;
+  }
+
+  // Restrict the filled chunk to selected rows without refilling
+  void slice(duckdb::SelectionVector &sel, duckdb::idx_t count) {
+    chunk_.Slice(sel, count);
+    count_ = count;
+  }
+
+  // Evaluate expression e over the current chunk; result is flattened and
+  // valid until the next execute(e) call
+  duckdb::Vector &execute(size_t e) {
+    executors_[e]->ExecuteExpression(chunk_, results_[e]);
+    results_[e].Flatten(count_);
+    return results_[e];
+  }
+
+  // Read one entry of a flattened evaluation result as a Value, with typed
+  // fast paths for common types (Vector::GetValue dispatches per call)
+  static duckdb::Value read_result(duckdb::Vector &vec,
+                                   const duckdb::LogicalType &type,
+                                   duckdb::idx_t i) {
+    if (!duckdb::FlatVector::Validity(vec).RowIsValid(i)) {
+      return duckdb::Value(type);
+    }
+    switch (type.id()) {
+    case duckdb::LogicalTypeId::BOOLEAN:
+      return duckdb::Value::BOOLEAN(
+          duckdb::FlatVector::GetData<bool>(vec)[i]);
+    case duckdb::LogicalTypeId::INTEGER:
+      return duckdb::Value::INTEGER(
+          duckdb::FlatVector::GetData<int32_t>(vec)[i]);
+    case duckdb::LogicalTypeId::BIGINT:
+      return duckdb::Value::BIGINT(
+          duckdb::FlatVector::GetData<int64_t>(vec)[i]);
+    case duckdb::LogicalTypeId::FLOAT:
+      return duckdb::Value::FLOAT(duckdb::FlatVector::GetData<float>(vec)[i]);
+    case duckdb::LogicalTypeId::DOUBLE:
+      return duckdb::Value::DOUBLE(
+          duckdb::FlatVector::GetData<double>(vec)[i]);
+    case duckdb::LogicalTypeId::VARCHAR:
+      return duckdb::Value(
+          duckdb::FlatVector::GetData<duckdb::string_t>(vec)[i].GetString());
+    default:
+      return vec.GetValue(i);
+    }
+  }
+
+private:
+  // Fill one chunk column from row values. Typed fast paths write vector
+  // data directly; anything else falls back to per-value SetValue (which
+  // handles casts). Per-cell Value boxing is what made the naive chunk fill
+  // barely faster than the row-at-a-time path.
+  static void fill_column(duckdb::Vector &vec, const duckdb::LogicalType &type,
+                          const DuckDBRow *const *rows, duckdb::idx_t count,
+                          duckdb::idx_t c) {
+    auto &validity = duckdb::FlatVector::Validity(vec);
+    validity.SetAllValid(count);
+
+    auto value_at = [&](duckdb::idx_t i) -> const duckdb::Value * {
+      const auto &cols = rows[i]->columns;
+      return c < cols.size() ? &cols[c] : nullptr;
+    };
+    auto slow_cell = [&](duckdb::idx_t i, const duckdb::Value *v) {
+      duckdb::Value cast = v ? *v : duckdb::Value(type);
+      if (cast.type() != type) {
+        cast = cast.DefaultCastAs(type);
+      }
+      vec.SetValue(i, cast);
+    };
+
+    switch (type.id()) {
+    case duckdb::LogicalTypeId::BOOLEAN:
+      fill_typed<bool>(vec, validity, type, count, value_at, slow_cell);
+      break;
+    case duckdb::LogicalTypeId::INTEGER:
+      fill_typed<int32_t>(vec, validity, type, count, value_at, slow_cell);
+      break;
+    case duckdb::LogicalTypeId::BIGINT:
+      fill_typed<int64_t>(vec, validity, type, count, value_at, slow_cell);
+      break;
+    case duckdb::LogicalTypeId::FLOAT:
+      fill_typed<float>(vec, validity, type, count, value_at, slow_cell);
+      break;
+    case duckdb::LogicalTypeId::DOUBLE:
+      fill_typed<double>(vec, validity, type, count, value_at, slow_cell);
+      break;
+    case duckdb::LogicalTypeId::VARCHAR: {
+      auto data = duckdb::FlatVector::GetData<duckdb::string_t>(vec);
+      for (duckdb::idx_t i = 0; i < count; i++) {
+        const duckdb::Value *v = value_at(i);
+        if (!v || v->IsNull()) {
+          validity.SetInvalid(i);
+        } else if (v->type().id() == duckdb::LogicalTypeId::VARCHAR) {
+          data[i] = duckdb::StringVector::AddStringOrBlob(
+              vec, duckdb::StringValue::Get(*v));
+        } else {
+          slow_cell(i, v);
+        }
+      }
+      break;
+    }
+    default:
+      for (duckdb::idx_t i = 0; i < count; i++) {
+        slow_cell(i, value_at(i));
+      }
+      break;
+    }
+  }
+
+  template <typename T, typename ValueAt, typename SlowCell>
+  static void fill_typed(duckdb::Vector &vec, duckdb::ValidityMask &validity,
+                         const duckdb::LogicalType &type, duckdb::idx_t count,
+                         ValueAt &&value_at, SlowCell &&slow_cell) {
+    auto data = duckdb::FlatVector::GetData<T>(vec);
+    for (duckdb::idx_t i = 0; i < count; i++) {
+      const duckdb::Value *v = value_at(i);
+      if (!v || v->IsNull()) {
+        validity.SetInvalid(i);
+      } else if (v->type() == type) {
+        data[i] = v->GetValueUnsafe<T>();
+      } else {
+        slow_cell(i, v);
+      }
+    }
+  }
+
+  // Declared first so it outlives the executors during destruction
+  std::shared_ptr<PlanKeepAlive> keep_alive_;
+  duckdb::ClientContext &context_;
+  std::vector<const duckdb::Expression *> exprs_;
+  duckdb::vector<duckdb::LogicalType> input_types_;
+  std::vector<std::unique_ptr<duckdb::ExpressionExecutor>> executors_;
+  std::vector<duckdb::Vector> results_;
+  duckdb::DataChunk chunk_;
+  duckdb::idx_t count_ = 0;
 };
 
 // One aggregate within an AGGREGATE spec (B2)
@@ -958,41 +1133,117 @@ private:
   std::unique_ptr<NativeMaterializedView> view_;
 };
 
-// Fused filter+project (IR optimizer): evaluates predicates and, for
-// surviving rows, the projection — one node, no intermediate Z-set between
-// WHERE and SELECT. Weight-preserving, like FilterNode and MapNode.
-class PlanFilterMapNode : public dbsp::Node {
+// Batched filter/project node (D1): covers FILTER_EXPR (filters only,
+// identity output), MAP_EXPR (projections only), and the IR optimizer's
+// fused FILTER_MAP (both). Delta rows are evaluated in DataChunk batches
+// through ChunkedEval; projections run over filter survivors only, matching
+// the old per-row semantics. Weight-preserving.
+class PlanBatchNode : public dbsp::Node {
 public:
   using InputFn = std::function<const DuckDBZSet &()>;
-  using Evals = std::vector<std::unique_ptr<RowExprEval>>;
 
-  PlanFilterMapNode(dbsp::NodeId id, InputFn input_fn,
-                    std::shared_ptr<Evals> filters,
-                    std::shared_ptr<Evals> projs)
-      : dbsp::Node(id, "plan_filter_project"), input_fn_(std::move(input_fn)),
-        filters_(std::move(filters)), projs_(std::move(projs)) {}
+  // exprs = filters (num_filters of them) followed by projections; all
+  // evaluate against ONE shared input chunk filled once per batch, with
+  // survivors selected via DataChunk::Slice (no refill)
+  PlanBatchNode(dbsp::NodeId id, InputFn input_fn,
+                std::shared_ptr<PlanKeepAlive> keep_alive,
+                std::vector<const duckdb::Expression *> filter_exprs,
+                std::vector<const duckdb::Expression *> proj_exprs,
+                duckdb::vector<duckdb::LogicalType> input_types)
+      : dbsp::Node(id, "plan_batch"), input_fn_(std::move(input_fn)),
+        num_filters_(filter_exprs.size()) {
+    for (const auto *e : proj_exprs) {
+      filter_exprs.push_back(e);
+    }
+    eval_ = std::make_unique<BatchEvaluator>(
+        std::move(keep_alive), std::move(filter_exprs),
+        std::move(input_types));
+  }
 
   void step() override {
     output_.clear();
-    for (const auto &[row, w] : input_fn_()) {
-      bool pass = true;
-      for (auto &f : *filters_) {
-        duckdb::Value v = f->eval(row);
-        if (v.IsNull() || !v.GetValue<bool>()) {
-          pass = false;
-          break;
+    const DuckDBZSet &input = input_fn_();
+
+    std::vector<const DuckDBRow *> rows;
+    std::vector<int64_t> weights;
+    rows.reserve(BatchEvaluator::kBatch);
+    weights.reserve(BatchEvaluator::kBatch);
+
+    const size_t num_projs = eval_->expr_count() - num_filters_;
+
+    auto flush = [&]() {
+      if (rows.empty()) {
+        return;
+      }
+      const duckdb::idx_t n = rows.size();
+      eval_->fill(rows.data(), n);
+
+      // Filters: conjunction over the batch (NULL = fail)
+      duckdb::SelectionVector sel(n);
+      duckdb::idx_t m = n;
+      if (num_filters_ > 0) {
+        std::vector<bool> keep(n, true);
+        for (size_t f = 0; f < num_filters_; f++) {
+          duckdb::Vector &v = eval_->execute(f); // flattened BOOLEAN
+          auto &validity = duckdb::FlatVector::Validity(v);
+          auto data = duckdb::FlatVector::GetData<bool>(v);
+          for (duckdb::idx_t i = 0; i < n; i++) {
+            if (keep[i] && (!validity.RowIsValid(i) || !data[i])) {
+              keep[i] = false;
+            }
+          }
+        }
+        m = 0;
+        for (duckdb::idx_t i = 0; i < n; i++) {
+          if (keep[i]) {
+            sel.set_index(m++, i);
+          }
+        }
+      } else {
+        for (duckdb::idx_t i = 0; i < n; i++) {
+          sel.set_index(i, i);
         }
       }
-      if (!pass) {
-        continue;
+
+      if (num_projs == 0) {
+        for (duckdb::idx_t i = 0; i < m; i++) {
+          const duckdb::idx_t src = sel.get_index(i);
+          output_.insert(*rows[src], weights[src]);
+        }
+      } else if (m > 0) {
+        // Projections over survivors only: slice the already-filled chunk
+        if (m < n) {
+          eval_->slice(sel, m);
+        }
+        std::vector<DuckDBRow> out(m);
+        for (auto &row : out) {
+          row.columns.reserve(num_projs);
+        }
+        for (size_t p = 0; p < num_projs; p++) {
+          const size_t e = num_filters_ + p;
+          duckdb::Vector &v = eval_->execute(e);
+          const auto &type = eval_->return_type(e);
+          for (duckdb::idx_t i = 0; i < m; i++) {
+            out[i].columns.push_back(BatchEvaluator::read_result(v, type, i));
+          }
+        }
+        for (duckdb::idx_t i = 0; i < m; i++) {
+          output_.insert(std::move(out[i]), weights[sel.get_index(i)]);
+        }
       }
-      DuckDBRow out;
-      out.columns.reserve(projs_->size());
-      for (auto &p : *projs_) {
-        out.columns.push_back(p->eval(row));
+
+      rows.clear();
+      weights.clear();
+    };
+
+    for (const auto &[row, w] : input) {
+      rows.push_back(&row);
+      weights.push_back(w);
+      if (rows.size() == BatchEvaluator::kBatch) {
+        flush();
       }
-      output_.insert(out, w);
     }
+    flush();
     has_output_ = !output_.empty();
   }
 
@@ -1007,8 +1258,8 @@ public:
 
 private:
   InputFn input_fn_;
-  std::shared_ptr<Evals> filters_;
-  std::shared_ptr<Evals> projs_;
+  size_t num_filters_;
+  std::unique_ptr<BatchEvaluator> eval_;
   DuckDBZSet output_;
   bool has_output_ = false;
 };
@@ -1185,7 +1436,6 @@ class PlannedCircuitView : public NativeMaterializedView {
 public:
   using RowSource = dbsp::SourceNode<DuckDBRow, DuckDBRowHash>;
   using RowSink = dbsp::SinkNode<DuckDBRow, DuckDBRowHash>;
-  using RowFilter = dbsp::FilterNode<DuckDBRow, DuckDBRowHash>;
   using RowMap =
       dbsp::MapNode<DuckDBRow, DuckDBRow, DuckDBRowHash, DuckDBRowHash>;
   using OutputFn = std::function<const DuckDBZSet &()>;
@@ -1205,7 +1455,7 @@ public:
                      const DuckDBZSet &changes) override {
     auto it = sources_.find(table_name);
     if (it != sources_.end()) {
-      it->second->push(changes);
+      it->second->push_borrowed(changes);
     }
     circuit_.step();
     ++version_;
@@ -1284,45 +1534,17 @@ private:
     }
     case PlanOpSpec::Kind::FILTER_EXPR: {
       OutputFn child = build(*spec.children[0], keep_alive);
-      auto evals =
-          std::make_shared<std::vector<std::unique_ptr<RowExprEval>>>();
-      for (const auto *expr : spec.exprs) {
-        evals->push_back(std::make_unique<RowExprEval>(keep_alive, *expr,
-                                                       spec.input_types));
-      }
-      auto *node = circuit_.add_node(std::make_unique<RowFilter>(
-          circuit_.next_node_id(), std::move(child),
-          [evals](const DuckDBRow &row) {
-            for (auto &eval : *evals) {
-              duckdb::Value v = eval->eval(row);
-              if (v.IsNull() || !v.GetValue<bool>()) {
-                return false;
-              }
-            }
-            return true;
-          },
-          "plan_filter"));
+      auto *node = circuit_.add_node(std::make_unique<PlanBatchNode>(
+          circuit_.next_node_id(), std::move(child), keep_alive, spec.exprs,
+          std::vector<const duckdb::Expression *>{}, spec.input_types));
       return [node]() -> const DuckDBZSet & { return node->output(); };
     }
     case PlanOpSpec::Kind::MAP_EXPR: {
       OutputFn child = build(*spec.children[0], keep_alive);
-      auto evals =
-          std::make_shared<std::vector<std::unique_ptr<RowExprEval>>>();
-      for (const auto *expr : spec.exprs) {
-        evals->push_back(std::make_unique<RowExprEval>(keep_alive, *expr,
-                                                       spec.input_types));
-      }
-      auto *node = circuit_.add_node(std::make_unique<RowMap>(
-          circuit_.next_node_id(), std::move(child),
-          [evals](const DuckDBRow &row) {
-            DuckDBRow out;
-            out.columns.reserve(evals->size());
-            for (auto &eval : *evals) {
-              out.columns.push_back(eval->eval(row));
-            }
-            return out;
-          },
-          "plan_project"));
+      auto *node = circuit_.add_node(std::make_unique<PlanBatchNode>(
+          circuit_.next_node_id(), std::move(child), keep_alive,
+          std::vector<const duckdb::Expression *>{}, spec.exprs,
+          spec.input_types));
       return [node]() -> const DuckDBZSet & { return node->output(); };
     }
     case PlanOpSpec::Kind::AGGREGATE: {
@@ -1417,19 +1639,9 @@ private:
       return cte_outputs_.at(spec.cte_index);
     case PlanOpSpec::Kind::FILTER_MAP: {
       OutputFn child = build(*spec.children[0], keep_alive);
-      auto filters = std::make_shared<PlanFilterMapNode::Evals>();
-      for (const auto *expr : spec.filter_exprs) {
-        filters->push_back(std::make_unique<RowExprEval>(keep_alive, *expr,
-                                                         spec.input_types));
-      }
-      auto projs = std::make_shared<PlanFilterMapNode::Evals>();
-      for (const auto *expr : spec.exprs) {
-        projs->push_back(std::make_unique<RowExprEval>(keep_alive, *expr,
-                                                       spec.input_types));
-      }
-      auto *node = circuit_.add_node(std::make_unique<PlanFilterMapNode>(
-          circuit_.next_node_id(), std::move(child), std::move(filters),
-          std::move(projs)));
+      auto *node = circuit_.add_node(std::make_unique<PlanBatchNode>(
+          circuit_.next_node_id(), std::move(child), keep_alive,
+          spec.filter_exprs, spec.exprs, spec.input_types));
       return [node]() -> const DuckDBZSet & { return node->output(); };
     }
     case PlanOpSpec::Kind::DISTINCT_ON: {

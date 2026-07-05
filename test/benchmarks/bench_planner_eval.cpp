@@ -147,3 +147,4 @@ TEST_CASE("Benchmark: planner join delta throughput",
             << "-row index: " << join_us << " us ("
             << rows_per_sec(join_us) << " rows/s)\n";
 }
+
