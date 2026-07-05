@@ -817,3 +817,101 @@ TEST_CASE("planner recursive: removing an edge shrinks the closure",
   db.assertViewRowCount("v_rreach", 1); // only (1,2)
   requireViewMatchesQuery(db, "v_rreach", sql);
 }
+
+// ===== Phase D2: outer joins =====
+
+TEST_CASE("planner D2: LEFT JOIN pads and unpads incrementally",
+          "[integration][planner][outer_join]") {
+  DuckDBTestHarness db;
+  db.createTable("ol", "id INT, x INT", {"(1, 10)", "(2, 20)"});
+  db.exec("SELECT * FROM dbsp_track('ol')");
+  db.exec("SELECT * FROM dbsp_sync('ol')");
+  db.createTable("orr", "id INT, y INT", {"(1, 100)"});
+  db.exec("SELECT * FROM dbsp_track('orr')");
+  db.exec("SELECT * FROM dbsp_sync('orr')");
+  db.exec("SELECT * FROM dbsp_use_planner(true)");
+
+  const std::string sql =
+      "SELECT ol.id, ol.x, orr.y FROM ol LEFT JOIN orr ON ol.id = orr.id";
+  db.exec("SELECT * FROM dbsp_create_view('v_lj', '" + sql + "')");
+  REQUIRE(plannerBuilt("v_lj"));
+  requireViewMatchesQuery(db, "v_lj", sql); // (1,10,100), (2,20,NULL)
+
+  // First match for id=2: NULL pad must retract
+  db.exec("INSERT INTO orr VALUES (2, 200)");
+  db.exec("SELECT * FROM dbsp_sync('orr')");
+  requireViewMatchesQuery(db, "v_lj", sql);
+
+  // Last match for id=2 leaves: pad comes back
+  db.exec("DELETE FROM orr WHERE id = 2");
+  db.exec("SELECT * FROM dbsp_sync('orr')");
+  requireViewMatchesQuery(db, "v_lj", sql);
+
+  // Unmatched left row deleted: its pad goes away
+  db.exec("DELETE FROM ol WHERE id = 2");
+  db.exec("SELECT * FROM dbsp_sync('ol')");
+  requireViewMatchesQuery(db, "v_lj", sql);
+
+  // NULL join key on the left: LEFT JOIN must still emit it padded
+  db.exec("INSERT INTO ol VALUES (NULL, 30)");
+  db.exec("SELECT * FROM dbsp_sync('ol')");
+  requireViewMatchesQuery(db, "v_lj", sql);
+}
+
+TEST_CASE("planner D2: LEFT JOIN differential",
+          "[integration][planner][outer_join]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  setupTableU(db);
+
+  const std::string sql =
+      "SELECT t.id, t.val, u.val FROM t LEFT JOIN u ON t.id = u.id";
+  db.exec("SELECT * FROM dbsp_create_view('v_ljd', '" + sql + "')");
+  REQUIRE(plannerBuilt("v_ljd"));
+  requireViewMatchesQuery(db, "v_ljd", sql);
+  runDifferentialTwoTables(db, "v_ljd", sql, 611);
+}
+
+TEST_CASE("planner D2: RIGHT JOIN differential",
+          "[integration][planner][outer_join]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  setupTableU(db);
+
+  const std::string sql =
+      "SELECT t.val, u.id, u.val FROM t RIGHT JOIN u ON t.id = u.id";
+  db.exec("SELECT * FROM dbsp_create_view('v_rjd', '" + sql + "')");
+  REQUIRE(plannerBuilt("v_rjd"));
+  requireViewMatchesQuery(db, "v_rjd", sql);
+  runDifferentialTwoTables(db, "v_rjd", sql, 613);
+}
+
+TEST_CASE("planner D2: FULL JOIN differential",
+          "[integration][planner][outer_join]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  setupTableU(db);
+
+  const std::string sql =
+      "SELECT t.id, t.val, u.id, u.val FROM t FULL JOIN u ON t.id = u.id";
+  db.exec("SELECT * FROM dbsp_create_view('v_fjd', '" + sql + "')");
+  REQUIRE(plannerBuilt("v_fjd"));
+  requireViewMatchesQuery(db, "v_fjd", sql);
+  runDifferentialTwoTables(db, "v_fjd", sql, 617);
+}
+
+TEST_CASE("planner D2: LEFT JOIN with residual predicate differential",
+          "[integration][planner][outer_join]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  setupTableU(db);
+
+  // Residual (t.val < u.val) participates in matching: a right row with the
+  // same key but failing the residual must NOT count as a match
+  const std::string sql = "SELECT t.id, t.val, u.val FROM t LEFT JOIN u "
+                          "ON t.id = u.id AND t.val < u.val";
+  db.exec("SELECT * FROM dbsp_create_view('v_ljr', '" + sql + "')");
+  REQUIRE(plannerBuilt("v_ljr"));
+  requireViewMatchesQuery(db, "v_ljr", sql);
+  runDifferentialTwoTables(db, "v_ljr", sql, 619);
+}

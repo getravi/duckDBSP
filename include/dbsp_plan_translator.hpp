@@ -368,6 +368,7 @@ struct PlanOpSpec {
   std::vector<JoinCond> residual_conds;          // JOIN: other comparisons
   duckdb::vector<duckdb::LogicalType> left_types, right_types; // JOIN
   SetOp set_op = SetOp::UNION_ALL;               // SET_OP
+  duckdb::JoinType join_type = duckdb::JoinType::INNER; // JOIN
   std::vector<NativeWindowView::WindowDef> window_defs;   // WINDOW
   std::vector<ColumnInfo> window_source_cols;             // WINDOW
   std::vector<ColumnInfo> window_result_cols;             // WINDOW
@@ -766,10 +767,20 @@ public:
 
   PlanJoinNode(dbsp::NodeId id, InputFn left_fn, InputFn right_fn,
                std::vector<KeyPair> keys, std::vector<Residual> residuals,
+               duckdb::JoinType join_type = duckdb::JoinType::INNER,
+               duckdb::vector<duckdb::LogicalType> left_types = {},
+               duckdb::vector<duckdb::LogicalType> right_types = {},
                std::string name = "plan_join")
       : dbsp::Node(id, std::move(name)), left_fn_(std::move(left_fn)),
         right_fn_(std::move(right_fn)), keys_(std::move(keys)),
-        residuals_(std::move(residuals)) {}
+        residuals_(std::move(residuals)), join_type_(join_type),
+        left_types_(std::move(left_types)),
+        right_types_(std::move(right_types)) {
+    pads_left_ = join_type_ == duckdb::JoinType::LEFT ||
+                 join_type_ == duckdb::JoinType::OUTER;
+    pads_right_ = join_type_ == duckdb::JoinType::RIGHT ||
+                  join_type_ == duckdb::JoinType::OUTER;
+  }
 
   void step() override {
     output_.clear();
@@ -834,15 +845,30 @@ public:
       }
     }
 
-    // Integrate deltas into the side indexes
+    // Integrate deltas into the side indexes (and, for outer joins, the
+    // per-row weight maps that include NULL-key rows)
     integrate(dl, /*left=*/true);
     integrate(dr, /*left=*/false);
+
+    // Outer-join NULL padding: reconcile the pad of every row whose match
+    // count may have changed. Desired pad weight = the row's total weight
+    // when it has no (residual-passing) matches, else 0; emit the diff.
+    if (pads_left_) {
+      reconcile_pads(dl, dr, /*left=*/true);
+    }
+    if (pads_right_) {
+      reconcile_pads(dr, dl, /*left=*/false);
+    }
     has_output_ = !output_.empty();
   }
 
   void reset() override {
     left_index_.clear();
     right_index_.clear();
+    left_weights_.clear();
+    right_weights_.clear();
+    left_pad_.clear();
+    right_pad_.clear();
     output_.clear();
     has_output_ = false;
   }
@@ -920,7 +946,16 @@ private:
 
   void integrate(const DuckDBZSet &delta, bool left) {
     Index &index = left ? left_index_ : right_index_;
+    const bool track_weights = left ? pads_left_ : pads_right_;
+    RowWeights &weights = left ? left_weights_ : right_weights_;
     for (const auto &[row, w] : delta) {
+      if (track_weights) {
+        int64_t &total = weights[row];
+        total += w;
+        if (total == 0) {
+          weights.erase(row);
+        }
+      }
       DuckDBRow key;
       if (!eval_key(row, left, key)) {
         continue;
@@ -937,10 +972,108 @@ private:
     }
   }
 
+  // Weighted count of residual-passing matches for one row of the padded
+  // side against the other side's integrated index. NULL keys never match.
+  int64_t match_count(const DuckDBRow &row, bool left) {
+    DuckDBRow key;
+    if (!eval_key(row, left, key)) {
+      return 0;
+    }
+    const Index &other = left ? right_index_ : left_index_;
+    auto it = other.find(key);
+    if (it == other.end()) {
+      return 0;
+    }
+    int64_t count = 0;
+    for (const auto &[orow, ow] : it->second) {
+      const bool pass = left ? residuals_pass(row, orow)
+                             : residuals_pass(orow, row);
+      if (pass) {
+        count += ow;
+      }
+    }
+    return count;
+  }
+
+  DuckDBRow pad_row(const DuckDBRow &row, bool left) const {
+    DuckDBRow out;
+    if (left) {
+      out.columns = row.columns;
+      for (const auto &t : right_types_) {
+        out.columns.push_back(duckdb::Value(t));
+      }
+    } else {
+      out.columns.reserve(left_types_.size() + row.columns.size());
+      for (const auto &t : left_types_) {
+        out.columns.push_back(duckdb::Value(t));
+      }
+      out.columns.insert(out.columns.end(), row.columns.begin(),
+                         row.columns.end());
+    }
+    return out;
+  }
+
+  // Reconcile pads for every row whose match count may have changed:
+  // rows in this side's delta, plus integrated rows sharing an equi key
+  // with the other side's delta (keyless joins share one empty key, so a
+  // non-empty other-side delta touches every row — correct, if not cheap).
+  void reconcile_pads(const DuckDBZSet &own_delta,
+                      const DuckDBZSet &other_delta, bool left) {
+    std::unordered_map<DuckDBRow, char, DuckDBRowHash> affected;
+    for (const auto &[row, w] : own_delta) {
+      affected.emplace(row, 0);
+    }
+    if (!other_delta.empty()) {
+      const Index &own_index = left ? left_index_ : right_index_;
+      std::unordered_map<DuckDBRow, char, DuckDBRowHash> seen_keys;
+      for (const auto &[orow, ow] : other_delta) {
+        DuckDBRow key;
+        if (!eval_key(orow, !left, key)) {
+          continue;
+        }
+        if (!seen_keys.emplace(key, 0).second) {
+          continue;
+        }
+        auto it = own_index.find(key);
+        if (it == own_index.end()) {
+          continue;
+        }
+        for (const auto &[row, w] : it->second) {
+          affected.emplace(row, 0);
+        }
+      }
+    }
+
+    RowWeights &weights = left ? left_weights_ : right_weights_;
+    RowWeights &pads = left ? left_pad_ : right_pad_;
+    for (const auto &[row, unused] : affected) {
+      auto wit = weights.find(row);
+      const int64_t total = wit == weights.end() ? 0 : wit->second;
+      const int64_t desired =
+          (total > 0 && match_count(row, left) == 0) ? total : 0;
+      auto pit = pads.find(row);
+      const int64_t current = pit == pads.end() ? 0 : pit->second;
+      if (desired == current) {
+        continue;
+      }
+      output_.insert(pad_row(row, left), desired - current);
+      if (desired == 0) {
+        pads.erase(row);
+      } else {
+        pads[row] = desired;
+      }
+    }
+  }
+
   InputFn left_fn_, right_fn_;
   std::vector<KeyPair> keys_;
   std::vector<Residual> residuals_;
+  duckdb::JoinType join_type_;
+  duckdb::vector<duckdb::LogicalType> left_types_, right_types_;
+  bool pads_left_ = false, pads_right_ = false;
   Index left_index_, right_index_;
+  RowWeights left_weights_, right_weights_;   // incl. NULL-key rows
+  RowWeights left_pad_, right_pad_;           // currently emitted pad weight
   DuckDBZSet output_;
   bool has_output_ = false;
 };
@@ -1597,7 +1730,8 @@ private:
       }
       auto *node = circuit_.add_node(std::make_unique<PlanJoinNode>(
           circuit_.next_node_id(), std::move(left), std::move(right),
-          std::move(keys), std::move(residuals)));
+          std::move(keys), std::move(residuals), spec.join_type,
+          spec.left_types, spec.right_types));
       return [node]() -> const DuckDBZSet & { return node->output(); };
     }
     case PlanOpSpec::Kind::DISTINCT: {
@@ -2119,7 +2253,13 @@ private:
     }
 
     SpecPtr visit_join(duckdb::LogicalComparisonJoin &op) {
-      if (op.join_type != duckdb::JoinType::INNER) {
+      switch (op.join_type) {
+      case duckdb::JoinType::INNER:
+      case duckdb::JoinType::LEFT:
+      case duckdb::JoinType::RIGHT:
+      case duckdb::JoinType::OUTER:
+        break;
+      default:
         return unsupported("join type " +
                            duckdb::EnumUtil::ToString(op.join_type));
       }
@@ -2136,6 +2276,7 @@ private:
 
       auto spec = std::make_unique<PlanOpSpec>();
       spec->kind = PlanOpSpec::Kind::JOIN;
+      spec->join_type = op.join_type;
       for (const auto &cond : op.conditions) {
         PlanOpSpec::JoinCond jc{cond.left.get(), cond.right.get(),
                                 cond.comparison};
