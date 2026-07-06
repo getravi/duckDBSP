@@ -4,12 +4,48 @@ Complete reference for all DBSP extension functions.
 
 ## Table of Contents
 
+- [SQL DDL Syntax](#sql-ddl-syntax)
 - [Table Tracking](#table-tracking)
 - [View Management](#view-management)
 - [Querying](#querying)
 - [Persistence](#persistence)
 - [Manual CDC](#manual-cdc)
 - [Runtime Modes](#runtime-modes)
+
+---
+
+## SQL DDL Syntax
+
+The primary interface. Sources are tracked automatically and views keep
+themselves current (auto-sync is on by default).
+
+### CREATE MATERIALIZED VIEW
+
+```sql
+CREATE MATERIALIZED VIEW name AS SELECT ...;
+```
+
+Creates an incrementally maintained view. Equivalent to
+`dbsp_create_view('name', 'SELECT ...')`. Internally routed through the
+`dbsp_create_materialized_view` table function (registered for the
+parser extension; not intended for direct use).
+
+### REFRESH MATERIALIZED VIEW
+
+```sql
+REFRESH MATERIALIZED VIEW name;
+```
+
+Accepted for compatibility — a no-op, since views refresh automatically.
+
+### DROP MATERIALIZED VIEW
+
+DuckDB parses `DROP MATERIALIZED VIEW` natively, which bypasses the
+extension's parser hook — use the function form instead:
+
+```sql
+SELECT dbsp_drop('name');           -- or dbsp_drop_cascade('name')
+```
 
 ---
 
@@ -243,6 +279,8 @@ SELECT * FROM dbsp_views();
 
 ### dbsp_drop(view_name)
 
+Alias: `dbsp_drop_view(view_name)` (identical scalar function).
+
 Drop a materialized view.
 
 ```sql
@@ -262,6 +300,8 @@ SELECT dbsp_drop('view_name');
 ---
 
 ### dbsp_drop_cascade(view_name)
+
+Alias: `dbsp_drop_view_cascade(view_name)`.
 
 Drop a view and all views that depend on it.
 
