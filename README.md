@@ -22,7 +22,9 @@ DBSP:         INSERT 1 row → Update affected aggregates → O(delta)
 - **Automatic CDC**: Change Data Capture with sync detection
 - **Persistence**: Save/restore views across sessions
 - **Zero Dependencies**: Pure C++ header-only core library
-- **Bounded Memory**: optional disk-backed baselines (`dbsp_spill`)
+- **Bounded Memory**: optional disk-backed state (`dbsp_spill`)
+- **Parallel Updates**: optional multi-core sync, propagation, and join
+  probing (`dbsp_parallel`)
 
 ## Quick Start
 

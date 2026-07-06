@@ -9,6 +9,7 @@ Complete reference for all DBSP extension functions.
 - [Querying](#querying)
 - [Persistence](#persistence)
 - [Manual CDC](#manual-cdc)
+- [Runtime Modes](#runtime-modes)
 
 ---
 
@@ -155,12 +156,18 @@ The function stays callable so existing scripts don't break; it always
 reports ENABLED. `dbsp_create_view` translates view SQL through DuckDB's
 own binder/planner, covering scan/filter/projection (arbitrary
 expressions), GROUP BY aggregation (multiple aggregates, expression keys,
-HAVING, global aggregates, exact DECIMAL SUM), inner joins (equi +
-residual predicates), cross joins, DISTINCT, DISTINCT ON,
-UNION/INTERSECT/EXCEPT (ALL and DISTINCT), window functions over plain
-columns, non-recursive CTEs, WITH RECURSIVE, and ORDER BY/LIMIT/OFFSET.
-Anything else (outer joins, correlated subqueries, ...) fails with a
-DBSP-E110 error naming the operator.
+HAVING, global aggregates, exact DECIMAL SUM, DISTINCT and FILTER
+modifiers, ROLLUP/CUBE/GROUPING SETS with GROUPING(), ordered
+STRING_AGG/ARRAY_AGG, holistic MEDIAN/QUANTILE_CONT/QUANTILE_DISC/
+MODE/MAD), inner and outer joins (LEFT/RIGHT/FULL, equi + residual
+predicates), cross joins, IN/NOT IN/EXISTS/scalar subqueries
+(correlated included), DISTINCT, DISTINCT ON, UNION/INTERSECT/EXCEPT
+(ALL and DISTINCT), window functions (expressions auto-projected),
+non-recursive CTEs, WITH RECURSIVE (deletions included), and ORDER
+BY/LIMIT/OFFSET (constant or percentage). The few remaining gaps
+(USING KEY recursion, expression LIMIT, approximate statistics like
+approx_quantile, unordered string_agg) fail with a DBSP-E110 error
+naming the construct.
 
 ```sql
 SELECT * FROM dbsp_use_planner();       -- Always: ENABLED
@@ -447,6 +454,44 @@ SELECT * FROM dbsp_notify_delete('orders', 1, 'Alice', 100.00);
 - VARCHAR: Confirmation message
 
 ---
+
+## Runtime Modes
+
+### dbsp_auto_sync(enable)
+
+Toggle automatic change capture: with auto-sync on, views update on
+every transaction commit without calling `dbsp_sync`. Explicit
+INSERT-only transactions commit in O(delta) via captured deltas; other
+writes use scan-and-diff scoped to the tables the transaction touched.
+
+```sql
+SELECT * FROM dbsp_auto_sync(true);   -- Enable
+SELECT * FROM dbsp_auto_sync(false);  -- Disable
+SELECT * FROM dbsp_auto_sync();       -- Query status
+```
+
+### dbsp_parallel(enable)
+
+Toggle parallel execution (default off): multi-table syncs scan on
+threads, views at the same dependency level update concurrently during
+propagation, and large residual-free inner-join probe passes split
+across cores.
+
+```sql
+SELECT * FROM dbsp_parallel(true);
+```
+
+### dbsp_spill(enable)
+
+Toggle disk-backed state (default off): tracked-table baselines, join
+indexes (shared and local), top-K sort windows, and oversized holistic
+aggregate groups move to disk record logs; RAM keeps compact digest
+indexes and hot-bucket caches. Trades sync CPU (row serialization) for
+bounded memory. Live state migrates both directions on toggle.
+
+```sql
+SELECT * FROM dbsp_spill(true);
+```
 
 ## Error Handling
 

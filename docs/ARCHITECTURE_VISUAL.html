@@ -340,9 +340,10 @@
         <span class="name">One reader of your SQL</span><span class="caret">&#9656;</span></span>
         <span class="detail">Your question (“total per customer”) is written in SQL.
         One translator turns it into a blueprint for the assembly line below,
-        borrowing DuckDB's own query brain so it speaks fluent SQL. If it meets
-        a phrase it can't handle (say, an outer join), it tells you exactly
-        which one instead of guessing.
+        borrowing DuckDB's own query brain so it speaks fluent SQL. Joins of
+        every flavor, subqueries, window functions, ROLLUP breakdowns — it
+        reads nearly all of analytic SQL now; on the rare phrase it can't
+        handle it tells you exactly which one instead of guessing.
         <span class="tech">Planner Frontend (the only frontend since Phase C — the in-house SQL parser was retired)</span></span>
       </button>
       <div class="stack-arrow" aria-hidden="true">&#9660;</div>
@@ -352,7 +353,7 @@
         <span class="detail">Each live answer you asked for — a filter, a running
         total, a join of two tables — lives here as a small machine that knows how
         to nudge itself when ledger entries arrive.
-        <span class="tech">circuit-backed views: filter, project, aggregate, join, distinct, set ops, recursive</span></span>
+        <span class="tech">circuit-backed views: filter, project, aggregate (incl. medians and grouping sets), joins of all kinds, subqueries, windows, distinct, set ops, recursive</span></span>
       </button>
       <div class="stack-arrow" aria-hidden="true">&#9660;</div>
       <button class="layer" aria-expanded="false">
@@ -453,14 +454,18 @@
     <h2>The fine print, kept short</h2>
     <div class="facts">
       <div class="fact">
-        <h3>Reads don't wait</h3>
-        <p>Many people can read the live answers at the same time. Only changes
-        (new data, new views) take a brief exclusive turn.</p>
+        <h3>Reads don't wait, work can fan out</h3>
+        <p>Many people can read the live answers at the same time. And with
+        <code class="inline">dbsp_parallel</code> on, independent answers
+        update side by side on separate threads, and big joins split their
+        work across cores.</p>
       </div>
       <div class="fact">
-        <h3>It lives in memory</h3>
-        <p>Live answers are kept in RAM for speed. The <em>definitions</em> are
-        saved; after a restart, answers are rebuilt from your tables.</p>
+        <h3>Memory or disk — your choice</h3>
+        <p>Live answers run in RAM for speed. Flip one switch
+        (<code class="inline">dbsp_spill</code>) and the bulky working notes —
+        table snapshots, join notebooks, top-10 leftovers — move to disk,
+        so big tables fit on small machines.</p>
       </div>
       <div class="fact">
         <h3>It can follow chains</h3>
@@ -468,9 +473,10 @@
         questions are answered by looping until nothing new appears.</p>
       </div>
       <div class="fact">
-        <h3>It tidies the line first</h3>
-        <p>Before building an assembly line, an optimizer rearranges it —
-        filtering early, dropping unused columns — so less data rides through.</p>
+        <h3>It tidies the line, then shares the tools</h3>
+        <p>An optimizer rearranges each assembly line — filtering early,
+        dropping unused columns — and views that join the same table share
+        one lookup notebook instead of each keeping their own copy.</p>
       </div>
     </div>
     <dl class="gloss">
