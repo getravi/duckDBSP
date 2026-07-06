@@ -3222,6 +3222,7 @@ private:
     // PlanKeepAlive::rewritten_exprs after the walk so they outlive the
     // circuit's evaluators.
     std::vector<std::unique_ptr<duckdb::Expression>> owned_exprs;
+    duckdb::idx_t synthetic_cte_seq_ = 0; // grouping-set input sharing
 
     using SpecPtr = std::unique_ptr<PlanOpSpec>;
 
@@ -3467,11 +3468,21 @@ private:
       union_spec->kind = PlanOpSpec::Kind::SET_OP;
       union_spec->set_op = PlanOpSpec::SetOp::UNION_ALL;
 
+      // Build the input subtree ONCE and share it across all grouping-set
+      // branches through the CTE machinery (a synthetic index well above
+      // DuckDB's table_index range) — CUBE(3) = 8 branches would
+      // otherwise recompute the input 8 times per delta
+      auto shared_input = visit(*op.children[0]);
+      if (!shared_input) {
+        return nullptr;
+      }
+      const duckdb::idx_t synthetic_cte =
+          (duckdb::idx_t(1) << 40) + synthetic_cte_seq_++;
+
       for (const auto &gset : sets) {
-        auto child = visit(*op.children[0]);
-        if (!child) {
-          return nullptr;
-        }
+        auto child = std::make_unique<PlanOpSpec>();
+        child->kind = PlanOpSpec::Kind::CTE_REF;
+        child->cte_index = synthetic_cte;
 
         auto agg = std::make_unique<PlanOpSpec>();
         agg->kind = PlanOpSpec::Kind::AGGREGATE;
@@ -3545,10 +3556,15 @@ private:
                            op.types[num_groups + num_aggs + f]});
       }
 
-      if (union_spec->children.size() == 1) {
-        return std::move(union_spec->children[0]);
-      }
-      return union_spec;
+      SpecPtr body = union_spec->children.size() == 1
+                         ? std::move(union_spec->children[0])
+                         : std::move(union_spec);
+      auto cte = std::make_unique<PlanOpSpec>();
+      cte->kind = PlanOpSpec::Kind::CTE;
+      cte->cte_index = synthetic_cte;
+      cte->children.push_back(std::move(shared_input));
+      cte->children.push_back(std::move(body));
+      return cte;
     }
 
     // Parse BoundAggregateExpressions into PlanAggSpecs (fn, argument,
