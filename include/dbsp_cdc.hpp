@@ -1045,6 +1045,10 @@ public:
       }
     }
     spill_enabled_ = enable;
+    g_spill_mode.store(enable);
+    if (enable) {
+      g_spill_dir = spill_dir_;
+    }
     return true;
   }
 

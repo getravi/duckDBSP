@@ -1840,3 +1840,38 @@ TEST_CASE("planner M3: percentage LIMIT differential",
   requireViewMatchesQuery(db, "v_pct", sql);
   runDifferential(db, "v_pct", sql, 727);
 }
+
+// ---------------------------------------------------------------------------
+// Phase N: RAM-state work (bounded top-K, local index spill, big groups)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("planner N2: bounded top-K under spill with refills",
+          "[integration][planner][spill][topk]") {
+  DuckDBTestHarness db;
+  db.exec("CREATE TABLE tk (id INT, score INT)");
+  db.exec("SELECT * FROM dbsp_track('tk')");
+  db.exec("SELECT * FROM dbsp_sync('tk')");
+  db.exec("SELECT * FROM dbsp_spill(true)");
+
+  const std::string sql =
+      "SELECT id, score FROM tk ORDER BY score DESC, id LIMIT 10";
+  db.exec("SELECT * FROM dbsp_create_view('v_topk_sp', '" + sql + "')");
+
+  // Fill well past the window, then delete the ENTIRE top repeatedly —
+  // every round digs through the window and forces a refill from the log
+  db.exec("INSERT INTO tk SELECT i, i FROM range(2000) s(i)");
+  db.exec("SELECT * FROM dbsp_sync('tk')");
+  requireViewMatchesQuery(db, "v_topk_sp", sql);
+
+  for (int round = 0; round < 6; round++) {
+    db.exec("DELETE FROM tk WHERE score >= (SELECT MAX(score) - 150 "
+            "FROM tk)");
+    db.exec("SELECT * FROM dbsp_sync('tk')");
+    requireViewMatchesQuery(db, "v_topk_sp", sql);
+    db.exec("INSERT INTO tk SELECT 10000 + " + std::to_string(round) +
+            " * 100 + i, 5000 + i FROM range(50) s(i)");
+    db.exec("SELECT * FROM dbsp_sync('tk')");
+    requireViewMatchesQuery(db, "v_topk_sp", sql);
+  }
+  db.exec("SELECT * FROM dbsp_spill(false)");
+}

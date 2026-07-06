@@ -24,6 +24,7 @@
 #include "duckdb/common/serializer/memory_stream.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -35,6 +36,12 @@
 #include <vector>
 
 namespace dbsp_native {
+
+// Spill mode globals (set by CDCManager::set_spill under struct_mutex_;
+// read at view construction under the same lock)
+inline std::atomic<bool> g_spill_mode{false};
+inline std::string g_spill_dir;
+inline std::atomic<uint64_t> g_spill_file_seq{0};
 
 // 128-bit row hash: two independent 64-bit FNV-1a passes over the
 // serialized row bytes (different offset bases → independent streams).

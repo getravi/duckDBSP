@@ -1236,7 +1236,22 @@ public:
         sort_columns_(std::move(sort_columns)), comparator_(sort_columns_),
         sorted_rows_(comparator_), project_(std::move(project)) {
     schema_.table_name = name;
+    // N2 bounded top-K (spill mode, constant LIMIT only): keep the top
+    // offset+limit+margin rows in RAM; everything below the cutoff goes
+    // to a disk record log (digest index in RAM). Rows re-enter the
+    // window from the log when deletions shrink it (rare full log pass).
+    // Mode fixed at construction; the flag is read under the same CDC
+    // lock that guards set_spill.
+    if (g_spill_mode.load() && limit_ >= 0 && limit_percent_ < 0) {
+      window_cap_ = static_cast<size_t>(offset_ + limit_) +
+                    std::max<size_t>(64, static_cast<size_t>(limit_));
+      overflow_ = std::make_unique<SpilledBaseline>(
+          g_spill_dir + "/limit_" +
+          std::to_string(g_spill_file_seq.fetch_add(1)) + ".dbspill");
+    }
   }
+
+  bool bounded() const { return overflow_ != nullptr; }
 
   // LIMIT p% counts against the CURRENT input size — recomputed on every
   // apply, so membership tracks table growth/shrinkage incrementally
@@ -1254,6 +1269,11 @@ public:
     delta_.clear();
     if (table_name != source_table_)
       return;
+
+    if (overflow_) {
+      apply_bounded(changes);
+      return;
+    }
 
     // Apply changes to full state
     for (const auto &[row, weight] : changes) {
@@ -1311,6 +1331,9 @@ public:
 
   void reset() override {
     sorted_rows_.clear();
+    if (overflow_) {
+      overflow_->discard();
+    }
     result_.clear();
     delta_.clear();
     version_ = 0;
@@ -1404,6 +1427,94 @@ private:
     }
   };
 
+  static std::vector<duckdb::Value> row_vals(const DuckDBRow &row) {
+    std::vector<duckdb::Value> vals;
+    vals.reserve(row.columns.size());
+    for (size_t i = 0; i < row.columns.size(); i++) {
+      vals.push_back(row.columns[i]);
+    }
+    return vals;
+  }
+
+  void apply_bounded(const DuckDBZSet &changes) {
+    for (const auto &[row, weight] : changes) {
+      if (weight > 0) {
+        for (Weight i = 0; i < weight; ++i) {
+          // Below the current cutoff → overflow log; else into the window
+          if (sorted_rows_.size() >= window_cap_ &&
+              !comparator_(row, *sorted_rows_.rbegin())) {
+            overflow_->apply_row(row_vals(row), 1);
+            continue;
+          }
+          sorted_rows_.insert(row);
+          if (sorted_rows_.size() > window_cap_) {
+            auto last = std::prev(sorted_rows_.end());
+            overflow_->apply_row(row_vals(*last), 1);
+            sorted_rows_.erase(last);
+          }
+        }
+      } else if (weight < 0) {
+        for (Weight i = 0; i > weight; --i) {
+          auto it = sorted_rows_.find(row);
+          if (it != sorted_rows_.end()) {
+            sorted_rows_.erase(it);
+          } else {
+            overflow_->apply_row(row_vals(row), -1);
+          }
+        }
+      }
+    }
+
+    // Refill from the log when deletions dug into the window (rare:
+    // one full log pass, smallest rows promoted, log rewritten)
+    if (sorted_rows_.size() < window_cap_ && !overflow_->empty()) {
+      std::multiset<DuckDBRow, RowComparator> all(comparator_);
+      overflow_->scan([&](const std::vector<duckdb::Value> &vals,
+                          int64_t w) {
+        for (int64_t c = 0; c < w; c++) {
+          DuckDBRow r;
+          std::vector<duckdb::Value> copy = vals;
+          r.columns.assign(std::move(copy));
+          all.insert(std::move(r));
+        }
+      });
+      overflow_->discard();
+      for (auto &r : all) {
+        if (sorted_rows_.size() < window_cap_) {
+          sorted_rows_.insert(r);
+        } else if (comparator_(r, *sorted_rows_.rbegin())) {
+          overflow_->apply_row(row_vals(*std::prev(sorted_rows_.end())), 1);
+          sorted_rows_.erase(std::prev(sorted_rows_.end()));
+          sorted_rows_.insert(r);
+        } else {
+          overflow_->apply_row(row_vals(r), 1);
+        }
+      }
+    }
+
+    // Result recompute + delta: identical to the full-state path (the
+    // window always covers offset+limit rows when they exist)
+    DuckDBZSet new_result;
+    int64_t current_idx = 0;
+    int64_t count = 0;
+    const int64_t effective = effective_limit();
+    for (const auto &row : sorted_rows_) {
+      if (current_idx >= offset_) {
+        if (effective < 0 || count < effective) {
+          DuckDBRow result_row = project_ ? project_(row) : row;
+          new_result.insert(result_row, 1);
+          count++;
+        } else {
+          break;
+        }
+      }
+      current_idx++;
+    }
+    delta_ = new_result + (-result_);
+    result_ = new_result;
+    ++version_;
+  }
+
   std::string source_table_;
   TableSchema schema_;
   int64_t limit_;
@@ -1412,6 +1523,8 @@ private:
   std::vector<SortColumn> sort_columns_;
   RowComparator comparator_;
   std::multiset<DuckDBRow, RowComparator> sorted_rows_;
+  size_t window_cap_ = 0;
+  std::unique_ptr<SpilledBaseline> overflow_; // N2: rows below the window
   ProjectFn project_;
   DuckDBZSet result_;
   DuckDBZSet delta_;
