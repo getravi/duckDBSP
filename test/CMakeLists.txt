@@ -24,6 +24,7 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/..
     ${CMAKE_CURRENT_SOURCE_DIR}/../include
     ${DUCKDB_SOURCE_DIR}/src/include
+    ${DUCKDB_SOURCE_DIR}/extension/core_functions/include
     ${DUCKDB_SOURCE_DIR}/third_party/catch
 )
 

@@ -1,5 +1,25 @@
 # Changelog
 
+## Phase L: Holistic aggregates & intra-operator sharding - Jul 2026
+
+- L1 median / quantile_cont / quantile_disc / mode: median and the
+  quantiles read the sorted per-group multiset the engine already keeps
+  for MIN/MAX (interpolation and ceil-index semantics match DuckDB;
+  fraction read from the public QuantileBindData header - the argument
+  is erased at bind time). mode maintains per-value multiplicities;
+  ties break by smallest value (DuckDB's tie choice is scan-order-
+  dependent and unreproducible incrementally - documented). FILTER
+  combines; DISTINCT on holistic aggregates stays E110.
+- L2 intra-operator sharding: residual-free inner equi-join probe
+  passes over deltas >= 4096 rows split across threads (up to 8, tied
+  to the dbsp_parallel knob alongside I2 view-level parallelism).
+  Probes are read-only; each shard emits into its own Z-set, merged
+  after; spilled-arrangement probes use shard-local scratches. The
+  serial path keeps its hoisted index reference - re-resolving the
+  side per row cost ~20% and was caught and reverted by bench. Join
+  delta bench: serial 434k rows/s, sharded 533k (thin buckets; fat
+  buckets gain more). Pads/marks/residual joins stay serial.
+
 ## Phase K2: Spilled shared join arrangements - Jul 2026
 
 - dbsp_spill(true) now also moves shared join arrangements (the largest

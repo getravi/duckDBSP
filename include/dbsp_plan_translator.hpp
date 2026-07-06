@@ -64,6 +64,7 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "core_functions/aggregate/quantile_helpers.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
@@ -86,7 +87,9 @@
 #include <atomic>
 #include <memory>
 #include <set>
+#include <cmath>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -332,7 +335,11 @@ struct PlanAggSpec {
     MAX,
     FIRST,
     STRING_AGG, // order-sensitive: requires ORDER BY inside the aggregate
-    ARRAY_AGG
+    ARRAY_AGG,
+    MEDIAN,        // quantile_cont 0.5
+    QUANTILE_CONT, // interpolated
+    QUANTILE_DISC, // lower-bound element
+    MODE           // most frequent (ties break by smallest value)
   };
 
   struct OrderKey {
@@ -346,6 +353,7 @@ struct PlanAggSpec {
   const duckdb::Expression *filter = nullptr; // FILTER (WHERE ...) clause
   std::vector<OrderKey> order_keys; // STRING_AGG/ARRAY_AGG
   std::string separator = ",";      // STRING_AGG
+  double quantile = 0.5;            // QUANTILE_CONT/DISC
   bool distinct = false;                   // COUNT/SUM/AVG(DISTINCT x)
   bool integer_arg = false;                // SUM/AVG: int64 vs double sum
   bool decimal_arg = false; // SUM over DECIMAL: exact unscaled hugeint sum
@@ -437,6 +445,13 @@ struct PlanOpSpec {
 // Projection pruning is deliberately NOT ported: DuckDB's binder already
 // prunes via GET column_ids, so canonical plans have nothing left to prune.
 inline std::atomic<bool> g_plan_ir_optimize{true};
+
+// L2: intra-operator sharding. When > 1, residual-free inner equi-join
+// probe passes over large deltas split across this many threads (probes
+// are read-only; each shard emits into its own Z-set, merged after).
+// Set by CDCManager::set_parallel_sync — one knob with view-level
+// parallelism.
+inline std::atomic<int> g_intraop_shards{0};
 
 namespace plan_ir {
 
@@ -593,6 +608,7 @@ public:
     std::vector<int> order_idxs;
     std::vector<std::pair<bool, bool>> order_dirs; // (ascending, nulls_first)
     std::string separator;
+    double quantile = 0.5;
   };
 
   // exprs layout in the shared batch evaluator: group keys first, then
@@ -744,6 +760,9 @@ private:
     // whole aggregate re-renders from this on every group change
     std::vector<std::pair<std::vector<duckdb::Value>, duckdb::Value>>
         ordered;
+    // MODE: per-value multiplicities (values multiset serves
+    // MEDIAN/QUANTILE the same way it serves MIN/MAX)
+    std::map<duckdb::Value, int64_t> mode_counts;
   };
 
   struct GroupState {
@@ -869,6 +888,9 @@ private:
       case PlanAggSpec::Fn::MIN:
       case PlanAggSpec::Fn::MAX:
       case PlanAggSpec::Fn::FIRST:
+      case PlanAggSpec::Fn::MEDIAN:
+      case PlanAggSpec::Fn::QUANTILE_CONT:
+      case PlanAggSpec::Fn::QUANTILE_DISC:
         if (weight > 0) {
           for (int64_t w = 0; w < weight; w++) {
             s.values.insert(v);
@@ -882,6 +904,14 @@ private:
           }
         }
         break;
+      case PlanAggSpec::Fn::MODE: {
+        int64_t &c = s.mode_counts[v];
+        c += weight;
+        if (c <= 0) {
+          s.mode_counts.erase(v);
+        }
+        break;
+      }
       default:
         break;
       }
@@ -968,6 +998,66 @@ private:
         first = false;
       }
       return duckdb::Value(out);
+    }
+    case PlanAggSpec::Fn::MEDIAN:
+    case PlanAggSpec::Fn::QUANTILE_CONT: {
+      if (s.values.empty()) {
+        return duckdb::Value(spec.return_type);
+      }
+      // Interpolated quantile over the sorted multiset: position
+      // q*(n-1) between neighbors lo and hi
+      const double q =
+          spec.fn == PlanAggSpec::Fn::MEDIAN ? 0.5 : spec.quantile;
+      const size_t n = s.values.size();
+      const double pos = q * static_cast<double>(n - 1);
+      const size_t lo_idx = static_cast<size_t>(pos);
+      const double frac = pos - static_cast<double>(lo_idx);
+      auto it = s.values.begin();
+      std::advance(it, lo_idx);
+      const duckdb::Value lo = *it;
+      if (frac == 0.0 || lo_idx + 1 >= n) {
+        return lo.DefaultCastAs(spec.return_type);
+      }
+      const duckdb::Value hi = *std::next(it);
+      const double lod = lo.DefaultCastAs(duckdb::LogicalType::DOUBLE)
+                             .GetValue<double>();
+      const double hid = hi.DefaultCastAs(duckdb::LogicalType::DOUBLE)
+                             .GetValue<double>();
+      return duckdb::Value(lod + frac * (hid - lod))
+          .DefaultCastAs(spec.return_type);
+    }
+    case PlanAggSpec::Fn::QUANTILE_DISC: {
+      if (s.values.empty()) {
+        return duckdb::Value(spec.return_type);
+      }
+      // Discrete quantile: element at ceil(q*n)-1 (DuckDB semantics)
+      const size_t n = s.values.size();
+      size_t idx = static_cast<size_t>(
+          std::ceil(spec.quantile * static_cast<double>(n)));
+      idx = idx > 0 ? idx - 1 : 0;
+      if (idx >= n) {
+        idx = n - 1;
+      }
+      auto it = s.values.begin();
+      std::advance(it, idx);
+      return it->DefaultCastAs(spec.return_type);
+    }
+    case PlanAggSpec::Fn::MODE: {
+      if (s.mode_counts.empty()) {
+        return duckdb::Value(spec.return_type);
+      }
+      // Highest multiplicity; ties break by smallest value (std::map is
+      // value-ordered, first hit wins) — DuckDB's tie choice is
+      // scan-order-dependent and unreproducible incrementally
+      const duckdb::Value *best = nullptr;
+      int64_t best_count = 0;
+      for (const auto &[v, c] : s.mode_counts) {
+        if (c > best_count) {
+          best = &v;
+          best_count = c;
+        }
+      }
+      return best->DefaultCastAs(spec.return_type);
     }
     case PlanAggSpec::Fn::ARRAY_AGG: {
       if (s.ordered.empty()) {
@@ -1362,30 +1452,76 @@ public:
     // passes; a shared side: NEW state — the arrangement was updated
     // before views stepped, and the Δl⋈Δr term is dropped to compensate:
     // Δl⋈R_new + L_old⋈Δr == Δl⋈R_old + L_old⋈Δr + Δl⋈Δr)
-    for (size_t i = 0; i < kl.rows.size(); i++) {
-      if (!kl.valid[i]) {
-        continue;
+    // Intra-operator sharding (L2): pure inner equi-joins (no residuals,
+    // no pads, no marks) may split large probe passes across threads —
+    // probes are read-only, each shard emits into its own Z-set
+    const int shards_cfg = g_intraop_shards.load(std::memory_order_relaxed);
+    const bool shardable = shards_cfg > 1 && residuals_.empty() &&
+                           !marks_ && !pads_left_ && !pads_right_ &&
+                           kl.rows.size() + kr.rows.size() >= 4096;
+
+    if (shardable) {
+      run_sharded_probe(kl, /*probe_left_side=*/false, shards_cfg);
+    } else if (shared_right_ && shared_right_->is_spilled()) {
+      for (size_t i = 0; i < kl.rows.size(); i++) {
+        if (!kl.valid[i]) {
+          continue;
+        }
+        const RowWeights *bucket = probe_side(/*left=*/false, kl.keys[i]);
+        if (!bucket) {
+          continue;
+        }
+        for (const auto &[rrow, rw] : *bucket) {
+          try_emit(*kl.rows[i], rrow, kl.weights[i] * rw);
+        }
       }
-      const RowWeights *bucket = probe_side(/*left=*/false, kl.keys[i]);
-      if (!bucket) {
-        continue;
-      }
-      for (const auto &[rrow, rw] : *bucket) {
-        try_emit(*kl.rows[i], rrow, kl.weights[i] * rw);
+    } else {
+      // Hot path: hoist the index ref out of the loop (per-row branch
+      // resolution cost ~20% of join throughput)
+      const Index &right_probe = side_index(/*left=*/false);
+      for (size_t i = 0; i < kl.rows.size(); i++) {
+        if (!kl.valid[i]) {
+          continue;
+        }
+        auto it = right_probe.find(kl.keys[i]);
+        if (it == right_probe.end()) {
+          continue;
+        }
+        for (const auto &[rrow, rw] : it->second) {
+          try_emit(*kl.rows[i], rrow, kl.weights[i] * rw);
+        }
       }
     }
 
     // L ⋈ Δr
-    for (size_t i = 0; i < kr.rows.size(); i++) {
-      if (!kr.valid[i]) {
-        continue;
+    if (shardable) {
+      run_sharded_probe(kr, /*probe_left_side=*/true, shards_cfg);
+    } else if (shared_left_ && shared_left_->is_spilled()) {
+      for (size_t i = 0; i < kr.rows.size(); i++) {
+        if (!kr.valid[i]) {
+          continue;
+        }
+        const RowWeights *bucket = probe_side(/*left=*/true, kr.keys[i]);
+        if (!bucket) {
+          continue;
+        }
+        for (const auto &[lrow, lw] : *bucket) {
+          try_emit(lrow, *kr.rows[i], lw * kr.weights[i]);
+        }
       }
-      const RowWeights *bucket = probe_side(/*left=*/true, kr.keys[i]);
-      if (!bucket) {
-        continue;
-      }
-      for (const auto &[lrow, lw] : *bucket) {
-        try_emit(lrow, *kr.rows[i], lw * kr.weights[i]);
+    } else {
+      const Index &left_probe = side_index(/*left=*/true);
+      for (size_t i = 0; i < kr.rows.size(); i++) {
+        if (!kr.valid[i]) {
+          continue;
+        }
+        auto it = left_probe.find(kr.keys[i]);
+        if (it == left_probe.end()) {
+          continue;
+        }
+        for (const auto &[lrow, lw] : it->second) {
+          try_emit(lrow, *kr.rows[i], lw * kr.weights[i]);
+        }
       }
     }
 
@@ -1568,6 +1704,81 @@ private:
     std::vector<DuckDBRow> keys;
     std::vector<char> valid;
   };
+
+  // Range-split one probe pass across shards. `dk` is the delta being
+  // probed; probe_left_side is the side whose index gets probed (the
+  // OPPOSITE of dk's side). Only called for residual-free inner joins:
+  // the emit is a pure concat, and shard-local scratches make spilled
+  // probes thread-safe (the arrangement's cache has its own mutex).
+  void run_sharded_probe(const DeltaKeys &dk, bool probe_left_side,
+                         int shards_cfg) {
+    const size_t n = dk.rows.size();
+    if (n == 0) {
+      return;
+    }
+    const size_t shards =
+        std::min<size_t>(static_cast<size_t>(shards_cfg), (n + 511) / 512);
+    if (shards <= 1) {
+      for (size_t i = 0; i < n; i++) {
+        probe_one(dk, i, probe_left_side, output_, nullptr);
+      }
+      return;
+    }
+    std::vector<DuckDBZSet> outs(shards);
+    std::vector<std::thread> threads;
+    threads.reserve(shards);
+    const size_t chunk = (n + shards - 1) / shards;
+    for (size_t t = 0; t < shards; t++) {
+      threads.emplace_back([&, t]() {
+        RowWeights scratch;
+        const size_t lo = t * chunk;
+        const size_t hi = std::min(n, lo + chunk);
+        for (size_t i = lo; i < hi; i++) {
+          probe_one(dk, i, probe_left_side, outs[t], &scratch);
+        }
+      });
+    }
+    for (auto &th : threads) {
+      th.join();
+    }
+    for (auto &out : outs) {
+      for (const auto &[row, w] : out) {
+        output_.insert(row, w);
+      }
+    }
+  }
+
+  void probe_one(const DeltaKeys &dk, size_t i, bool probe_left_side,
+                 DuckDBZSet &out, RowWeights *scratch) {
+    if (!dk.valid[i]) {
+      return;
+    }
+    const RowWeights *bucket;
+    const auto &sh = probe_left_side ? shared_left_ : shared_right_;
+    if (sh && sh->is_spilled() && scratch) {
+      bucket = sh->probe_spilled(dk.keys[i], *scratch) ? scratch : nullptr;
+    } else {
+      bucket = probe_side(probe_left_side, dk.keys[i]);
+    }
+    if (!bucket) {
+      return;
+    }
+    for (const auto &[orow, ow] : *bucket) {
+      const int64_t w = dk.weights[i] * ow;
+      if (w == 0) {
+        continue;
+      }
+      std::vector<duckdb::Value> vals;
+      const DuckDBRow &lrow = probe_left_side ? orow : *dk.rows[i];
+      const DuckDBRow &rrow = probe_left_side ? *dk.rows[i] : orow;
+      vals.reserve(lrow.columns.size() + rrow.columns.size());
+      vals.insert(vals.end(), lrow.columns.begin(), lrow.columns.end());
+      vals.insert(vals.end(), rrow.columns.begin(), rrow.columns.end());
+      DuckDBRow combined;
+      combined.columns.assign(std::move(vals));
+      out.insert(std::move(combined), w);
+    }
+  }
 
   DeltaKeys materialize_keys(const DuckDBZSet &delta, bool left) {
     DeltaKeys out;
@@ -2613,6 +2824,7 @@ private:
         inst.return_type = agg_spec.return_type;
         inst.distinct = agg_spec.distinct;
         inst.separator = agg_spec.separator;
+        inst.quantile = agg_spec.quantile;
         if (agg_spec.arg) {
           inst.arg_idx = static_cast<int>(arg_exprs.size());
           arg_exprs.push_back(agg_spec.arg);
@@ -3321,8 +3533,39 @@ private:
           agg_spec.fn = PlanAggSpec::Fn::STRING_AGG;
         } else if (fn == "array_agg" || fn == "list") {
           agg_spec.fn = PlanAggSpec::Fn::ARRAY_AGG;
+        } else if (fn == "median") {
+          agg_spec.fn = PlanAggSpec::Fn::MEDIAN;
+        } else if (fn == "quantile_cont" || fn == "quantile_disc" ||
+                   fn == "quantile") {
+          agg_spec.fn = fn == "quantile_cont"
+                            ? PlanAggSpec::Fn::QUANTILE_CONT
+                            : PlanAggSpec::Fn::QUANTILE_DISC;
+          // The fraction argument is erased at bind time and stored in
+          // QuantileBindData (public core_functions header — no layout
+          // mirror needed, unlike string_agg's separator)
+          if (!agg.bind_info) {
+            unsupported(fn + " without bind data");
+            return false;
+          }
+          const auto &qbd =
+              agg.bind_info->Cast<duckdb::QuantileBindData>();
+          if (qbd.quantiles.size() != 1) {
+            unsupported(fn + " with a fraction LIST (single fraction only)");
+            return false;
+          }
+          agg_spec.quantile = qbd.quantiles[0].dbl;
+        } else if (fn == "mode") {
+          agg_spec.fn = PlanAggSpec::Fn::MODE;
         } else {
           unsupported("aggregate function " + fn);
+          return false;
+        }
+        if ((agg_spec.fn == PlanAggSpec::Fn::MEDIAN ||
+             agg_spec.fn == PlanAggSpec::Fn::QUANTILE_CONT ||
+             agg_spec.fn == PlanAggSpec::Fn::QUANTILE_DISC ||
+             agg_spec.fn == PlanAggSpec::Fn::MODE) &&
+            agg_spec.distinct) {
+          unsupported("DISTINCT on " + fn);
           return false;
         }
         if (agg_spec.fn == PlanAggSpec::Fn::FIRST &&

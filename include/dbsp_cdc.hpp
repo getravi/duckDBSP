@@ -1057,6 +1057,12 @@ public:
   void set_parallel_sync(bool enable) {
     std::unique_lock<std::shared_mutex> lock(struct_mutex_);
     use_parallel_sync_ = enable;
+    // One knob: view-level (I2) and intra-operator (L2) parallelism
+    g_intraop_shards.store(
+        enable ? static_cast<int>(std::min<unsigned>(
+                     8, std::max<unsigned>(
+                            2, std::thread::hardware_concurrency())))
+               : 0);
   }
 
   bool get_parallel_sync() const {

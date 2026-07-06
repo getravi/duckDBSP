@@ -343,3 +343,29 @@ TEST_CASE("Benchmark: spilled vs RAM baselines", "[benchmark][spill_bench]") {
   run(true);
   run(false);
 }
+
+// L2: sharded join probe throughput — serial vs intra-operator threads
+TEST_CASE("Benchmark: sharded join probes", "[benchmark][shard_bench]") {
+  auto run = [&](bool parallel) -> double {
+    dbsp_native::g_intraop_shards.store(parallel ? 8 : 0);
+    DuckDBTestHarness db;
+    db.exec("CREATE TABLE t (id INT, val INT, tag VARCHAR)");
+    db.exec("CREATE TABLE u (id INT, val INT, tag VARCHAR)");
+    auto join = translate_view(
+        db, "bench_shard_join",
+        "SELECT t.id, u.val FROM t JOIN u ON t.id = u.id");
+    const DuckDBZSet delta = build_delta();
+    join->apply_changes("t", delta);
+    double us = measure_us([&]() { join->apply_changes("u", delta); });
+    REQUIRE(join->get_result().size() == kRows);
+    return us;
+  };
+  double serial_us = run(false);
+  double sharded_us = run(true);
+  dbsp_native::g_intraop_shards.store(0);
+  std::cout << "[bench] join delta " << kRows << " rows vs " << kRows
+            << "-row index: serial " << serial_us << " us ("
+            << rows_per_sec(serial_us) << " rows/s); sharded "
+            << sharded_us << " us (" << rows_per_sec(sharded_us)
+            << " rows/s)\n";
+}

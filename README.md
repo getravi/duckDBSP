@@ -231,6 +231,8 @@ See [Error Handling Guide](docs/ERROR_HANDLING.md) for details.
   aggregate branch per grouping set
 - `STRING_AGG` / `ARRAY_AGG` with in-aggregate `ORDER BY` (sorted
   per-group state, re-rendered on change)
+- `MEDIAN`, `QUANTILE_CONT`, `QUANTILE_DISC`, `MODE` (holistic, over the
+  sorted per-group multiset; mode ties break by smallest value)
 
 **Circuit Optimization:**
 - Automatic filter pushdown through JOINs

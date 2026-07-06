@@ -12,6 +12,9 @@ subsystem, bespoke parser, standalone Z-set spilling).
 - WITH RECURSIVE ... USING KEY
 - Non-constant / percentage LIMIT
 - Window ORDER BY / PARTITION BY over expressions (project first)
+- DISTINCT on holistic aggregates (median/quantile/mode)
+- MODE tie-breaking differs from DuckDB on ties (ours: smallest value;
+  DuckDB: scan-order-dependent) — unreproducible incrementally
 - string_agg/array_agg WITHOUT ORDER BY inside the aggregate (result
   order unreproducible incrementally; the ordered forms are supported —
   ties on order keys break by value, not input order)

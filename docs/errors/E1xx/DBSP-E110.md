@@ -8,7 +8,8 @@ message names the operator.
 ## Supported SQL (no E110)
 
 Filter/projection with arbitrary expressions, GROUP BY aggregation
-(COUNT/SUM/AVG/MIN/MAX/FIRST incl. exact DECIMAL SUM, HAVING, expression
+(COUNT/SUM/AVG/MIN/MAX/FIRST/MEDIAN/QUANTILE_CONT/QUANTILE_DISC/MODE
+incl. exact DECIMAL SUM, HAVING, expression
 keys, global aggregates, DISTINCT and FILTER (WHERE ...) modifiers,
 ROLLUP / CUBE / GROUPING SETS with GROUPING()), inner and outer joins
 (LEFT/RIGHT/FULL; equi +

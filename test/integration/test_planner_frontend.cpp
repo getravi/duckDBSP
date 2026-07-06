@@ -1682,3 +1682,106 @@ TEST_CASE("planner K2: parallel propagation over one spilled arrangement",
   db.exec("SELECT * FROM dbsp_parallel(false)");
   db.exec("SELECT * FROM dbsp_spill(false)");
 }
+
+// ---------------------------------------------------------------------------
+// Phase L1: holistic aggregates (median / quantile / mode)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("planner L1: median differential",
+          "[integration][planner][holistic]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  const std::string sql = "SELECT tag, MEDIAN(val) FROM t GROUP BY tag";
+  db.exec("SELECT * FROM dbsp_create_view('v_med', '" + sql + "')");
+  requireViewMatchesQuery(db, "v_med", sql);
+  runDifferential(db, "v_med", sql, 601);
+}
+
+TEST_CASE("planner L1: quantile_cont and quantile_disc differential",
+          "[integration][planner][holistic]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  const std::string sql =
+      "SELECT tag, QUANTILE_CONT(val, 0.25), QUANTILE_DISC(val, 0.75) "
+      "FROM t GROUP BY tag";
+  db.exec("SELECT * FROM dbsp_create_view('v_quant', '" + sql + "')");
+  requireViewMatchesQuery(db, "v_quant", sql);
+  runDifferential(db, "v_quant", sql, 607);
+}
+
+TEST_CASE("planner L1: mode differential on tie-free data",
+          "[integration][planner][holistic]") {
+  DuckDBTestHarness db;
+  // Deterministic multiplicities: value v appears v times → unique mode.
+  // (Our tie-break is smallest value; DuckDB's is scan-order-dependent,
+  // so ties would flake the differential.)
+  db.exec("CREATE TABLE t (id INT, val INT, tag VARCHAR)");
+  db.exec("SELECT * FROM dbsp_track('t')");
+  db.exec("SELECT * FROM dbsp_sync('t')");
+  const std::string sql = "SELECT MODE(val) FROM t";
+  db.exec("SELECT * FROM dbsp_create_view('v_mode', '" + sql + "')");
+
+  int next_id = 0;
+  for (int v = 1; v <= 5; v++) {
+    for (int c = 0; c < v; c++) {
+      db.exec("INSERT INTO t VALUES (" + std::to_string(next_id++) + ", " +
+              std::to_string(v) + ", 'x')");
+    }
+    db.exec("SELECT * FROM dbsp_sync('t')");
+    requireViewMatchesQuery(db, "v_mode", sql);
+  }
+  // Delete the current winner's copies → mode falls back to 4
+  db.exec("DELETE FROM t WHERE val = 5");
+  db.exec("SELECT * FROM dbsp_sync('t')");
+  requireViewMatchesQuery(db, "v_mode", sql);
+}
+
+TEST_CASE("planner L1: median with FILTER inside ROLLUP",
+          "[integration][planner][holistic][groupingsets]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  const std::string sql =
+      "SELECT tag, MEDIAN(val) FILTER (WHERE id % 2 = 0) "
+      "FROM t GROUP BY ROLLUP(tag)";
+  db.exec("SELECT * FROM dbsp_create_view('v_medroll', '" + sql + "')");
+  requireViewMatchesQuery(db, "v_medroll", sql);
+  runDifferential(db, "v_medroll", sql, 613);
+}
+
+TEST_CASE("planner L2: sharded probe passes match serial",
+          "[integration][planner][parallel][shard]") {
+  DuckDBTestHarness db;
+  db.exec("CREATE TABLE bl (id INT, v INT)");
+  db.exec("CREATE TABLE br (id INT, w INT)");
+  db.exec("SELECT * FROM dbsp_track('bl')");
+  db.exec("SELECT * FROM dbsp_track('br')");
+  db.exec("SELECT * FROM dbsp_sync('bl')");
+  db.exec("SELECT * FROM dbsp_sync('br')");
+  db.exec("SELECT * FROM dbsp_parallel(true)");
+
+  const std::string sql =
+      "SELECT bl.id, bl.v, br.w FROM bl JOIN br ON bl.id = br.id";
+  db.exec("SELECT * FROM dbsp_create_view('v_shard', '" + sql + "')");
+
+  // Deltas above the 4096-row shard threshold, small key space so
+  // buckets are fat and every shard emits
+  for (int round = 0; round < 3; round++) {
+    db.exec("INSERT INTO bl SELECT i % 100, i FROM range(" +
+            std::to_string(round * 5000) + ", " +
+            std::to_string(round * 5000 + 5000) + ") s(i)");
+    db.exec("INSERT INTO br SELECT i % 100, i FROM range(" +
+            std::to_string(round * 3000) + ", " +
+            std::to_string(round * 3000 + 3000) + ") s(i)");
+    db.exec("DELETE FROM bl WHERE v % 7 = " + std::to_string(round));
+    db.exec("SELECT * FROM dbsp_sync('bl')");
+    db.exec("SELECT * FROM dbsp_sync('br')");
+    // Row counts only per round (full compare would be 500k+ rows);
+    // exact compare at the end
+    auto expected = db.query("SELECT COUNT(*) FROM (" + sql + ")");
+    auto actual =
+        db.query("SELECT COUNT(*) FROM dbsp_query('v_shard')");
+    REQUIRE(actual->GetValue(0, 0) == expected->GetValue(0, 0));
+  }
+  requireViewMatchesQuery(db, "v_shard", sql);
+  db.exec("SELECT * FROM dbsp_parallel(false)");
+}

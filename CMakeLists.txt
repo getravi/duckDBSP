@@ -36,6 +36,7 @@ target_include_directories(${TARGET_NAME}_loadable_extension PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${DUCKDB_SOURCE_DIR}/src/include
+    ${DUCKDB_SOURCE_DIR}/extension/core_functions/include
 )
 
 message(STATUS "")
