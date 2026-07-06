@@ -320,9 +320,11 @@
       <button class="layer" aria-expanded="false">
         <span class="head"><span class="role">Front desk</span>
         <span class="name">Commands you type</span><span class="caret">&#9656;</span></span>
-        <span class="detail">You talk to duckDBSP with a handful of simple commands:
-        “watch this table,” “keep this answer live,” “show me the answer.”
-        <span class="tech">table functions: dbsp_track, dbsp_create_view, dbsp_query, dbsp_sync</span></span>
+        <span class="detail">You talk to duckDBSP with a handful of simple commands —
+        mostly just “keep this answer live” and “show me the answer.” Watching
+        tables and refreshing happen on their own; the rest of the commands
+        exist for manual control when you want it.
+        <span class="tech">table functions: dbsp_create_view, dbsp_query (automatic: tracking + refresh-on-commit; manual: dbsp_track, dbsp_sync, dbsp_auto_sync)</span></span>
       </button>
       <div class="stack-arrow" aria-hidden="true">&#9660;</div>
       <button class="layer" aria-expanded="false">

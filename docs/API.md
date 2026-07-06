@@ -15,6 +15,12 @@ Complete reference for all DBSP extension functions.
 
 ## Table Tracking
 
+> **Usually unnecessary**: creating a view auto-tracks its source
+> tables and loads their current state, and auto-sync (on by default)
+> keeps views current on every commit. These functions serve manual
+> workflows: pre-tracking, bulk loads with auto-sync off, and the
+> notify API.
+
 ### dbsp_track(table_name)
 
 Track a DuckDB table for automatic change detection.
@@ -459,10 +465,12 @@ SELECT * FROM dbsp_notify_delete('orders', 1, 'Alice', 100.00);
 
 ### dbsp_auto_sync(enable)
 
-Toggle automatic change capture: with auto-sync on, views update on
+Toggle automatic change capture — **ON by default**: views update on
 every transaction commit without calling `dbsp_sync`. Explicit
 INSERT-only transactions commit in O(delta) via captured deltas; other
 writes use scan-and-diff scoped to the tables the transaction touched.
+Turn it off for bulk loads (each autocommit statement pays a scoped
+scan) and run one `dbsp_sync()` afterwards.
 
 ```sql
 SELECT * FROM dbsp_auto_sync(true);   -- Enable

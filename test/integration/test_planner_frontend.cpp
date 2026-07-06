@@ -1929,3 +1929,26 @@ TEST_CASE("planner N4: oversized holistic group spills its values",
   requireViewMatchesQuery(db, "v_bg", sql);
   db.exec("SELECT * FROM dbsp_spill(false)");
 }
+
+TEST_CASE("zero-ceremony UX: create view, insert, read — no track/sync",
+          "[integration][planner][autosync]") {
+  DuckDBTestHarness db;
+  // No dbsp_track, no dbsp_sync anywhere in this test: view creation
+  // auto-tracks + loads sources, and auto-sync (default ON) keeps the
+  // view current on every commit
+  db.exec("CREATE TABLE orders (id INT, customer VARCHAR, amount INT)");
+  db.exec("INSERT INTO orders VALUES (1, 'Alice', 100), (2, 'Bob', 200)");
+  const std::string sql =
+      "SELECT customer, SUM(amount) AS total FROM orders GROUP BY customer";
+  db.exec("SELECT * FROM dbsp_create_view('totals', '" + sql + "')");
+  requireViewMatchesQuery(db, "totals", sql);
+
+  db.exec("INSERT INTO orders VALUES (3, 'Alice', 50)");
+  requireViewMatchesQuery(db, "totals", sql);
+
+  db.exec("DELETE FROM orders WHERE id = 2");
+  requireViewMatchesQuery(db, "totals", sql);
+
+  db.exec("UPDATE orders SET amount = 500 WHERE id = 1");
+  requireViewMatchesQuery(db, "totals", sql);
+}

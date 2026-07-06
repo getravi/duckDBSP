@@ -1,5 +1,20 @@
 # Changelog
 
+## Zero-ceremony views: auto-sync ON by default - Jul 2026
+
+- dbsp_auto_sync now defaults ON. Creating a view already auto-tracked
+  and loaded its source tables; with auto-sync on by default, a
+  materialized view keeps itself current on every commit with no
+  dbsp_track or dbsp_sync calls at all: CREATE TABLE, CREATE
+  MATERIALIZED VIEW, INSERT, SELECT - done. Explicit INSERT-only
+  transactions take the O(delta) captured-delta path; other writes
+  scan-and-diff scoped to touched tables.
+- Bulk-load escape hatch documented: dbsp_auto_sync(false), load,
+  dbsp_sync() once, re-enable.
+- dbsp_track/dbsp_sync stay for manual workflows; docs and quickstart
+  rewritten to drop the ceremony. Benchmarks disable auto-sync
+  explicitly (they time manual syncs).
+
 ## Phase O4: Cross-projection arrangement sharing - Jul 2026
 
 - Views needing DIFFERENT column subsets of the same join side now

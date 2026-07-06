@@ -62,6 +62,7 @@ translate_view(DuckDBTestHarness &db, const std::string &name,
 TEST_CASE("Benchmark: RowExprEval vs hand-written lambda on filter path",
           "[benchmark][planner_eval]") {
   DuckDBTestHarness db;
+  db.exec("SELECT * FROM dbsp_auto_sync(false)"); // timed manual syncs
   db.exec("CREATE TABLE t (id INT, val INT, tag VARCHAR)");
 
   const DuckDBZSet delta = build_delta();
@@ -114,6 +115,7 @@ TEST_CASE("Benchmark: RowExprEval vs hand-written lambda on filter path",
 TEST_CASE("Benchmark: planner aggregate throughput",
           "[benchmark][planner_eval]") {
   DuckDBTestHarness db;
+  db.exec("SELECT * FROM dbsp_auto_sync(false)"); // timed manual syncs
   db.exec("CREATE TABLE t (id INT, val INT, tag VARCHAR)");
 
   const DuckDBZSet delta = build_delta();
@@ -129,6 +131,7 @@ TEST_CASE("Benchmark: planner aggregate throughput",
 TEST_CASE("Benchmark: planner join delta throughput",
           "[benchmark][planner_eval]") {
   DuckDBTestHarness db;
+  db.exec("SELECT * FROM dbsp_auto_sync(false)"); // timed manual syncs
   db.exec("CREATE TABLE t (id INT, val INT, tag VARCHAR)");
   db.exec("CREATE TABLE u (id INT, val INT, tag VARCHAR)");
 
@@ -154,6 +157,7 @@ TEST_CASE("Benchmark: cascaded view sync cost", "[benchmark][cascade_bench]") {
   // single-row syncs: with reset+recompute cascades this is O(base size)
   // per sync; with delta propagation it must be O(delta).
   DuckDBTestHarness db;
+  db.exec("SELECT * FROM dbsp_auto_sync(false)"); // timed manual syncs
   db.exec("CREATE TABLE big (id INT, val INT, tag VARCHAR)");
   db.exec("INSERT INTO big SELECT range, range % 100, chr(CAST(97 + range % 3 AS INT)) "
           "FROM range(50000)");
@@ -243,6 +247,8 @@ TEST_CASE("Benchmark: shared vs private join arrangements",
   auto run = [&](bool shared, bool parallel = false) -> double {
     mgr.set_parallel_sync(parallel);
     DuckDBTestHarness db;
+  db.exec("SELECT * FROM dbsp_auto_sync(false)"); // timed manual syncs
+    db.exec("SELECT * FROM dbsp_auto_sync(false)"); // timed manual syncs
     db.exec("CREATE TABLE l (id INT, val INT)");
     db.exec("CREATE TABLE r (id INT, a INT, b INT, c INT, d INT, e INT, "
             "f INT, g INT, h INT)");
@@ -306,6 +312,8 @@ TEST_CASE("Benchmark: spilled vs RAM baselines", "[benchmark][spill_bench]") {
 
   auto run = [&](bool spill) {
     DuckDBTestHarness db;
+  db.exec("SELECT * FROM dbsp_auto_sync(false)"); // timed manual syncs
+    db.exec("SELECT * FROM dbsp_auto_sync(false)"); // timed manual syncs
     if (spill) {
       db.exec("SELECT * FROM dbsp_spill(true)");
     }
@@ -349,6 +357,8 @@ TEST_CASE("Benchmark: sharded join probes", "[benchmark][shard_bench]") {
   auto run = [&](bool parallel) -> double {
     dbsp_native::g_intraop_shards.store(parallel ? 8 : 0);
     DuckDBTestHarness db;
+  db.exec("SELECT * FROM dbsp_auto_sync(false)"); // timed manual syncs
+    db.exec("SELECT * FROM dbsp_auto_sync(false)"); // timed manual syncs
     db.exec("CREATE TABLE t (id INT, val INT, tag VARCHAR)");
     db.exec("CREATE TABLE u (id INT, val INT, tag VARCHAR)");
     auto join = translate_view(

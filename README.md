@@ -34,31 +34,36 @@ DBSP:         INSERT 1 row → Update affected aggregates → O(delta)
 -- Load the extension
 LOAD 'dbsp';
 
--- Create a table and track it for CDC
+-- Create a table
 CREATE TABLE orders (id INT, customer VARCHAR, amount DECIMAL);
-SELECT * FROM dbsp_track('orders');
 
--- Create an incrementally maintained view (modern DDL syntax)
+-- Create an incrementally maintained view. That's it — the source
+-- table is tracked automatically and the view keeps itself current.
 CREATE MATERIALIZED VIEW customer_totals AS
 SELECT customer, SUM(amount) as total
 FROM orders
 GROUP BY customer;
 
--- Insert data (views update automatically)
+-- Insert data — the view updates on commit, no sync call needed
 INSERT INTO orders VALUES (1, 'Alice', 100), (2, 'Bob', 200), (3, 'Alice', 150);
-SELECT * FROM dbsp_sync('orders');
 
--- Query the view (instant - no recomputation)
+-- Query the view (instant — no recomputation)
 SELECT * FROM customer_totals;
 -- Returns: Alice: 250, Bob: 200
 
--- Insert more data
 INSERT INTO orders VALUES (4, 'Alice', 50);
-SELECT * FROM dbsp_sync('orders');
-
--- View is already updated!
 SELECT * FROM customer_totals;
 -- Returns: Alice: 300, Bob: 200
+```
+
+**Bulk loading?** Turn the automatic refresh off while you load, then
+sync once:
+
+```sql
+SELECT * FROM dbsp_auto_sync(false);
+-- ... millions of inserts ...
+SELECT * FROM dbsp_sync();          -- one scan-and-diff
+SELECT * FROM dbsp_auto_sync(true);
 ```
 
 **Alternative Syntax** (table functions):
@@ -154,9 +159,9 @@ See [docs/TESTING.md](docs/TESTING.md) for details.
 
 | Function | Description |
 |----------|-------------|
-| `dbsp_track(table)` | Track a table for change detection |
-| `dbsp_sync(table)` | Sync tracked table with DuckDB |
-| `dbsp_sync()` | Sync all tracked tables |
+| `dbsp_track(table)` | Pre-track a table (optional — view creation auto-tracks its sources) |
+| `dbsp_sync(table)` | Manually sync one table (needed only with auto-sync off) |
+| `dbsp_sync()` | Manually sync all tracked tables |
 | `dbsp_tables()` | List all tracked tables |
 
 ### View Management
@@ -190,7 +195,7 @@ See [docs/TESTING.md](docs/TESTING.md) for details.
 
 | Function | Description |
 |----------|-------------|
-| `dbsp_auto_sync(bool)` | Toggle automatic sync on transaction commit |
+| `dbsp_auto_sync(bool)` | Toggle automatic sync on commit (default ON; turn off for bulk loads) |
 | `dbsp_parallel(bool)` | Toggle parallel multi-table sync + same-level view propagation |
 | `dbsp_spill(bool)` | Toggle disk-backed state: baselines, join indexes, top-K windows, big aggregate groups |
 | `dbsp_use_planner([bool])` | No-op since Phase C (planner is the only frontend); kept for script compatibility |

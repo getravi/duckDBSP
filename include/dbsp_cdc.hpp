@@ -369,7 +369,7 @@ public:
     arrangements_.clear();
     arrangements_by_table_.clear();
     last_error_.clear();
-    auto_sync_enabled_ = false;
+    auto_sync_enabled_ = true; // matches a fresh manager
   }
 
   // Auto-sync (automatic CDC) control. Flag is atomic so transaction hooks
@@ -2361,7 +2361,9 @@ private:
   std::unordered_map<std::string, ViewDefinition> view_definitions_;
   DependencyGraph dep_graph_;
   std::string last_error_;
-  std::atomic<bool> auto_sync_enabled_{false};
+  // ON by default: a materialized view keeps itself current. Turn off
+  // for bulk loads (each autocommit write pays a scoped scan-and-diff).
+  std::atomic<bool> auto_sync_enabled_{true};
   std::atomic<uint64_t> captured_delta_syncs_{0};
   std::atomic<uint64_t> scan_syncs_{0};
   bool use_parallel_sync_ = false;
