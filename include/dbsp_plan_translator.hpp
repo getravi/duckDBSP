@@ -1447,6 +1447,23 @@ public:
     pads_right_ = join_type_ == duckdb::JoinType::RIGHT ||
                   join_type_ == duckdb::JoinType::OUTER;
     marks_ = join_type_ == duckdb::JoinType::MARK;
+    // N3: under spill mode, local indexes of pure probe-target sides go
+    // to disk bucket logs (self-padding / mark-preserved sides keep RAM —
+    // their pad/weight reconciliation walks full-row structures). Files
+    // open lazily; a side later covered by a shared arrangement simply
+    // never writes its local log.
+    if (g_spill_mode.load()) {
+      if (!(pads_left_ || marks_)) {
+        local_spill_left_ = std::make_unique<SpilledBucketIndex>(
+            g_spill_dir + "/join_" +
+            std::to_string(g_spill_file_seq.fetch_add(1)) + "_l.dbspill");
+      }
+      if (!pads_right_) {
+        local_spill_right_ = std::make_unique<SpilledBucketIndex>(
+            g_spill_dir + "/join_" +
+            std::to_string(g_spill_file_seq.fetch_add(1)) + "_r.dbspill");
+      }
+    }
   }
 
   void step() override {
@@ -1512,7 +1529,8 @@ public:
 
     if (shardable) {
       run_sharded_probe(kl, /*probe_left_side=*/false, shards_cfg);
-    } else if (shared_right_ && shared_right_->is_spilled()) {
+    } else if ((shared_right_ && shared_right_->is_spilled()) ||
+               (!shared_right_ && local_spill_right_)) {
       for (size_t i = 0; i < kl.rows.size(); i++) {
         if (!kl.valid[i]) {
           continue;
@@ -1546,7 +1564,8 @@ public:
     // L ⋈ Δr
     if (shardable) {
       run_sharded_probe(kr, /*probe_left_side=*/true, shards_cfg);
-    } else if (shared_left_ && shared_left_->is_spilled()) {
+    } else if ((shared_left_ && shared_left_->is_spilled()) ||
+               (!shared_left_ && local_spill_left_)) {
       for (size_t i = 0; i < kr.rows.size(); i++) {
         if (!kr.valid[i]) {
           continue;
@@ -1629,6 +1648,12 @@ public:
   void reset() override {
     left_index_.clear();
     right_index_.clear();
+    if (local_spill_left_) {
+      local_spill_left_->discard();
+    }
+    if (local_spill_right_) {
+      local_spill_right_->discard();
+    }
     left_weights_.clear();
     right_weights_.clear();
     left_pad_.clear();
@@ -1674,9 +1699,35 @@ private:
       RowWeights &scratch = left ? probe_scratch_left_ : probe_scratch_right_;
       return sh->probe_spilled(key, scratch) ? &scratch : nullptr;
     }
+    if (!sh) {
+      SpilledBucketIndex *spill =
+          left ? local_spill_left_.get() : local_spill_right_.get();
+      if (spill) {
+        RowWeights &scratch =
+            left ? probe_scratch_left_ : probe_scratch_right_;
+        return probe_local_spill(*spill, key, scratch) ? &scratch : nullptr;
+      }
+    }
     const Index &idx = side_index(left);
     auto it = idx.find(key);
     return it == idx.end() ? nullptr : &it->second;
+  }
+
+  static bool probe_local_spill(SpilledBucketIndex &spill,
+                                const DuckDBRow &key, RowWeights &out) {
+    out.clear();
+    const auto *bucket =
+        spill.probe(SharedArrangement::digest_of_row(key));
+    if (!bucket) {
+      return false;
+    }
+    for (const auto &[vals, w] : *bucket) {
+      DuckDBRow row;
+      std::vector<duckdb::Value> copy = vals;
+      row.columns.assign(std::move(copy));
+      out.emplace(std::move(row), w);
+    }
+    return true;
   }
 
   // Returns false when any key value is NULL (row can never match) —
@@ -1805,8 +1856,16 @@ private:
     }
     const RowWeights *bucket;
     const auto &sh = probe_left_side ? shared_left_ : shared_right_;
+    SpilledBucketIndex *lspill =
+        probe_left_side ? local_spill_left_.get() : local_spill_right_.get();
     if (sh && sh->is_spilled() && scratch) {
       bucket = sh->probe_spilled(dk.keys[i], *scratch) ? scratch : nullptr;
+    } else if (!sh && lspill && scratch) {
+      // Local spilled index: LRU cache is node-private but shared across
+      // shard threads — serialize via the node's spill probe mutex
+      std::lock_guard<std::mutex> g(local_spill_mutex_);
+      bucket =
+          probe_local_spill(*lspill, dk.keys[i], *scratch) ? scratch : nullptr;
     } else {
       bucket = probe_side(probe_left_side, dk.keys[i]);
     }
@@ -1890,6 +1949,10 @@ private:
     Index &index = left ? left_index_ : right_index_;
     const bool track_weights = left ? (pads_left_ || marks_) : pads_right_;
     RowWeights &weights = left ? left_weights_ : right_weights_;
+    SpilledBucketIndex *spill =
+        left ? local_spill_left_.get() : local_spill_right_.get();
+    std::unordered_map<RowDigest, SpilledBucketIndex::Bucket, RowDigestHash>
+        spill_batch;
     for (size_t i = 0; i < dk.rows.size(); i++) {
       const DuckDBRow &row = *dk.rows[i];
       const int64_t w = dk.weights[i];
@@ -1910,6 +1973,16 @@ private:
       if (!left && marks_) {
         right_total_ += w;
       }
+      if (spill) {
+        std::vector<duckdb::Value> vals;
+        vals.reserve(row.columns.size());
+        for (size_t c = 0; c < row.columns.size(); c++) {
+          vals.push_back(row.columns[c]);
+        }
+        spill_batch[SharedArrangement::digest_of_row(dk.keys[i])]
+            .emplace_back(std::move(vals), w);
+        continue;
+      }
       auto &rows = index[dk.keys[i]];
       int64_t &weight = rows[row];
       weight += w;
@@ -1919,6 +1992,9 @@ private:
           index.erase(dk.keys[i]);
         }
       }
+    }
+    for (auto &[digest, delta_bucket] : spill_batch) {
+      spill->update(digest, delta_bucket);
     }
   }
 
@@ -2124,6 +2200,9 @@ private:
   // (updated BEFORE views step, so it is post-delta for the current step)
   std::shared_ptr<const SharedArrangement> shared_left_, shared_right_;
   RowWeights probe_scratch_left_, probe_scratch_right_;
+  // N3: local indexes on disk for pure probe-target sides (spill mode)
+  std::unique_ptr<SpilledBucketIndex> local_spill_left_, local_spill_right_;
+  std::mutex local_spill_mutex_; // shard threads share the LRU cache
   Index left_index_, right_index_;
   RowWeights left_weights_, right_weights_;   // incl. NULL-key rows
   RowWeights left_pad_, right_pad_;           // currently emitted pad weight

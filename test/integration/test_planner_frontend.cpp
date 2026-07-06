@@ -1875,3 +1875,33 @@ TEST_CASE("planner N2: bounded top-K under spill with refills",
   }
   db.exec("SELECT * FROM dbsp_spill(false)");
 }
+
+TEST_CASE("planner N3: local (unshareable) join index spills",
+          "[integration][planner][spill][localidx]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  setupTableU(db);
+  db.exec("SELECT * FROM dbsp_spill(true)");
+  auto &mgr = dbsp_native::get_cdc_manager();
+  const size_t arr_base = mgr.shared_arrangement_count();
+
+  // Right side is a SUBQUERY (filter under the join) — not a bare scan,
+  // so no shared arrangement; its local index goes to the bucket log
+  const std::string sql =
+      "SELECT t.id, t.val, f.val FROM t JOIN "
+      "(SELECT id, val FROM u WHERE val > 10) f ON t.id = f.id";
+  db.exec("SELECT * FROM dbsp_create_view('v_lidx', '" + sql + "')");
+  // No new arrangement for the filtered side
+  REQUIRE(mgr.shared_arrangement_count() <= arr_base + 1);
+  requireViewMatchesQuery(db, "v_lidx", sql);
+  runDifferentialTwoTables(db, "v_lidx", sql, 811);
+
+  // LEFT join: left self-pads (stays RAM), filtered right spills local
+  const std::string sql2 =
+      "SELECT t.id, f.val FROM t LEFT JOIN "
+      "(SELECT id, val FROM u WHERE val > 10) f ON t.id = f.id";
+  db.exec("SELECT * FROM dbsp_create_view('v_lidx2', '" + sql2 + "')");
+  requireViewMatchesQuery(db, "v_lidx2", sql2);
+  runDifferentialTwoTables(db, "v_lidx2", sql2, 821);
+  db.exec("SELECT * FROM dbsp_spill(false)");
+}
