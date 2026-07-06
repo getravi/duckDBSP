@@ -23,11 +23,13 @@ ORDER BY / LIMIT / OFFSET (constant).
 
 **WITH RECURSIVE ... USING KEY** — use plain WITH RECURSIVE.
 
-**Non-constant / percentage LIMIT** — use a constant LIMIT.
+**Non-constant (expression) LIMIT** — use a constant or percentage
+LIMIT.
 
-**Window ORDER BY / PARTITION BY over expressions** — project the
-expression to a column in an inner view first, then window over the
-column.
+**approx_quantile / reservoir_quantile / approx_top_k** — approximate
+algorithms; results cannot match DuckDB's, and mapping them to exact
+equivalents would silently differ. Use median/quantile_cont/
+quantile_disc/mode/mad (exact, supported).
 
 **string_agg / array_agg without ORDER BY** — add an ORDER BY inside
 the aggregate (e.g. `string_agg(x, ',' ORDER BY x)`). Unordered results

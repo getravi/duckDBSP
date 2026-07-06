@@ -196,8 +196,12 @@ public:
           if (i < partition_rows.size()) {
             same = true;
             for (const auto &col : primary_sort_columns_) {
-              if (partition_rows[i].columns[col.column_idx] !=
-                  partition_rows[i - 1].columns[col.column_idx]) {
+              const auto &va = partition_rows[i].columns[col.column_idx];
+              const auto &vb = partition_rows[i - 1].columns[col.column_idx];
+              // duckdb::Value comparisons throw on NULL — treat NULLs as
+              // peers of each other (matches the sort comparator)
+              const bool an = va.IsNull(), bn = vb.IsNull();
+              if (an != bn || (!an && va != vb)) {
                 same = false;
                 break;
               }

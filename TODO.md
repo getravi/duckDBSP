@@ -10,8 +10,10 @@ subsystem, bespoke parser, standalone Z-set spilling).
 ## Not supported (DBSP-E110 at view creation)
 
 - WITH RECURSIVE ... USING KEY
-- Non-constant / percentage LIMIT
-- Window ORDER BY / PARTITION BY over expressions (project first)
+- Non-constant (expression) LIMIT — constant and percentage forms work
+- approx_quantile / reservoir_quantile / approx_top_k (approximate
+  results can't match DuckDB in differentials; exact mapping would
+  silently differ)
 - DISTINCT on holistic aggregates (median/quantile/mode)
 - MODE tie-breaking differs from DuckDB on ties (ours: smallest value;
   DuckDB: scan-order-dependent) — unreproducible incrementally

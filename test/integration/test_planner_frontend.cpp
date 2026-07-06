@@ -554,13 +554,16 @@ TEST_CASE("planner C1: percentage LIMIT is not planner-built",
   db.exec("SELECT * FROM dbsp_sync('pt')");
   db.exec("SELECT * FROM dbsp_use_planner(true)");
 
-  // Non-constant/percentage limits must yield E110, not a wrong translation.
-  // (Until C5 this falls back to the parser; either way it must not be a
-  // PlannedCircuitView claiming to support it.)
+  // Percentage LIMIT translates since Phase M3 (count tracks input
+  // size); truly non-constant limits (expressions) still yield E110
   auto res = db.query("SELECT * FROM dbsp_create_view('v_pct', "
                       "'SELECT id FROM pt LIMIT 50%')");
-  REQUIRE_FALSE(plannerBuilt("v_pct"));
-  (void)res;
+  REQUIRE_FALSE(res->HasError());
+  REQUIRE(plannerBuilt("v_pct"));
+  auto expected = db.query("SELECT COUNT(*) FROM (SELECT id FROM pt "
+                           "LIMIT 50%)");
+  auto actual = db.query("SELECT COUNT(*) FROM dbsp_query('v_pct')");
+  REQUIRE(actual->GetValue(0, 0) == expected->GetValue(0, 0));
 }
 
 TEST_CASE("planner C1: ORDER BY + LIMIT differential",
@@ -1784,4 +1787,56 @@ TEST_CASE("planner L2: sharded probe passes match serial",
   }
   requireViewMatchesQuery(db, "v_shard", sql);
   db.exec("SELECT * FROM dbsp_parallel(false)");
+}
+
+// ---------------------------------------------------------------------------
+// Phase M: SQL-coverage leaves — window-over-expressions, mad, LIMIT %
+// ---------------------------------------------------------------------------
+
+TEST_CASE("planner M1: window PARTITION BY / ORDER BY over expressions",
+          "[integration][planner][window][coverage]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  // Both the partition and the order are expressions; previously E110
+  // with a rewrite hint — now auto-projected below the window
+  const std::string sql =
+      "SELECT id, val, ROW_NUMBER() OVER "
+      "(PARTITION BY id % 2 ORDER BY val * 2, id) FROM t";
+  db.exec("SELECT * FROM dbsp_create_view('v_wexpr', '" + sql + "')");
+  requireViewMatchesQuery(db, "v_wexpr", sql);
+  runDifferential(db, "v_wexpr", sql, 701);
+}
+
+TEST_CASE("planner M1: window aggregate over an expression",
+          "[integration][planner][window][coverage]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  const std::string sql =
+      "SELECT id, SUM(val + 1) OVER "
+      "(PARTITION BY tag ORDER BY id) FROM t";
+  db.exec("SELECT * FROM dbsp_create_view('v_wagg', '" + sql + "')");
+  requireViewMatchesQuery(db, "v_wagg", sql);
+  runDifferential(db, "v_wagg", sql, 709);
+}
+
+TEST_CASE("planner M2: mad differential",
+          "[integration][planner][holistic][coverage]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  const std::string sql = "SELECT tag, MAD(val) FROM t GROUP BY tag";
+  db.exec("SELECT * FROM dbsp_create_view('v_mad', '" + sql + "')");
+  requireViewMatchesQuery(db, "v_mad", sql);
+  runDifferential(db, "v_mad", sql, 719);
+}
+
+TEST_CASE("planner M3: percentage LIMIT differential",
+          "[integration][planner][sort][coverage]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  // 30% of a changing table: the cutoff count must track table size
+  const std::string sql =
+      "SELECT id, val FROM t ORDER BY id LIMIT 30 PERCENT";
+  db.exec("SELECT * FROM dbsp_create_view('v_pct', '" + sql + "')");
+  requireViewMatchesQuery(db, "v_pct", sql);
+  runDifferential(db, "v_pct", sql, 727);
 }

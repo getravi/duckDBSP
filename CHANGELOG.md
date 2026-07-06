@@ -1,5 +1,28 @@
 # Changelog
 
+## Phase M: SQL-coverage leaves - Jul 2026
+
+- M1 window PARTITION BY / ORDER BY / argument expressions: the
+  translator projects non-column expressions into helper columns below
+  the window (MAP -> WINDOW -> MAP sandwich; helper columns stripped
+  above, user-visible layout unchanged). Removes the "use a plain
+  column" rewrite footgun for every window function including window
+  aggregates. Also fixed a latent NULL crash in the window view's peer
+  comparison (raw Value != throws on NULL order keys - affected
+  nullable plain columns too).
+- M2 mad: median absolute deviation over the sorted per-group multiset
+  (interpolated median, deviations merged sorted from the two halves).
+  Numeric arguments only; temporal mad (DATE -> INTERVAL) stays E110.
+- M3 LIMIT p PERCENT: the limit view recomputes its cutoff as
+  trunc(p/100 * input rows) on every apply - matches DuckDB's
+  truncation exactly and tracks table growth/shrinkage incrementally.
+  Truly non-constant limits (expressions) remain E110.
+
+Remaining E110 after M: USING KEY recursion, expression LIMIT,
+approx_/reservoir_ quantiles + approx_top_k (approximate results cannot
+match DuckDB's, mapping them to exact would silently differ), unordered
+string_agg/array_agg, DISTINCT on holistic aggregates.
+
 ## Phase L: Holistic aggregates & intra-operator sharding - Jul 2026
 
 - L1 median / quantile_cont / quantile_disc / mode: median and the

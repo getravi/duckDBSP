@@ -88,6 +88,7 @@
 #include <memory>
 #include <set>
 #include <cmath>
+#include <limits>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -339,7 +340,8 @@ struct PlanAggSpec {
     MEDIAN,        // quantile_cont 0.5
     QUANTILE_CONT, // interpolated
     QUANTILE_DISC, // lower-bound element
-    MODE           // most frequent (ties break by smallest value)
+    MODE,          // most frequent (ties break by smallest value)
+    MAD            // median absolute deviation (numeric args)
   };
 
   struct OrderKey {
@@ -424,7 +426,8 @@ struct PlanOpSpec {
   // keys dropped from the output still order it. presentation_root marks the
   // plan root: only then does the view's ordered scan drive dbsp_query.
   std::vector<NativeSortView::SortColumn> sort_columns;
-  int64_t limit = -1; // -1 = no limit
+  int64_t limit = -1;        // -1 = no limit
+  double limit_percent = -1; // LIMIT p PERCENT (>= 0 wins over limit)
   int64_t offset = 0;
   std::vector<duckdb::idx_t> project_idxs; // empty = identity
   bool presentation_root = false;
@@ -891,6 +894,7 @@ private:
       case PlanAggSpec::Fn::MEDIAN:
       case PlanAggSpec::Fn::QUANTILE_CONT:
       case PlanAggSpec::Fn::QUANTILE_DISC:
+      case PlanAggSpec::Fn::MAD:
         if (weight > 0) {
           for (int64_t w = 0; w < weight; w++) {
             s.values.insert(v);
@@ -1041,6 +1045,52 @@ private:
       auto it = s.values.begin();
       std::advance(it, idx);
       return it->DefaultCastAs(spec.return_type);
+    }
+    case PlanAggSpec::Fn::MAD: {
+      if (s.values.empty()) {
+        return duckdb::Value(spec.return_type);
+      }
+      // Median absolute deviation: median(|x - median(x)|), both medians
+      // interpolated (DuckDB semantics). Deviations come out sorted by
+      // merging the two halves around the median.
+      std::vector<double> vals;
+      vals.reserve(s.values.size());
+      for (const auto &v : s.values) {
+        vals.push_back(v.DefaultCastAs(duckdb::LogicalType::DOUBLE)
+                           .GetValue<double>());
+      }
+      auto interp = [](const std::vector<double> &sorted) {
+        const double pos = 0.5 * static_cast<double>(sorted.size() - 1);
+        const size_t lo = static_cast<size_t>(pos);
+        const double frac = pos - static_cast<double>(lo);
+        if (frac == 0.0 || lo + 1 >= sorted.size()) {
+          return sorted[lo];
+        }
+        return sorted[lo] + frac * (sorted[lo + 1] - sorted[lo]);
+      };
+      const double med = interp(vals);
+      std::vector<double> devs;
+      devs.reserve(vals.size());
+      size_t below = 0;
+      while (below < vals.size() && vals[below] <= med) {
+        below++;
+      }
+      size_t l = below, r = below; // l walks down, r walks up
+      while (devs.size() < vals.size()) {
+        const double dl =
+            l > 0 ? med - vals[l - 1] : std::numeric_limits<double>::max();
+        const double dr = r < vals.size()
+                              ? vals[r] - med
+                              : std::numeric_limits<double>::max();
+        if (dl <= dr) {
+          devs.push_back(dl);
+          l--;
+        } else {
+          devs.push_back(dr);
+          r++;
+        }
+      }
+      return duckdb::Value(interp(devs)).DefaultCastAs(spec.return_type);
     }
     case PlanAggSpec::Fn::MODE: {
       if (s.mode_counts.empty()) {
@@ -3040,10 +3090,11 @@ private:
         };
       }
       std::unique_ptr<NativeMaterializedView> view;
-      if (spec.limit >= 0 || spec.offset > 0) {
+      if (spec.limit >= 0 || spec.offset > 0 || spec.limit_percent >= 0) {
         view = std::make_unique<NativeLimitView>(
             name_ + "_limit", "", EmbeddedViewNode::kInputName, vschema,
-            spec.limit, spec.offset, spec.sort_columns, project);
+            spec.limit, spec.offset, spec.sort_columns, project,
+            spec.limit_percent);
       } else {
         view = std::make_unique<NativeSortView>(
             name_ + "_sort", "", EmbeddedViewNode::kInputName, vschema,
@@ -3288,9 +3339,12 @@ private:
 
     SpecPtr visit_limit(duckdb::LogicalLimit &op) {
       int64_t limit = -1, offset = 0;
+      double limit_percent = -1;
       using LT = duckdb::LimitNodeType;
       if (op.limit_val.Type() == LT::CONSTANT_VALUE) {
         limit = static_cast<int64_t>(op.limit_val.GetConstantValue());
+      } else if (op.limit_val.Type() == LT::CONSTANT_PERCENTAGE) {
+        limit_percent = op.limit_val.GetConstantPercentage();
       } else if (op.limit_val.Type() != LT::UNSET) {
         return unsupported("non-constant LIMIT");
       }
@@ -3301,17 +3355,19 @@ private:
       }
       auto &child = *op.children[0];
       if (child.type == duckdb::LogicalOperatorType::LOGICAL_ORDER_BY) {
-        return visit_order(child.Cast<duckdb::LogicalOrder>(), limit, offset);
+        return visit_order(child.Cast<duckdb::LogicalOrder>(), limit, offset,
+                           limit_percent);
       }
       auto child_spec = visit(child);
       if (!child_spec) {
         return nullptr;
       }
-      return make_sort_limit(std::move(child_spec), {}, limit, offset);
+      return make_sort_limit(std::move(child_spec), {}, limit, offset,
+                             limit_percent);
     }
 
     SpecPtr visit_order(duckdb::LogicalOrder &op, int64_t limit,
-                        int64_t offset) {
+                        int64_t offset, double limit_percent = -1) {
       if (!op.projection_map.empty()) {
         return unsupported("ORDER BY with projection map");
       }
@@ -3333,19 +3389,21 @@ private:
         return nullptr;
       }
       return make_sort_limit(std::move(child_spec), std::move(cols), limit,
-                             offset);
+                             offset, limit_percent);
     }
 
     // ORDER BY/LIMIT pass rows through (LIMIT changes membership, not
     // layout): columns stay as the child left them
     SpecPtr make_sort_limit(SpecPtr child,
                             std::vector<NativeSortView::SortColumn> cols,
-                            int64_t limit, int64_t offset) {
+                            int64_t limit, int64_t offset,
+                            double limit_percent = -1) {
       auto spec = std::make_unique<PlanOpSpec>();
       spec->kind = PlanOpSpec::Kind::SORT_LIMIT;
       spec->sort_columns = std::move(cols);
       spec->limit = limit;
       spec->offset = offset;
+      spec->limit_percent = limit_percent;
       spec->children.push_back(std::move(child));
       return spec;
     }
@@ -3556,6 +3614,16 @@ private:
           agg_spec.quantile = qbd.quantiles[0].dbl;
         } else if (fn == "mode") {
           agg_spec.fn = PlanAggSpec::Fn::MODE;
+        } else if (fn == "mad") {
+          agg_spec.fn = PlanAggSpec::Fn::MAD;
+          // Temporal mad (DATE/TIMESTAMP → INTERVAL) needs interval
+          // arithmetic we don't do — numeric only
+          if (!agg.children.empty() &&
+              !agg.children[0]->return_type.IsNumeric()) {
+            unsupported("mad over " +
+                        agg.children[0]->return_type.ToString());
+            return false;
+          }
         } else {
           unsupported("aggregate function " + fn);
           return false;
@@ -3563,7 +3631,8 @@ private:
         if ((agg_spec.fn == PlanAggSpec::Fn::MEDIAN ||
              agg_spec.fn == PlanAggSpec::Fn::QUANTILE_CONT ||
              agg_spec.fn == PlanAggSpec::Fn::QUANTILE_DISC ||
-             agg_spec.fn == PlanAggSpec::Fn::MODE) &&
+             agg_spec.fn == PlanAggSpec::Fn::MODE ||
+             agg_spec.fn == PlanAggSpec::Fn::MAD) &&
             agg_spec.distinct) {
           unsupported("DISTINCT on " + fn);
           return false;
@@ -4024,7 +4093,29 @@ private:
       }
       auto spec = std::make_unique<PlanOpSpec>();
       spec->kind = PlanOpSpec::Kind::WINDOW;
+      const std::vector<ColumnInfo> original_cols = columns;
       spec->window_source_cols = columns;
+
+      // M1: PARTITION BY / ORDER BY / argument expressions that are not
+      // plain column refs get projected into helper columns below the
+      // window (a MAP_EXPR computing [child cols..., expr...]) and
+      // stripped again above it — the user-visible layout is unchanged.
+      const size_t ncols = op.children[0]->types.size();
+      std::vector<const duckdb::Expression *> helper_exprs;
+      auto resolve_col = [&](const duckdb::Expression &e) -> int {
+        int idx = column_ref(e);
+        if (idx >= 0) {
+          return idx;
+        }
+        const std::string repr = e.ToString();
+        for (size_t k = 0; k < helper_exprs.size(); k++) {
+          if (helper_exprs[k]->ToString() == repr) {
+            return static_cast<int>(ncols + k);
+          }
+        }
+        helper_exprs.push_back(&e);
+        return static_cast<int>(ncols + helper_exprs.size() - 1);
+      };
 
       for (const auto &expr : op.expressions) {
         if (expr->GetExpressionClass() !=
@@ -4044,21 +4135,12 @@ private:
         def.end = w.end;
 
         for (const auto &p : w.partitions) {
-          int idx = column_ref(*p);
-          if (idx < 0) {
-            return unsupported("window PARTITION BY expression (use a "
-                               "plain column)");
-          }
-          def.partition_indices.push_back(static_cast<size_t>(idx));
+          def.partition_indices.push_back(
+              static_cast<size_t>(resolve_col(*p)));
         }
         for (const auto &o : w.orders) {
-          int idx = column_ref(*o.expression);
-          if (idx < 0) {
-            return unsupported("window ORDER BY expression (use a plain "
-                               "column)");
-          }
           NativeSortView::SortColumn sc;
-          sc.column_idx = static_cast<size_t>(idx);
+          sc.column_idx = static_cast<size_t>(resolve_col(*o.expression));
           sc.ascending = o.type != duckdb::OrderType::DESCENDING;
           sc.nulls_first = o.null_order == duckdb::OrderByNullType::NULLS_FIRST;
           def.sort_columns.push_back(sc);
@@ -4091,11 +4173,7 @@ private:
           if (w.children.empty()) {
             return unsupported(def.function + " without argument");
           }
-          def.arg_column_idx = column_ref(*w.children[0]);
-          if (def.arg_column_idx < 0) {
-            return unsupported(def.function +
-                               " over an expression (use a plain column)");
-          }
+          def.arg_column_idx = resolve_col(*w.children[0]);
           def.offset = 1;
           if (w.offset_expr) {
             if (!constant_int(*w.offset_expr, n)) {
@@ -4121,11 +4199,7 @@ private:
           if (w.children.empty()) {
             return unsupported(def.function + " without argument");
           }
-          def.arg_column_idx = column_ref(*w.children[0]);
-          if (def.arg_column_idx < 0) {
-            return unsupported(def.function +
-                               " over an expression (use a plain column)");
-          }
+          def.arg_column_idx = resolve_col(*w.children[0]);
           if (t == duckdb::ExpressionType::WINDOW_NTH_VALUE) {
             if (w.children.size() < 2 || !constant_int(*w.children[1], n)) {
               return unsupported("NTH_VALUE with non-constant N");
@@ -4146,11 +4220,7 @@ private:
           }
           def.function = fn;
           if (!w.children.empty()) {
-            def.arg_column_idx = column_ref(*w.children[0]);
-            if (def.arg_column_idx < 0) {
-              return unsupported(fn + " OVER an expression (use a plain "
-                                      "column)");
-            }
+            def.arg_column_idx = resolve_col(*w.children[0]);
           }
           break;
         }
@@ -4197,13 +4267,74 @@ private:
       }
 
       // Output: child columns then one column per window expression
-      duckdb::idx_t base = op.children[0]->types.size();
-      for (duckdb::idx_t i = 0; i < op.expressions.size(); i++) {
-        columns.push_back({op.expressions[i]->GetName(), op.types[base + i]});
+      const size_t num_windows = op.expressions.size();
+      std::vector<ColumnInfo> window_cols;
+      for (duckdb::idx_t i = 0; i < num_windows; i++) {
+        window_cols.push_back(
+            {op.expressions[i]->GetName(), op.types[ncols + i]});
       }
-      spec->window_result_cols = columns;
-      spec->children.push_back(std::move(child));
-      return spec;
+
+      if (helper_exprs.empty()) {
+        columns = original_cols;
+        columns.insert(columns.end(), window_cols.begin(),
+                       window_cols.end());
+        spec->window_result_cols = columns;
+        spec->children.push_back(std::move(child));
+        return spec;
+      }
+
+      // Sandwich: MAP (add helper cols) → WINDOW → MAP (strip them)
+      const size_t nhelp = helper_exprs.size();
+      auto pre_map = std::make_unique<PlanOpSpec>();
+      pre_map->kind = PlanOpSpec::Kind::MAP_EXPR;
+      pre_map->input_types = op.children[0]->types;
+      std::vector<ColumnInfo> widened_cols = original_cols;
+      duckdb::vector<duckdb::LogicalType> widened_types =
+          op.children[0]->types;
+      for (size_t c = 0; c < ncols; c++) {
+        auto e = duckdb::make_uniq<duckdb::BoundReferenceExpression>(
+            op.children[0]->types[c], c);
+        pre_map->exprs.push_back(e.get());
+        owned_exprs.push_back(std::move(e));
+      }
+      for (size_t k = 0; k < nhelp; k++) {
+        pre_map->exprs.push_back(helper_exprs[k]);
+        widened_cols.push_back({"__w_expr_" + std::to_string(k),
+                                helper_exprs[k]->return_type});
+        widened_types.push_back(helper_exprs[k]->return_type);
+      }
+      pre_map->children.push_back(std::move(child));
+
+      spec->window_source_cols = widened_cols;
+      std::vector<ColumnInfo> window_out_cols = widened_cols;
+      window_out_cols.insert(window_out_cols.end(), window_cols.begin(),
+                             window_cols.end());
+      spec->window_result_cols = window_out_cols;
+      spec->children.push_back(std::move(pre_map));
+
+      auto post_map = std::make_unique<PlanOpSpec>();
+      post_map->kind = PlanOpSpec::Kind::MAP_EXPR;
+      post_map->input_types = widened_types;
+      for (duckdb::idx_t i = 0; i < num_windows; i++) {
+        post_map->input_types.push_back(op.types[ncols + i]);
+      }
+      for (size_t c = 0; c < ncols; c++) {
+        auto e = duckdb::make_uniq<duckdb::BoundReferenceExpression>(
+            op.children[0]->types[c], c);
+        post_map->exprs.push_back(e.get());
+        owned_exprs.push_back(std::move(e));
+      }
+      for (duckdb::idx_t i = 0; i < num_windows; i++) {
+        auto e = duckdb::make_uniq<duckdb::BoundReferenceExpression>(
+            op.types[ncols + i], ncols + nhelp + i);
+        post_map->exprs.push_back(e.get());
+        owned_exprs.push_back(std::move(e));
+      }
+      post_map->children.push_back(std::move(spec));
+
+      columns = original_cols;
+      columns.insert(columns.end(), window_cols.begin(), window_cols.end());
+      return post_map;
     }
 
     SpecPtr visit_cte(duckdb::LogicalMaterializedCTE &op) {

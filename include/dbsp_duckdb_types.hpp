@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cmath>
+
 #include "dbsp_spill_store.hpp"
 
 #include "dbsp_zset.hpp"
@@ -1227,12 +1229,24 @@ public:
                   const std::string &source_table,
                   const TableSchema &result_schema, int64_t limit,
                   int64_t offset, std::vector<SortColumn> sort_columns,
-                  ProjectFn project = nullptr)
+                  ProjectFn project = nullptr, double limit_percent = -1)
       : NativeMaterializedView(name, sql), source_table_(source_table),
         schema_(result_schema), limit_(limit), offset_(offset),
+        limit_percent_(limit_percent),
         sort_columns_(std::move(sort_columns)), comparator_(sort_columns_),
         sorted_rows_(comparator_), project_(std::move(project)) {
     schema_.table_name = name;
+  }
+
+  // LIMIT p% counts against the CURRENT input size — recomputed on every
+  // apply, so membership tracks table growth/shrinkage incrementally
+  int64_t effective_limit() const {
+    if (limit_percent_ < 0) {
+      return limit_;
+    }
+    // DuckDB truncates: idx_t(percent / 100 * count)
+    return static_cast<int64_t>(limit_percent_ / 100.0 *
+                                static_cast<double>(sorted_rows_.size()));
   }
 
   void apply_changes(const std::string &table_name,
@@ -1260,10 +1274,11 @@ public:
 
     int64_t current_idx = 0;
     int64_t count = 0;
+    const int64_t effective = effective_limit();
 
     for (const auto &row : sorted_rows_) {
       if (current_idx >= offset_) {
-        if (limit_ < 0 || count < limit_) {
+        if (effective < 0 || count < effective) {
           DuckDBRow result_row = project_ ? project_(row) : row;
           new_result.insert(result_row, 1);
           count++;
@@ -1323,10 +1338,11 @@ public:
     DuckDBRow prev;
     bool first_in_output = true;
     Weight current_weight = 0;
+    const int64_t effective = effective_limit();
 
     for (const auto &row : sorted_rows_) {
       if (current_idx >= offset_) {
-        if (limit_ < 0 || count < limit_) {
+        if (effective < 0 || count < effective) {
           // This row is in output
           if (first_in_output) {
             prev = row;
@@ -1392,6 +1408,7 @@ private:
   TableSchema schema_;
   int64_t limit_;
   int64_t offset_;
+  double limit_percent_ = -1;
   std::vector<SortColumn> sort_columns_;
   RowComparator comparator_;
   std::multiset<DuckDBRow, RowComparator> sorted_rows_;

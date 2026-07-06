@@ -231,8 +231,9 @@ See [Error Handling Guide](docs/ERROR_HANDLING.md) for details.
   aggregate branch per grouping set
 - `STRING_AGG` / `ARRAY_AGG` with in-aggregate `ORDER BY` (sorted
   per-group state, re-rendered on change)
-- `MEDIAN`, `QUANTILE_CONT`, `QUANTILE_DISC`, `MODE` (holistic, over the
-  sorted per-group multiset; mode ties break by smallest value)
+- `MEDIAN`, `QUANTILE_CONT`, `QUANTILE_DISC`, `MODE`, `MAD` (holistic,
+  over the sorted per-group multiset; mode ties break by smallest value)
+- Window functions over expressions (auto-projected below the window)
 
 **Circuit Optimization:**
 - Automatic filter pushdown through JOINs
@@ -265,7 +266,7 @@ parser was deleted):**
 ### 📋 Not yet supported
 
 - WITH RECURSIVE ... USING KEY
-- Non-constant / percentage LIMIT
+- Non-constant (expression) LIMIT — percentage LIMIT works
 - Window ORDER BY / PARTITION BY over expressions (project first)
 - string_agg / array_agg without ORDER BY inside the aggregate (ordered
   forms are supported)
