@@ -48,18 +48,20 @@ message(STATUS "")
 enable_testing()
 add_subdirectory(test)
 
-# Benchmark
-add_executable(benchmark_runner
-    benchmark/benchmark_runner.cpp
-    src/dbsp_extension.cpp
-    src/dbsp_recovery.cpp
-    src/dbsp_crash_marker.cpp
-)
-target_include_directories(benchmark_runner PRIVATE
-    ${DUCKDB_SOURCE_DIR}/src/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-target_link_libraries(benchmark_runner duckdb_static
-                      duckdb_generated_extension_loader
-                      core_functions_extension parquet_extension)
+# Benchmark (only when the benchmark sources are present)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/benchmark/benchmark_runner.cpp")
+    add_executable(benchmark_runner
+        benchmark/benchmark_runner.cpp
+        src/dbsp_extension.cpp
+        src/dbsp_recovery.cpp
+        src/dbsp_crash_marker.cpp
+    )
+    target_include_directories(benchmark_runner PRIVATE
+        ${DUCKDB_SOURCE_DIR}/src/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(benchmark_runner duckdb_static
+                          duckdb_generated_extension_loader
+                          core_functions_extension parquet_extension)
+endif()

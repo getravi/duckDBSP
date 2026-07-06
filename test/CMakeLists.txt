@@ -16,8 +16,11 @@ set(BUILD_UNITTESTS OFF CACHE BOOL "" FORCE)
 set(BUILD_SHELL OFF CACHE BOOL "" FORCE)
 set(BUILD_EXTENSIONS "" CACHE STRING "" FORCE)
 set(ENABLE_UBSAN OFF CACHE BOOL "" FORCE)
-# DuckDB is already built by parent project
-add_subdirectory(${DUCKDB_SOURCE_DIR} duckdb EXCLUDE_FROM_ALL)
+# DuckDB is already built by parent project; only add it when building
+# test/ standalone (guard avoids duplicate-target errors under the root build)
+if(NOT TARGET duckdb_static)
+    add_subdirectory(${DUCKDB_SOURCE_DIR} duckdb EXCLUDE_FROM_ALL)
+endif()
 
 # Include directories
 include_directories(
