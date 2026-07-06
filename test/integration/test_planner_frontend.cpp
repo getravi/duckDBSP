@@ -1519,3 +1519,84 @@ TEST_CASE("planner J2: unordered string_agg stays rejected",
   REQUIRE(result->GetError().find("DBSP-E110") != std::string::npos);
   REQUIRE(result->GetError().find("ORDER BY") != std::string::npos);
 }
+
+// ---------------------------------------------------------------------------
+// Phase K1: disk-backed baselines (dbsp_spill)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("planner K1: spill mode differential across view shapes",
+          "[integration][planner][spill]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  setupTableU(db);
+  auto status = db.query("SELECT * FROM dbsp_spill(true)");
+  REQUIRE_FALSE(status->HasError());
+  REQUIRE(status->GetValue(0, 0).ToString().find("ENABLED") !=
+          std::string::npos);
+  auto &mgr = dbsp_native::get_cdc_manager();
+  REQUIRE(mgr.spill_enabled());
+
+  // Join view created AFTER spill: init replay + arrangement backfill
+  // must stream from disk
+  const std::string sql =
+      "SELECT t.tag, COUNT(*), SUM(u.val) FROM t JOIN u ON t.id = u.id "
+      "GROUP BY t.tag";
+  db.exec("SELECT * FROM dbsp_create_view('v_spill', '" + sql + "')");
+  requireViewMatchesQuery(db, "v_spill", sql);
+  runDifferentialTwoTables(db, "v_spill", sql, 401);
+
+  db.exec("SELECT * FROM dbsp_spill(false)");
+  REQUIRE_FALSE(mgr.spill_enabled());
+  // After migrating back to RAM everything still lines up
+  db.exec("INSERT INTO t VALUES (7, 77, 'c')");
+  db.exec("SELECT * FROM dbsp_sync('t')");
+  requireViewMatchesQuery(db, "v_spill", sql);
+}
+
+TEST_CASE("planner K1: enabling spill migrates an existing baseline",
+          "[integration][planner][spill]") {
+  DuckDBTestHarness db;
+  setupTable(db); // tracked + synced in RAM mode
+  const std::string sql = "SELECT tag, SUM(val) FROM t GROUP BY tag";
+  db.exec("SELECT * FROM dbsp_create_view('v_mig', '" + sql + "')");
+  requireViewMatchesQuery(db, "v_mig", sql);
+
+  db.exec("SELECT * FROM dbsp_spill(true)"); // migrate live baseline
+  auto &mgr = dbsp_native::get_cdc_manager();
+  REQUIRE(mgr.get_tracked_table_count("t") == 3);
+
+  // Deltas after migration diff against the spilled baseline
+  db.exec("INSERT INTO t VALUES (10, 5, 'b'), (11, NULL, 'a')");
+  db.exec("DELETE FROM t WHERE id = 1");
+  db.exec("SELECT * FROM dbsp_sync('t')");
+  requireViewMatchesQuery(db, "v_mig", sql);
+  runDifferential(db, "v_mig", sql, 409);
+  db.exec("SELECT * FROM dbsp_spill(false)");
+}
+
+TEST_CASE("planner K1: captured-delta commits hit the spilled baseline",
+          "[integration][planner][spill][autocdc]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  db.exec("SELECT * FROM dbsp_spill(true)");
+  db.exec("SELECT * FROM dbsp_auto_sync(true)");
+  const std::string sql = "SELECT COUNT(*), SUM(val) FROM t";
+  db.exec("SELECT * FROM dbsp_create_view('v_cap', '" + sql + "')");
+
+  auto &mgr = dbsp_native::get_cdc_manager();
+  const uint64_t before = mgr.captured_delta_syncs();
+  db.exec("BEGIN TRANSACTION");
+  db.exec("INSERT INTO t VALUES (100, 1, 'z'), (101, 2, 'z')");
+  db.exec("COMMIT");
+  // Fast path must still fire (baseline weight guard reads spilled totals)
+  REQUIRE(mgr.captured_delta_syncs() == before + 1);
+  requireViewMatchesQuery(db, "v_cap", sql);
+
+  // Follow-up scan-diff sync agrees with the appended baseline
+  db.exec("SELECT * FROM dbsp_auto_sync(false)");
+  db.exec("INSERT INTO t VALUES (102, 3, 'z')");
+  db.exec("DELETE FROM t WHERE id = 100");
+  db.exec("SELECT * FROM dbsp_sync('t')");
+  requireViewMatchesQuery(db, "v_cap", sql);
+  db.exec("SELECT * FROM dbsp_spill(false)");
+}

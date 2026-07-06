@@ -49,6 +49,7 @@ enable_testing()
 
 # Unit tests (no DuckDB integration needed)
 add_dbsp_test(zset unit/test_zset.cpp)
+add_dbsp_test(spill_store unit/test_spill_store.cpp)
 add_dbsp_test(cdc_manager unit/test_cdc_manager.cpp)
 add_dbsp_test(thread_safety unit/test_thread_safety.cpp)
 add_dbsp_test(security_validation unit/test_security_validation.cpp)

@@ -54,6 +54,11 @@ subsystem, bespoke parser, standalone Z-set spilling).
 
 ## Architectural
 
+- Baseline spill (K1) covers tracked-table baselines only. Join
+  arrangements, aggregate states, and embedded sort/window views still
+  live in RAM — spilling those needs cached random access (a real trace
+  storage layer), not the sequential record log baselines use.
+
 - CDCManager is a deliberately leaked process-wide singleton (views pin
   the DatabaseInstance; instance-scoped ownership would be a reference
   cycle). Multi-database processes share one manager.

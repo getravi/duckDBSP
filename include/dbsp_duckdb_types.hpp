@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "dbsp_spill_store.hpp"
+
 #include "dbsp_zset.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -291,20 +293,70 @@ public:
   const std::string &name() const { return name_; }
   const TableSchema &schema() const { return schema_; }
 
+  // ---- spill mode (Phase K1) -------------------------------------------
+  // Baseline row payloads move to a disk record log; RAM keeps only a
+  // 128-bit digest index (~40 bytes/row). DuckDB storage stays the only
+  // durable source — a lost spill file just forces a resync.
+
+  bool spilled() const { return spill_ != nullptr; }
+
+  void enable_spill(const std::string &path) {
+    if (spill_) {
+      return;
+    }
+    spill_ = std::make_unique<SpilledBaseline>(path);
+    if (!current_state_.empty()) {
+      // Migrate the in-RAM baseline, then free it
+      spill_->begin_rebuild();
+      for (const auto &[row, w] : current_state_) {
+        spill_->add(row_values(row), w);
+      }
+      spill_->end_rebuild([](const std::vector<duckdb::Value> &, int64_t) {},
+                          [](const std::vector<duckdb::Value> &, int64_t) {});
+      current_state_ = DuckDBZSet();
+    }
+  }
+
+  void disable_spill() {
+    if (!spill_) {
+      return;
+    }
+    spill_->scan([&](const std::vector<duckdb::Value> &vals, int64_t w) {
+      DuckDBRow row;
+      std::vector<duckdb::Value> copy = vals;
+      row.columns.assign(std::move(copy));
+      current_state_.insert(std::move(row), w);
+    });
+    spill_.reset();
+  }
+
   // Apply changes
   void insert(const DuckDBRow &row) {
-    current_state_.insert(row, 1);
+    if (spill_) {
+      spill_->apply_row(row_values(row), 1);
+    } else {
+      current_state_.insert(row, 1);
+    }
     pending_changes_.insert(row, 1);
   }
 
   void remove(const DuckDBRow &row) {
-    current_state_.insert(row, -1);
+    if (spill_) {
+      spill_->apply_row(row_values(row), -1);
+    } else {
+      current_state_.insert(row, -1);
+    }
     pending_changes_.insert(row, -1);
   }
 
   void update(const DuckDBRow &old_row, const DuckDBRow &new_row) {
-    current_state_.insert(old_row, -1);
-    current_state_.insert(new_row, 1);
+    if (spill_) {
+      spill_->apply_row(row_values(old_row), -1);
+      spill_->apply_row(row_values(new_row), 1);
+    } else {
+      current_state_.insert(old_row, -1);
+      current_state_.insert(new_row, 1);
+    }
     pending_changes_.insert(old_row, -1);
     pending_changes_.insert(new_row, 1);
   }
@@ -314,18 +366,65 @@ public:
   // not involved)
   void apply_delta(const DuckDBZSet &delta) {
     for (const auto &[row, w] : delta) {
-      current_state_.insert(row, w);
+      if (spill_) {
+        spill_->apply_row(row_values(row), w);
+      } else {
+        current_state_.insert(row, w);
+      }
     }
     sequence_++;
   }
 
-  // Replace the whole baseline in one move (scan-based sync: the delta is
-  // computed against the old state by the caller, so re-applying it row by
-  // row through insert()/remove() would just repeat n hash operations)
-  void replace_state(DuckDBZSet &&new_state) {
-    current_state_ = std::move(new_state);
+  // ---- full-scan rebuild (scan-and-diff sync, both modes) --------------
+  // begin_rebuild(); add_scanned_row() for every row DuckDB returns;
+  // finish_rebuild() returns the delta vs the previous baseline and
+  // swaps the new baseline in.
+
+  void begin_rebuild() {
+    if (spill_) {
+      spill_->begin_rebuild();
+    } else {
+      rebuild_state_ = DuckDBZSet();
+    }
+  }
+
+  void add_scanned_row(DuckDBRow &&row) {
+    if (spill_) {
+      spill_->add(row_values(row), 1);
+    } else {
+      rebuild_state_.insert(std::move(row), 1);
+    }
+  }
+
+  DuckDBZSet finish_rebuild() {
+    DuckDBZSet delta;
+    if (spill_) {
+      spill_->end_rebuild(
+          [&](const std::vector<duckdb::Value> &vals, int64_t w) {
+            delta.insert(make_row(vals), w);
+          },
+          [&](const std::vector<duckdb::Value> &vals, int64_t w) {
+            delta.insert(make_row(vals), -w);
+          });
+    } else {
+      for (const auto &[row, weight] : rebuild_state_) {
+        int64_t diff = weight - current_state_.get(row);
+        if (diff != 0) {
+          delta.insert(row, diff);
+        }
+      }
+      for (const auto &[row, weight] : current_state_) {
+        if (rebuild_state_.get(row) == 0) {
+          delta.insert(row, -weight);
+        }
+      }
+      // The freshly scanned state IS the new baseline: swap whole
+      current_state_ = std::move(rebuild_state_);
+      rebuild_state_ = DuckDBZSet();
+    }
     pending_changes_.clear();
     sequence_++;
+    return delta;
   }
 
   // Get and clear pending changes (for view updates)
@@ -335,13 +434,63 @@ public:
     return changes;
   }
 
+  // Stream the baseline (both modes). Spill mode reads the record log
+  // sequentially; rows are materialized one at a time.
+  void
+  scan_state(const std::function<void(const DuckDBRow &, int64_t)> &fn) const {
+    if (spill_) {
+      spill_->scan([&](const std::vector<duckdb::Value> &vals, int64_t w) {
+        fn(make_row(vals), w);
+      });
+    } else {
+      for (const auto &[row, w] : current_state_) {
+        fn(row, w);
+      }
+    }
+  }
+
+  size_t state_size() const {
+    return spill_ ? spill_->distinct_rows() : current_state_.size();
+  }
+
+  int64_t state_total_weight() const {
+    if (spill_) {
+      return spill_->total_weight();
+    }
+    int64_t total = 0;
+    for (const auto &[row, w] : current_state_) {
+      total += w;
+    }
+    return total;
+  }
+
+  // In-RAM baseline access — RAM mode only (spill mode callers use
+  // scan_state); kept for code paths that need Z-set semantics directly
   const DuckDBZSet &current_state() const { return current_state_; }
 
 private:
+  static std::vector<duckdb::Value> row_values(const DuckDBRow &row) {
+    std::vector<duckdb::Value> vals;
+    vals.reserve(row.columns.size());
+    for (size_t i = 0; i < row.columns.size(); i++) {
+      vals.push_back(row.columns[i]);
+    }
+    return vals;
+  }
+
+  static DuckDBRow make_row(const std::vector<duckdb::Value> &vals) {
+    DuckDBRow row;
+    std::vector<duckdb::Value> copy = vals;
+    row.columns.assign(std::move(copy));
+    return row;
+  }
+
   std::string name_;
   TableSchema schema_;
   DuckDBZSet current_state_;
+  DuckDBZSet rebuild_state_; // RAM-mode rebuild in progress
   DuckDBZSet pending_changes_;
+  std::unique_ptr<SpilledBaseline> spill_;
   uint64_t sequence_;
 };
 

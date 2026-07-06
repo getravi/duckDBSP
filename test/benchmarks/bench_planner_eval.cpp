@@ -290,3 +290,56 @@ TEST_CASE("Benchmark: shared vs private join arrangements",
             << "+1 arrangements) " << private_us << " us; shared+parallel "
             << parallel_us << " us\n";
 }
+
+#include <sys/resource.h>
+
+// K1: baseline spill — RAM footprint and sync cost, disk vs RAM baselines
+TEST_CASE("Benchmark: spilled vs RAM baselines", "[benchmark][spill_bench]") {
+  constexpr int kRowsBig = 200000;
+  auto &mgr = dbsp_native::get_cdc_manager();
+
+  auto rss_mb = []() {
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+    return static_cast<double>(ru.ru_maxrss) / (1024.0 * 1024.0);
+  };
+
+  auto run = [&](bool spill) {
+    DuckDBTestHarness db;
+    if (spill) {
+      db.exec("SELECT * FROM dbsp_spill(true)");
+    }
+    db.exec("CREATE TABLE big (id INT, val INT, s VARCHAR)");
+    db.exec("INSERT INTO big SELECT i, i % 1000, 'row_' || i FROM range(" +
+            std::to_string(kRowsBig) + ") t(i)");
+    db.exec("SELECT * FROM dbsp_track('big')");
+    auto t0 = high_resolution_clock::now();
+    db.exec("SELECT * FROM dbsp_sync('big')");
+    auto t1 = high_resolution_clock::now();
+    db.exec("SELECT * FROM dbsp_create_view('bv_spill', "
+            "'SELECT val, COUNT(*) FROM big GROUP BY val')");
+    // Incremental round on the existing baseline
+    db.exec("INSERT INTO big SELECT i, i % 1000, 'row_' || i FROM range(" +
+            std::to_string(kRowsBig) + ", " +
+            std::to_string(kRowsBig + 1000) + ") t(i)");
+    auto t2 = high_resolution_clock::now();
+    db.exec("SELECT * FROM dbsp_sync('big')");
+    auto t3 = high_resolution_clock::now();
+    double first_ms =
+        duration_cast<microseconds>(t1 - t0).count() / 1000.0;
+    double incr_ms =
+        duration_cast<microseconds>(t3 - t2).count() / 1000.0;
+    std::cout << "[bench] " << (spill ? "spill" : "ram  ") << " baseline: "
+              << kRowsBig << "-row first sync " << first_ms
+              << " ms; +1000-row resync " << incr_ms << " ms; maxrss "
+              << rss_mb() << " MB\n";
+    if (spill) {
+      db.exec("SELECT * FROM dbsp_spill(false)");
+    }
+  };
+
+  // Spill FIRST: maxrss is monotone, so the RAM run inflating it later
+  // cannot mask the spill run's footprint
+  run(true);
+  run(false);
+}

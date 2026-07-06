@@ -1,5 +1,22 @@
 # Changelog
 
+## Phase K1: Disk-backed table baselines - Jul 2026
+
+- dbsp_spill(true) moves tracked-table baselines (the engine's largest
+  RAM consumer: a full copy of every tracked table kept for
+  scan-and-diff) to on-disk record logs. RAM keeps a 128-bit row-digest
+  index (~40 bytes/row). Scan-diff compares digest indexes; deleted-row
+  payloads are read back from the old generation, added rows are in
+  hand from the scan; files swap atomically (tmp+rename). View init and
+  arrangement backfill stream baselines in 64k-row chunks — the whole
+  table never materializes in RAM. Captured-delta commits append to the
+  live log; net-zero records compact on the next full rebuild. Toggling
+  migrates live baselines both directions. Crash-torn files are simply
+  discarded — DuckDB storage remains the only durable source and
+  recovery resyncs. Measured (200k rows): maxrss 259 -> 132 MB; first
+  sync 170 -> 712 ms, incremental resync 210 -> 287 ms (Value
+  serialization is the cost — hence opt-in).
+
 ## Phase J2: Order-sensitive aggregates - Jul 2026
 
 - string_agg (+ group_concat/listagg aliases) and array_agg (+ list

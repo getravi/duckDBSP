@@ -36,6 +36,7 @@
 #include <queue>
 #include <shared_mutex>
 #include <thread>
+#include <unistd.h>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -419,6 +420,9 @@ public:
 
     tracked_tables_[table_name] =
         std::make_unique<TrackedTable>(table_name, schema);
+    if (spill_enabled_) {
+      tracked_tables_[table_name]->enable_spill(spill_path(table_name));
+    }
     table_schemas_[table_name] = schema;
     table_locks_[table_name] = std::make_unique<std::shared_mutex>();
 
@@ -594,9 +598,21 @@ public:
           continue;
         }
         if (tracked_tables_.count(source)) {
+          // Stream the baseline in bounded chunks: deltas are additive,
+          // so N smaller applies equal one big one — and spill mode never
+          // materializes the whole table in RAM
           const auto &table = tracked_tables_.at(source);
-          const auto &state = table->current_state();
-          view->apply_changes(source, state);
+          DuckDBZSet chunk;
+          table->scan_state([&](const DuckDBRow &row, int64_t w) {
+            chunk.insert(row, w);
+            if (chunk.size() >= 65536) {
+              view->apply_changes(source, chunk);
+              chunk = DuckDBZSet();
+            }
+          });
+          // Final chunk applies even when empty: global aggregates emit
+          // their one row only when the circuit steps
+          view->apply_changes(source, chunk);
         } else if (views_.count(source)) {
           // Source is a view - use its result
           view->apply_changes(source, views_[source]->get_result());
@@ -645,7 +661,18 @@ public:
         }
         // Backfill full current state so init replay can skip this table
         if (source_is_table) {
-          arr->apply(tracked_tables_.at(req.table)->current_state());
+          DuckDBZSet chunk;
+          tracked_tables_.at(req.table)
+              ->scan_state([&](const DuckDBRow &row, int64_t w) {
+                chunk.insert(row, w);
+                if (chunk.size() >= 65536) {
+                  arr->apply(chunk);
+                  chunk = DuckDBZSet();
+                }
+              });
+          if (!chunk.empty()) {
+            arr->apply(chunk);
+          }
         } else {
           arr->apply(views_.at(req.table)->get_result());
         }
@@ -961,6 +988,44 @@ public:
         }
       }
     }
+  }
+
+  // Enable/disable baseline spilling (Phase K1). Existing tables migrate
+  // immediately: enabling moves their baselines to disk record logs,
+  // disabling reloads them into RAM. New tables follow the current mode.
+  bool set_spill(bool enable) {
+    std::unique_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    if (enable == spill_enabled_) {
+      return true;
+    }
+    if (enable) {
+      namespace fs = std::filesystem;
+      std::error_code ec;
+      spill_dir_ = (fs::temp_directory_path(ec) /
+                    ("dbsp_spill_" + std::to_string(::getpid())))
+                       .string();
+      fs::create_directories(spill_dir_, ec);
+      if (ec) {
+        last_error_ = "Cannot create spill directory: " + spill_dir_;
+        return false;
+      }
+    }
+    for (auto &[name, table] : tracked_tables_) {
+      auto lock_it = table_locks_.find(name);
+      std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
+      if (enable) {
+        table->enable_spill(spill_path(name));
+      } else {
+        table->disable_spill();
+      }
+    }
+    spill_enabled_ = enable;
+    return true;
+  }
+
+  bool spill_enabled() const {
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
+    return spill_enabled_;
   }
 
   // Enable/disable parallel sync
@@ -1428,11 +1493,7 @@ public:
     if (it == tracked_tables_.end()) {
       return -1;
     }
-    int64_t total = 0;
-    for (const auto &[row, w] : it->second->current_state()) {
-      total += w;
-    }
-    return total;
+    return it->second->state_total_weight();
   }
 
   // Apply a delta captured from a transaction's local storage (G2 fast
@@ -1485,7 +1546,7 @@ public:
     std::shared_lock<std::shared_mutex> lock(struct_mutex_);
     auto it = tracked_tables_.find(table_name);
     if (it != tracked_tables_.end()) {
-      return it->second->current_state().size();
+      return it->second->state_size();
     }
     return 0;
   }
@@ -1666,7 +1727,7 @@ private:
       }
       auto &catalog = target_db->GetCatalog();
 
-      DuckDBZSet new_state;
+      it->second->begin_rebuild();
       scan_syncs_++;
 
       {
@@ -1759,34 +1820,15 @@ private:
           for (idx_t i = 0; i < n; i++) {
             DuckDBRow row;
             row.columns.assign(std::move(vals[i]));
-            new_state.insert(std::move(row), 1);
+            it->second->add_scanned_row(std::move(row));
           }
         }
       }
 
-      // Compute delta = new_state - old_state
-      DuckDBZSet delta;
-      const auto &old_state = it->second->current_state();
-
-      for (const auto &[row, weight] : new_state) {
-        int64_t old_weight = old_state.get(row);
-        int64_t diff = weight - old_weight;
-        if (diff != 0) {
-          delta.insert(row, diff);
-        }
-      }
-
-      for (const auto &[row, weight] : old_state) {
-        if (new_state.get(row) == 0) {
-          delta.insert(row, -weight);
-        }
-      }
-
-      // The freshly scanned state IS the new baseline: swap it in whole
-      // instead of replaying the delta row by row (which repeated every
-      // hash operation the diff above already paid for)
-      it->second->replace_state(std::move(new_state));
-      return delta;
+      // Diff against the previous baseline and swap the new one in
+      // (spill mode: digest-index compare + on-disk payloads; RAM mode:
+      // whole-map diff + move)
+      return it->second->finish_rebuild();
 
     } catch (const std::exception &e) {
       last_error_ = std::string("Exception in sync_table_scan_and_consume: ") + e.what();
@@ -1811,6 +1853,9 @@ private:
 
     tracked_tables_[table_name] =
         std::make_unique<TrackedTable>(table_name, schema);
+    if (spill_enabled_) {
+      tracked_tables_[table_name]->enable_spill(spill_path(table_name));
+    }
     table_schemas_[table_name] = schema;
     table_locks_[table_name] = std::make_unique<std::shared_mutex>();
 
@@ -2284,6 +2329,12 @@ private:
   std::atomic<uint64_t> captured_delta_syncs_{0};
   std::atomic<uint64_t> scan_syncs_{0};
   bool use_parallel_sync_ = false;
+  bool spill_enabled_ = false;
+  std::string spill_dir_;
+
+  std::string spill_path(const std::string &table_name) const {
+    return spill_dir_ + "/" + table_name + ".dbspill";
+  }
 };
 
 // Global CDC manager instance

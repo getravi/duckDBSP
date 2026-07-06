@@ -909,6 +909,62 @@ void ParallelFunc(ClientContext &context, TableFunctionInput &input,
 }
 
 // ============================================================================
+// dbsp_spill - Enable/disable disk-backed table baselines (Phase K1)
+// Usage: SELECT * FROM dbsp_spill(true);   -- Enable
+//        SELECT * FROM dbsp_spill(false);  -- Disable
+//        SELECT * FROM dbsp_spill();       -- Query status
+// ============================================================================
+
+struct SpillBindData : public TableFunctionData {
+  bool enable = false;
+  bool query_only = false;
+  bool done = false;
+};
+
+unique_ptr<FunctionData> SpillBind(ClientContext &context,
+                                   TableFunctionBindInput &input,
+                                   vector<LogicalType> &return_types,
+                                   vector<string> &names) {
+  auto data = make_uniq<SpillBindData>();
+  if (input.inputs.empty()) {
+    data->query_only = true;
+  } else {
+    data->enable = input.inputs[0].GetValue<bool>();
+  }
+  return_types.push_back(LogicalType::VARCHAR);
+  names.push_back("result");
+  return std::move(data);
+}
+
+void SpillFunc(ClientContext &context, TableFunctionInput &input,
+               DataChunk &output) {
+  auto &data = input.bind_data->CastNoConst<SpillBindData>();
+  if (data.done)
+    return;
+  auto &manager = dbsp_native::get_cdc_manager();
+  if (data.query_only) {
+    bool enabled = manager.spill_enabled();
+    output.SetCardinality(1);
+    output.SetValue(0, 0,
+                    Value(string("Baseline spill is ") +
+                          (enabled ? "ENABLED" : "DISABLED")));
+  } else if (!manager.set_spill(data.enable)) {
+    output.SetCardinality(1);
+    output.SetValue(0, 0, Value("Spill toggle FAILED: " +
+                                manager.last_error()));
+  } else {
+    output.SetCardinality(1);
+    output.SetValue(
+        0, 0,
+        Value(data.enable
+                  ? "Baseline spill ENABLED: tracked-table baselines live "
+                    "on disk; RAM holds digest indexes only"
+                  : "Baseline spill DISABLED: baselines back in RAM"));
+  }
+  data.done = true;
+}
+
+// ============================================================================
 // dbsp_use_planner - Enable/disable the planner frontend (Phase B)
 // Usage: SELECT * FROM dbsp_use_planner(true);   -- Enable
 //        SELECT * FROM dbsp_use_planner(false);  -- Disable
@@ -1345,6 +1401,10 @@ static void LoadInternal(ExtensionLoader &loader) {
                               ParallelBind);
   parallel_func.varargs = LogicalType::BOOLEAN;
   loader.RegisterFunction(parallel_func);
+
+  TableFunction spill_func("dbsp_spill", {}, SpillFunc, SpillBind);
+  spill_func.varargs = LogicalType::BOOLEAN;
+  loader.RegisterFunction(spill_func);
 
   // Register scalar functions
   CreateScalarFunctionInfo drop_func_info(
