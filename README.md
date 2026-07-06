@@ -48,11 +48,11 @@ GROUP BY customer;
 INSERT INTO orders VALUES (1, 'Alice', 100), (2, 'Bob', 200), (3, 'Alice', 150);
 
 -- Query the view (instant — no recomputation)
-SELECT * FROM customer_totals;
+SELECT * FROM dbsp_query('customer_totals');
 -- Returns: Alice: 250, Bob: 200
 
 INSERT INTO orders VALUES (4, 'Alice', 50);
-SELECT * FROM customer_totals;
+SELECT * FROM dbsp_query('customer_totals');
 -- Returns: Alice: 300, Bob: 200
 ```
 
@@ -179,10 +179,12 @@ See [docs/TESTING.md](docs/TESTING.md) for details.
 
 | Function | Description |
 |----------|-------------|
-| `dbsp_save()` | Save views to DuckDB table |
-| `dbsp_save(file)` | Save views to JSON file |
-| `dbsp_load()` | Load views from DuckDB table |
-| `dbsp_load(file)` | Load views from JSON file |
+| `dbsp_save('views.json')` | Save view definitions to a JSON file |
+| `dbsp_load('views.json', 'json')` | Load view definitions from a JSON file |
+
+Persistence is JSON-file only (definitions, not materialized state); the
+zero-argument DuckDB-table forms are not supported. File paths must be
+relative to the working directory — absolute paths are rejected.
 
 ### Manual CDC
 

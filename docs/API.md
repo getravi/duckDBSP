@@ -380,34 +380,19 @@ SELECT * FROM dbsp_query('customer_totals');
 
 ## Persistence
 
-### dbsp_save()
-
-Save all view definitions to DuckDB table `_dbsp_views`.
-
-```sql
-SELECT * FROM dbsp_save();
-```
-
-**Returns:**
-- VARCHAR: Confirmation message
-
-**Notes:**
-- Creates `_dbsp_views` and `_dbsp_views_tables` if not exist
-- Overwrites existing saved state
-- Saves view SQL and creation timestamps
-
----
-
 ### dbsp_save(filepath)
 
-Save all view definitions to a JSON file.
+Save all view definitions to a JSON file. JSON is the only supported
+persistence format — the zero-argument DuckDB-table form
+(`dbsp_save()`) returns "DuckDB table persistence not supported".
 
 ```sql
-SELECT * FROM dbsp_save('/path/to/views.json');
+SELECT * FROM dbsp_save('views.json');
 ```
 
 **Parameters:**
-- `filepath` (VARCHAR): Path to output JSON file
+- `filepath` (VARCHAR): Path to output JSON file, relative to the working
+  directory (absolute paths and path traversal are rejected)
 
 **Returns:**
 - VARCHAR: Confirmation message
@@ -429,34 +414,25 @@ SELECT * FROM dbsp_save('/path/to/views.json');
 
 ---
 
-### dbsp_load()
+### dbsp_load(filepath, 'json')
 
-Load view definitions from DuckDB table `_dbsp_views`.
+Load view definitions from a JSON file. The explicit `'json'` format
+argument is required — one-argument and zero-argument forms return
+"DuckDB table persistence not supported".
 
 ```sql
-SELECT * FROM dbsp_load();
+SELECT * FROM dbsp_load('views.json', 'json');
 ```
 
-**Returns:**
-- VARCHAR: Confirmation with view count
+**Parameters:**
+- `filepath` (VARCHAR): Path to JSON file, relative to the working
+  directory (absolute paths and path traversal are rejected)
+- `format` (VARCHAR): Must be `'json'`
 
 **Notes:**
 - Recreates views in creation order (handles dependencies)
 - Re-syncs with current table data
 - Continues loading if individual views fail
-
----
-
-### dbsp_load(filepath)
-
-Load view definitions from a JSON file.
-
-```sql
-SELECT * FROM dbsp_load('/path/to/views.json');
-```
-
-**Parameters:**
-- `filepath` (VARCHAR): Path to JSON file
 
 **Returns:**
 - VARCHAR: Confirmation with view count
