@@ -1043,6 +1043,82 @@ struct SharedArrangement {
   int64_t total = 0;
   int64_t nulls = 0;
 
+  // K2: index spilled to a disk bucket log (dbsp_spill). Probes go
+  // through probe_spilled() with an internal mutex — concurrent
+  // same-level views (I2) may probe simultaneously. Weights/counters
+  // stay in RAM (shared sides never self-pad, so they are empty/tiny).
+  std::unique_ptr<SpilledBucketIndex> spilled;
+  mutable std::mutex spill_probe_mutex;
+
+  bool is_spilled() const { return spilled != nullptr; }
+
+  static RowDigest digest_of_row(const DuckDBRow &row) {
+    std::vector<duckdb::Value> vals;
+    vals.reserve(row.columns.size());
+    for (size_t i = 0; i < row.columns.size(); i++) {
+      vals.push_back(row.columns[i]);
+    }
+    std::vector<uint8_t> bytes;
+    serialize_row(vals, bytes);
+    return digest_bytes(bytes.data(), bytes.size());
+  }
+
+  // Fill `out` with the bucket for `key`; false when absent
+  bool probe_spilled(const DuckDBRow &key, RowWeights &out) const {
+    out.clear();
+    std::lock_guard<std::mutex> guard(spill_probe_mutex);
+    const auto *bucket = spilled->probe(digest_of_row(key));
+    if (!bucket) {
+      return false;
+    }
+    for (const auto &[vals, w] : *bucket) {
+      DuckDBRow row;
+      std::vector<duckdb::Value> copy = vals;
+      row.columns.assign(std::move(copy));
+      out.emplace(std::move(row), w);
+    }
+    return true;
+  }
+
+  void enable_spill(const std::string &path) {
+    if (spilled) {
+      return;
+    }
+    spilled = std::make_unique<SpilledBucketIndex>(path);
+    for (const auto &[key, bucket] : index) {
+      SpilledBucketIndex::Bucket delta;
+      delta.reserve(bucket.size());
+      for (const auto &[row, w] : bucket) {
+        std::vector<duckdb::Value> vals;
+        vals.reserve(row.columns.size());
+        for (size_t i = 0; i < row.columns.size(); i++) {
+          vals.push_back(row.columns[i]);
+        }
+        delta.emplace_back(std::move(vals), w);
+      }
+      spilled->update(digest_of_row(key), delta);
+    }
+    index.clear();
+  }
+
+  void disable_spill() {
+    if (!spilled) {
+      return;
+    }
+    spilled->scan([&](const SpilledBucketIndex::Bucket &bucket) {
+      for (const auto &[vals, w] : bucket) {
+        DuckDBRow row;
+        std::vector<duckdb::Value> copy = vals;
+        row.columns.assign(std::move(copy));
+        DuckDBRow key;
+        if (eval_key(row, key)) {
+          index[key][row] += w;
+        }
+      }
+    });
+    spilled.reset();
+  }
+
   // Key evaluation owned by the arrangement (first registrant's bound
   // expressions; keep_alive pins that plan for the arrangement's lifetime)
   std::shared_ptr<PlanKeepAlive> keep_alive;
@@ -1121,6 +1197,10 @@ struct SharedArrangement {
         base += chunk;
       }
     }
+    // Spilled mode: group contributions per key first, one disk-bucket
+    // merge per touched key (updates run pre-views, single-threaded)
+    std::unordered_map<RowDigest, SpilledBucketIndex::Bucket, RowDigestHash>
+        spill_batch;
     for (size_t i = 0; i < rows.size(); i++) {
       const DuckDBRow &row = *rows[i];
       const int64_t w = ws[i];
@@ -1140,6 +1220,15 @@ struct SharedArrangement {
       if (!valid[i]) {
         continue;
       }
+      if (spilled) {
+        std::vector<duckdb::Value> vals;
+        vals.reserve(row.columns.size());
+        for (size_t c = 0; c < row.columns.size(); c++) {
+          vals.push_back(row.columns[c]);
+        }
+        spill_batch[digest_of_row(keys[i])].emplace_back(std::move(vals), w);
+        continue;
+      }
       auto &bucket = index[keys[i]];
       int64_t &weight = bucket[row];
       weight += w;
@@ -1149,6 +1238,9 @@ struct SharedArrangement {
           index.erase(keys[i]);
         }
       }
+    }
+    for (auto &[digest, delta_bucket] : spill_batch) {
+      spilled->update(digest, delta_bucket);
     }
   }
 };
@@ -1270,31 +1362,29 @@ public:
     // passes; a shared side: NEW state — the arrangement was updated
     // before views stepped, and the Δl⋈Δr term is dropped to compensate:
     // Δl⋈R_new + L_old⋈Δr == Δl⋈R_old + L_old⋈Δr + Δl⋈Δr)
-    const Index &right_probe = side_index(/*left=*/false);
     for (size_t i = 0; i < kl.rows.size(); i++) {
       if (!kl.valid[i]) {
         continue;
       }
-      auto it = right_probe.find(kl.keys[i]);
-      if (it == right_probe.end()) {
+      const RowWeights *bucket = probe_side(/*left=*/false, kl.keys[i]);
+      if (!bucket) {
         continue;
       }
-      for (const auto &[rrow, rw] : it->second) {
+      for (const auto &[rrow, rw] : *bucket) {
         try_emit(*kl.rows[i], rrow, kl.weights[i] * rw);
       }
     }
 
     // L ⋈ Δr
-    const Index &left_probe = side_index(/*left=*/true);
     for (size_t i = 0; i < kr.rows.size(); i++) {
       if (!kr.valid[i]) {
         continue;
       }
-      auto it = left_probe.find(kr.keys[i]);
-      if (it == left_probe.end()) {
+      const RowWeights *bucket = probe_side(/*left=*/true, kr.keys[i]);
+      if (!bucket) {
         continue;
       }
-      for (const auto &[lrow, lw] : it->second) {
+      for (const auto &[lrow, lw] : *bucket) {
         try_emit(lrow, *kr.rows[i], lw * kr.weights[i]);
       }
     }
@@ -1385,6 +1475,22 @@ private:
       return shared_right_->index;
     }
     return left ? left_index_ : right_index_;
+  }
+
+  // Probe one side for `key`. Returns nullptr on no match. For a spilled
+  // shared side the bucket materializes into this node's scratch (nodes
+  // are per-view, so scratches are thread-private under I2 parallel
+  // propagation; the arrangement serializes its own cache internally).
+  // The pointer is valid until the next probe_side call on that side.
+  const RowWeights *probe_side(bool left, const DuckDBRow &key) {
+    const auto &sh = left ? shared_left_ : shared_right_;
+    if (sh && sh->is_spilled()) {
+      RowWeights &scratch = left ? probe_scratch_left_ : probe_scratch_right_;
+      return sh->probe_spilled(key, scratch) ? &scratch : nullptr;
+    }
+    const Index &idx = side_index(left);
+    auto it = idx.find(key);
+    return it == idx.end() ? nullptr : &it->second;
   }
 
   // Returns false when any key value is NULL (row can never match) —
@@ -1562,13 +1668,12 @@ private:
     if (!eval_key(row, left, key)) {
       return 0;
     }
-    const Index &other = side_index(!left);
-    auto it = other.find(key);
-    if (it == other.end()) {
+    const RowWeights *bucket = probe_side(!left, key);
+    if (!bucket) {
       return 0;
     }
     int64_t count = 0;
-    for (const auto &[orow, ow] : it->second) {
+    for (const auto &[orow, ow] : *bucket) {
       const bool pass = left ? residuals_pass(row, orow)
                              : residuals_pass(orow, row);
       if (pass) {
@@ -1757,6 +1862,7 @@ private:
   // I1: at most one side reads a shared, CDC-maintained arrangement
   // (updated BEFORE views step, so it is post-delta for the current step)
   std::shared_ptr<const SharedArrangement> shared_left_, shared_right_;
+  RowWeights probe_scratch_left_, probe_scratch_right_;
   Index left_index_, right_index_;
   RowWeights left_weights_, right_weights_;   // incl. NULL-key rows
   RowWeights left_pad_, right_pad_;           // currently emitted pad weight

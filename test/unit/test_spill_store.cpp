@@ -187,3 +187,78 @@ TEST_CASE("spill: property test vs in-memory oracle", "[unit][spill]") {
     REQUIRE(scanned == oracle);
   }
 }
+
+namespace {
+RowDigest key_digest_of(int k) {
+  std::vector<uint8_t> bytes;
+  serialize_row({Value::INTEGER(k)}, bytes);
+  return digest_bytes(bytes.data(), bytes.size());
+}
+} // namespace
+
+TEST_CASE("spill: bucket index probe/update/erase", "[unit][spill]") {
+  SpilledBucketIndex idx(temp_spill_path("bidx"), /*cache_capacity=*/2);
+
+  REQUIRE(idx.probe(key_digest_of(1)) == nullptr);
+
+  idx.update(key_digest_of(1), {{{Value("a")}, 2}, {{Value("b")}, 1}});
+  idx.update(key_digest_of(2), {{{Value("c")}, 1}});
+  idx.update(key_digest_of(3), {{{Value("d")}, 1}}); // evicts key 1 from cache
+
+  const auto *b1 = idx.probe(key_digest_of(1)); // disk reload
+  REQUIRE(b1 != nullptr);
+  REQUIRE(b1->size() == 2);
+
+  // Merge: b loses its weight, a gains
+  idx.update(key_digest_of(1), {{{Value("b")}, -1}, {{Value("a")}, 3}});
+  b1 = idx.probe(key_digest_of(1));
+  REQUIRE(b1->size() == 1);
+  REQUIRE((*b1)[0].second == 5);
+
+  // Empty bucket leaves the index
+  idx.update(key_digest_of(2), {{{Value("c")}, -1}});
+  REQUIRE(idx.probe(key_digest_of(2)) == nullptr);
+  REQUIRE(idx.key_count() == 2);
+}
+
+TEST_CASE("spill: bucket index property test vs oracle incl. compaction",
+          "[unit][spill]") {
+  SpilledBucketIndex idx(temp_spill_path("bprop"), /*cache_capacity=*/4);
+  std::map<int, std::map<std::string, int64_t>> oracle;
+  std::mt19937 rng(777);
+
+  for (int step = 0; step < 4000; step++) {
+    const int k = (int)(rng() % 12);
+    // Long payload so compaction thresholds actually trip
+    const std::string v(50 + rng() % 100, 'a' + (char)(rng() % 4));
+    const int64_t w = (rng() % 3 == 0) ? -1 : 1;
+    idx.update(key_digest_of(k), {{{Value(v)}, w}});
+    auto &ob = oracle[k];
+    ob[v] += w;
+    if (ob[v] == 0) {
+      ob.erase(v);
+    }
+    if (ob.empty()) {
+      oracle.erase(k);
+    }
+
+    if (step % 251 == 0) {
+      for (int q = 0; q < 12; q++) {
+        const auto *bucket = idx.probe(key_digest_of(q));
+        auto oit = oracle.find(q);
+        if (oit == oracle.end()) {
+          REQUIRE(bucket == nullptr);
+          continue;
+        }
+        REQUIRE(bucket != nullptr);
+        REQUIRE(bucket->size() == oit->second.size());
+        for (const auto &[row, w2] : *bucket) {
+          const std::string key = row[0].GetValue<std::string>();
+          INFO("step " << step << " bucket " << q << " row " << key);
+          REQUIRE(oit->second.at(key) == w2);
+        }
+      }
+    }
+  }
+  REQUIRE(idx.key_count() == oracle.size());
+}

@@ -659,6 +659,11 @@ public:
                 req.keep_alive, *e, req.side_types));
           }
         }
+        if (spill_enabled_) {
+          arr->enable_spill(spill_dir_ + "/arr_" +
+                            std::to_string(arrangement_file_seq_++) +
+                            ".dbspill");
+        }
         // Backfill full current state so init replay can skip this table
         if (source_is_table) {
           DuckDBZSet chunk;
@@ -1017,6 +1022,26 @@ public:
         table->enable_spill(spill_path(name));
       } else {
         table->disable_spill();
+      }
+    }
+    {
+      // Arrangement content is guarded by view_mutex_
+      // (lock order: struct_mutex_ → view_mutex_)
+      std::unique_lock<std::shared_mutex> view_lock(view_mutex_);
+      for (auto it = arrangements_.begin(); it != arrangements_.end();) {
+        auto arr = it->second.lock();
+        if (!arr) {
+          it = arrangements_.erase(it);
+          continue;
+        }
+        if (enable) {
+          arr->enable_spill(spill_dir_ + "/arr_" +
+                            std::to_string(arrangement_file_seq_++) +
+                            ".dbspill");
+        } else {
+          arr->disable_spill();
+        }
+        ++it;
       }
     }
     spill_enabled_ = enable;
@@ -2331,6 +2356,7 @@ private:
   bool use_parallel_sync_ = false;
   bool spill_enabled_ = false;
   std::string spill_dir_;
+  uint64_t arrangement_file_seq_ = 0;
 
   std::string spill_path(const std::string &table_name) const {
     return spill_dir_ + "/" + table_name + ".dbspill";

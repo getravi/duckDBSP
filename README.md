@@ -190,7 +190,7 @@ See [docs/TESTING.md](docs/TESTING.md) for details.
 |----------|-------------|
 | `dbsp_auto_sync(bool)` | Toggle automatic sync on transaction commit |
 | `dbsp_parallel(bool)` | Toggle parallel multi-table sync + same-level view propagation |
-| `dbsp_spill(bool)` | Toggle disk-backed table baselines (RAM keeps digest indexes only) |
+| `dbsp_spill(bool)` | Toggle disk-backed state: table baselines + shared join arrangements |
 | `dbsp_use_planner([bool])` | No-op since Phase C (planner is the only frontend); kept for script compatibility |
 
 ## Error Handling

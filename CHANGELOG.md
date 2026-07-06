@@ -1,5 +1,22 @@
 # Changelog
 
+## Phase K2: Spilled shared join arrangements - Jul 2026
+
+- dbsp_spill(true) now also moves shared join arrangements (the largest
+  random-probe state) to disk: buckets live in an append-only log, RAM
+  keeps a key-digest -> (offset, length) slot map plus an LRU cache of
+  hot deserialized buckets. Probes hit the cache or cost one disk read;
+  updates merge + append at the log tail; the log compacts (rewrite +
+  atomic rename) when it exceeds 2x the live payload. Join nodes probe
+  through per-node scratch buckets — thread-private under I2 parallel
+  propagation — while the arrangement serializes its own cache with an
+  internal mutex (TSAN-verified with 4 views probing one spilled
+  arrangement concurrently). Toggling migrates live arrangements both
+  directions (unspill re-derives bucket keys through the arrangement's
+  own key evaluators). Weights/counter maps stay in RAM: shared sides
+  never self-pad, so they are empty or tiny. Aggregate states and
+  embedded sort/window views remain RAM-resident (TODO).
+
 ## Phase K1: Disk-backed table baselines - Jul 2026
 
 - dbsp_spill(true) moves tracked-table baselines (the engine's largest

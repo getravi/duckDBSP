@@ -1600,3 +1600,85 @@ TEST_CASE("planner K1: captured-delta commits hit the spilled baseline",
   requireViewMatchesQuery(db, "v_cap", sql);
   db.exec("SELECT * FROM dbsp_spill(false)");
 }
+
+// ---------------------------------------------------------------------------
+// Phase K2: spilled shared join arrangements
+// ---------------------------------------------------------------------------
+
+TEST_CASE("planner K2: spilled arrangement differential + live migration",
+          "[integration][planner][spill][arrangement]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  setupTableU(db);
+
+  // Views FIRST (RAM arrangements), then spill: live arrangements must
+  // migrate to disk and keep answering probes
+  const std::string sql =
+      "SELECT t.id, t.val, u.val FROM t JOIN u ON t.id = u.id";
+  db.exec("SELECT * FROM dbsp_create_view('v_arrsp', '" + sql + "')");
+  auto &mgr = dbsp_native::get_cdc_manager();
+  REQUIRE(mgr.shared_arrangement_count() >= 1);
+
+  db.exec("SELECT * FROM dbsp_spill(true)");
+  requireViewMatchesQuery(db, "v_arrsp", sql);
+  runDifferentialTwoTables(db, "v_arrsp", sql, 501);
+
+  // Back to RAM: buckets reload, keys re-derived from arrangement evals
+  db.exec("SELECT * FROM dbsp_spill(false)");
+  db.exec("INSERT INTO t VALUES (2, 33, 'z')");
+  db.exec("SELECT * FROM dbsp_sync('t')");
+  requireViewMatchesQuery(db, "v_arrsp", sql);
+}
+
+TEST_CASE("planner K2: NOT IN over spilled right side",
+          "[integration][planner][spill][arrangement][mark]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  setupTableU(db);
+  db.exec("SELECT * FROM dbsp_spill(true)");
+
+  const std::string sql =
+      "SELECT id, val FROM t WHERE val NOT IN (SELECT val FROM u)";
+  db.exec("SELECT * FROM dbsp_create_view('v_spmark', '" + sql + "')");
+  requireViewMatchesQuery(db, "v_spmark", sql);
+  runDifferentialTwoTables(db, "v_spmark", sql, 503);
+
+  db.exec("DELETE FROM u");
+  db.exec("SELECT * FROM dbsp_sync('u')");
+  requireViewMatchesQuery(db, "v_spmark", sql);
+  db.exec("SELECT * FROM dbsp_spill(false)");
+}
+
+TEST_CASE("planner K2: parallel propagation over one spilled arrangement",
+          "[integration][planner][spill][arrangement][parallel]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  setupTableU(db);
+  db.exec("SELECT * FROM dbsp_spill(true)");
+  db.exec("SELECT * FROM dbsp_parallel(true)");
+
+  // Identical SQL → same fingerprint → several views probe ONE spilled
+  // arrangement concurrently (the probe mutex is what this pins down)
+  const std::string sql =
+      "SELECT t.id, t.val, u.val FROM t JOIN u ON t.id = u.id";
+  for (int v = 0; v < 4; v++) {
+    db.exec("SELECT * FROM dbsp_create_view('v_par" + std::to_string(v) +
+            "', '" + sql + "')");
+  }
+
+  for (int round = 0; round < 3; round++) {
+    db.exec("INSERT INTO t SELECT i % 8, i, 'p' FROM range(" +
+            std::to_string(round * 400) + ", " +
+            std::to_string(round * 400 + 400) + ") s(i)");
+    db.exec("INSERT INTO u SELECT i % 8, i, 'q' FROM range(" +
+            std::to_string(round * 300) + ", " +
+            std::to_string(round * 300 + 300) + ") s(i)");
+    db.exec("SELECT * FROM dbsp_sync('t')");
+    db.exec("SELECT * FROM dbsp_sync('u')");
+    for (int v = 0; v < 4; v++) {
+      requireViewMatchesQuery(db, "v_par" + std::to_string(v), sql);
+    }
+  }
+  db.exec("SELECT * FROM dbsp_parallel(false)");
+  db.exec("SELECT * FROM dbsp_spill(false)");
+}

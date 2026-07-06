@@ -54,10 +54,12 @@ subsystem, bespoke parser, standalone Z-set spilling).
 
 ## Architectural
 
-- Baseline spill (K1) covers tracked-table baselines only. Join
-  arrangements, aggregate states, and embedded sort/window views still
-  live in RAM — spilling those needs cached random access (a real trace
-  storage layer), not the sequential record log baselines use.
+- Spill mode (K1+K2) covers tracked-table baselines and shared join
+  arrangements. Still RAM-resident: node-local join indexes (sides not
+  eligible for sharing), aggregate group states, and embedded
+  sort/window/distinct-on views. Aggregate states are usually small
+  (groups << rows); local join indexes matter for self-padding sides —
+  spilling them means extending the bucket-log design into the node.
 
 - CDCManager is a deliberately leaked process-wide singleton (views pin
   the DatabaseInstance; instance-scoped ownership would be a reference

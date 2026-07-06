@@ -23,10 +23,13 @@
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <functional>
+#include <list>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -351,6 +354,279 @@ private:
   int64_t total_weight_ = 0;
   std::unordered_map<RowDigest, Slot, RowDigestHash> index_;
   std::unordered_map<RowDigest, Slot, RowDigestHash> pending_;
+};
+
+// Disk-backed key → bucket index for join arrangements (Phase K2).
+// Buckets (row → weight maps) live in an append-only log; RAM keeps a
+// key-digest → (offset, length) slot map plus an LRU cache of hot
+// deserialized buckets. Probes hit the cache or cost one disk read;
+// updates rewrite the bucket at the log tail. When the log grows past
+// 2× the live payload (and a floor), live buckets are rewritten to a
+// fresh file (atomic rename).
+//
+// Same collision stance as SpilledBaseline: 128-bit key digests, no
+// byte compare. NOT thread-safe — callers serialize (view_mutex_).
+class SpilledBucketIndex {
+public:
+  using Bucket = std::vector<std::pair<std::vector<duckdb::Value>, int64_t>>;
+
+  explicit SpilledBucketIndex(std::string path, size_t cache_capacity = 1024)
+      : path_(std::move(path)), cache_capacity_(cache_capacity) {}
+
+  ~SpilledBucketIndex() { discard(); }
+
+  SpilledBucketIndex(const SpilledBucketIndex &) = delete;
+  SpilledBucketIndex &operator=(const SpilledBucketIndex &) = delete;
+
+  size_t key_count() const { return slots_.size(); }
+
+  // Bucket for `key_digest`, or nullptr when absent. The pointer is
+  // owned by the cache and stays valid until the next probe/update on
+  // this index (sequential probe-then-consume usage only).
+  const Bucket *probe(const RowDigest &key_digest) {
+    auto it = slots_.find(key_digest);
+    if (it == slots_.end()) {
+      return nullptr;
+    }
+    return &load(key_digest, it->second);
+  }
+
+  // Merge `delta` (row, weight pairs) into the bucket. Rows at net-zero
+  // weight leave the bucket; empty buckets leave the index.
+  void update(const RowDigest &key_digest, const Bucket &delta) {
+    Bucket merged;
+    auto it = slots_.find(key_digest);
+    if (it != slots_.end()) {
+      merged = load(key_digest, it->second); // copy out of cache
+      live_bytes_ -= it->second.length;
+    }
+    for (const auto &[row, w] : delta) {
+      bool found = false;
+      for (auto &[mrow, mw] : merged) {
+        if (rows_equal(mrow, row)) {
+          mw += w;
+          found = true;
+          break;
+        }
+      }
+      if (!found && w != 0) {
+        merged.emplace_back(row, w);
+      }
+    }
+    merged.erase(std::remove_if(merged.begin(), merged.end(),
+                                [](const auto &e) { return e.second == 0; }),
+                 merged.end());
+    cache_erase(key_digest);
+    if (merged.empty()) {
+      if (it != slots_.end()) {
+        slots_.erase(it);
+      }
+      maybe_compact();
+      return;
+    }
+    const Slot slot = append_bucket(merged);
+    slots_[key_digest] = slot;
+    live_bytes_ += slot.length;
+    cache_put(key_digest, std::move(merged));
+    maybe_compact();
+  }
+
+  // Full walk (unspill migration)
+  void scan(const std::function<void(const Bucket &)> &fn) {
+    for (const auto &[d, slot] : slots_) {
+      fn(read_bucket(slot));
+    }
+  }
+
+  void discard() {
+    if (file_) {
+      std::fclose(file_);
+      file_ = nullptr;
+    }
+    slots_.clear();
+    cache_.clear();
+    lru_.clear();
+    live_bytes_ = file_bytes_ = 0;
+    std::error_code ec;
+    std::filesystem::remove(path_, ec);
+    std::filesystem::remove(path_ + ".tmp", ec);
+  }
+
+private:
+  struct Slot {
+    uint64_t offset = 0;
+    uint32_t length = 0;
+  };
+
+  static bool rows_equal(const std::vector<duckdb::Value> &a,
+                         const std::vector<duckdb::Value> &b) {
+    if (a.size() != b.size()) {
+      return false;
+    }
+    for (size_t i = 0; i < a.size(); i++) {
+      const bool an = a[i].IsNull(), bn = b[i].IsNull();
+      if (an != bn) {
+        return false;
+      }
+      if (!an && !(a[i] == b[i])) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static void serialize_bucket(const Bucket &bucket,
+                               std::vector<uint8_t> &out) {
+    duckdb::MemoryStream stream;
+    const uint32_t n = static_cast<uint32_t>(bucket.size());
+    stream.WriteData(duckdb::const_data_ptr_cast(&n), sizeof(n));
+    for (const auto &[row, w] : bucket) {
+      stream.WriteData(duckdb::const_data_ptr_cast(&w), sizeof(w));
+      std::vector<uint8_t> rb;
+      serialize_row(row, rb);
+      const uint32_t rl = static_cast<uint32_t>(rb.size());
+      stream.WriteData(duckdb::const_data_ptr_cast(&rl), sizeof(rl));
+      stream.WriteData(rb.data(), rb.size());
+    }
+    out.assign(stream.GetData(), stream.GetData() + stream.GetPosition());
+  }
+
+  static Bucket deserialize_bucket(const uint8_t *data, size_t len) {
+    Bucket bucket;
+    size_t pos = 0;
+    auto read = [&](void *dst, size_t n) {
+      std::memcpy(dst, data + pos, n);
+      pos += n;
+    };
+    uint32_t n = 0;
+    read(&n, sizeof(n));
+    bucket.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+      int64_t w = 0;
+      read(&w, sizeof(w));
+      uint32_t rl = 0;
+      read(&rl, sizeof(rl));
+      bucket.emplace_back(deserialize_row(data + pos, rl), w);
+      pos += rl;
+    }
+    return bucket;
+  }
+
+  void ensure_file() {
+    if (!file_) {
+      file_ = std::fopen(path_.c_str(), "ab+");
+      if (!file_) {
+        throw std::runtime_error("dbsp spill: cannot open " + path_);
+      }
+      std::fseek(file_, 0, SEEK_END);
+      file_bytes_ = static_cast<uint64_t>(std::ftell(file_));
+    }
+  }
+
+  Slot append_bucket(const Bucket &bucket) {
+    ensure_file();
+    std::vector<uint8_t> bytes;
+    serialize_bucket(bucket, bytes);
+    std::fseek(file_, 0, SEEK_END);
+    Slot slot;
+    slot.offset = static_cast<uint64_t>(std::ftell(file_));
+    slot.length = static_cast<uint32_t>(bytes.size());
+    std::fwrite(bytes.data(), 1, bytes.size(), file_);
+    std::fflush(file_);
+    file_bytes_ = slot.offset + bytes.size();
+    return slot;
+  }
+
+  Bucket read_bucket(const Slot &slot) {
+    ensure_file();
+    if (std::fseek(file_, static_cast<long>(slot.offset), SEEK_SET) != 0) {
+      throw std::runtime_error("dbsp spill: seek failed");
+    }
+    std::vector<uint8_t> bytes(slot.length);
+    if (slot.length > 0 &&
+        std::fread(bytes.data(), 1, slot.length, file_) != slot.length) {
+      throw std::runtime_error("dbsp spill: short bucket read");
+    }
+    return deserialize_bucket(bytes.data(), bytes.size());
+  }
+
+  const Bucket &load(const RowDigest &d, const Slot &slot) {
+    auto cit = cache_.find(d);
+    if (cit != cache_.end()) {
+      lru_.splice(lru_.begin(), lru_, cit->second.second);
+      return cit->second.first;
+    }
+    Bucket bucket = read_bucket(slot);
+    return cache_put(d, std::move(bucket));
+  }
+
+  const Bucket &cache_put(const RowDigest &d, Bucket &&bucket) {
+    cache_erase(d);
+    lru_.push_front(d);
+    auto [it, ok] =
+        cache_.emplace(d, std::make_pair(std::move(bucket), lru_.begin()));
+    while (cache_.size() > cache_capacity_) {
+      cache_.erase(lru_.back());
+      lru_.pop_back();
+    }
+    return it->second.first;
+  }
+
+  void cache_erase(const RowDigest &d) {
+    auto it = cache_.find(d);
+    if (it != cache_.end()) {
+      lru_.erase(it->second.second);
+      cache_.erase(it);
+    }
+  }
+
+  void maybe_compact() {
+    constexpr uint64_t kFloor = 4 * 1024 * 1024;
+    if (file_bytes_ < kFloor || file_bytes_ < 2 * live_bytes_) {
+      return;
+    }
+    const std::string tmp = path_ + ".tmp";
+    std::FILE *nf = std::fopen(tmp.c_str(), "wb");
+    if (!nf) {
+      throw std::runtime_error("dbsp spill: cannot open " + tmp);
+    }
+    uint64_t off = 0;
+    std::unordered_map<RowDigest, Slot, RowDigestHash> new_slots;
+    new_slots.reserve(slots_.size());
+    for (const auto &[d, slot] : slots_) {
+      Bucket bucket = read_bucket(slot);
+      std::vector<uint8_t> bytes;
+      serialize_bucket(bucket, bytes);
+      std::fwrite(bytes.data(), 1, bytes.size(), nf);
+      new_slots[d] = Slot{off, static_cast<uint32_t>(bytes.size())};
+      off += bytes.size();
+    }
+    std::fclose(nf);
+    if (file_) {
+      std::fclose(file_);
+      file_ = nullptr;
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, path_, ec);
+    if (ec) {
+      throw std::runtime_error("dbsp spill: rename failed: " + ec.message());
+    }
+    slots_ = std::move(new_slots);
+    file_bytes_ = off;
+    live_bytes_ = off;
+  }
+
+  std::string path_;
+  std::FILE *file_ = nullptr;
+  uint64_t live_bytes_ = 0;
+  uint64_t file_bytes_ = 0;
+  size_t cache_capacity_;
+  std::unordered_map<RowDigest, Slot, RowDigestHash> slots_;
+  std::unordered_map<RowDigest,
+                     std::pair<Bucket, std::list<RowDigest>::iterator>,
+                     RowDigestHash>
+      cache_;
+  std::list<RowDigest> lru_;
 };
 
 } // namespace dbsp_native
