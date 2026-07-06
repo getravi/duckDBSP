@@ -766,6 +766,10 @@ private:
     // MODE: per-value multiplicities (values multiset serves
     // MEDIAN/QUANTILE the same way it serves MIN/MAX)
     std::map<duckdb::Value, int64_t> mode_counts;
+    // N4: a group whose values multiset grows past the threshold (spill
+    // mode) moves its values to a disk record log; renders reload the
+    // group when it is touched. mode_counts/ordered entries stay in RAM.
+    std::unique_ptr<SpilledBaseline> spilled_values;
   };
 
   struct GroupState {
@@ -895,6 +899,10 @@ private:
       case PlanAggSpec::Fn::QUANTILE_CONT:
       case PlanAggSpec::Fn::QUANTILE_DISC:
       case PlanAggSpec::Fn::MAD:
+        if (s.spilled_values) {
+          s.spilled_values->apply_row({v}, weight);
+          break;
+        }
         if (weight > 0) {
           for (int64_t w = 0; w < weight; w++) {
             s.values.insert(v);
@@ -906,6 +914,21 @@ private:
               s.values.erase(it);
             }
           }
+        }
+        // N4: oversized group → move values to disk (spill mode). Renders
+        // reload the group only when it is touched again.
+        if (g_spill_mode.load() && s.values.size() > 65536) {
+          s.spilled_values = std::make_unique<SpilledBaseline>(
+              g_spill_dir + "/agg_" +
+              std::to_string(g_spill_file_seq.fetch_add(1)) + ".dbspill");
+          auto it = s.values.begin();
+          while (it != s.values.end()) {
+            auto next = s.values.upper_bound(*it);
+            s.spilled_values->apply_row(
+                {*it}, static_cast<int64_t>(std::distance(it, next)));
+            it = next;
+          }
+          s.values.clear();
         }
         break;
       case PlanAggSpec::Fn::MODE: {
@@ -955,7 +978,25 @@ private:
     return value_less(a.second, b.second, true, false);
   }
 
+  // N4: multiset renders read through this — a spilled group reloads
+  // into `tmp` (touched groups only; untouched groups never re-render)
+  static const std::multiset<duckdb::Value> &
+  values_of(const AggState &s, std::multiset<duckdb::Value> &tmp) {
+    if (!s.spilled_values) {
+      return s.values;
+    }
+    s.spilled_values->scan(
+        [&](const std::vector<duckdb::Value> &vals, int64_t w) {
+          for (int64_t c = 0; c < w; c++) {
+            tmp.insert(vals[0]);
+          }
+        });
+    return tmp;
+  }
+
   duckdb::Value agg_value(const AggInstance &spec, const AggState &s) const {
+    std::multiset<duckdb::Value> spill_tmp;
+    const std::multiset<duckdb::Value> &values = values_of(s, spill_tmp);
     switch (spec.fn) {
     case PlanAggSpec::Fn::COUNT_STAR:
     case PlanAggSpec::Fn::COUNT:
@@ -982,11 +1023,11 @@ private:
     }
     case PlanAggSpec::Fn::MIN:
     case PlanAggSpec::Fn::FIRST:
-      return s.values.empty() ? duckdb::Value(spec.return_type)
-                              : *s.values.begin();
+      return values.empty() ? duckdb::Value(spec.return_type)
+                              : *values.begin();
     case PlanAggSpec::Fn::MAX:
-      return s.values.empty() ? duckdb::Value(spec.return_type)
-                              : *s.values.rbegin();
+      return values.empty() ? duckdb::Value(spec.return_type)
+                              : *values.rbegin();
     case PlanAggSpec::Fn::STRING_AGG: {
       if (s.ordered.empty()) {
         return duckdb::Value(spec.return_type);
@@ -1005,18 +1046,18 @@ private:
     }
     case PlanAggSpec::Fn::MEDIAN:
     case PlanAggSpec::Fn::QUANTILE_CONT: {
-      if (s.values.empty()) {
+      if (values.empty()) {
         return duckdb::Value(spec.return_type);
       }
       // Interpolated quantile over the sorted multiset: position
       // q*(n-1) between neighbors lo and hi
       const double q =
           spec.fn == PlanAggSpec::Fn::MEDIAN ? 0.5 : spec.quantile;
-      const size_t n = s.values.size();
+      const size_t n = values.size();
       const double pos = q * static_cast<double>(n - 1);
       const size_t lo_idx = static_cast<size_t>(pos);
       const double frac = pos - static_cast<double>(lo_idx);
-      auto it = s.values.begin();
+      auto it = values.begin();
       std::advance(it, lo_idx);
       const duckdb::Value lo = *it;
       if (frac == 0.0 || lo_idx + 1 >= n) {
@@ -1031,31 +1072,31 @@ private:
           .DefaultCastAs(spec.return_type);
     }
     case PlanAggSpec::Fn::QUANTILE_DISC: {
-      if (s.values.empty()) {
+      if (values.empty()) {
         return duckdb::Value(spec.return_type);
       }
       // Discrete quantile: element at ceil(q*n)-1 (DuckDB semantics)
-      const size_t n = s.values.size();
+      const size_t n = values.size();
       size_t idx = static_cast<size_t>(
           std::ceil(spec.quantile * static_cast<double>(n)));
       idx = idx > 0 ? idx - 1 : 0;
       if (idx >= n) {
         idx = n - 1;
       }
-      auto it = s.values.begin();
+      auto it = values.begin();
       std::advance(it, idx);
       return it->DefaultCastAs(spec.return_type);
     }
     case PlanAggSpec::Fn::MAD: {
-      if (s.values.empty()) {
+      if (values.empty()) {
         return duckdb::Value(spec.return_type);
       }
       // Median absolute deviation: median(|x - median(x)|), both medians
       // interpolated (DuckDB semantics). Deviations come out sorted by
       // merging the two halves around the median.
       std::vector<double> vals;
-      vals.reserve(s.values.size());
-      for (const auto &v : s.values) {
+      vals.reserve(values.size());
+      for (const auto &v : values) {
         vals.push_back(v.DefaultCastAs(duckdb::LogicalType::DOUBLE)
                            .GetValue<double>());
       }

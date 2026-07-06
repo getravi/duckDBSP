@@ -1905,3 +1905,27 @@ TEST_CASE("planner N3: local (unshareable) join index spills",
   runDifferentialTwoTables(db, "v_lidx2", sql2, 821);
   db.exec("SELECT * FROM dbsp_spill(false)");
 }
+
+TEST_CASE("planner N4: oversized holistic group spills its values",
+          "[integration][planner][spill][biggroup]") {
+  DuckDBTestHarness db;
+  db.exec("CREATE TABLE bg (id INT, x INT)");
+  db.exec("SELECT * FROM dbsp_track('bg')");
+  db.exec("SELECT * FROM dbsp_sync('bg')");
+  db.exec("SELECT * FROM dbsp_spill(true)");
+
+  // One giant group: 70k values crosses the 65536-value threshold and
+  // migrates the multiset to disk mid-stream
+  const std::string sql = "SELECT MEDIAN(x), MIN(x), MAX(x) FROM bg";
+  db.exec("SELECT * FROM dbsp_create_view('v_bg', '" + sql + "')");
+  db.exec("INSERT INTO bg SELECT i, i * 7 % 100000 FROM range(70000) s(i)");
+  db.exec("SELECT * FROM dbsp_sync('bg')");
+  requireViewMatchesQuery(db, "v_bg", sql);
+
+  // Post-migration deltas hit the spilled path; deletions included
+  db.exec("DELETE FROM bg WHERE id % 9 = 0");
+  db.exec("INSERT INTO bg SELECT 100000 + i, i FROM range(500) s(i)");
+  db.exec("SELECT * FROM dbsp_sync('bg')");
+  requireViewMatchesQuery(db, "v_bg", sql);
+  db.exec("SELECT * FROM dbsp_spill(false)");
+}
