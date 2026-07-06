@@ -28,6 +28,9 @@ ORDER BY / LIMIT / OFFSET (constant).
 expression to a column in an inner view first, then window over the
 column.
 
-**Order-sensitive aggregate functions (string_agg, array_agg, ...)** —
-not yet translated; ORDER BY inside the supported order-insensitive
-aggregates (SUM/COUNT/AVG/MIN/MAX) is accepted and ignored.
+**string_agg / array_agg without ORDER BY** — add an ORDER BY inside
+the aggregate (e.g. `string_agg(x, ',' ORDER BY x)`). Unordered results
+follow DuckDB's scan order, which cannot be reproduced incrementally.
+Ties on the order keys are broken by value; use unique keys for exact
+DuckDB parity. ORDER BY inside the order-insensitive aggregates
+(SUM/COUNT/AVG/MIN/MAX) is accepted and ignored.

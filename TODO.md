@@ -12,7 +12,9 @@ subsystem, bespoke parser, standalone Z-set spilling).
 - WITH RECURSIVE ... USING KEY
 - Non-constant / percentage LIMIT
 - Window ORDER BY / PARTITION BY over expressions (project first)
-- Order-sensitive aggregate functions (string_agg, array_agg, ...)
+- string_agg/array_agg WITHOUT ORDER BY inside the aggregate (result
+  order unreproducible incrementally; the ordered forms are supported —
+  ties on order keys break by value, not input order)
 
 ## Performance
 

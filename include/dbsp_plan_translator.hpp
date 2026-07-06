@@ -323,11 +323,29 @@ private:
 
 // One aggregate within an AGGREGATE spec (B2)
 struct PlanAggSpec {
-  enum class Fn { COUNT_STAR, COUNT, SUM, AVG, MIN, MAX, FIRST };
+  enum class Fn {
+    COUNT_STAR,
+    COUNT,
+    SUM,
+    AVG,
+    MIN,
+    MAX,
+    FIRST,
+    STRING_AGG, // order-sensitive: requires ORDER BY inside the aggregate
+    ARRAY_AGG
+  };
+
+  struct OrderKey {
+    const duckdb::Expression *expr = nullptr;
+    bool ascending = true;
+    bool nulls_first = false;
+  };
 
   Fn fn;
   const duckdb::Expression *arg = nullptr; // null for COUNT_STAR
   const duckdb::Expression *filter = nullptr; // FILTER (WHERE ...) clause
+  std::vector<OrderKey> order_keys; // STRING_AGG/ARRAY_AGG
+  std::string separator = ",";      // STRING_AGG
   bool distinct = false;                   // COUNT/SUM/AVG(DISTINCT x)
   bool integer_arg = false;                // SUM/AVG: int64 vs double sum
   bool decimal_arg = false; // SUM over DECIMAL: exact unscaled hugeint sum
@@ -570,6 +588,11 @@ public:
     bool decimal_arg = false;
     uint8_t decimal_scale = 0;
     duckdb::LogicalType return_type;
+    // Order-sensitive aggregates: batch slots of the ORDER BY keys +
+    // their direction/null placement; STRING_AGG separator
+    std::vector<int> order_idxs;
+    std::vector<std::pair<bool, bool>> order_dirs; // (ascending, nulls_first)
+    std::string separator;
   };
 
   // exprs layout in the shared batch evaluator: group keys first, then
@@ -717,6 +740,10 @@ private:
     // DISTINCT: per-value weights; contributions fire on presence
     // transitions (0→>0 adds the value once, >0→0 retracts it)
     std::map<duckdb::Value, int64_t> dvals;
+    // Order-sensitive aggregates: (order keys, value) kept sorted; the
+    // whole aggregate re-renders from this on every group change
+    std::vector<std::pair<std::vector<duckdb::Value>, duckdb::Value>>
+        ordered;
   };
 
   struct GroupState {
@@ -745,6 +772,46 @@ private:
         continue;
       }
       const duckdb::Value &v = args[static_cast<size_t>(spec.arg_idx)];
+      if (spec.fn == PlanAggSpec::Fn::STRING_AGG ||
+          spec.fn == PlanAggSpec::Fn::ARRAY_AGG) {
+        // string_agg skips NULLs; array_agg keeps them (DuckDB semantics)
+        if (v.IsNull() && spec.fn == PlanAggSpec::Fn::STRING_AGG) {
+          continue;
+        }
+        std::vector<duckdb::Value> okeys;
+        okeys.reserve(spec.order_idxs.size());
+        for (int oi : spec.order_idxs) {
+          okeys.push_back(args[static_cast<size_t>(oi)]);
+        }
+        std::pair<std::vector<duckdb::Value>, duckdb::Value> entry{
+            std::move(okeys), v};
+        auto cmp = [&spec, this](const decltype(entry) &a,
+                                 const decltype(entry) &b) {
+          return ordered_less(spec, a, b);
+        };
+        if (weight > 0) {
+          for (int64_t w = 0; w < weight; w++) {
+            auto it = std::upper_bound(s.ordered.begin(), s.ordered.end(),
+                                       entry, cmp);
+            s.ordered.insert(it, entry);
+          }
+        } else {
+          for (int64_t w = 0; w < -weight; w++) {
+            auto range = std::equal_range(s.ordered.begin(),
+                                          s.ordered.end(), entry, cmp);
+            // Erase one exact match (order keys AND value equal)
+            for (auto it = range.first; it != range.second; ++it) {
+              if (it->second.IsNull() == entry.second.IsNull() &&
+                  (it->second.IsNull() || !(it->second < entry.second) &&
+                                              !(entry.second < it->second))) {
+                s.ordered.erase(it);
+                break;
+              }
+            }
+          }
+        }
+        continue;
+      }
       if (v.IsNull()) {
         continue; // SQL: NULL arguments are ignored
       }
@@ -821,6 +888,39 @@ private:
     }
   }
 
+  // Sort order for order-sensitive aggregate entries: the declared ORDER
+  // BY keys (direction + null placement per key), then the value itself
+  // as a deterministic tiebreak. duckdb::Value::operator< cannot compare
+  // NULLs, so NULL handling comes first at every step.
+  static bool value_less(const duckdb::Value &a, const duckdb::Value &b,
+                         bool ascending, bool nulls_first) {
+    const bool an = a.IsNull(), bn = b.IsNull();
+    if (an || bn) {
+      if (an && bn) {
+        return false;
+      }
+      return an ? nulls_first : !nulls_first;
+    }
+    return ascending ? a < b : b < a;
+  }
+
+  bool ordered_less(
+      const AggInstance &spec,
+      const std::pair<std::vector<duckdb::Value>, duckdb::Value> &a,
+      const std::pair<std::vector<duckdb::Value>, duckdb::Value> &b) const {
+    for (size_t k = 0; k < spec.order_dirs.size(); k++) {
+      const auto &[asc, nf] = spec.order_dirs[k];
+      if (value_less(a.first[k], b.first[k], asc, nf)) {
+        return true;
+      }
+      if (value_less(b.first[k], a.first[k], asc, nf)) {
+        return false;
+      }
+    }
+    // Tiebreak on the value (ascending, NULLs last) for determinism
+    return value_less(a.second, b.second, true, false);
+  }
+
   duckdb::Value agg_value(const AggInstance &spec, const AggState &s) const {
     switch (spec.fn) {
     case PlanAggSpec::Fn::COUNT_STAR:
@@ -853,6 +953,35 @@ private:
     case PlanAggSpec::Fn::MAX:
       return s.values.empty() ? duckdb::Value(spec.return_type)
                               : *s.values.rbegin();
+    case PlanAggSpec::Fn::STRING_AGG: {
+      if (s.ordered.empty()) {
+        return duckdb::Value(spec.return_type);
+      }
+      std::string out;
+      bool first = true;
+      for (const auto &[keys, v] : s.ordered) {
+        if (!first) {
+          out += spec.separator;
+        }
+        out += v.DefaultCastAs(duckdb::LogicalType::VARCHAR)
+                   .GetValue<std::string>();
+        first = false;
+      }
+      return duckdb::Value(out);
+    }
+    case PlanAggSpec::Fn::ARRAY_AGG: {
+      if (s.ordered.empty()) {
+        return duckdb::Value(spec.return_type);
+      }
+      duckdb::vector<duckdb::Value> vals;
+      vals.reserve(s.ordered.size());
+      for (const auto &[keys, v] : s.ordered) {
+        vals.push_back(v);
+      }
+      return duckdb::Value::LIST(
+          duckdb::ListType::GetChildType(spec.return_type),
+          std::move(vals));
+    }
     }
     return duckdb::Value(spec.return_type);
   }
@@ -2377,6 +2506,7 @@ private:
         inst.decimal_scale = agg_spec.decimal_scale;
         inst.return_type = agg_spec.return_type;
         inst.distinct = agg_spec.distinct;
+        inst.separator = agg_spec.separator;
         if (agg_spec.arg) {
           inst.arg_idx = static_cast<int>(arg_exprs.size());
           arg_exprs.push_back(agg_spec.arg);
@@ -2384,6 +2514,11 @@ private:
         if (agg_spec.filter) {
           inst.filter_idx = static_cast<int>(arg_exprs.size());
           arg_exprs.push_back(agg_spec.filter);
+        }
+        for (const auto &key : agg_spec.order_keys) {
+          inst.order_idxs.push_back(static_cast<int>(arg_exprs.size()));
+          inst.order_dirs.emplace_back(key.ascending, key.nulls_first);
+          arg_exprs.push_back(key.expr);
         }
         aggs.push_back(std::move(inst));
       }
@@ -3075,6 +3210,11 @@ private:
           // the input there is a single row, so any deterministic pick
           // (smallest value) is exact
           agg_spec.fn = PlanAggSpec::Fn::FIRST;
+        } else if (fn == "string_agg" || fn == "group_concat" ||
+                   fn == "listagg") {
+          agg_spec.fn = PlanAggSpec::Fn::STRING_AGG;
+        } else if (fn == "array_agg" || fn == "list") {
+          agg_spec.fn = PlanAggSpec::Fn::ARRAY_AGG;
         } else {
           unsupported("aggregate function " + fn);
           return false;
@@ -3088,6 +3228,54 @@ private:
         }
         // ORDER BY inside COUNT/SUM/AVG/MIN/MAX is semantically inert
         // (order-insensitive aggregates) — accept and ignore
+
+        if (agg_spec.fn == PlanAggSpec::Fn::STRING_AGG ||
+            agg_spec.fn == PlanAggSpec::Fn::ARRAY_AGG) {
+          // Without an internal ORDER BY the result order is whatever
+          // DuckDB's scan produced — unreproducible incrementally after
+          // deletes/reinserts. Deterministic subset only.
+          if (!agg.order_bys || agg.order_bys->orders.empty()) {
+            unsupported(fn + " without ORDER BY inside the aggregate "
+                             "(add e.g. " + fn + "(x ORDER BY x))");
+            return false;
+          }
+          if (agg_spec.distinct) {
+            unsupported("DISTINCT on " + fn);
+            return false;
+          }
+          for (const auto &o : agg.order_bys->orders) {
+            PlanAggSpec::OrderKey key;
+            key.expr = o.expression.get();
+            key.ascending = o.type != duckdb::OrderType::DESCENDING;
+            key.nulls_first =
+                o.null_order == duckdb::OrderByNullType::NULLS_FIRST;
+            agg_spec.order_keys.push_back(key);
+          }
+          if (agg_spec.fn == PlanAggSpec::Fn::STRING_AGG &&
+              agg.bind_info) {
+            // DuckDB's bind erases the separator argument and stores it
+            // in a TU-local StringAggBindData { string sep; }. The engine
+            // is pinned (v1.5.4, built in-tree), so a layout mirror is
+            // safe; sep is the sole member after the FunctionData base.
+            struct SeparatorMirror : public duckdb::FunctionData {
+              std::string sep;
+              duckdb::unique_ptr<duckdb::FunctionData>
+              Copy() const override {
+                return nullptr;
+              }
+              bool Equals(const duckdb::FunctionData &) const override {
+                return false;
+              }
+            };
+            agg_spec.separator =
+                reinterpret_cast<const SeparatorMirror *>(
+                    agg.bind_info.get())
+                    ->sep;
+          }
+          agg_spec.arg = agg.children[0].get();
+          out.push_back(std::move(agg_spec));
+          continue;
+        }
 
         if (agg_spec.fn != PlanAggSpec::Fn::COUNT_STAR) {
           if (agg.children.size() != 1) {

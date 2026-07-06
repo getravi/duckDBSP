@@ -1439,3 +1439,83 @@ TEST_CASE("planner J: ROLLUP over join with DISTINCT agg",
   requireViewMatchesQuery(db, "v_rolljoin", sql);
   runDifferentialTwoTables(db, "v_rolljoin", sql, 251);
 }
+
+// ---------------------------------------------------------------------------
+// Phase J2: order-sensitive aggregates (string_agg / array_agg)
+// ---------------------------------------------------------------------------
+
+namespace {
+std::string escapeSql(const std::string &sql) {
+  std::string out = sql;
+  for (size_t pos = 0; (pos = out.find('\'', pos)) != std::string::npos;
+       pos += 2) {
+    out.insert(pos, 1, '\'');
+  }
+  return out;
+}
+} // namespace
+
+TEST_CASE("planner J2: string_agg ORDER BY differential",
+          "[integration][planner][orderagg]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  // id is unique → deterministic order, matches DuckDB exactly
+  const std::string sql =
+      "SELECT tag, STRING_AGG(CAST(val AS VARCHAR), '|' ORDER BY id) "
+      "FROM t GROUP BY tag";
+  db.exec("SELECT * FROM dbsp_create_view('v_sagg', '" + escapeSql(sql) +
+          "')");
+  requireViewMatchesQuery(db, "v_sagg", sql);
+  runDifferential(db, "v_sagg", sql, 307);
+}
+
+TEST_CASE("planner J2: string_agg DESC + NULLS FIRST key differential",
+          "[integration][planner][orderagg]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  const std::string sql =
+      "SELECT tag, STRING_AGG(CAST(id AS VARCHAR) ORDER BY val DESC "
+      "NULLS FIRST, id) FROM t GROUP BY tag";
+  db.exec("SELECT * FROM dbsp_create_view('v_saggd', '" + escapeSql(sql) +
+          "')");
+  requireViewMatchesQuery(db, "v_saggd", sql);
+  runDifferential(db, "v_saggd", sql, 311);
+}
+
+TEST_CASE("planner J2: array_agg ORDER BY differential (keeps NULLs)",
+          "[integration][planner][orderagg]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  // val includes NULLs from the generator — array_agg must keep them
+  const std::string sql =
+      "SELECT tag, ARRAY_AGG(val ORDER BY id) FROM t GROUP BY tag";
+  db.exec("SELECT * FROM dbsp_create_view('v_aagg', '" + escapeSql(sql) +
+          "')");
+  requireViewMatchesQuery(db, "v_aagg", sql);
+  runDifferential(db, "v_aagg", sql, 313);
+}
+
+TEST_CASE("planner J2: string_agg with FILTER, global",
+          "[integration][planner][orderagg]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  const std::string sql =
+      "SELECT STRING_AGG(CAST(id AS VARCHAR) ORDER BY id) "
+      "FILTER (WHERE val > 40) FROM t";
+  db.exec("SELECT * FROM dbsp_create_view('v_saggf', '" + escapeSql(sql) +
+          "')");
+  requireViewMatchesQuery(db, "v_saggf", sql);
+  runDifferential(db, "v_saggf", sql, 317);
+}
+
+TEST_CASE("planner J2: unordered string_agg stays rejected",
+          "[integration][planner][orderagg]") {
+  DuckDBTestHarness db;
+  setupTable(db);
+  auto result = db.query(
+      "SELECT * FROM dbsp_create_view('v_bad', "
+      "'SELECT tag, STRING_AGG(CAST(val AS VARCHAR)) FROM t GROUP BY tag')");
+  REQUIRE(result->HasError());
+  REQUIRE(result->GetError().find("DBSP-E110") != std::string::npos);
+  REQUIRE(result->GetError().find("ORDER BY") != std::string::npos);
+}

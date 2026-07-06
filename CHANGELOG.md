@@ -1,5 +1,21 @@
 # Changelog
 
+## Phase J2: Order-sensitive aggregates - Jul 2026
+
+- string_agg (+ group_concat/listagg aliases) and array_agg (+ list
+  alias) with a REQUIRED ORDER BY inside the aggregate. Per group the
+  node keeps (order keys, value) entries sorted by the declared keys
+  (direction and null placement honored) with the value as a
+  deterministic tiebreak; any group change re-renders the aggregate.
+  string_agg skips NULL values, array_agg keeps them; custom separators
+  read from DuckDB's bind data (the binder erases the separator
+  argument). FILTER combines freely. Unordered string_agg/array_agg
+  remain DBSP-E110 — DuckDB's scan order is unreproducible after
+  incremental deletes/reinserts — with the error suggesting the ORDER BY
+  rewrite. Ties on the order keys are broken by value, which can differ
+  from DuckDB's input-order tiebreak; use unique order keys for exact
+  parity.
+
 ## Phase J: Grouping sets & aggregate modifiers - Jul 2026
 
 - ROLLUP / CUBE / GROUPING SETS: the planner translates N grouping sets
