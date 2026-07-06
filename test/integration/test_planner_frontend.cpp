@@ -1155,13 +1155,13 @@ TEST_CASE("planner I1: identical join sides share one arrangement",
   db.exec("SELECT * FROM dbsp_create_view('v_arr2', '" + sql1 + "')");
   REQUIRE(mgr.shared_arrangement_count() == base + 2);
 
-  // Different column needs → different projected row shapes → separate
-  // arrangements on both sides (fingerprint includes the side's column
-  // projection)
+  // O4: DIFFERENT column needs still share — arrangements hold full
+  // rows with canonical (full-table-space) key fingerprints; each
+  // consumer projects bucket rows to its own shape at probe time
   const std::string sql3 =
       "SELECT t.tag, u.tag FROM t JOIN u ON t.id = u.id WHERE t.val > 20";
   db.exec("SELECT * FROM dbsp_create_view('v_arr3', '" + sql3 + "')");
-  REQUIRE(mgr.shared_arrangement_count() == base + 4);
+  REQUIRE(mgr.shared_arrangement_count() == base + 2);
 
   requireViewMatchesQuery(db, "v_arr1", sql1);
   requireViewMatchesQuery(db, "v_arr2", sql1);

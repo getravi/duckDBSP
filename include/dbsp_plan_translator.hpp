@@ -1244,8 +1244,10 @@ struct SharedArrangement {
     return digest_bytes(bytes.data(), bytes.size());
   }
 
-  // Fill `out` with the bucket for `key`; false when absent
-  bool probe_spilled(const DuckDBRow &key, RowWeights &out) const {
+  // Fill `out` with the bucket for `key` (projected through `proj` when
+  // given — O4 consumers see their own column shape); false when absent
+  bool probe_spilled(const DuckDBRow &key, RowWeights &out,
+                     const std::vector<duckdb::idx_t> *proj = nullptr) const {
     out.clear();
     std::lock_guard<std::mutex> guard(spill_probe_mutex);
     const auto *bucket = spilled->probe(digest_of_row(key));
@@ -1254,9 +1256,39 @@ struct SharedArrangement {
     }
     for (const auto &[vals, w] : *bucket) {
       DuckDBRow row;
-      std::vector<duckdb::Value> copy = vals;
+      std::vector<duckdb::Value> copy;
+      if (proj) {
+        copy.reserve(proj->size());
+        for (auto idx : *proj) {
+          copy.push_back(idx < vals.size() ? vals[idx] : duckdb::Value());
+        }
+      } else {
+        copy = vals;
+      }
       row.columns.assign(std::move(copy));
-      out.emplace(std::move(row), w);
+      out[std::move(row)] += w; // projection can collapse distinct rows
+    }
+    return true;
+  }
+
+  // O4: RAM-resident arrangement probe with consumer projection
+  bool probe_projected(const DuckDBRow &key, RowWeights &out,
+                       const std::vector<duckdb::idx_t> &proj) const {
+    out.clear();
+    auto it = index.find(key);
+    if (it == index.end()) {
+      return false;
+    }
+    for (const auto &[row, w] : it->second) {
+      DuckDBRow projected;
+      std::vector<duckdb::Value> vals;
+      vals.reserve(proj.size());
+      for (auto idx : proj) {
+        vals.push_back(idx < row.columns.size() ? row.columns[idx]
+                                                : duckdb::Value());
+      }
+      projected.columns.assign(std::move(vals));
+      out[std::move(projected)] += w; // collapse under projection
     }
     return true;
   }
@@ -1435,9 +1467,15 @@ struct ArrangementRequest {
   bool null_safe = false;
   bool track_weights = false;
   bool track_counters = false;
+  // Key expressions REMAPPED into full-table column space (canonical
+  // across consumers with different projections); side_types = full
+  // table layout
   std::vector<const duckdb::Expression *> key_exprs;
   duckdb::vector<duckdb::LogicalType> side_types;
-  bool project = false; // side is MAP_COLS(SOURCE): project before indexing
+  // O4: consumer's projection applied to bucket rows at probe time
+  // (empty = identity, zero-copy fast path)
+  std::vector<duckdb::idx_t> consumer_projection;
+  bool project = false; // arrangement-side projection (unused since O4)
   std::vector<duckdb::idx_t> column_idxs;
   // Skip this table's init replay (the arrangement already holds full
   // state). For a both-sides-shared join only ONE side is skipped: the
@@ -1570,7 +1608,9 @@ public:
 
     if (shardable) {
       run_sharded_probe(kl, /*probe_left_side=*/false, shards_cfg);
-    } else if ((shared_right_ && shared_right_->is_spilled()) ||
+    } else if ((shared_right_ &&
+                (shared_right_->is_spilled() ||
+                 !shared_proj_right_.empty())) ||
                (!shared_right_ && local_spill_right_)) {
       for (size_t i = 0; i < kl.rows.size(); i++) {
         if (!kl.valid[i]) {
@@ -1605,7 +1645,9 @@ public:
     // L ⋈ Δr
     if (shardable) {
       run_sharded_probe(kr, /*probe_left_side=*/true, shards_cfg);
-    } else if ((shared_left_ && shared_left_->is_spilled()) ||
+    } else if ((shared_left_ &&
+                (shared_left_->is_spilled() ||
+                 !shared_proj_left_.empty())) ||
                (!shared_left_ && local_spill_left_)) {
       for (size_t i = 0; i < kr.rows.size(); i++) {
         if (!kr.valid[i]) {
@@ -1711,8 +1753,10 @@ public:
   const DuckDBZSet &output() const { return output_; }
 
   void set_shared_arrangement(bool left,
-                              std::shared_ptr<const SharedArrangement> arr) {
+                              std::shared_ptr<const SharedArrangement> arr,
+                              std::vector<duckdb::idx_t> projection = {}) {
     (left ? shared_left_ : shared_right_) = std::move(arr);
+    (left ? shared_proj_left_ : shared_proj_right_) = std::move(projection);
   }
 
 private:
@@ -1736,9 +1780,18 @@ private:
   // The pointer is valid until the next probe_side call on that side.
   const RowWeights *probe_side(bool left, const DuckDBRow &key) {
     const auto &sh = left ? shared_left_ : shared_right_;
+    const auto &proj = left ? shared_proj_left_ : shared_proj_right_;
     if (sh && sh->is_spilled()) {
       RowWeights &scratch = left ? probe_scratch_left_ : probe_scratch_right_;
-      return sh->probe_spilled(key, scratch) ? &scratch : nullptr;
+      return sh->probe_spilled(key, scratch,
+                               proj.empty() ? nullptr : &proj)
+                 ? &scratch
+                 : nullptr;
+    }
+    if (sh && !proj.empty()) {
+      // O4: arrangement holds full rows; project to this consumer's shape
+      RowWeights &scratch = left ? probe_scratch_left_ : probe_scratch_right_;
+      return sh->probe_projected(key, scratch, proj) ? &scratch : nullptr;
     }
     if (!sh) {
       SpilledBucketIndex *spill =
@@ -1897,10 +1950,18 @@ private:
     }
     const RowWeights *bucket;
     const auto &sh = probe_left_side ? shared_left_ : shared_right_;
+    const auto &proj =
+        probe_left_side ? shared_proj_left_ : shared_proj_right_;
     SpilledBucketIndex *lspill =
         probe_left_side ? local_spill_left_.get() : local_spill_right_.get();
     if (sh && sh->is_spilled() && scratch) {
-      bucket = sh->probe_spilled(dk.keys[i], *scratch) ? scratch : nullptr;
+      bucket = sh->probe_spilled(dk.keys[i], *scratch,
+                                 proj.empty() ? nullptr : &proj)
+                   ? scratch
+                   : nullptr;
+    } else if (sh && !proj.empty() && scratch) {
+      bucket = sh->probe_projected(dk.keys[i], *scratch, proj) ? scratch
+                                                               : nullptr;
     } else if (!sh && lspill && scratch) {
       // Local spilled index: LRU cache is node-private but shared across
       // shard threads — serialize via the node's spill probe mutex
@@ -2240,6 +2301,9 @@ private:
   // I1: at most one side reads a shared, CDC-maintained arrangement
   // (updated BEFORE views step, so it is post-delta for the current step)
   std::shared_ptr<const SharedArrangement> shared_left_, shared_right_;
+  // O4: consumer projections into the full-row arrangements (empty =
+  // identity = zero-copy fast path)
+  std::vector<duckdb::idx_t> shared_proj_left_, shared_proj_right_;
   RowWeights probe_scratch_left_, probe_scratch_right_;
   // N3: local indexes on disk for pure probe-target sides (spill mode)
   std::unique_ptr<SpilledBucketIndex> local_spill_left_, local_spill_right_;
@@ -2827,6 +2891,27 @@ public:
   }
 
 private:
+  // Rewrite BoundReference indexes from MAP_COLS output space back to
+  // full-table space (index i → column_idxs[i]); false when a ref points
+  // past the table (virtual column)
+  static bool remap_bound_refs(duckdb::Expression &expr,
+                               const std::vector<duckdb::idx_t> &idxs) {
+    if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+      auto &ref = expr.Cast<duckdb::BoundReferenceExpression>();
+      if (ref.index >= idxs.size()) {
+        return false;
+      }
+      ref.index = idxs[ref.index];
+      return true;
+    }
+    bool ok = true;
+    duckdb::ExpressionIterator::EnumerateChildren(
+        expr, [&](duckdb::Expression &child) {
+          ok = ok && remap_bound_refs(child, idxs);
+        });
+    return ok;
+  }
+
   void count_sources(const PlanOpSpec &spec) {
     if (spec.kind == PlanOpSpec::Kind::SOURCE) {
       source_refs_[spec.table]++;
@@ -2887,13 +2972,17 @@ private:
         continue;
       }
       const PlanOpSpec &side = *spec.children[left_side ? 0 : 1];
-      const auto &key_exprs = left_side ? lkeys : rkeys;
+      const auto &side_keys = left_side ? lkeys : rkeys;
+      const PlanOpSpec *src = scan_of(side);
 
       ArrangementRequest req;
-      req.table = scan_of(side)->table;
+      req.table = src->table;
+      // O4: arrangements store FULL table rows; MAP_COLS consumers
+      // project bucket rows at probe time and their key expressions are
+      // remapped into full-table space, so views with different column
+      // needs share one arrangement
       if (side.kind == PlanOpSpec::Kind::MAP_COLS) {
-        req.project = true;
-        req.column_idxs = side.column_idxs;
+        req.consumer_projection = side.column_idxs;
       }
       req.left_side = left_side;
       req.init_skip = !(left_side && right_ok);
@@ -2904,8 +2993,24 @@ private:
       req.track_weights = false;
       req.track_counters =
           !left_side && spec.join_type == duckdb::JoinType::MARK;
-      req.key_exprs = key_exprs;
-      req.side_types = left_side ? spec.left_types : spec.right_types;
+      bool remap_ok = true;
+      if (req.consumer_projection.empty()) {
+        req.key_exprs = side_keys;
+      } else {
+        for (const auto *e : side_keys) {
+          auto copy = e->Copy();
+          if (!remap_bound_refs(*copy, req.consumer_projection)) {
+            remap_ok = false; // key reads a virtual column — don't share
+            break;
+          }
+          req.key_exprs.push_back(copy.get());
+          keep_alive_->rewritten_exprs.push_back(std::move(copy));
+        }
+      }
+      if (!remap_ok) {
+        continue;
+      }
+      req.side_types = src->input_types;
       req.keep_alive = keep_alive_;
       req.node = node;
       finish_request(std::move(req));
@@ -2918,11 +3023,7 @@ private:
     fp += req.null_safe ? "|ns1" : "|ns0";
     fp += req.track_weights ? "|w1" : "|w0";
     fp += req.track_counters ? "|c1" : "|c0";
-    fp += "|p";
-    for (auto idx : req.column_idxs) {
-      fp += std::to_string(idx);
-      fp += ",";
-    }
+    // O4: no projection component — keys are canonical full-space
     for (const auto *e : key_exprs) {
       fp += "|";
       fp += e->ToString();
@@ -4579,6 +4680,9 @@ private:
       auto source = std::make_unique<PlanOpSpec>();
       source->kind = PlanOpSpec::Kind::SOURCE;
       source->table = table_entry->name;
+      // Full-table layout (CDC row shape) — arrangement key remapping
+      // needs it (O4 cross-projection sharing)
+      source->input_types = op.returned_types;
 
       // CDC rows carry ALL table columns in declared order; GET's output is
       // column_ids order. Emit an index-selection map unless it's identity.

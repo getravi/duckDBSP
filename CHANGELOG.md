@@ -1,5 +1,23 @@
 # Changelog
 
+## Phase O4: Cross-projection arrangement sharing - Jul 2026
+
+- Views needing DIFFERENT column subsets of the same join side now
+  share one arrangement. Arrangements store full table rows; each
+  consumer's key expressions are remapped into full-table column space
+  (BoundReference index rewrite, clones pinned in PlanKeepAlive) so
+  fingerprints canonicalize across projections, and each consumer
+  projects bucket rows to its own shape at probe time. Bare-scan
+  consumers (identity projection) keep the zero-copy hoisted fast path.
+  Projection can collapse distinct full rows to equal projected rows -
+  probe materialization ACCUMULATES weights (the differential caught an
+  emplace that silently dropped the second copy). Keys reading virtual
+  columns skip sharing.
+- Perf gate (rollback condition): projected probes 55.7ms vs identity
+  54.8ms per sync on the 8-view bench (~noise), vs 68.5ms when the same
+  views needed 9 private arrangements - 9 -> 2 arrangements AND ~19%
+  faster. Standard benches untouched. Kept.
+
 ## Phase N: RAM-state closeout - Jul 2026
 
 Four items, individually committed for per-item rollback; default-path

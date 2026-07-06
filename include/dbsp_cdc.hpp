@@ -684,7 +684,8 @@ public:
         arrangements_[req.fingerprint] = arr;
         arrangements_by_table_[req.table].push_back(arr);
       }
-      req.node->set_shared_arrangement(req.left_side, arr);
+      req.node->set_shared_arrangement(req.left_side, arr,
+                                       req.consumer_projection);
       if (req.init_skip) {
         pview.mark_shared_init_skip(req.table);
       }

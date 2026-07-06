@@ -67,8 +67,10 @@ subsystem, bespoke parser, standalone Z-set spilling).
   ORDER BY / window views (the answer IS the total order), and
   percentage-limit views (cutoff needs total count — could bound with a
   count-only overflow later).
-- Cross-projection arrangement sharing excluded by decision (emit-path
-  perf risk; L2 hoisting incident showed the loop's sensitivity).
+- Cross-projection arrangement sharing shipped (O4): full-row
+  arrangements + canonical key fingerprints + probe-time consumer
+  projection; bench-gated (no regression). Fingerprints no longer
+  include projections.
 
 - CDCManager is a deliberately leaked process-wide singleton (views pin
   the DatabaseInstance; instance-scoped ownership would be a reference

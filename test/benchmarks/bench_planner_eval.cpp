@@ -264,11 +264,11 @@ TEST_CASE("Benchmark: shared vs private join arrangements",
       db.exec("SELECT * FROM dbsp_create_view('bv" + std::to_string(v) +
               "', '" + sql + "')");
     }
-    // Both join sides share since I1b: identical views hold l + r
-    // arrangements (2); distinct projections split only the r side
-    // (kViews r-side + 1 shared l-side)
+    // O4: distinct projections share too — both variants hold exactly
+    // l + r arrangements. The shared=false variant measures projected
+    // probes (each view reshapes bucket rows) vs identity probes.
     const size_t arrs = mgr.shared_arrangement_count();
-    REQUIRE(arrs == (shared ? 2u : static_cast<size_t>(kViews) + 1));
+    REQUIRE(arrs == 2u);
 
     db.exec("INSERT INTO r SELECT i, i, i, i, i, i, i, i, i FROM range(" +
             std::to_string(kBase) + ", " +
@@ -285,10 +285,10 @@ TEST_CASE("Benchmark: shared vs private join arrangements",
   double parallel_us = run(true, /*parallel=*/true);
   mgr.set_parallel_sync(false);
   std::cout << "[bench] " << kViews << " views, " << kDelta
-            << "-row delta into " << kBase << "-row probe side: shared (2 "
-            "arrangements) " << shared_us << " us; private (" << kViews
-            << "+1 arrangements) " << private_us << " us; shared+parallel "
-            << parallel_us << " us\n";
+            << "-row delta into " << kBase << "-row probe side: identity "
+            "probes " << shared_us << " us; projected probes (O4) "
+            << private_us << " us; identity+parallel " << parallel_us
+            << " us\n";
 }
 
 #include <sys/resource.h>
