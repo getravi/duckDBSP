@@ -144,7 +144,7 @@ SourceNode per base table) covering:
   FILTER (WHERE ...) modifiers maintain incrementally (value-weight
   presence transitions / per-aggregate predicate slots); ordered
   STRING_AGG/ARRAY_AGG re-render from sorted per-group entries; holistic
-  MEDIAN/QUANTILE_CONT/QUANTILE_DISC read the sorted multiset, MODE
+  MEDIAN/QUANTILE_CONT/QUANTILE_DISC/MAD read the sorted multiset, MODE
   per-value multiplicities (ties break by smallest value).
   ROLLUP/CUBE/GROUPING SETS fan out into one aggregate branch per
   grouping set (typed-NULL pads + constant GROUPING() masks) unioned
