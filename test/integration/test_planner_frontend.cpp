@@ -449,8 +449,8 @@ TEST_CASE("planner frontend: dbsp_use_planner(false) no longer disables it",
 namespace {
 
 // True when the view was built by the planner frontend (no parser fallback)
-bool plannerBuilt(const std::string &view) {
-  const auto *v = dbsp_native::get_cdc_manager().get_view(view);
+bool plannerBuilt(DuckDBTestHarness &db, const std::string &view) {
+  const auto *v = db.manager().get_view(view);
   return dynamic_cast<const dbsp_native::PlannedCircuitView *>(v) != nullptr;
 }
 
@@ -478,7 +478,7 @@ TEST_CASE("planner C1: ORDER BY view scans in sorted order",
 
   const std::string sql = "SELECT val, id FROM st ORDER BY val DESC";
   db.exec("SELECT * FROM dbsp_create_view('v_sorted', '" + sql + "')");
-  REQUIRE(plannerBuilt("v_sorted"));
+  REQUIRE(plannerBuilt(db, "v_sorted"));
 
   REQUIRE(scanColumn0(db, "v_sorted") == std::vector<int64_t>{30, 20, 10});
 
@@ -504,7 +504,7 @@ TEST_CASE("planner C1: ORDER BY on column dropped from output",
   // must fold into the sort view so scan order still follows val
   const std::string sql = "SELECT id FROM st2 ORDER BY val DESC";
   db.exec("SELECT * FROM dbsp_create_view('v_sorted_drop', '" + sql + "')");
-  REQUIRE(plannerBuilt("v_sorted_drop"));
+  REQUIRE(plannerBuilt(db, "v_sorted_drop"));
   REQUIRE(scanColumn0(db, "v_sorted_drop") == std::vector<int64_t>{1, 3, 2});
 }
 
@@ -518,7 +518,7 @@ TEST_CASE("planner C1: LIMIT with ORDER BY maintains top-k incrementally",
 
   const std::string sql = "SELECT id FROM lt ORDER BY val DESC, id LIMIT 2";
   db.exec("SELECT * FROM dbsp_create_view('v_top2', '" + sql + "')");
-  REQUIRE(plannerBuilt("v_top2"));
+  REQUIRE(plannerBuilt(db, "v_top2"));
   REQUIRE(scanColumn0(db, "v_top2") == std::vector<int64_t>{1, 3}); // 30, 20
 
   // New max displaces the tail
@@ -542,7 +542,7 @@ TEST_CASE("planner C1: bare LIMIT/OFFSET", "[integration][planner][limit]") {
 
   const std::string sql = "SELECT id FROM bt LIMIT 3 OFFSET 1";
   db.exec("SELECT * FROM dbsp_create_view('v_lim', '" + sql + "')");
-  REQUIRE(plannerBuilt("v_lim"));
+  REQUIRE(plannerBuilt(db, "v_lim"));
   db.assertViewRowCount("v_lim", 3);
 }
 
@@ -559,7 +559,7 @@ TEST_CASE("planner C1: percentage LIMIT is not planner-built",
   auto res = db.query("SELECT * FROM dbsp_create_view('v_pct', "
                       "'SELECT id FROM pt LIMIT 50%')");
   REQUIRE_FALSE(res->HasError());
-  REQUIRE(plannerBuilt("v_pct"));
+  REQUIRE(plannerBuilt(db, "v_pct"));
   auto expected = db.query("SELECT COUNT(*) FROM (SELECT id FROM pt "
                            "LIMIT 50%)");
   auto actual = db.query("SELECT COUNT(*) FROM dbsp_query('v_pct')");
@@ -576,7 +576,7 @@ TEST_CASE("planner C1: ORDER BY + LIMIT differential",
   const std::string sql =
       "SELECT id, val FROM t ORDER BY val DESC, id LIMIT 5";
   db.exec("SELECT * FROM dbsp_create_view('v_topk', '" + sql + "')");
-  REQUIRE(plannerBuilt("v_topk"));
+  REQUIRE(plannerBuilt(db, "v_topk"));
   requireViewMatchesQuery(db, "v_topk", sql);
   runDifferential(db, "v_topk", sql, 71);
 }
@@ -595,7 +595,7 @@ TEST_CASE("planner C2: recursive CTE UNION ALL",
       "WITH RECURSIVE r AS (SELECT id FROM seed UNION ALL "
       "SELECT id+1 FROM r WHERE id < 5) SELECT * FROM r";
   db.exec("SELECT * FROM dbsp_create_view('v_rec_all', '" + sql + "')");
-  REQUIRE(plannerBuilt("v_rec_all"));
+  REQUIRE(plannerBuilt(db, "v_rec_all"));
   db.assertViewRowCount("v_rec_all", 5); // 1..5
 
   db.exec("INSERT INTO seed VALUES (4)");
@@ -615,7 +615,7 @@ TEST_CASE("planner C2: recursive CTE UNION dedups across deltas",
       "WITH RECURSIVE r AS (SELECT id FROM seed2 UNION "
       "SELECT id+1 FROM r WHERE id < 5) SELECT * FROM r";
   db.exec("SELECT * FROM dbsp_create_view('v_rec_u', '" + sql + "')");
-  REQUIRE(plannerBuilt("v_rec_u"));
+  REQUIRE(plannerBuilt(db, "v_rec_u"));
   db.assertViewRowCount("v_rec_u", 5); // 1..5
 
   // 3,4,5 are already reachable: UNION must not double-count them even
@@ -640,7 +640,7 @@ TEST_CASE("planner C2: recursive CTE joining a second table",
       "UNION SELECT r.src, e.dst FROM reach r JOIN edges e ON r.dst = e.src) "
       "SELECT * FROM reach";
   db.exec("SELECT * FROM dbsp_create_view('v_reach', '" + sql + "')");
-  REQUIRE(plannerBuilt("v_reach"));
+  REQUIRE(plannerBuilt(db, "v_reach"));
   db.assertViewRowCount("v_reach", 3); // (1,2) (1,3) (1,4)
 
   db.exec("INSERT INTO edges VALUES (4, 5)");
@@ -662,7 +662,7 @@ TEST_CASE("planner C3: DISTINCT ON keeps winner per key",
   const std::string sql = "SELECT DISTINCT ON (tag) id, val FROM dt "
                           "ORDER BY tag, val DESC";
   db.exec("SELECT * FROM dbsp_create_view('v_don', '" + sql + "')");
-  REQUIRE(plannerBuilt("v_don"));
+  REQUIRE(plannerBuilt(db, "v_don"));
 
   // One winner per tag, scanned in tag order: 'a' -> id 2 (val 30 wins),
   // 'b' -> id 3
@@ -693,7 +693,7 @@ TEST_CASE("planner C3: DISTINCT ON differential",
   const std::string sql = "SELECT DISTINCT ON (tag) tag, val, id FROM t "
                           "ORDER BY tag, val DESC, id";
   db.exec("SELECT * FROM dbsp_create_view('v_don_diff', '" + sql + "')");
-  REQUIRE(plannerBuilt("v_don_diff"));
+  REQUIRE(plannerBuilt(db, "v_don_diff"));
   requireViewMatchesQuery(db, "v_don_diff", sql);
   runDifferential(db, "v_don_diff", sql, 83);
 }
@@ -702,9 +702,9 @@ TEST_CASE("planner C3: DISTINCT ON differential",
 
 namespace {
 
-size_t nodeCount(const std::string &view) {
+size_t nodeCount(DuckDBTestHarness &db, const std::string &view) {
   const auto *v = dynamic_cast<const dbsp_native::PlannedCircuitView *>(
-      dbsp_native::get_cdc_manager().get_view(view));
+      db.manager().get_view(view));
   REQUIRE(v != nullptr);
   return v->node_count();
 }
@@ -721,14 +721,14 @@ TEST_CASE("planner C4: filter+project fuse into one node",
 
   const std::string sql = "SELECT id FROM ot WHERE val > 10";
   db.exec("SELECT * FROM dbsp_create_view('v_fused', '" + sql + "')");
-  REQUIRE(plannerBuilt("v_fused"));
-  size_t fused = nodeCount("v_fused");
+  REQUIRE(plannerBuilt(db, "v_fused"));
+  size_t fused = nodeCount(db, "v_fused");
 
   // Same view without the IR optimizer: one extra node (filter + map split)
   dbsp_native::g_plan_ir_optimize = false;
   db.exec("SELECT * FROM dbsp_create_view('v_raw', '" + sql + "')");
   dbsp_native::g_plan_ir_optimize = true;
-  size_t raw = nodeCount("v_raw");
+  size_t raw = nodeCount(db, "v_raw");
   REQUIRE(fused < raw);
 
   // Identical behavior, incrementally too
@@ -753,15 +753,15 @@ TEST_CASE("planner C4: join filter pushdown keeps results exact",
       "SELECT pl.id FROM pl JOIN pr ON pl.id = pr.id "
       "WHERE pl.x > 10 AND pr.y < 5";
   db.exec("SELECT * FROM dbsp_create_view('v_pd', '" + sql + "')");
-  REQUIRE(plannerBuilt("v_pd"));
+  REQUIRE(plannerBuilt(db, "v_pd"));
 
   // Pushdown must actually fire: pushed-down plan has MORE nodes (two
   // filters below the join) than the unoptimized one (one filter above)
-  size_t pushed = nodeCount("v_pd");
+  size_t pushed = nodeCount(db, "v_pd");
   dbsp_native::g_plan_ir_optimize = false;
   db.exec("SELECT * FROM dbsp_create_view('v_pd_raw', '" + sql + "')");
   dbsp_native::g_plan_ir_optimize = true;
-  REQUIRE(pushed != nodeCount("v_pd_raw"));
+  REQUIRE(pushed != nodeCount(db, "v_pd_raw"));
 
   db.assertViewRowCount("v_pd", 1); // only id=2 passes both predicates
 
@@ -787,7 +787,7 @@ TEST_CASE("planner recursive: deleting the seed retracts derived rows",
       "WITH RECURSIVE r AS (SELECT id FROM rseed UNION ALL "
       "SELECT id+1 FROM r WHERE id < 5) SELECT * FROM r";
   db.exec("SELECT * FROM dbsp_create_view('v_rdel', '" + sql + "')");
-  REQUIRE(plannerBuilt("v_rdel"));
+  REQUIRE(plannerBuilt(db, "v_rdel"));
   db.assertViewRowCount("v_rdel", 6); // 1..5 from seed 1, plus 20
 
   // Deleting seed 1 must retract its whole derived chain
@@ -815,7 +815,7 @@ TEST_CASE("planner recursive: removing an edge shrinks the closure",
       "UNION SELECT r.src, e.dst FROM reach r JOIN redges e ON r.dst = e.src) "
       "SELECT * FROM reach";
   db.exec("SELECT * FROM dbsp_create_view('v_rreach', '" + sql + "')");
-  REQUIRE(plannerBuilt("v_rreach"));
+  REQUIRE(plannerBuilt(db, "v_rreach"));
   db.assertViewRowCount("v_rreach", 3); // (1,2)(1,3)(1,4)
   requireViewMatchesQuery(db, "v_rreach", sql);
 
@@ -842,7 +842,7 @@ TEST_CASE("planner D2: LEFT JOIN pads and unpads incrementally",
   const std::string sql =
       "SELECT ol.id, ol.x, orr.y FROM ol LEFT JOIN orr ON ol.id = orr.id";
   db.exec("SELECT * FROM dbsp_create_view('v_lj', '" + sql + "')");
-  REQUIRE(plannerBuilt("v_lj"));
+  REQUIRE(plannerBuilt(db, "v_lj"));
   requireViewMatchesQuery(db, "v_lj", sql); // (1,10,100), (2,20,NULL)
 
   // First match for id=2: NULL pad must retract
@@ -875,7 +875,7 @@ TEST_CASE("planner D2: LEFT JOIN differential",
   const std::string sql =
       "SELECT t.id, t.val, u.val FROM t LEFT JOIN u ON t.id = u.id";
   db.exec("SELECT * FROM dbsp_create_view('v_ljd', '" + sql + "')");
-  REQUIRE(plannerBuilt("v_ljd"));
+  REQUIRE(plannerBuilt(db, "v_ljd"));
   requireViewMatchesQuery(db, "v_ljd", sql);
   runDifferentialTwoTables(db, "v_ljd", sql, 611);
 }
@@ -889,7 +889,7 @@ TEST_CASE("planner D2: RIGHT JOIN differential",
   const std::string sql =
       "SELECT t.val, u.id, u.val FROM t RIGHT JOIN u ON t.id = u.id";
   db.exec("SELECT * FROM dbsp_create_view('v_rjd', '" + sql + "')");
-  REQUIRE(plannerBuilt("v_rjd"));
+  REQUIRE(plannerBuilt(db, "v_rjd"));
   requireViewMatchesQuery(db, "v_rjd", sql);
   runDifferentialTwoTables(db, "v_rjd", sql, 613);
 }
@@ -903,7 +903,7 @@ TEST_CASE("planner D2: FULL JOIN differential",
   const std::string sql =
       "SELECT t.id, t.val, u.id, u.val FROM t FULL JOIN u ON t.id = u.id";
   db.exec("SELECT * FROM dbsp_create_view('v_fjd', '" + sql + "')");
-  REQUIRE(plannerBuilt("v_fjd"));
+  REQUIRE(plannerBuilt(db, "v_fjd"));
   requireViewMatchesQuery(db, "v_fjd", sql);
   runDifferentialTwoTables(db, "v_fjd", sql, 617);
 }
@@ -919,7 +919,7 @@ TEST_CASE("planner D2: LEFT JOIN with residual predicate differential",
   const std::string sql = "SELECT t.id, t.val, u.val FROM t LEFT JOIN u "
                           "ON t.id = u.id AND t.val < u.val";
   db.exec("SELECT * FROM dbsp_create_view('v_ljr', '" + sql + "')");
-  REQUIRE(plannerBuilt("v_ljr"));
+  REQUIRE(plannerBuilt(db, "v_ljr"));
   requireViewMatchesQuery(db, "v_ljr", sql);
   runDifferentialTwoTables(db, "v_ljr", sql, 619);
 }
@@ -934,7 +934,7 @@ TEST_CASE("planner D3: IN subquery differential",
 
   const std::string sql = "SELECT id, val FROM t WHERE id IN (SELECT id FROM u)";
   db.exec("SELECT * FROM dbsp_create_view('v_in', '" + sql + "')");
-  REQUIRE(plannerBuilt("v_in"));
+  REQUIRE(plannerBuilt(db, "v_in"));
   requireViewMatchesQuery(db, "v_in", sql);
   runDifferentialTwoTables(db, "v_in", sql, 701);
 }
@@ -950,7 +950,7 @@ TEST_CASE("planner D3: NOT IN with NULLs is three-valued",
   const std::string sql =
       "SELECT id, val FROM t WHERE val NOT IN (SELECT val FROM u)";
   db.exec("SELECT * FROM dbsp_create_view('v_notin', '" + sql + "')");
-  REQUIRE(plannerBuilt("v_notin"));
+  REQUIRE(plannerBuilt(db, "v_notin"));
   requireViewMatchesQuery(db, "v_notin", sql);
   runDifferentialTwoTables(db, "v_notin", sql, 703);
 }
@@ -964,7 +964,7 @@ TEST_CASE("planner D3: scalar subquery comparison differential",
   const std::string sql =
       "SELECT id, val FROM t WHERE val > (SELECT AVG(val) FROM u)";
   db.exec("SELECT * FROM dbsp_create_view('v_scalar', '" + sql + "')");
-  REQUIRE(plannerBuilt("v_scalar"));
+  REQUIRE(plannerBuilt(db, "v_scalar"));
   requireViewMatchesQuery(db, "v_scalar", sql);
   runDifferentialTwoTables(db, "v_scalar", sql, 709);
 }
@@ -982,7 +982,7 @@ TEST_CASE("planner D3: IN over emptied subquery flips marks in bulk",
 
   const std::string sql = "SELECT id FROM mt WHERE id NOT IN (SELECT id FROM ms)";
   db.exec("SELECT * FROM dbsp_create_view('v_bulk', '" + sql + "')");
-  REQUIRE(plannerBuilt("v_bulk"));
+  REQUIRE(plannerBuilt(db, "v_bulk"));
   db.assertViewRowCount("v_bulk", 2); // 1, 3
 
   // Emptying the subquery side: NOT IN over empty set = TRUE for all
@@ -1023,9 +1023,9 @@ TEST_CASE("planner E1: three-level cascade differential",
   db.exec("SELECT * FROM dbsp_create_view('v_e1_j', '" + sql_j + "')");
   db.exec("SELECT * FROM dbsp_create_view('v_e1_a', '" + sql_a + "')");
   db.exec("SELECT * FROM dbsp_create_view('v_e1_s', '" + sql_s + "')");
-  REQUIRE(plannerBuilt("v_e1_j"));
-  REQUIRE(plannerBuilt("v_e1_a"));
-  REQUIRE(plannerBuilt("v_e1_s"));
+  REQUIRE(plannerBuilt(db, "v_e1_j"));
+  REQUIRE(plannerBuilt(db, "v_e1_a"));
+  REQUIRE(plannerBuilt(db, "v_e1_s"));
 
   std::mt19937 rng(811);
   std::vector<std::pair<std::string, int>> live;
@@ -1073,7 +1073,7 @@ TEST_CASE("planner E1: diamond dependency applies both parent deltas",
   db.exec("SELECT * FROM dbsp_create_view('v_e1_hi', '" + sql_hi + "')");
   db.exec("SELECT * FROM dbsp_create_view('v_e1_lo', '" + sql_lo + "')");
   db.exec("SELECT * FROM dbsp_create_view('v_e1_u', '" + sql_u + "')");
-  REQUIRE(plannerBuilt("v_e1_u"));
+  REQUIRE(plannerBuilt(db, "v_e1_u"));
   requireViewMatchesQuery(db, "v_e1_u", sql_u_direct);
 
   // One insert lands in exactly one parent; a mixed batch lands in both
@@ -1098,7 +1098,7 @@ TEST_CASE("planner E2: correlated scalar subquery differential",
       "SELECT id, val FROM t WHERE val > "
       "(SELECT AVG(val) FROM u WHERE u.id = t.id)";
   db.exec("SELECT * FROM dbsp_create_view('v_corr', '" + sql + "')");
-  REQUIRE(plannerBuilt("v_corr"));
+  REQUIRE(plannerBuilt(db, "v_corr"));
   requireViewMatchesQuery(db, "v_corr", sql);
   runDifferentialTwoTables(db, "v_corr", sql, 907);
 }
@@ -1113,7 +1113,7 @@ TEST_CASE("planner E2: correlated EXISTS differential",
       "SELECT id, val FROM t WHERE EXISTS "
       "(SELECT 1 FROM u WHERE u.id = t.id AND u.val > t.val)";
   db.exec("SELECT * FROM dbsp_create_view('v_exists', '" + sql + "')");
-  REQUIRE(plannerBuilt("v_exists"));
+  REQUIRE(plannerBuilt(db, "v_exists"));
   requireViewMatchesQuery(db, "v_exists", sql);
   runDifferentialTwoTables(db, "v_exists", sql, 911);
 }
@@ -1128,7 +1128,7 @@ TEST_CASE("planner E2: correlated NOT EXISTS differential",
       "SELECT id, val FROM t WHERE NOT EXISTS "
       "(SELECT 1 FROM u WHERE u.id = t.id)";
   db.exec("SELECT * FROM dbsp_create_view('v_nexists', '" + sql + "')");
-  REQUIRE(plannerBuilt("v_nexists"));
+  REQUIRE(plannerBuilt(db, "v_nexists"));
   requireViewMatchesQuery(db, "v_nexists", sql);
   runDifferentialTwoTables(db, "v_nexists", sql, 919);
 }
@@ -1143,7 +1143,7 @@ TEST_CASE("planner I1: identical join sides share one arrangement",
   DuckDBTestHarness db;
   setupTable(db);
   setupTableU(db);
-  auto &mgr = dbsp_native::get_cdc_manager();
+  auto &mgr = db.manager();
   const size_t base = mgr.shared_arrangement_count();
 
   // Identical SQL → identical plan → identical fingerprints: an inner
@@ -1178,7 +1178,7 @@ TEST_CASE("planner I1: arrangement survives dropping one of two views",
   DuckDBTestHarness db;
   setupTable(db);
   setupTableU(db);
-  auto &mgr = dbsp_native::get_cdc_manager();
+  auto &mgr = db.manager();
   const size_t base = mgr.shared_arrangement_count();
 
   const std::string sql =
@@ -1207,7 +1207,7 @@ TEST_CASE("planner I1: LEFT join probing a shared right side",
   const std::string sql =
       "SELECT t.id, t.val, u.val FROM t LEFT JOIN u ON t.id = u.id";
   db.exec("SELECT * FROM dbsp_create_view('v_arr_left', '" + sql + "')");
-  auto &mgr = dbsp_native::get_cdc_manager();
+  auto &mgr = db.manager();
   REQUIRE(mgr.shared_arrangement_count() >= 1);
   requireViewMatchesQuery(db, "v_arr_left", sql);
   runDifferentialTwoTables(db, "v_arr_left", sql, 107);
@@ -1238,7 +1238,7 @@ TEST_CASE("planner I1: self-padding sides refuse to share",
   DuckDBTestHarness db;
   setupTable(db);
   setupTableU(db);
-  auto &mgr = dbsp_native::get_cdc_manager();
+  auto &mgr = db.manager();
   const size_t base = mgr.shared_arrangement_count();
 
   // FULL OUTER: both sides self-pad — no arrangement may be created
@@ -1268,7 +1268,7 @@ TEST_CASE("planner I1b: both-sides-shared join bootstraps from one replay",
       "SELECT t.id, t.val, u.val FROM t JOIN u ON t.id = u.id";
   db.exec("SELECT * FROM dbsp_create_view('v_both', '" + sql + "')");
 
-  auto &mgr = dbsp_native::get_cdc_manager();
+  auto &mgr = db.manager();
   REQUIRE(mgr.shared_arrangement_count() == 2);
   requireViewMatchesQuery(db, "v_both", sql);
 
@@ -1536,7 +1536,7 @@ TEST_CASE("planner K1: spill mode differential across view shapes",
   REQUIRE_FALSE(status->HasError());
   REQUIRE(status->GetValue(0, 0).ToString().find("ENABLED") !=
           std::string::npos);
-  auto &mgr = dbsp_native::get_cdc_manager();
+  auto &mgr = db.manager();
   REQUIRE(mgr.spill_enabled());
 
   // Join view created AFTER spill: init replay + arrangement backfill
@@ -1565,8 +1565,8 @@ TEST_CASE("planner K1: enabling spill migrates an existing baseline",
   requireViewMatchesQuery(db, "v_mig", sql);
 
   db.exec("SELECT * FROM dbsp_spill(true)"); // migrate live baseline
-  auto &mgr = dbsp_native::get_cdc_manager();
-  REQUIRE(mgr.get_tracked_table_count("t") == 3);
+  auto &mgr = db.manager();
+  REQUIRE(mgr.get_tracked_table_count("memory.main.t") == 3); // canonical key (D2)
 
   // Deltas after migration diff against the spilled baseline
   db.exec("INSERT INTO t VALUES (10, 5, 'b'), (11, NULL, 'a')");
@@ -1586,7 +1586,7 @@ TEST_CASE("planner K1: captured-delta commits hit the spilled baseline",
   const std::string sql = "SELECT COUNT(*), SUM(val) FROM t";
   db.exec("SELECT * FROM dbsp_create_view('v_cap', '" + sql + "')");
 
-  auto &mgr = dbsp_native::get_cdc_manager();
+  auto &mgr = db.manager();
   const uint64_t before = mgr.captured_delta_syncs();
   db.exec("BEGIN TRANSACTION");
   db.exec("INSERT INTO t VALUES (100, 1, 'z'), (101, 2, 'z')");
@@ -1619,7 +1619,7 @@ TEST_CASE("planner K2: spilled arrangement differential + live migration",
   const std::string sql =
       "SELECT t.id, t.val, u.val FROM t JOIN u ON t.id = u.id";
   db.exec("SELECT * FROM dbsp_create_view('v_arrsp', '" + sql + "')");
-  auto &mgr = dbsp_native::get_cdc_manager();
+  auto &mgr = db.manager();
   REQUIRE(mgr.shared_arrangement_count() >= 1);
 
   db.exec("SELECT * FROM dbsp_spill(true)");
@@ -1882,7 +1882,7 @@ TEST_CASE("planner N3: local (unshareable) join index spills",
   setupTable(db);
   setupTableU(db);
   db.exec("SELECT * FROM dbsp_spill(true)");
-  auto &mgr = dbsp_native::get_cdc_manager();
+  auto &mgr = db.manager();
   const size_t arr_base = mgr.shared_arrangement_count();
 
   // Right side is a SUBQUERY (filter under the join) — not a bare scan,

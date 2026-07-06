@@ -142,7 +142,7 @@ TEST_CASE("G2: explicit-txn inserts sync via captured deltas",
           "'SELECT id, val FROM ct WHERE val > 5')");
   db.exec("SELECT * FROM dbsp_auto_sync(true)");
 
-  auto &manager = dbsp_native::get_cdc_manager();
+  auto &manager = db.manager();
   const uint64_t before = manager.captured_delta_syncs();
 
   db.exec("BEGIN");
@@ -168,7 +168,7 @@ TEST_CASE("G2: txn with a delete falls back to scan-and-diff",
           "'SELECT id FROM ct2 WHERE val > 5')");
   db.exec("SELECT * FROM dbsp_auto_sync(true)");
 
-  auto &manager = dbsp_native::get_cdc_manager();
+  auto &manager = db.manager();
   const uint64_t before = manager.captured_delta_syncs();
 
   db.exec("BEGIN");
@@ -282,7 +282,7 @@ TEST_CASE("H1: commits scan only the tables they touched",
   db.exec("SELECT * FROM dbsp_create_view('v_sb', 'SELECT id FROM sb')");
   db.exec("SELECT * FROM dbsp_auto_sync(true)");
 
-  auto &manager = dbsp_native::get_cdc_manager();
+  auto &manager = db.manager();
 
   // Autocommit DELETE on sa: exactly one table scanned, not two
   uint64_t scans = manager.scan_syncs();

@@ -66,8 +66,9 @@ private:
 
 public:
   DuckDBTestHarness() : db_(nullptr), conn_(db_) {
-    // Reset global CDC manager state between tests
-    dbsp_native::get_cdc_manager().reset();
+    // Drop any stale manager entry left at a recycled instance address
+    // (per-instance registry, Phase D1); this instance starts fresh.
+    dbsp_native::get_cdc_registry().take(db_.instance.get());
 
     // Register extension functions directly (compiled into test binary)
     try {
@@ -79,14 +80,19 @@ public:
   }
 
   ~DuckDBTestHarness() {
-    // Free views (and their internal Connections) promptly so each test's
-    // DatabaseInstance is released as soon as the harness goes away. The
-    // exit-crash itself is fixed by the leaked CDCManager singleton (see
-    // get_cdc_manager); this is hygiene, not correctness.
-    dbsp_native::get_cdc_manager().reset();
+    // Destroy this instance's manager (views + their internal Connections)
+    // before the instance itself goes away. Safe inline: we are not inside
+    // ConnectionManager::RemoveConnection here.
+    dbsp_native::get_cdc_registry().take(db_.instance.get());
   }
 
   Connection &conn() { return conn_; }
+
+  DatabaseInstance &instance() { return *db_.instance; }
+
+  dbsp_native::CDCManager &manager() {
+    return dbsp_native::get_cdc_manager(*db_.instance);
+  }
 
   // Execute query and return result
   unique_ptr<MaterializedQueryResult> query(const std::string &sql) {

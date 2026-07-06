@@ -56,6 +56,8 @@
 #include "dbsp_circuit_views.hpp"
 #include "dbsp_distinct_on.hpp"
 #include "dbsp_errors.hpp"
+#include "dbsp_instance_registry.hpp"
+#include "dbsp_qualified_name.hpp"
 #include "dbsp_window_view.hpp"
 
 #include "duckdb.hpp"
@@ -105,6 +107,21 @@ struct PlanKeepAlive {
   // shifts column indices): node lambdas reference them, so they must live
   // exactly as long as the plan itself
   std::vector<std::unique_ptr<duckdb::Expression>> rewritten_exprs;
+
+  PlanKeepAlive() = default;
+  PlanKeepAlive(const PlanKeepAlive &) = delete;
+  PlanKeepAlive &operator=(const PlanKeepAlive &) = delete;
+
+  ~PlanKeepAlive() {
+    if (connection && connection->context) {
+      // Destroy the connection first, then unregister: ~Connection fires
+      // OnConnectionClosed, which must still classify this context as
+      // internal or it would count it as a departing user connection.
+      auto *ctx = connection->context.get();
+      connection.reset();
+      get_instance_registry().unregister_internal(ctx);
+    }
+  }
 };
 
 // Row-at-a-time adapter over ExpressionExecutor: builds a 1-row DataChunk
@@ -3371,8 +3388,10 @@ public:
       const std::vector<std::pair<std::string, TableSchema>> &mv_schemas = {}) {
     auto keep_alive = std::make_shared<PlanKeepAlive>();
     try {
-      keep_alive->connection = std::make_unique<duckdb::Connection>(
-          duckdb::DatabaseInstance::GetDatabase(context));
+      auto &db = duckdb::DatabaseInstance::GetDatabase(context);
+      keep_alive->connection = std::make_unique<duckdb::Connection>(db);
+      get_instance_registry().register_internal(
+          keep_alive->connection->context.get(), &db);
       for (const auto &[mv_name, mv_schema] : mv_schemas) {
         std::string ddl = "CREATE TEMP TABLE \"" + mv_name + "\" (";
         for (size_t i = 0; i < mv_schema.columns.size(); i++) {
@@ -3419,6 +3438,23 @@ public:
     TableSchema schema;
     schema.table_name = view_name;
     schema.columns = walker.columns;
+    // The walker names columns from plan expressions; bound references
+    // (e.g. GROUP BY 1,2 output) have no alias and degrade to "0","1".
+    // The binder's real output names live on the prepared statement, so
+    // prefer those when they line up.
+    try {
+      auto prep = keep_alive->connection->Prepare(sql);
+      if (prep && !prep->HasError()) {
+        const auto &names = prep->GetNames();
+        if (names.size() == schema.columns.size()) {
+          for (size_t i = 0; i < names.size(); i++) {
+            schema.columns[i].name = names[i];
+          }
+        }
+      }
+    } catch (...) {
+      // keep walker-derived names
+    }
     // Deduplicate column names (e.g. t.val and u.val in a join): repeated
     // names would make the result unqueryable through dbsp_query
     std::unordered_map<std::string, int> seen;
@@ -4679,7 +4715,16 @@ private:
 
       auto source = std::make_unique<PlanOpSpec>();
       source->kind = PlanOpSpec::Kind::SOURCE;
-      source->table = table_entry->name;
+      // Canonical catalog.schema.table key (D2): derived from the bound
+      // entry, never from SQL text, so attached-catalog tables and bare
+      // names key identically everywhere in the CDC layer. Temp-catalog
+      // entries keep their bare name: views-on-views bind through TEMP
+      // shadow tables whose names must match the referenced view's key.
+      if (table_entry->ParentCatalog().GetName() == TEMP_CATALOG) {
+        source->table = table_entry->name;
+      } else {
+        source->table = canonical_table_key(*table_entry);
+      }
       // Full-table layout (CDC row shape) — arrangement key remapping
       // needs it (O4 cross-projection sharing)
       source->input_types = op.returned_types;

@@ -26,7 +26,7 @@ TEST_CASE("Replay restore: filter view content survives recovery",
   Connection con(db);
 
   auto &recovery_manager = get_recovery_manager();
-  auto &cdc_manager = get_cdc_manager();
+  auto &cdc_manager = get_cdc_manager(*db.instance);
 
   recovery_manager.set_recovery_enabled(false);
   cdc_manager.reset();
@@ -72,7 +72,7 @@ TEST_CASE("Replay restore: aggregate view stays correct after first "
   Connection con(db);
 
   auto &recovery_manager = get_recovery_manager();
-  auto &cdc_manager = get_cdc_manager();
+  auto &cdc_manager = get_cdc_manager(*db.instance);
 
   recovery_manager.set_recovery_enabled(false);
   cdc_manager.reset();
@@ -132,7 +132,7 @@ TEST_CASE("Replay restore: ordered view still scans its rows after recovery",
   Connection con(db);
 
   auto &recovery_manager = get_recovery_manager();
-  auto &cdc_manager = get_cdc_manager();
+  auto &cdc_manager = get_cdc_manager(*db.instance);
 
   recovery_manager.set_recovery_enabled(false);
   cdc_manager.reset();
@@ -184,7 +184,7 @@ TEST_CASE("End-to-end crash recovery across database restarts",
     DuckDB db("test_e2e.db");
     Connection con(db);
 
-    auto &cdc_manager = get_cdc_manager();
+    auto &cdc_manager = get_cdc_manager(*db.instance);
     auto &recovery_manager = get_recovery_manager();
     cdc_manager.reset();
 
@@ -213,7 +213,7 @@ TEST_CASE("End-to-end crash recovery across database restarts",
     DuckDB db("test_e2e.db");
     Connection con(db);
 
-    auto &cdc_manager = get_cdc_manager();
+    auto &cdc_manager = get_cdc_manager(*db.instance);
     cdc_manager.clear_all_state();
 
     auto &recovery_manager = get_recovery_manager();
@@ -234,7 +234,7 @@ TEST_CASE("End-to-end crash recovery across database restarts",
     DuckDB db("test_e2e.db");
     Connection con(db);
 
-    auto &cdc_manager = get_cdc_manager();
+    auto &cdc_manager = get_cdc_manager(*db.instance);
     cdc_manager.clear_all_state();
 
     auto &recovery_manager = get_recovery_manager();

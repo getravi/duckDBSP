@@ -22,7 +22,7 @@ TEST_CASE("Phase 1.1: View definitions persist across restarts",
 
   // Simulate first session: create views
   {
-    auto &cdc_manager = get_cdc_manager();
+    auto &cdc_manager = get_cdc_manager(*db.instance);
     cdc_manager.reset();
 
     // Initialize persistence manually
@@ -56,7 +56,7 @@ TEST_CASE("Phase 1.1: View definitions persist across restarts",
 
   // Simulate crash and recovery: reset CDC manager but keep database
   {
-    auto &cdc_manager = get_cdc_manager();
+    auto &cdc_manager = get_cdc_manager(*db.instance);
     cdc_manager.reset();
 
     // Verify view doesn't exist in memory
@@ -85,7 +85,7 @@ TEST_CASE("Phase 1.2: Multiple views with dependencies recover correctly",
   Connection con(db);
 
   auto &recovery_manager = get_recovery_manager();
-  auto &cdc_manager = get_cdc_manager();
+  auto &cdc_manager = get_cdc_manager(*db.instance);
 
   recovery_manager.set_recovery_enabled(false);  // Disable auto-recovery for testing
   cdc_manager.reset();
@@ -148,7 +148,7 @@ TEST_CASE("Phase 1.3: Table data resyncs after recovery",
   Connection con(db);
 
   auto &recovery_manager = get_recovery_manager();
-  auto &cdc_manager = get_cdc_manager();
+  auto &cdc_manager = get_cdc_manager(*db.instance);
 
   recovery_manager.set_recovery_enabled(false);  // Disable auto-recovery for testing
   cdc_manager.reset();
@@ -243,7 +243,7 @@ TEST_CASE("Phase 1.5: Drop view removes from persistence",
   Connection con(db);
 
   auto &recovery_manager = get_recovery_manager();
-  auto &cdc_manager = get_cdc_manager();
+  auto &cdc_manager = get_cdc_manager(*db.instance);
 
   recovery_manager.set_recovery_enabled(false);  // Disable auto-recovery for testing
   cdc_manager.reset();

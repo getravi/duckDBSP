@@ -44,7 +44,7 @@ public:
     if (internal_query_depth > 0) {
       return;
     }
-    if (!get_cdc_manager().is_auto_sync_enabled()) {
+    if (!get_cdc_manager(context).is_auto_sync_enabled()) {
       stmt_ = {};
       return; // no auto-sync: don't pay the parse on every statement
     }
@@ -54,7 +54,7 @@ public:
     // of the in-flight statement (stmt_), not just per-txn accumulation
     stmt_ = classify(context.GetCurrentQuery());
     if (context.transaction.HasActiveTransaction()) {
-      fold_into_txn(stmt_);
+      fold_into_txn(context, stmt_);
     }
   }
 
@@ -71,7 +71,7 @@ public:
     if (internal_query_depth > 0) {
       return;
     }
-    auto &manager = get_cdc_manager();
+    auto &manager = get_cdc_manager(context);
     if (!manager.is_auto_sync_enabled()) {
       return;
     }
@@ -103,7 +103,7 @@ public:
       return;
     }
 
-    auto &manager = get_cdc_manager();
+    auto &manager = get_cdc_manager(context);
     if (!manager.is_auto_sync_enabled()) {
       capture_ = {};
       return;
@@ -120,7 +120,7 @@ public:
       // Autocommit commits fire mid-statement, before QueryEnd folded the
       // in-flight classification — fold it now.
       if (!capture_.saw_statements && stmt_.kind != StmtClass::NONE) {
-        fold_into_txn(stmt_);
+        fold_into_txn(context, stmt_);
       }
       const bool know_all_writes =
           capture_.saw_statements && !capture_.unknown_writes;
@@ -199,9 +199,26 @@ private:
 
   static std::string base_table_name(const duckdb::TableRef *ref) {
     if (ref && ref->type == duckdb::TableReferenceType::BASE_TABLE) {
-      return ref->Cast<duckdb::BaseTableRef>().table_name;
+      auto &base = ref->Cast<duckdb::BaseTableRef>();
+      return dotted_ref(base.catalog_name, base.schema_name, base.table_name);
     }
     return {};
+  }
+
+  // Textual dotted reference from parsed statement parts (either or both
+  // qualifiers may be absent). Canonicalization happens at fold/capture
+  // time via resolve_table_entry — parse-time text is never used as a key.
+  static std::string dotted_ref(const std::string &catalog,
+                                const std::string &schema,
+                                const std::string &table) {
+    std::string out;
+    if (!catalog.empty()) {
+      out += catalog + ".";
+    }
+    if (!schema.empty()) {
+      out += schema + ".";
+    }
+    return out + table;
   }
 
   StmtClass classify(const std::string &query) {
@@ -232,7 +249,7 @@ private:
       return out;
     case duckdb::StatementType::INSERT_STATEMENT: {
       auto &insert = stmt.Cast<duckdb::InsertStatement>();
-      out.table = insert.table;
+      out.table = dotted_ref(insert.catalog, insert.schema, insert.table);
       out.kind = insert.on_conflict_info ? StmtClass::WRITE_KNOWN
                                          : StmtClass::INSERT_OK;
       return out;
@@ -258,7 +275,7 @@ private:
   }
 
   // Merge one statement's classification into the transaction's sync scope
-  void fold_into_txn(const StmtClass &c) {
+  void fold_into_txn(duckdb::ClientContext &context, const StmtClass &c) {
     if (c.kind == StmtClass::NONE) {
       return;
     }
@@ -267,10 +284,16 @@ private:
     case StmtClass::READ:
       break;
     case StmtClass::INSERT_OK:
-    case StmtClass::WRITE_KNOWN:
-      if (get_cdc_manager().is_table_tracked(c.table)) {
-        capture_.touched.insert(c.table);
+    case StmtClass::WRITE_KNOWN: {
+      // Canonicalize the parsed reference; a target that does not resolve
+      // cannot be a tracked table (tracked keys always resolve), so skip.
+      auto entry = resolve_table_entry(context, c.table);
+      if (entry &&
+          get_cdc_manager(context).is_table_tracked(
+              canonical_table_key(*entry))) {
+        capture_.touched.insert(canonical_table_key(*entry));
       }
+    }
       if (c.kind == StmtClass::WRITE_KNOWN) {
         capture_.dirty = true; // not capturable, but the target is known
       }
@@ -288,11 +311,16 @@ private:
     if (c.kind != StmtClass::INSERT_OK) {
       return; // scoping already folded at QueryBegin; only capture remains
     }
-    auto &manager = get_cdc_manager();
-    if (!manager.is_table_tracked(c.table)) {
+    auto &manager = get_cdc_manager(context);
+    auto entry = resolve_table_entry(context, c.table);
+    if (!entry) {
+      return; // unresolvable target cannot be tracked
+    }
+    const std::string key = canonical_table_key(*entry);
+    if (!manager.is_table_tracked(key)) {
       return; // untracked target: irrelevant to views
     }
-    capture_appended_rows(context, c.table);
+    capture_appended_rows(context, key);
     capture_.active = true;
   }
 
@@ -301,27 +329,23 @@ private:
   void capture_appended_rows(duckdb::ClientContext &context,
                              const std::string &table_name) {
     auto &meta = context.transaction.ActiveTransaction();
-    auto &db_manager = duckdb::DatabaseManager::Get(context);
-    for (auto &db : db_manager.GetDatabases()) {
-      if (db->IsSystem() || db->IsTemporary()) {
-        continue;
-      }
-      auto txn = meta.TryGetTransaction(*db);
+    // table_name is a canonical key: resolve it to its entry and use the
+    // transaction of the table's own attached database (D2).
+    auto entry = resolve_table_entry(context, table_name);
+    if (!entry) {
+      return;
+    }
+    {
+      auto &attached = entry->ParentCatalog().GetAttached();
+      auto txn = meta.TryGetTransaction(attached);
       if (!txn) {
-        continue;
+        return;
       }
       auto &dtxn = txn->Cast<duckdb::DuckTransaction>();
       auto &ls = dtxn.GetLocalStorage();
-      auto &catalog = db->GetCatalog();
-      auto entry = catalog.GetEntry<duckdb::TableCatalogEntry>(
-          context, DEFAULT_SCHEMA, table_name,
-          duckdb::OnEntryNotFound::RETURN_NULL);
-      if (!entry) {
-        continue;
-      }
       auto &table = entry->GetStorage();
       if (!ls.Find(table)) {
-        continue;
+        return; // no transaction-local rows for this table
       }
 
       auto &slot = capture_.appends[table_name];
@@ -384,7 +408,7 @@ private:
     auto it = count_stmts_.find(table);
     if (it == count_stmts_.end()) {
       auto prep =
-          guard_con_->Prepare("SELECT COUNT(*) FROM \"" + table + "\"");
+          guard_con_->Prepare("SELECT COUNT(*) FROM " + quote_table_key(table));
       if (!prep || prep->HasError()) {
         return -1;
       }

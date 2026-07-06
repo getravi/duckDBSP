@@ -8,7 +8,9 @@
 using namespace dbsp_native;
 
 TEST_CASE("Singleton thread-safety", "[thread_safety][singleton]") {
-  // Test that get_cdc_manager() is thread-safe
+  // Registry get_or_create must be thread-safe and return one manager per
+  // instance (Phase D1)
+  duckdb::DuckDB db(nullptr);
   std::vector<std::thread> threads;
   std::vector<CDCManager*> managers;
   std::mutex managers_mutex;
@@ -16,8 +18,8 @@ TEST_CASE("Singleton thread-safety", "[thread_safety][singleton]") {
   const int num_threads = 10;
 
   for (int i = 0; i < num_threads; i++) {
-    threads.emplace_back([&managers, &managers_mutex]() {
-      CDCManager& mgr = get_cdc_manager();
+    threads.emplace_back([&managers, &managers_mutex, &db]() {
+      CDCManager& mgr = get_cdc_manager(*db.instance);
       std::lock_guard<std::mutex> lock(managers_mutex);
       managers.push_back(&mgr);
     });
@@ -44,7 +46,7 @@ TEST_CASE("Concurrent view creation", "[thread_safety][views]") {
   conn.Query("CREATE TABLE test_table (id INTEGER, value INTEGER)");
   conn.Query("INSERT INTO test_table VALUES (1, 10), (2, 20), (3, 30)");
 
-  CDCManager& manager = get_cdc_manager();
+  CDCManager& manager = get_cdc_manager(*db.instance);
 
   // track_table needs an active DuckDB transaction for catalog access
   conn.BeginTransaction();
@@ -115,7 +117,7 @@ TEST_CASE("Concurrent table tracking", "[thread_safety][tracking]") {
     conn.Query("INSERT INTO " + table_name + " VALUES (1, 10)");
   }
 
-  CDCManager& manager = get_cdc_manager();
+  CDCManager& manager = get_cdc_manager(*db.instance);
   std::vector<std::thread> threads;
   std::atomic<int> success_count{0};
 
@@ -155,7 +157,7 @@ TEST_CASE("Concurrent list_views thread-safety", "[thread_safety][sync]") {
 
   conn.Query("CREATE TABLE list_test_table (id INTEGER)");
 
-  CDCManager& manager = get_cdc_manager();
+  CDCManager& manager = get_cdc_manager(*db.instance);
 
   conn.BeginTransaction();
   manager.track_table(context, "list_test_table");
@@ -203,7 +205,8 @@ TEST_CASE("Concurrent list_views thread-safety", "[thread_safety][sync]") {
 
 TEST_CASE("Parallel sync flag thread-safety", "[thread_safety][parallel_sync]") {
   // Test thread-safe access to parallel sync flag
-  CDCManager& manager = get_cdc_manager();
+  duckdb::DuckDB db(nullptr);
+  CDCManager& manager = get_cdc_manager(*db.instance);
 
   std::vector<std::thread> threads;
   std::atomic<int> read_count{0};
@@ -250,7 +253,7 @@ TEST_CASE("Concurrent drop operations", "[thread_safety][drop]") {
 
   conn.Query("CREATE TABLE drop_test (id INTEGER)");
 
-  CDCManager& manager = get_cdc_manager();
+  CDCManager& manager = get_cdc_manager(*db.instance);
 
   // Setup: track table and create views (needs active transaction)
   conn.BeginTransaction();
@@ -302,8 +305,9 @@ TEST_CASE("Concurrent drop operations", "[thread_safety][drop]") {
 }
 
 TEST_CASE("Auto-sync and parallel-sync flag concurrency", "[thread_safety][flags]") {
-  // Test concurrent access to CDCManager state flags (no DuckDB access needed)
-  CDCManager& manager = get_cdc_manager();
+  // Test concurrent access to CDCManager state flags
+  duckdb::DuckDB db(nullptr);
+  CDCManager& manager = get_cdc_manager(*db.instance);
 
   std::vector<std::thread> threads;
   std::atomic<int> ops_count{0};
@@ -360,7 +364,7 @@ TEST_CASE("Concurrent scan_view during change propagation",
   conn.Query("CREATE TABLE scan_t (id INTEGER, val INTEGER)");
   conn.Query("INSERT INTO scan_t VALUES (1, 10), (2, 20)");
 
-  CDCManager &manager = get_cdc_manager();
+  CDCManager &manager = get_cdc_manager(*db.instance);
   manager.reset();
 
   conn.BeginTransaction();

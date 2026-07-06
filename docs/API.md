@@ -378,13 +378,54 @@ SELECT * FROM dbsp_query('customer_totals');
 
 ---
 
+### dbsp_changes(view_name)
+
+Rows added or removed by the view's most recent sync, as the view's columns
+plus a signed BIGINT `weight` (+n insert, -n delete).
+
+```sql
+SELECT * FROM dbsp_changes('customer_totals');
+```
+
+**Parameters:**
+- `view_name` (VARCHAR): Name of the view
+
+**Returns:**
+- The view's columns, plus `weight` (BIGINT)
+
+**Semantics:**
+- Single-generation buffer: holds the delta of the most recent sync step
+  that touched the view, and is overwritten by the next one — consume
+  between syncs.
+- While a group survives an aggregate update, the step contains an
+  `(old row, -1)`, `(new row, +1)` pair, so one read yields both old and
+  new values.
+- One `dbsp_notify_insert`/`dbsp_notify_delete` call is one step: a
+  delete+insert notify pair leaves only the insert step's delta. Read
+  between the two notifies if both halves are needed.
+- Empty result when the view exists but no sync has touched it; error when
+  the view does not exist.
+
+---
+
 ## Persistence
+
+### dbsp_save()
+
+Save all view definitions to the `_dbsp_views` table in the default
+catalog — inside the database file, so copies and backups carry the
+views. `dbsp_save('view_name', 'table_name')` saves one view to a named
+table (identifier-validated).
+
+```sql
+SELECT * FROM dbsp_save();
+```
+
+---
 
 ### dbsp_save(filepath)
 
-Save all view definitions to a JSON file. JSON is the only supported
-persistence format — the zero-argument DuckDB-table form
-(`dbsp_save()`) returns "DuckDB table persistence not supported".
+Save all view definitions to a JSON file.
 
 ```sql
 SELECT * FROM dbsp_save('views.json');
@@ -414,11 +455,25 @@ SELECT * FROM dbsp_save('views.json');
 
 ---
 
+### dbsp_load()
+
+Load view definitions from the `_dbsp_views` table (see `dbsp_save()`).
+Missing `_dbsp_views` is not an error — there is simply nothing to load.
+`dbsp_load('table_name')` loads from a named table (identifier-validated;
+a missing named table IS an error). Loading rebuilds view state from
+current table data.
+
+```sql
+SELECT * FROM dbsp_load();
+```
+
+---
+
 ### dbsp_load(filepath, 'json')
 
 Load view definitions from a JSON file. The explicit `'json'` format
-argument is required — one-argument and zero-argument forms return
-"DuckDB table persistence not supported".
+argument is required — a bare one-argument form is interpreted as a
+DuckDB table name, not a file.
 
 ```sql
 SELECT * FROM dbsp_load('views.json', 'json');

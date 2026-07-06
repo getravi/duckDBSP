@@ -1,5 +1,82 @@
 # Changelog
 
+## Phase D3: view definitions persist in DuckDB tables - Jul 2026
+
+- dbsp_save() / dbsp_load() (zero-arg) now work: view definitions are
+  stored in a _dbsp_views table in the default catalog, so they travel
+  with the database file and its copies/backups. Named-table forms
+  dbsp_save('view', 'table') and dbsp_load('table') are honored, with
+  identifier validation (restores absolute-path/traversal rejection).
+  JSON file save/load unchanged.
+- create_view's best-effort _dbsp_views insert now creates the table if
+  missing, so crash recovery finds definitions without an explicit save.
+- Planner naming fix: output column names now come from the prepared
+  statement's binder names; positional GROUP BY (GROUP BY 1,2) no longer
+  degrades group columns to "0","1" — at creation or after load.
+- Scope note: persistence covers definitions; loading rebuilds view state
+  from current table data (O(source)). O(state) restore requires circuit
+  checkpointing — tracked as D3b in docs/PHASE_D_PLAN.md.
+- Regression test: test/python/test_table_persistence.py.
+
+## Phase D2: attached-catalog tables as view sources - Jul 2026
+
+- Materialized views can now source tables in ATTACHed databases
+  (CREATE MATERIALIZED VIEW ... FROM m.li_1). Tracked-table keys are
+  canonical catalog.schema.table, derived from the bound plan's
+  TableCatalogEntry — never from SQL text — so bare and qualified
+  references key identically. Same-name tables in different catalogs no
+  longer collide.
+- All internal lookups/scans resolve through the catalog (any attached
+  db) instead of hardcoded main-catalog + DEFAULT_SCHEMA; scan/guard SQL
+  emits quoted qualified names; commit-hook write attribution
+  canonicalizes parsed statement targets (two-part refs try schema-first
+  then catalog-first, mirroring the binder).
+- Autocommit callers (no active transaction) canonicalize via a textual
+  fallback against the tracked-key map — starting a transaction inside
+  executing queries deadlocks.
+- DETACH with live views degrades gracefully: the view keeps its last
+  state (queryable, droppable); syncs against the gone catalog fail with
+  a clear error; everything else keeps working.
+- Temp-catalog entries keep bare names: views-on-views bind through TEMP
+  shadow tables whose names must match view keys.
+- Regression test: test/python/test_attached_catalog.py. Debug tracing:
+  DBSP_DEBUG_SYNC=1.
+
+## Phase D4: dbsp_changes() delta read-back - Jul 2026
+
+- New table function dbsp_changes('view'): rows added/removed by the
+  view's most recent sync as (view columns..., weight BIGINT). Exposes the
+  per-view last-step delta the propagation engine already retains
+  (NativeMaterializedView::get_delta) via a locked CDCManager accessor
+  (scan_view_delta). Single-generation buffer; aggregate updates on a
+  surviving group arrive as (old,-1),(new,+1) pairs.
+  Regression test: test/python/test_dbsp_changes.py.
+
+## Phase D1: per-instance CDCManager - Jul 2026
+
+- One CDCManager per DatabaseInstance (CDCManagerRegistry) instead of one
+  process-wide singleton. get_cdc_manager() now requires a
+  DatabaseInstance&/ClientContext&; two databases open in one process get
+  isolated views and tracked tables (test/python/test_multi_instance.py).
+- Last-user-connection teardown now take()s the instance's manager out of
+  the registry (atomic single-flight) and destroys it on a detached thread.
+- Known gap: crash recovery still runs once per process (static
+  recovery_done in OnConnectionOpened), so persisted views auto-load only
+  for the first instance opened; later instances need explicit dbsp_load.
+
+## Fix: release instance state on last connection close - Jul 2026
+
+- Same-process close + reopen of a database that had materialized views
+  used to hang forever: views' internal Connections (PlanKeepAlive) pinned
+  the DatabaseInstance, and DuckDB's DBInstanceCache busy-spins waiting for
+  a dying instance. Now an OnConnectionClosed callback releases all CDC
+  state on a detached thread when the last user connection closes (new
+  InstanceRegistry tells DBSP-internal connections apart from user ones).
+  Regression test: test/python/test_reopen_hang.py.
+- Build fixes: test/CMakeLists.txt no longer re-adds the duckdb
+  subdirectory under the root build; benchmark_runner target is skipped
+  when its sources are absent.
+
 ## Zero-ceremony views: auto-sync ON by default - Jul 2026
 
 - dbsp_auto_sync now defaults ON. Creating a view already auto-tracked

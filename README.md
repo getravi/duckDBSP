@@ -20,6 +20,11 @@ DBSP:         INSERT 1 row → Update affected aggregates → O(delta)
 - **SQL Syntax**: Define views using familiar SQL
 - **Cascading Views**: Views can reference other views
 - **Automatic CDC**: Change Data Capture with sync detection
+- **Delta read-back**: `dbsp_changes('view')` returns the last sync's
+  output delta with signed weights
+- **Attached catalogs**: views can source tables in `ATTACH`ed databases
+  (`... FROM m.orders`); tables are keyed by canonical
+  `catalog.schema.table`
 - **Persistence**: Save/restore views across sessions
 - **Zero Dependencies**: Pure C++ header-only core library
 - **Bounded Memory**: optional disk-backed state (`dbsp_spill`)
@@ -179,11 +184,14 @@ See [docs/TESTING.md](docs/TESTING.md) for details.
 
 | Function | Description |
 |----------|-------------|
+| `dbsp_save()` | Save view definitions to the `_dbsp_views` table (in the database file) |
+| `dbsp_load()` | Load view definitions from `_dbsp_views` |
 | `dbsp_save('views.json')` | Save view definitions to a JSON file |
 | `dbsp_load('views.json', 'json')` | Load view definitions from a JSON file |
 
-Persistence is JSON-file only (definitions, not materialized state); the
-zero-argument DuckDB-table forms are not supported. File paths must be
+Persistence covers definitions, not materialized state — loading rebuilds
+views from current table data. Table-form persistence lives in the database
+file, so file copies/backups carry the views. JSON file paths must be
 relative to the working directory — absolute paths are rejected.
 
 ### Manual CDC

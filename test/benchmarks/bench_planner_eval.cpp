@@ -186,7 +186,7 @@ TEST_CASE("Benchmark: cascaded view sync cost", "[benchmark][cascade_bench]") {
   // Isolate cascade cost from the scan-and-diff sync cost: on_insert
   // feeds a single-row delta straight into propagate_changes (no table
   // scan). 1000 rows through the whole 3-level chain.
-  auto &manager = dbsp_native::get_cdc_manager();
+  auto &manager = db.manager();
   double prop_us = measure_us([&]() {
     for (int i = 0; i < 1000; i++) {
       dbsp_native::DuckDBRow row;
@@ -202,7 +202,7 @@ TEST_CASE("Benchmark: cascaded view sync cost", "[benchmark][cascade_bench]") {
   // commit guard would (correctly) reject the mismatch.
   db.exec("SELECT * FROM dbsp_sync('big')");
   db.exec("SELECT * FROM dbsp_auto_sync(true)");
-  auto &mgr2 = dbsp_native::get_cdc_manager();
+  auto &mgr2 = db.manager();
   const uint64_t cap_before = mgr2.captured_delta_syncs();
   double cap_us = measure_us([&]() {
     for (int i = 0; i < 20; i++) {
@@ -242,11 +242,11 @@ TEST_CASE("Benchmark: shared vs private join arrangements",
   constexpr int kViews = 8;
   constexpr int kBase = 20000;
   constexpr int kDelta = 2000;
-  auto &mgr = dbsp_native::get_cdc_manager();
 
   auto run = [&](bool shared, bool parallel = false) -> double {
-    mgr.set_parallel_sync(parallel);
     DuckDBTestHarness db;
+    auto &mgr = db.manager();
+    mgr.set_parallel_sync(parallel);
   db.exec("SELECT * FROM dbsp_auto_sync(false)"); // timed manual syncs
     db.exec("SELECT * FROM dbsp_auto_sync(false)"); // timed manual syncs
     db.exec("CREATE TABLE l (id INT, val INT)");
@@ -289,7 +289,7 @@ TEST_CASE("Benchmark: shared vs private join arrangements",
   double shared_us = run(true);
   double private_us = run(false);
   double parallel_us = run(true, /*parallel=*/true);
-  mgr.set_parallel_sync(false);
+  // No flag reset needed: each run's manager dies with its harness (D1).
   std::cout << "[bench] " << kViews << " views, " << kDelta
             << "-row delta into " << kBase << "-row probe side: identity "
             "probes " << shared_us << " us; projected probes (O4) "
@@ -302,7 +302,6 @@ TEST_CASE("Benchmark: shared vs private join arrangements",
 // K1: baseline spill — RAM footprint and sync cost, disk vs RAM baselines
 TEST_CASE("Benchmark: spilled vs RAM baselines", "[benchmark][spill_bench]") {
   constexpr int kRowsBig = 200000;
-  auto &mgr = dbsp_native::get_cdc_manager();
 
   auto rss_mb = []() {
     struct rusage ru;
@@ -312,6 +311,7 @@ TEST_CASE("Benchmark: spilled vs RAM baselines", "[benchmark][spill_bench]") {
 
   auto run = [&](bool spill) {
     DuckDBTestHarness db;
+    auto &mgr = db.manager();
   db.exec("SELECT * FROM dbsp_auto_sync(false)"); // timed manual syncs
     db.exec("SELECT * FROM dbsp_auto_sync(false)"); // timed manual syncs
     if (spill) {

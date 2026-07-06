@@ -47,9 +47,13 @@
 
 #include "dbsp_cdc.hpp"
 #include "dbsp_context_state.hpp"
+#include "dbsp_instance_registry.hpp"
 #include "dbsp_parser_extension.hpp"
 #include "dbsp_recovery.hpp"
+#include "duckdb/main/connection_manager.hpp"
 #include "duckdb/planner/extension_callback.hpp"
+
+#include <thread>
 
 namespace duckdb {
 
@@ -63,6 +67,14 @@ static void EnsureContextState(ClientContext &context) {
         context.registered_state->GetOrCreate<dbsp_native::DBSPContextState>(
         "dbsp_cdc_state");
   }
+}
+
+// Canonicalize a user-supplied table reference to the tracked-table key
+// (catalog.schema.table, D2); unresolvable refs pass through unchanged so
+// the manager lookup fails with its normal "not tracked" error.
+static string CanonicalTableRef(ClientContext &context, const string &ref) {
+  auto entry = dbsp_native::resolve_table_entry(context, ref);
+  return entry ? dbsp_native::canonical_table_key(*entry) : ref;
 }
 
 // ============================================================================
@@ -100,7 +112,7 @@ void TrackFunc(ClientContext &context, TableFunctionInput &input,
   if (data.done)
     return;
 
-  auto &manager = dbsp_native::get_cdc_manager();
+  auto &manager = dbsp_native::get_cdc_manager(context);
   bool ok = manager.track_table(context, data.table_name);
 
   if (!ok) {
@@ -180,7 +192,7 @@ void CreateViewFunc(ClientContext &context, TableFunctionInput &input,
   if (data.done)
     return;
 
-  auto &manager = dbsp_native::get_cdc_manager();
+  auto &manager = dbsp_native::get_cdc_manager(context);
   string result;
 
   if (data.is_sql_mode) {
@@ -287,8 +299,8 @@ void NotifyInsertFunc(ClientContext &context, TableFunctionInput &input,
   if (data.done)
     return;
 
-  auto &manager = dbsp_native::get_cdc_manager();
-  manager.on_insert(data.table_name, data.row);
+  auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.on_insert(CanonicalTableRef(context, data.table_name), data.row);
 
   output.SetCardinality(1);
   output.SetValue(0, 0, Value("Notified insert into " + data.table_name));
@@ -302,8 +314,8 @@ void NotifyDeleteFunc(ClientContext &context, TableFunctionInput &input,
   if (data.done)
     return;
 
-  auto &manager = dbsp_native::get_cdc_manager();
-  manager.on_delete(data.table_name, data.row);
+  auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.on_delete(CanonicalTableRef(context, data.table_name), data.row);
 
   output.SetCardinality(1);
   output.SetValue(0, 0, Value("Notified delete from " + data.table_name));
@@ -346,14 +358,14 @@ void SyncFunc(ClientContext &context, TableFunctionInput &input,
   if (data.done)
     return;
 
-  auto &manager = dbsp_native::get_cdc_manager();
+  auto &manager = dbsp_native::get_cdc_manager(context);
 
   if (data.sync_all) {
     manager.sync_all(context);
     output.SetCardinality(1);
     output.SetValue(0, 0, Value("Synced all tracked tables"));
   } else {
-    bool ok = manager.sync_table(context, data.table_name);
+    bool ok = manager.sync_table(context, CanonicalTableRef(context, data.table_name));
     output.SetCardinality(1);
     output.SetValue(
         0, 0, Value(ok ? "Synced: " + data.table_name : "Failed to sync"));
@@ -385,7 +397,7 @@ unique_ptr<FunctionData> QueryBind(ClientContext &context,
 
   data->view_name = input.inputs[0].GetValue<string>();
 
-  auto &manager = dbsp_native::get_cdc_manager();
+  auto &manager = dbsp_native::get_cdc_manager(context);
   const auto *schema = manager.get_view_schema(data->view_name);
 
   // Collect rows via scan_view: holds the read locks for the whole
@@ -448,6 +460,83 @@ void QueryFunc(ClientContext &context, TableFunctionInput &input,
 }
 
 // ============================================================================
+// dbsp_changes - Rows added/removed by a view's most recent sync
+// Usage: SELECT * FROM dbsp_changes('view_name');
+// Columns: the view's columns plus a signed BIGINT `weight` (+n insert,
+// -n delete). Single-generation buffer: overwritten by the next sync that
+// touches the view — consume between syncs.
+// ============================================================================
+
+struct ChangesBindData : public TableFunctionData {
+  string view_name;
+  vector<dbsp_native::DuckDBRow> rows;
+  vector<int64_t> weights;
+  idx_t current = 0;
+};
+
+unique_ptr<FunctionData> ChangesBind(ClientContext &context,
+                                     TableFunctionBindInput &input,
+                                     vector<LogicalType> &return_types,
+                                     vector<string> &names) {
+  auto data = make_uniq<ChangesBindData>();
+
+  if (input.inputs.empty()) {
+    throw InvalidInputException("dbsp_changes(view_name)");
+  }
+
+  data->view_name = input.inputs[0].GetValue<string>();
+
+  auto &manager = dbsp_native::get_cdc_manager(context);
+  const auto *schema = manager.get_view_schema(data->view_name);
+
+  bool found = manager.scan_view_delta(
+      data->view_name,
+      [&](const dbsp_native::DuckDBRow &row, dbsp_native::Weight weight) {
+        data->rows.push_back(row);
+        data->weights.push_back(static_cast<int64_t>(weight));
+      });
+  if (!found) {
+    throw InvalidInputException("View not found: " + data->view_name);
+  }
+
+  if (schema && !schema->columns.empty()) {
+    for (const auto &col : schema->columns) {
+      return_types.push_back(col.type);
+      names.push_back(col.name);
+    }
+  } else if (!data->rows.empty()) {
+    const auto &first = data->rows[0];
+    for (size_t i = 0; i < first.columns.size(); i++) {
+      return_types.push_back(first.columns[i].type());
+      names.push_back("col" + std::to_string(i));
+    }
+  }
+  return_types.push_back(LogicalType::BIGINT);
+  names.push_back("weight");
+
+  return std::move(data);
+}
+
+void ChangesFunc(ClientContext &context, TableFunctionInput &input,
+                 DataChunk &output) {
+  EnsureContextState(context);
+  auto &data = input.bind_data->CastNoConst<ChangesBindData>();
+
+  const idx_t weight_col = output.ColumnCount() - 1;
+  idx_t count = 0;
+  while (data.current < data.rows.size() && count < STANDARD_VECTOR_SIZE) {
+    const auto &row = data.rows[data.current];
+    for (idx_t col = 0; col < weight_col && col < row.columns.size(); col++) {
+      output.SetValue(col, count, row.columns[col]);
+    }
+    output.SetValue(weight_col, count, Value::BIGINT(data.weights[data.current]));
+    data.current++;
+    count++;
+  }
+  output.SetCardinality(count);
+}
+
+// ============================================================================
 // dbsp_views - List all views
 // ============================================================================
 
@@ -462,7 +551,7 @@ unique_ptr<FunctionData> ListViewsBind(ClientContext &context,
                                        vector<string> &names) {
   auto data = make_uniq<ListViewsBindData>();
 
-  auto &manager = dbsp_native::get_cdc_manager();
+  auto &manager = dbsp_native::get_cdc_manager(context);
   for (const auto &name : manager.list_views()) {
     data->views.push_back(manager.get_view_info(name));
   }
@@ -513,7 +602,7 @@ unique_ptr<FunctionData> ListTablesBind(ClientContext &context,
                                         vector<string> &names) {
   auto data = make_uniq<ListTablesBindData>();
 
-  auto &manager = dbsp_native::get_cdc_manager();
+  auto &manager = dbsp_native::get_cdc_manager(context);
   data->tables = manager.list_tracked_tables();
 
   return_types.push_back(LogicalType::VARCHAR);
@@ -528,7 +617,7 @@ void ListTablesFunc(ClientContext &context, TableFunctionInput &input,
                     DataChunk &output) {
   auto &data = input.bind_data->CastNoConst<ListTablesBindData>();
 
-  auto &manager = dbsp_native::get_cdc_manager();
+  auto &manager = dbsp_native::get_cdc_manager(context);
 
   idx_t count = 0;
   while (data.current < data.tables.size() && count < STANDARD_VECTOR_SIZE) {
@@ -552,7 +641,7 @@ void ListTablesFunc(ClientContext &context, TableFunctionInput &input,
 void DropScalar(DataChunk &args, ExpressionState &state, Vector &result) {
   UnaryExecutor::Execute<string_t, string_t>(
       args.data[0], result, args.size(), [&](string_t name) {
-        auto &manager = dbsp_native::get_cdc_manager();
+        auto &manager = dbsp_native::get_cdc_manager(state.GetContext());
         bool ok = manager.drop_view(name.GetString());
         return StringVector::AddString(result,
                                        ok ? "Dropped" : manager.last_error());
@@ -567,7 +656,7 @@ void DropCascadeScalar(DataChunk &args, ExpressionState &state,
                        Vector &result) {
   UnaryExecutor::Execute<string_t, string_t>(
       args.data[0], result, args.size(), [&](string_t name) {
-        auto &manager = dbsp_native::get_cdc_manager();
+        auto &manager = dbsp_native::get_cdc_manager(state.GetContext());
         auto deps = manager.get_dependents(name.GetString());
         bool ok = manager.drop_view_cascade(name.GetString());
         string msg = ok ? "Dropped " + name.GetString() : "Not found";
@@ -631,7 +720,7 @@ void SaveFunc(ClientContext &context, TableFunctionInput &input,
   if (data.done)
     return;
 
-  auto &manager = dbsp_native::get_cdc_manager();
+  auto &manager = dbsp_native::get_cdc_manager(context);
   bool ok;
   string msg;
 
@@ -640,11 +729,12 @@ void SaveFunc(ClientContext &context, TableFunctionInput &input,
     msg =
         ok ? "Saved to file: " + data.target : "Error: " + manager.last_error();
   } else {
-    // Table mode - not supported from table functions due to DuckDB
-    // transaction restrictions
-    ok = false;
-    msg = "Error: DuckDB table persistence not supported (use JSON files "
-          "instead). Try: dbsp_save('view_name', 'file.json', 'json')";
+    // Table mode (D3): view definitions into a table in the default
+    // catalog, so they travel with the database file and its backups
+    ok = manager.save_to_duck_table(context, data.target,
+                                    data.save_all ? "" : data.view_name);
+    msg = ok ? "Saved views to " + data.target
+             : "Error: " + manager.last_error();
   }
 
   if (!ok) {
@@ -699,7 +789,7 @@ void LoadFunc(ClientContext &context, TableFunctionInput &input,
   if (data.done)
     return;
 
-  auto &manager = dbsp_native::get_cdc_manager();
+  auto &manager = dbsp_native::get_cdc_manager(context);
   bool ok;
   string msg;
 
@@ -708,11 +798,11 @@ void LoadFunc(ClientContext &context, TableFunctionInput &input,
     msg = ok ? "Loaded from file: " + data.source
              : "Error: " + manager.last_error();
   } else {
-    // Table mode - not supported from table functions due to DuckDB
-    // transaction restrictions
-    ok = false;
-    msg = "Error: DuckDB table persistence not supported (use JSON files "
-          "instead). Try: dbsp_load('file.json', 'json')";
+    // Table mode (D3): recreate views from a table in the default
+    // catalog (written by dbsp_save() / create_view)
+    ok = manager.load_from_duck_table(context, data.source);
+    msg = ok ? "Loaded views from " + data.source
+             : "Error: " + manager.last_error();
   }
 
   if (!ok) {
@@ -752,7 +842,7 @@ unique_ptr<FunctionData> DepsBind(ClientContext &context,
 
   data->view_name = input.inputs[0].GetValue<string>();
 
-  auto &manager = dbsp_native::get_cdc_manager();
+  auto &manager = dbsp_native::get_cdc_manager(context);
 
   // Get dependencies (what this view depends on)
   auto deps = manager.get_view_dependencies(data->view_name);
@@ -828,7 +918,7 @@ void AutoSyncFunc(ClientContext &context, TableFunctionInput &input,
   if (data.done)
     return;
 
-  auto &manager = dbsp_native::get_cdc_manager();
+  auto &manager = dbsp_native::get_cdc_manager(context);
 
   if (data.query_only) {
     bool enabled = manager.is_auto_sync_enabled();
@@ -887,7 +977,7 @@ void ParallelFunc(ClientContext &context, TableFunctionInput &input,
   auto &data = input.bind_data->CastNoConst<ParallelBindData>();
   if (data.done)
     return;
-  auto &manager = dbsp_native::get_cdc_manager();
+  auto &manager = dbsp_native::get_cdc_manager(context);
   if (data.query_only) {
     bool enabled = manager.get_parallel_sync();
     output.SetCardinality(1);
@@ -941,7 +1031,7 @@ void SpillFunc(ClientContext &context, TableFunctionInput &input,
   auto &data = input.bind_data->CastNoConst<SpillBindData>();
   if (data.done)
     return;
-  auto &manager = dbsp_native::get_cdc_manager();
+  auto &manager = dbsp_native::get_cdc_manager(context);
   if (data.query_only) {
     bool enabled = manager.spill_enabled();
     output.SetCardinality(1);
@@ -1044,7 +1134,7 @@ void CreateMaterializedViewExecute(ClientContext &context,
     return;
   }
 
-  auto &manager = dbsp_native::get_cdc_manager();
+  auto &manager = dbsp_native::get_cdc_manager(context);
   bool success =
       manager.create_view(context, state.view_name, state.select_query);
 
@@ -1105,7 +1195,7 @@ void DropMaterializedViewExecute(ClientContext &context,
     return;
   }
 
-  auto &manager = dbsp_native::get_cdc_manager();
+  auto &manager = dbsp_native::get_cdc_manager(context);
 
   // Check if view exists
   if (!manager.view_exists(state.view_name)) {
@@ -1317,6 +1407,51 @@ public:
         "dbsp_cdc_state");
 
       }
+
+  // Release DBSP state when the last user connection to an instance closes.
+  // Views hold internal Connections (PlanKeepAlive) that own a
+  // shared_ptr<DatabaseInstance>; the CDCManager singleton is deliberately
+  // leaked, so without this the instance is pinned forever and a
+  // same-process reopen of the same database file busy-spins inside
+  // DBInstanceCache::GetInstanceInternal waiting for it to die.
+  void OnConnectionClosed(ClientContext &context) override {
+    const bool dbg = std::getenv("DBSP_DEBUG_TEARDOWN") != nullptr;
+    auto &registry = dbsp_native::get_instance_registry();
+    if (registry.is_internal(&context)) {
+      if (dbg) {
+        std::cerr << "[dbsp] close: internal ctx " << &context << "\n";
+      }
+      return; // one of our own PlanKeepAlive connections going away
+    }
+    auto *db = context.db.get();
+    if (!dbsp_native::get_cdc_registry().find(db)) {
+      if (dbg) {
+        std::cerr << "[dbsp] close: ctx " << &context << " db " << db
+                  << " has no CDC state\n";
+      }
+      return; // no DBSP state for this instance
+    }
+    // We are called from inside ConnectionManager::RemoveConnection, before
+    // the closing context is erased, so the count still includes it.
+    auto total = ConnectionManager::Get(*db).GetConnectionCount();
+    auto internals = registry.internal_count(db);
+    if (dbg) {
+      std::cerr << "[dbsp] close: ctx " << &context << " total " << total
+                << " internals " << internals << "\n";
+    }
+    if (total > internals + 1) {
+      return; // other user connections remain
+    }
+    // take() is atomic single-flight: a racing close gets nullptr.
+    auto manager = dbsp_native::get_cdc_registry().take(db);
+    if (!manager) {
+      return;
+    }
+    // Destroy on a detached thread: destroying views destroys their
+    // Connections, whose destructors re-enter RemoveConnection and would
+    // deadlock on connections_lock if run inline here.
+    std::thread([m = std::move(manager)]() mutable { m.reset(); }).detach();
+  }
 };
 
 static void LoadInternal(ExtensionLoader &loader) {
@@ -1367,6 +1502,10 @@ static void LoadInternal(ExtensionLoader &loader) {
   TableFunction query_func("dbsp_query", {LogicalType::VARCHAR}, QueryFunc,
                            QueryBind);
   loader.RegisterFunction(query_func);
+
+  TableFunction changes_func("dbsp_changes", {LogicalType::VARCHAR},
+                             ChangesFunc, ChangesBind);
+  loader.RegisterFunction(changes_func);
 
   TableFunction list_views_func("dbsp_views", {}, ListViewsFunc, ListViewsBind);
   loader.RegisterFunction(list_views_func);

@@ -414,8 +414,29 @@ State after:
 - Planner-frontend views hold an internal DuckDB Connection and therefore
   **pin the DatabaseInstance** while they exist. This is required: their
   expression-executor buffers come from the instance's allocator, so a view
-  must never outlive its instance. Drop views (or `reset()` the manager) to
-  release the instance while the process runs.
+  must never outlive its instance.
+- **Qualified table keys (Phase D2)**: tracked tables are keyed by
+  canonical `catalog.schema.table` derived from bound catalog entries, so
+  views can source tables in attached databases and same-name tables in
+  two catalogs stay distinct. `dbsp_qualified_name.hpp` holds the
+  resolution utilities; temp-catalog entries keep bare names for the
+  views-on-views TEMP-shadow mechanism.
+- **Per-instance managers (Phase D1)**: `CDCManagerRegistry` keys one
+  `CDCManager` per `DatabaseInstance`; `get_cdc_manager(context)` resolves
+  through the closing/calling context. Two databases open in one process
+  have fully isolated views and tracked tables.
+- **Automatic release on last close**: the extension's `OnConnectionClosed`
+  callback (with `InstanceRegistry` distinguishing DBSP-internal connections
+  from user ones) detects when the last user connection to an instance
+  closes and `take()`s that instance's manager out of the registry
+  (atomic single-flight), destroying it on a detached thread — inline
+  destruction would deadlock, since destroying a view's Connection
+  re-enters `ConnectionManager::RemoveConnection`. Without this, a
+  same-process close + reopen of the same database file spins forever in
+  `DBInstanceCache::GetInstanceInternal`. Views are in-memory state, so
+  they are gone after the last close by design; use `dbsp_save`/`dbsp_load`
+  to carry definitions across sessions. Set `DBSP_DEBUG_TEARDOWN=1` to
+  trace the decision on stderr.
 - `CDCManager` is a **deliberately leaked** heap singleton: no destructors
   run at process exit, so DuckDB shutdown never happens during static
   teardown (which previously caused intermittent exit segfaults). The OS

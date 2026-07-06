@@ -82,7 +82,7 @@ bool DBSPRecoveryManager::initialize_persistence(duckdb::ClientContext &context)
     }
 
     // Initialize _dbsp_views table via CDC manager
-    auto &cdc_manager = get_cdc_manager();
+    auto &cdc_manager = get_cdc_manager(context);
     return cdc_manager.initialize_persistence_table(context);
 
   } catch (const std::exception &e) {
@@ -93,7 +93,7 @@ bool DBSPRecoveryManager::initialize_persistence(duckdb::ClientContext &context)
 
 bool DBSPRecoveryManager::load_views(duckdb::ClientContext &context) {
   try {
-    auto &cdc_manager = get_cdc_manager();
+    auto &cdc_manager = get_cdc_manager(context);
 
     // Query _dbsp_views table for all view definitions. Fresh connection:
     // `context` may be mid-query (recovery runs inside table functions).
@@ -150,7 +150,7 @@ bool DBSPRecoveryManager::load_views(duckdb::ClientContext &context) {
 
 bool DBSPRecoveryManager::resync_tracked_tables(duckdb::ClientContext &context) {
   try {
-    auto &cdc_manager = get_cdc_manager();
+    auto &cdc_manager = get_cdc_manager(context);
 
     // Get list of tracked tables
     auto tracked_tables = cdc_manager.list_tracked_tables();
@@ -178,8 +178,6 @@ bool DBSPRecoveryManager::resync_tracked_tables(duckdb::ClientContext &context) 
 
 bool DBSPRecoveryManager::rebuild_dependency_graph() {
   try {
-    auto &cdc_manager = get_cdc_manager();
-
     // Dependency graph is automatically rebuilt during view creation
     // in load_views(), so this method is a no-op for now
 
