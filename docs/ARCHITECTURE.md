@@ -20,8 +20,9 @@ Internal design of the DBSP DuckDB extension.
 │  │    (same-level views step in parallel with dbsp_parallel)   ││
 │  │  - Shared join arrangements: one index per (table, keys)    ││
 │  │    fingerprint, probed by matching joins across all views   ││
-│  │  - Baselines + shared arrangements in RAM or on disk        ││
-│  │    (dbsp_spill: digest indexes + LRU bucket cache in RAM)   ││
+│  │  - Spill mode (dbsp_spill): baselines, join indexes,        ││
+│  │    top-K windows, big agg groups on disk; digest indexes    ││
+│  │    + LRU bucket caches in RAM                               ││
 │  └─────────────────────────────────────────────────────────────┘│
 │                              │                                   │
 │  ┌─────────────────────────────────────────────────────────────┐│

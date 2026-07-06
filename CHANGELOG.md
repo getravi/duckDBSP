@@ -1,5 +1,32 @@
 # Changelog
 
+## Phase N: RAM-state closeout - Jul 2026
+
+Four items, individually committed for per-item rollback; default-path
+benches verified unchanged after each (join 443k rows/s, aggregate
+2.0M, propagate 14.7us/row - all within noise of the ledger).
+
+- N1 grouping-set input sharing: ROLLUP/CUBE branches share ONE input
+  subtree via the CTE machinery (synthetic index) instead of
+  recomputing it per grouping set - CUBE(3) input work drops 8x.
+- N2 bounded top-K (spill mode): constant-LIMIT sort views keep only
+  offset+limit+margin rows in RAM; the rest lives in a disk record log
+  and promotes back on window underflow (one log pass, margin absorbs
+  normal churn). Kept set is provably identical to the full multiset's
+  (same comparator, full-row tie-break). Percentage limits and plain
+  ORDER BY keep full state.
+- N3 local join index spill (spill mode): unshareable probe-target
+  sides (filtered inputs, subqueries) put their private indexes in disk
+  bucket logs - same self-padding exclusions as arrangement sharing.
+- N4 oversized holistic groups (spill mode): a values multiset past
+  65536 entries migrates to a disk log; touched groups reload on
+  render. mode counts and ordered-aggregate entries stay in RAM.
+
+Remaining RAM state after N: self-padding join sides' pad/weight/mark
+structures, mode/ordered aggregate state, plain ORDER BY and window
+views (their answer IS the total order), and cross-projection
+arrangement duplication (excluded by decision - emit-path risk).
+
 ## Phase M: SQL-coverage leaves - Jul 2026
 
 - M1 window PARTITION BY / ORDER BY / argument expressions: the

@@ -59,12 +59,16 @@ subsystem, bespoke parser, standalone Z-set spilling).
 
 ## Architectural
 
-- Spill mode (K1+K2) covers tracked-table baselines and shared join
-  arrangements. Still RAM-resident: node-local join indexes (sides not
-  eligible for sharing), aggregate group states, and embedded
-  sort/window/distinct-on views. Aggregate states are usually small
-  (groups << rows); local join indexes matter for self-padding sides —
-  spilling them means extending the bucket-log design into the node.
+- Spill mode (K1+K2+N2-N4) covers baselines, shared arrangements,
+  local probe-target join indexes, bounded top-K sort views, and
+  oversized holistic groups. Still RAM-resident: self-padding join
+  sides (pad/weight/mark reconciliation walks full-row structures),
+  mode value-counts, ordered-aggregate (string_agg) entries, plain
+  ORDER BY / window views (the answer IS the total order), and
+  percentage-limit views (cutoff needs total count — could bound with a
+  count-only overflow later).
+- Cross-projection arrangement sharing excluded by decision (emit-path
+  perf risk; L2 hoisting incident showed the loop's sensitivity).
 
 - CDCManager is a deliberately leaked process-wide singleton (views pin
   the DatabaseInstance; instance-scoped ownership would be a reference
