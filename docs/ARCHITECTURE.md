@@ -140,7 +140,15 @@ SourceNode per base table) covering:
   aggregates keep exactly one row, even on empty input; SUM(DECIMAL)
   accumulates exactly in 128-bit unscaled form (`PlanAggregateNode`,
   B2, C5, D3). FIRST unlocks uncorrelated scalar-subquery comparisons
-  (CROSS_PRODUCT + first()/count_star() guard plans).
+  (CROSS_PRODUCT + first()/count_star() guard plans). DISTINCT and
+  FILTER (WHERE ...) modifiers maintain incrementally (value-weight
+  presence transitions / per-aggregate predicate slots); ordered
+  STRING_AGG/ARRAY_AGG re-render from sorted per-group entries; holistic
+  MEDIAN/QUANTILE_CONT/QUANTILE_DISC read the sorted multiset, MODE
+  per-value multiplicities (ties break by smallest value).
+  ROLLUP/CUBE/GROUPING SETS fan out into one aggregate branch per
+  grouping set (typed-NULL pads + constant GROUPING() masks) unioned
+  with UNION ALL (J, J2, L1).
 - COMPARISON_JOIN — INNER (equi keys + residual comparisons, bilinear
   delta rule incl. the Δl⋈Δr self-join term; a bare-scan side may probe
   a shared CDC-owned arrangement instead of a private index — see
