@@ -15,6 +15,7 @@
 #pragma once
 
 #include "dbsp_cdc.hpp"
+#include "dbsp_recovery.hpp"
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -32,6 +33,7 @@
 #include "duckdb/transaction/meta_transaction.hpp"
 #include "duckdb/transaction/transaction_context.hpp"
 
+#include <atomic>
 #include <iostream>
 #include <unordered_map>
 #include <unordered_set>
@@ -44,6 +46,7 @@ public:
     if (internal_query_depth > 0) {
       return;
     }
+    maybe_run_recovery(context);
     if (!get_cdc_manager(context).is_auto_sync_enabled()) {
       stmt_ = {};
       return; // no auto-sync: don't pay the parse on every statement
@@ -157,6 +160,33 @@ public:
       return;
     }
     capture_ = {}; // rolled back: captured rows never happened
+  }
+
+  // One-time crash recovery, moved here from OnConnectionOpened: that
+  // callback runs under ConnectionManager::connections_lock, and recovery
+  // opens internal Connections whose constructors re-enter AddConnection —
+  // a self-deadlock. QueryBegin runs without that lock. Guarded so
+  // recovery's own internal connections (internal_query_depth > 0) and
+  // re-entrant queries never recurse.
+  static void maybe_run_recovery(duckdb::ClientContext &context) {
+    static std::atomic<bool> recovery_started{false};
+    bool expected = false;
+    if (!recovery_started.compare_exchange_strong(expected, true)) {
+      return;
+    }
+    auto &recovery_manager = get_recovery_manager();
+    std::string db_path;
+    try {
+      auto &db_manager = duckdb::DatabaseManager::Get(context);
+      auto default_db =
+          db_manager.GetDatabase(context, DEFAULT_SCHEMA);
+      if (default_db) {
+        db_path = default_db->GetName();
+      }
+    } catch (...) {
+      // fall back to the default recovery path
+    }
+    recovery_manager.recover_from_crash(context, db_path);
   }
 
 private:

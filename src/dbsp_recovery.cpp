@@ -126,7 +126,13 @@ bool DBSPRecoveryManager::load_views(duckdb::ClientContext &context) {
       }
 
       // Recreate view (re-plans the SQL and rebuilds the circuit by
-      // replaying committed table state)
+      // replaying committed table state). Views already live in this
+      // session (created before recovery's deferred first run) are kept
+      // as-is — recreating them would fail and rebuilding is wasted work.
+      if (cdc_manager.get_view(name)) {
+        view_count++;
+        continue;
+      }
       try {
         if (cdc_manager.create_view(name, sql, sources, context)) {
           view_count++;

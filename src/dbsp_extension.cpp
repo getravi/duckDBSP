@@ -1371,42 +1371,16 @@ using namespace duckdb;
 class DBSPExtensionCallback : public ExtensionCallback {
 public:
   void OnConnectionOpened(ClientContext &context) override {
-    
-    // First-time initialization: recover from crash if needed.
-    // Skip for DBSP's own helper connections (recovery itself opens
-    // connections; recursing here would re-enter recovery).
-    static bool recovery_done = false;
-    if (!recovery_done && dbsp_native::internal_query_depth == 0) {
-      // Set before recovering: connections opened during recovery must not
-      // re-trigger it.
-      recovery_done = true;
-      auto &recovery_manager = dbsp_native::get_recovery_manager();
-
-      // Get database path from context
-      std::string db_path = "";
-      try {
-        // Try to get database path from attached database
-        auto &db_manager = DatabaseManager::Get(context);
-        auto default_db = db_manager.GetDatabase(context, DEFAULT_SCHEMA);
-        if (default_db) {
-          db_path = default_db->GetName();
-        }
-      } catch (...) {
-        // If we can't get db path, use default recovery path
-      }
-
-      // Perform recovery (will initialize persistence and load views)
-      recovery_manager.recover_from_crash(context, db_path);
-    }
+    // NOTE: this callback runs inside ConnectionManager::AddConnection,
+    // which holds connections_lock. Recovery creates internal Connections,
+    // whose constructors re-enter AddConnection — running it here
+    // self-deadlocks. It is therefore deferred to the first QueryBegin
+    // (DBSPContextState::maybe_run_recovery), which runs lock-free.
 
     // Attach our context state for transaction hooking
-    auto &config = DBConfig::GetConfig(context);
-
-    // Register the context state to receive transaction events
     context.registered_state->GetOrCreate<dbsp_native::DBSPContextState>(
         "dbsp_cdc_state");
-
-      }
+  }
 
   // Release DBSP state when the last user connection to an instance closes.
   // Views hold internal Connections (PlanKeepAlive) that own a

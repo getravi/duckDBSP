@@ -1,5 +1,18 @@
 # Changelog
 
+## Fix: recovery deadlock on second connection - Jul 2026
+
+- Crash recovery ran inside OnConnectionOpened, which executes under
+  ConnectionManager::connections_lock; recovery opens internal
+  Connections whose constructors re-enter AddConnection on the same
+  mutex — self-deadlock. Single-connection scripts never hit it (the
+  callback registers at LOAD, after that connection was added), but
+  embedded hosts opening a connection per operation hung on connection
+  #2. Recovery now runs once at the first QueryBegin (no lock held).
+  Regression test: test/python/test_recovery_no_deadlock.py.
+- Recovery's view reload now skips views already live in the session
+  instead of failing "View already exists" per view.
+
 ## Phase D3: view definitions persist in DuckDB tables - Jul 2026
 
 - dbsp_save() / dbsp_load() (zero-arg) now work: view definitions are
