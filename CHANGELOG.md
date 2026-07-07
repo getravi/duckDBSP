@@ -1,5 +1,32 @@
 # Changelog
 
+## Phase D3b: circuit-state checkpointing - Jul 2026
+
+- dbsp_save() now also snapshots per-view operator state (aggregate
+  group scalars, private INNER-join indexes) and sink results into
+  _dbsp_ckpt, with per-source watermarks (COUNT + bit_xor(hash(row)))
+  in _dbsp_ckpt_meta. dbsp_load() cold-creates covered views (sources
+  tracked/synced and arrangements backfilled, but NO circuit replay)
+  and injects the checkpointed state; post-restore incremental updates
+  are exact. Stale checkpoints (source changed since save) fail the
+  watermark check and fall back to a full rebuild.
+- Scope: count/sum/avg aggregate family and INNER joins. Value-
+  collecting aggregates (MIN/MAX/DISTINCT/ordered/quantiles), outer or
+  mark joins, and spilled state are not checkpointed - those views
+  rebuild by replay as before.
+- Node API: dbsp::Node::state_kind()/serialize_state()/restore_state()
+  (byte-level; the core circuit stays free of storage dependencies),
+  NativeMaterializedView::checkpointable()/serialize_circuit_state()/
+  restore_circuit_state(), CDCManager::save_checkpoint()/
+  checkpoint_valid()/restore_view_state(), and create_view(...,
+  skip_init_replay).
+- Measured (1M-row join+SUM view): restore 3.3s vs rebuild 4.6s in the
+  engine; in the NumPad host, second-session first edit dropped from
+  25s to 10s. Remaining restore cost is source sync + arrangement
+  backfill + blob decode - codec/arrangement follow-ups tracked in
+  docs/PHASE_D_PLAN.md.
+- Regression test: test/python/test_checkpoint_restore.py.
+
 ## Fix: recovery deadlock on second connection - Jul 2026
 
 - Crash recovery ran inside OnConnectionOpened, which executes under

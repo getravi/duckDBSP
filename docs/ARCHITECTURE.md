@@ -406,8 +406,12 @@ State after:
 
 - All data stored in-memory
 - No automatic eviction or bounds
-- Persistence saves definitions only, not materialized state
-- On load, views are rebuilt from current table data
+- Persistence saves definitions plus (D3b) a circuit-state checkpoint for
+  supported views: aggregate group scalars, private INNER-join indexes,
+  and sink results, watermarked by source COUNT + bit_xor(hash(row))
+- On load, checkpointed views restore without circuit replay when the
+  watermarks still match; everything else is rebuilt from current table
+  data
 
 ### Lifetime
 

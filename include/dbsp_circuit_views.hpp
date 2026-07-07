@@ -67,6 +67,54 @@ public:
     version_ = 0;
   }
 
+  // --- Circuit-state checkpointing (D3b) -------------------------------
+  bool checkpointable() const override {
+    bool ok = true;
+    circuit_.for_each_node([&](const dbsp::Node &n) {
+      if (n.state_kind() == dbsp::Node::StateKind::UNSUPPORTED) {
+        ok = false;
+      }
+    });
+    return ok;
+  }
+
+  bool serialize_circuit_state(
+      std::vector<std::pair<uint64_t, std::vector<uint8_t>>> &out)
+      const override {
+    if (!checkpointable()) {
+      return false;
+    }
+    bool ok = true;
+    circuit_.for_each_node([&](const dbsp::Node &n) {
+      if (n.state_kind() == dbsp::Node::StateKind::SERIALIZABLE) {
+        std::vector<uint8_t> blob;
+        n.serialize_state(blob);
+        out.emplace_back(n.id(), std::move(blob));
+      }
+    });
+    return ok;
+  }
+
+  bool restore_circuit_state(
+      const std::unordered_map<uint64_t, std::vector<uint8_t>> &blobs)
+      override {
+    if (!checkpointable()) {
+      return false;
+    }
+    bool ok = true;
+    circuit_.for_each_node([&](dbsp::Node &n) {
+      if (!ok || n.state_kind() != dbsp::Node::StateKind::SERIALIZABLE) {
+        return;
+      }
+      auto it = blobs.find(n.id());
+      if (it == blobs.end() ||
+          !n.restore_state(it->second.data(), it->second.size())) {
+        ok = false;
+      }
+    });
+    return ok;
+  }
+
 protected:
   // Subclass calls this once after adding its operator nodes
   void finish(OutputFn last_output) {

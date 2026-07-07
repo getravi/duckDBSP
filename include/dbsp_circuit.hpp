@@ -7,6 +7,7 @@
 #include "dbsp_zset.hpp"
 
 #include <any>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -41,6 +42,30 @@ public:
     // Check if this node has output ready
     virtual bool has_output() const = 0;
 
+    // --- Checkpointing (Phase D3b) ---------------------------------------
+    // How this node participates in circuit-state checkpoints. STATELESS
+    // nodes save/restore nothing; SERIALIZABLE nodes implement the two
+    // methods below; any UNSUPPORTED node makes its whole view fall back
+    // to rebuild-by-replay on load. Byte-level API keeps the core circuit
+    // free of storage dependencies.
+    enum class StateKind { STATELESS, SERIALIZABLE, UNSUPPORTED };
+
+    virtual StateKind state_kind() const { return StateKind::UNSUPPORTED; }
+
+    // Append this node's state to `out`. Only called when state_kind() is
+    // SERIALIZABLE.
+    virtual void serialize_state(std::vector<uint8_t>& out) const {
+        (void)out;
+    }
+
+    // Restore state saved by serialize_state. Returns false on any
+    // mismatch (caller discards the checkpoint and rebuilds).
+    virtual bool restore_state(const uint8_t* data, size_t len) {
+        (void)data;
+        (void)len;
+        return false;
+    }
+
 protected:
     NodeId id_;
     std::string name_;
@@ -54,6 +79,10 @@ public:
 
     SourceNode(NodeId id, std::string name = "source")
         : Node(id, std::move(name)) {}
+
+    // Checkpoints are taken quiescent (no pending push), so a source
+    // carries no durable state.
+    StateKind state_kind() const override { return StateKind::STATELESS; }
 
     // Push new data into the source
     void push(const ZSetType& delta) {
@@ -136,6 +165,11 @@ public:
 
     SinkNode(NodeId id, InputFn input_fn, std::string name = "sink")
         : Node(id, std::move(name)), input_fn_(std::move(input_fn)) {}
+
+    // The integrated result is checkpointed at the VIEW level (the view's
+    // get_result/set_result already round-trips it), so the sink itself
+    // reports stateless to the circuit walk.
+    StateKind state_kind() const override { return StateKind::STATELESS; }
 
     void step() override {
         // Accumulate the input delta into our integrated state. The delta
@@ -498,6 +532,20 @@ public:
 
     // Get number of nodes
     size_t node_count() const { return nodes_.size(); }
+
+    // Visit every node in insertion order (checkpointing walks the circuit)
+    template <typename Fn>
+    void for_each_node(Fn fn) {
+        for (auto& node : nodes_) {
+            fn(*node);
+        }
+    }
+    template <typename Fn>
+    void for_each_node(Fn fn) const {
+        for (const auto& node : nodes_) {
+            fn(*node);
+        }
+    }
 
     // Generate a new unique node ID
     NodeId next_node_id() { return next_id_++; }

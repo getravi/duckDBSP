@@ -400,6 +400,204 @@ public:
     sync_all(context, meta_transaction);
   }
 
+  // --- Circuit-state checkpointing (D3b) --------------------------------
+  // Persist per-view operator state (aggregate groups, private join
+  // indexes) and sink results into _dbsp_ckpt, plus per-source watermarks
+  // (COUNT + bit_xor(hash(row))) into _dbsp_ckpt_meta. Baselines and
+  // shared arrangements are NOT persisted: the load fast path rebuilds
+  // them with the typed sync scan (fast), and skips only the expensive
+  // circuit replay. Views with unsupported node kinds are simply not
+  // checkpointed and rebuild normally.
+  bool save_checkpoint(duckdb::ClientContext &context) {
+    struct ViewCkpt {
+      std::string name;
+      std::vector<std::pair<uint64_t, std::vector<uint8_t>>> nodes;
+      std::vector<uint8_t> sink;
+    };
+    std::vector<ViewCkpt> view_blobs;
+    std::vector<std::string> table_names;
+    {
+      std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+      std::shared_lock<std::shared_mutex> view_lock(view_mutex_);
+      for (const auto &[name, view] : views_) {
+        if (!view->checkpointable()) {
+          continue;
+        }
+        ViewCkpt ck;
+        ck.name = name;
+        if (!view->serialize_circuit_state(ck.nodes)) {
+          continue;
+        }
+        BlobWriter w;
+        const auto &result = view->get_result();
+        w.u64(result.size());
+        for (const auto &[row, weight] : result) {
+          w.row(row.columns);
+          w.i64(weight);
+        }
+        ck.sink = w.take();
+        view_blobs.push_back(std::move(ck));
+      }
+      for (const auto &[name, _] : tracked_tables_) {
+        table_names.push_back(name);
+      }
+    }
+
+    try {
+      InternalQueryGuard guard;
+      duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+      con.Query("BEGIN");
+      con.Query("CREATE OR REPLACE TABLE _dbsp_ckpt (kind VARCHAR, name "
+                "VARCHAR, node_id BIGINT, data BLOB)");
+      con.Query("CREATE OR REPLACE TABLE _dbsp_ckpt_meta (table_name "
+                "VARCHAR, row_count BIGINT, row_hash VARCHAR)");
+      auto ins = con.Prepare("INSERT INTO _dbsp_ckpt VALUES ($1, $2, $3, $4)");
+      auto insm = con.Prepare("INSERT INTO _dbsp_ckpt_meta VALUES ($1, $2, $3)");
+      if (!ins || ins->HasError() || !insm || insm->HasError()) {
+        con.Query("ROLLBACK");
+        last_error_ = "checkpoint prepare failed";
+        return false;
+      }
+      for (const auto &ck : view_blobs) {
+        for (const auto &[node_id, blob] : ck.nodes) {
+          auto r = ins->Execute(
+              "node", ck.name, static_cast<int64_t>(node_id),
+              duckdb::Value::BLOB(blob.data(), blob.size()));
+          if (r->HasError()) {
+            con.Query("ROLLBACK");
+            last_error_ = r->GetError();
+            return false;
+          }
+        }
+        auto r = ins->Execute("sink", ck.name, static_cast<int64_t>(0),
+                              duckdb::Value::BLOB(ck.sink.data(),
+                                                  ck.sink.size()));
+        if (r->HasError()) {
+          con.Query("ROLLBACK");
+          last_error_ = r->GetError();
+          return false;
+        }
+      }
+      for (const auto &t : table_names) {
+        auto wm = con.Query("SELECT COUNT(*), CAST(bit_xor(hash(t)) AS "
+                            "VARCHAR) FROM " +
+                            quote_table_key(t) + " t");
+        if (wm->HasError() || wm->RowCount() != 1) {
+          con.Query("ROLLBACK");
+          last_error_ = "checkpoint watermark failed for " + t;
+          return false;
+        }
+        auto r = insm->Execute(t, wm->GetValue(0, 0),
+                               wm->GetValue(1, 0).ToString());
+        if (r->HasError()) {
+          con.Query("ROLLBACK");
+          last_error_ = r->GetError();
+          return false;
+        }
+      }
+      con.Query("COMMIT");
+      return true;
+    } catch (const std::exception &e) {
+      last_error_ = std::string("checkpoint save failed: ") + e.what();
+      return false;
+    }
+  }
+
+  // Load-side: true when a checkpoint exists and every watermark matches
+  // the live tables. Fills `views` with per-view node blobs and sink blob.
+  struct CkptData {
+    std::unordered_map<std::string,
+                       std::unordered_map<uint64_t, std::vector<uint8_t>>>
+        nodes;
+    std::unordered_map<std::string, std::vector<uint8_t>> sinks;
+  };
+
+  bool checkpoint_valid(duckdb::ClientContext &context, CkptData &out) {
+    try {
+      InternalQueryGuard guard;
+      duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+      auto exists = con.Query(
+          "SELECT 1 FROM information_schema.tables WHERE table_name = "
+          "'_dbsp_ckpt'");
+      if (exists->HasError() || exists->RowCount() == 0) {
+        return false;
+      }
+      auto meta = con.Query(
+          "SELECT table_name, row_count, row_hash FROM _dbsp_ckpt_meta");
+      if (meta->HasError()) {
+        return false;
+      }
+      for (duckdb::idx_t i = 0; i < meta->RowCount(); i++) {
+        const std::string t = meta->GetValue(0, i).ToString();
+        auto live = con.Query("SELECT COUNT(*), CAST(bit_xor(hash(t)) AS "
+                              "VARCHAR) FROM " +
+                              quote_table_key(t) + " t");
+        if (live->HasError() || live->RowCount() != 1 ||
+            live->GetValue(0, 0) != meta->GetValue(1, i) ||
+            live->GetValue(1, 0).ToString() !=
+                meta->GetValue(2, i).ToString()) {
+          return false; // table gone or changed since save
+        }
+      }
+      auto rows = con.Query("SELECT kind, name, node_id, data FROM _dbsp_ckpt");
+      if (rows->HasError()) {
+        return false;
+      }
+      for (duckdb::idx_t i = 0; i < rows->RowCount(); i++) {
+        const std::string kind = rows->GetValue(0, i).ToString();
+        const std::string name = rows->GetValue(1, i).ToString();
+        const auto node_id =
+            static_cast<uint64_t>(rows->GetValue(2, i).GetValue<int64_t>());
+        const auto blob_str =
+            duckdb::StringValue::Get(rows->GetValue(3, i));
+        std::vector<uint8_t> blob(blob_str.begin(), blob_str.end());
+        if (kind == "node") {
+          out.nodes[name][node_id] = std::move(blob);
+        } else if (kind == "sink") {
+          out.sinks[name] = std::move(blob);
+        }
+      }
+      return !out.sinks.empty();
+    } catch (...) {
+      return false;
+    }
+  }
+
+  // Inject checkpointed state into a cold-created view. Must be called
+  // right after create_view(..., skip_init_replay=true).
+  bool restore_view_state(const std::string &view_name,
+                          const CkptData &ckpt) {
+    std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    std::unique_lock<std::shared_mutex> view_lock(view_mutex_);
+    auto it = views_.find(view_name);
+    auto nodes_it = ckpt.nodes.find(view_name);
+    auto sink_it = ckpt.sinks.find(view_name);
+    if (it == views_.end() || sink_it == ckpt.sinks.end()) {
+      return false;
+    }
+    static const std::unordered_map<uint64_t, std::vector<uint8_t>> kEmpty;
+    const auto &blobs =
+        nodes_it != ckpt.nodes.end() ? nodes_it->second : kEmpty;
+    if (!it->second->restore_circuit_state(blobs)) {
+      return false;
+    }
+    try {
+      BlobReader r(sink_it->second.data(), sink_it->second.size());
+      DuckDBZSet result;
+      const uint64_t n = r.u64();
+      for (uint64_t i = 0; i < n; i++) {
+        DuckDBRow row;
+        row.columns.assign(r.row());
+        const int64_t w = r.i64();
+        result.insert(row, w);
+      }
+      it->second->set_result(result);
+      return r.done();
+    } catch (...) {
+      return false;
+    }
+  }
+
   // Zero-arg dbsp_save(): snapshot all view definitions into the default
   // catalog's _dbsp_views table, so they travel with the database file
   // (and its backups). Full rewrite for a consistent snapshot (D3).
@@ -522,6 +720,13 @@ public:
       last_error_ = std::string("Load failed: ") + e.what();
       return false;
     }
+    // Fast path (D3b): when a circuit-state checkpoint exists and every
+    // source watermark matches the live tables, cold-create the covered
+    // views (sources tracked + synced + arrangements backfilled, but no
+    // circuit replay) and inject their operator state + sink result.
+    CkptData ckpt;
+    const bool have_ckpt = checkpoint_valid(context, ckpt);
+
     size_t loaded = 0;
     for (const auto &[name, view_sql] : rows) {
       {
@@ -530,8 +735,17 @@ public:
           continue; // already live in this session
         }
       }
-      if (create_view(context, name, view_sql)) {
-        loaded++;
+      const bool cold = have_ckpt && ckpt.sinks.count(name) > 0;
+      if (create_view(context, name, view_sql, /*skip_init_replay=*/cold)) {
+        if (cold && !restore_view_state(name, ckpt)) {
+          // Corrupt/mismatched blob: rebuild this view the normal way
+          drop_view(name);
+          if (create_view(context, name, view_sql)) {
+            loaded++;
+          }
+        } else {
+          loaded++;
+        }
       }
       // Continue on individual failures (e.g. a source table was dropped)
     }
@@ -640,7 +854,7 @@ public:
   // Create a materialized view from SQL
   // Supports referencing other views (cascading views)
   bool create_view(duckdb::ClientContext &context, const std::string &view_name,
-                   const std::string &sql) {
+                   const std::string &sql, bool skip_init_replay = false) {
     std::unique_lock<std::shared_mutex> struct_lock(struct_mutex_);
 
     // Validate view name to prevent SQL injection
@@ -792,7 +1006,10 @@ public:
       // Initialize view with current data from sources
       // struct_mutex_ held exclusively so no concurrent mutations to tracked
       // tables or other views can occur; reads are safe without table_locks_
-      for (const auto &source : resolved_sources) {
+      // Checkpoint restore (D3b) skips this replay: node state and the sink
+      // result are injected from the checkpoint instead.
+      for (const auto &source :
+           skip_init_replay ? std::vector<std::string>{} : resolved_sources) {
         if (pview && pview->shared_init_skip().count(source)) {
           continue;
         }

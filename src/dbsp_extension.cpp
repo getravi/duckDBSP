@@ -730,10 +730,18 @@ void SaveFunc(ClientContext &context, TableFunctionInput &input,
         ok ? "Saved to file: " + data.target : "Error: " + manager.last_error();
   } else {
     // Table mode (D3): view definitions into a table in the default
-    // catalog, so they travel with the database file and its backups
+    // catalog, so they travel with the database file and its backups.
+    // D3b: also snapshot circuit state so the next load can skip replay.
     ok = manager.save_to_duck_table(context, data.target,
                                     data.save_all ? "" : data.view_name);
-    msg = ok ? "Saved views to " + data.target
+    std::string ckpt_note;
+    if (ok && data.save_all) {
+      ckpt_note = manager.save_checkpoint(context)
+                      ? " (+ circuit checkpoint)"
+                      : " (no circuit checkpoint: " + manager.last_error() +
+                            ")";
+    }
+    msg = ok ? "Saved views to " + data.target + ckpt_note
              : "Error: " + manager.last_error();
   }
 

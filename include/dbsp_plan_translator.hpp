@@ -57,6 +57,7 @@
 #include "dbsp_distinct_on.hpp"
 #include "dbsp_errors.hpp"
 #include "dbsp_instance_registry.hpp"
+#include "dbsp_checkpoint.hpp"
 #include "dbsp_qualified_name.hpp"
 #include "dbsp_window_view.hpp"
 
@@ -1206,6 +1207,76 @@ private:
   DuckDBZSet output_;
   bool has_output_ = false;
   bool global_emitted_ = false;
+
+public:
+  // Checkpointing (D3b): the count/sum/avg family keeps only scalars per
+  // group — serializable. Anything value-collecting (MIN/MAX multisets,
+  // DISTINCT weights, ordered aggregates, MODE/MEDIAN/quantiles) stays
+  // UNSUPPORTED in v1 and forces rebuild-by-replay.
+  StateKind state_kind() const override {
+    for (const auto &a : aggs_) {
+      const bool scalar_fn = a.fn == PlanAggSpec::Fn::COUNT_STAR ||
+                             a.fn == PlanAggSpec::Fn::COUNT ||
+                             a.fn == PlanAggSpec::Fn::SUM ||
+                             a.fn == PlanAggSpec::Fn::AVG;
+      if (!scalar_fn || a.distinct) {
+        return StateKind::UNSUPPORTED;
+      }
+    }
+    return StateKind::SERIALIZABLE;
+  }
+
+  void serialize_state(std::vector<uint8_t> &out) const override {
+    BlobWriter w;
+    w.u64(static_cast<uint64_t>(global_emitted_ ? 1 : 0));
+    w.u64(aggs_.size());
+    w.u64(states_.size());
+    for (const auto &[key, group] : states_) {
+      w.row(key.columns);
+      w.i64(group.row_weight);
+      w.u64(group.aggs.size());
+      for (const auto &a : group.aggs) {
+        w.i64(a.count);
+        w.i64(a.isum);
+        w.f64(a.dsum);
+        w.i64(a.hsum.upper);
+        w.u64(a.hsum.lower);
+      }
+    }
+    out = w.take();
+  }
+
+  bool restore_state(const uint8_t *data, size_t len) override {
+    try {
+      BlobReader r(data, len);
+      global_emitted_ = r.u64() != 0;
+      if (r.u64() != aggs_.size()) {
+        return false; // definition changed since save
+      }
+      states_.clear();
+      const uint64_t n_groups = r.u64();
+      for (uint64_t g = 0; g < n_groups; g++) {
+        DuckDBRow key;
+        key.columns.assign(r.row());
+        GroupState group;
+        group.row_weight = r.i64();
+        const uint64_t n_aggs = r.u64();
+        group.aggs.resize(n_aggs);
+        for (uint64_t i = 0; i < n_aggs; i++) {
+          auto &a = group.aggs[i];
+          a.count = r.i64();
+          a.isum = r.i64();
+          a.dsum = r.f64();
+          a.hsum.upper = r.i64();
+          a.hsum.lower = r.u64();
+        }
+        states_.emplace(std::move(key), std::move(group));
+      }
+      return r.done();
+    } catch (...) {
+      return false;
+    }
+  }
 };
 
 // Incremental inner join (B3). Bilinear delta rule per step:
@@ -2309,6 +2380,77 @@ private:
   InputFn left_fn_, right_fn_;
   std::vector<KeyPair> keys_;
   std::vector<Residual> residuals_;
+public:
+  // Checkpointing (D3b): INNER joins keep only equi-key indexes (private
+  // ones for non-shared sides; shared arrangements are checkpointed by the
+  // CDC layer). Outer/mark joins carry pad/mark bookkeeping and spilled
+  // indexes live on disk — both UNSUPPORTED in v1 (rebuild-by-replay).
+  StateKind state_kind() const override {
+    if (join_type_ != duckdb::JoinType::INNER || marks_ || pads_left_ ||
+        pads_right_ || local_spill_left_ || local_spill_right_) {
+      return StateKind::UNSUPPORTED;
+    }
+    return StateKind::SERIALIZABLE;
+  }
+
+  void serialize_state(std::vector<uint8_t> &out) const override {
+    BlobWriter w;
+    auto write_weights = [&w](const RowWeights &rw) {
+      w.u64(rw.size());
+      for (const auto &[row, weight] : rw) {
+        w.row(row.columns);
+        w.i64(weight);
+      }
+    };
+    auto write_index = [&](const Index &idx) {
+      w.u64(idx.size());
+      for (const auto &[key, bucket] : idx) {
+        w.row(key.columns);
+        write_weights(bucket);
+      }
+    };
+    write_index(left_index_);
+    write_index(right_index_);
+    write_weights(left_weights_);
+    write_weights(right_weights_);
+    out = w.take();
+  }
+
+  bool restore_state(const uint8_t *data, size_t len) override {
+    try {
+      BlobReader r(data, len);
+      auto read_weights = [&r](RowWeights &rw) {
+        rw.clear();
+        const uint64_t n = r.u64();
+        for (uint64_t i = 0; i < n; i++) {
+          DuckDBRow row;
+          row.columns.assign(r.row());
+          const int64_t weight = r.i64();
+          rw.emplace(std::move(row), weight);
+        }
+      };
+      auto read_index = [&](Index &idx) {
+        idx.clear();
+        const uint64_t n = r.u64();
+        for (uint64_t i = 0; i < n; i++) {
+          DuckDBRow key;
+          key.columns.assign(r.row());
+          RowWeights bucket;
+          read_weights(bucket);
+          idx.emplace(std::move(key), std::move(bucket));
+        }
+      };
+      read_index(left_index_);
+      read_index(right_index_);
+      read_weights(left_weights_);
+      read_weights(right_weights_);
+      return r.done();
+    } catch (...) {
+      return false;
+    }
+  }
+
+private:
   duckdb::JoinType join_type_;
   duckdb::vector<duckdb::LogicalType> left_types_, right_types_;
   bool pads_left_ = false, pads_right_ = false;
@@ -2550,6 +2692,9 @@ public:
         std::move(keep_alive), std::move(filter_exprs),
         std::move(input_types));
   }
+
+  // Pure filter/project over the incoming delta: no durable state.
+  StateKind state_kind() const override { return StateKind::STATELESS; }
 
   void step() override {
     output_.clear();

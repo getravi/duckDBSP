@@ -538,6 +538,21 @@ public:
     }
   }
 
+  // --- Circuit-state checkpointing (D3b) -------------------------------
+  // Planner-built views override these; legacy views report false and
+  // fall back to rebuild-by-replay on load.
+  virtual bool checkpointable() const { return false; }
+  virtual bool serialize_circuit_state(
+      std::vector<std::pair<uint64_t, std::vector<uint8_t>>> &out) const {
+    (void)out;
+    return false;
+  }
+  virtual bool restore_circuit_state(
+      const std::unordered_map<uint64_t, std::vector<uint8_t>> &blobs) {
+    (void)blobs;
+    return false;
+  }
+
 protected:
   std::string name_;
   std::string sql_;
