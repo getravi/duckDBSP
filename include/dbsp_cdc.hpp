@@ -112,6 +112,13 @@ inline bool is_valid_identifier(const std::string &name) {
   return validate_identifier(name, error_msg, error_code);
 }
 
+// Qualify a table name with an optional catalog prefix for cross-catalog SQL.
+// qualify("m", "_dbsp_views") -> "\"m\".\"_dbsp_views\""
+// qualify("",  "_dbsp_views") -> "\"_dbsp_views\""
+inline std::string qualify(const std::string &cat, const std::string &tbl) {
+  return cat.empty() ? ("\"" + tbl + "\"") : ("\"" + cat + "\".\"" + tbl + "\"");
+}
+
 // Validate and canonicalize file path to prevent path traversal
 // Returns canonicalized path if valid, empty string if invalid
 inline std::string validate_filepath(const std::string &filepath) {
@@ -408,7 +415,12 @@ public:
   // them with the typed sync scan (fast), and skips only the expensive
   // circuit replay. Views with unsupported node kinds are simply not
   // checkpointed and rebuild normally.
-  bool save_checkpoint(duckdb::ClientContext &context) {
+  bool save_checkpoint(duckdb::ClientContext &context,
+                       const std::string &catalog = "") {
+    if (!catalog.empty() && !is_valid_identifier(catalog)) {
+      last_error_ = "Invalid catalog name: " + catalog;
+      return false;
+    }
     struct ViewCkpt {
       std::string name;
       std::vector<std::pair<uint64_t, std::vector<uint8_t>>> nodes;
@@ -443,16 +455,19 @@ public:
       }
     }
 
+    const std::string ckpt_tbl = qualify(catalog, "_dbsp_ckpt");
+    const std::string ckpt_meta_tbl = qualify(catalog, "_dbsp_ckpt_meta");
+
     try {
       InternalQueryGuard guard;
       duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
       con.Query("BEGIN");
-      con.Query("CREATE OR REPLACE TABLE _dbsp_ckpt (kind VARCHAR, name "
+      con.Query("CREATE OR REPLACE TABLE " + ckpt_tbl + " (kind VARCHAR, name "
                 "VARCHAR, node_id BIGINT, data BLOB)");
-      con.Query("CREATE OR REPLACE TABLE _dbsp_ckpt_meta (table_name "
+      con.Query("CREATE OR REPLACE TABLE " + ckpt_meta_tbl + " (table_name "
                 "VARCHAR, row_count BIGINT, row_hash VARCHAR)");
-      auto ins = con.Prepare("INSERT INTO _dbsp_ckpt VALUES ($1, $2, $3, $4)");
-      auto insm = con.Prepare("INSERT INTO _dbsp_ckpt_meta VALUES ($1, $2, $3)");
+      auto ins = con.Prepare("INSERT INTO " + ckpt_tbl + " VALUES ($1, $2, $3, $4)");
+      auto insm = con.Prepare("INSERT INTO " + ckpt_meta_tbl + " VALUES ($1, $2, $3)");
       if (!ins || ins->HasError() || !insm || insm->HasError()) {
         con.Query("ROLLBACK");
         last_error_ = "checkpoint prepare failed";
@@ -512,18 +527,27 @@ public:
     std::unordered_map<std::string, std::vector<uint8_t>> sinks;
   };
 
-  bool checkpoint_valid(duckdb::ClientContext &context, CkptData &out) {
+  bool checkpoint_valid(duckdb::ClientContext &context, CkptData &out,
+                        const std::string &catalog = "") {
+    const std::string ckpt_tbl = qualify(catalog, "_dbsp_ckpt");
+    const std::string ckpt_meta_tbl = qualify(catalog, "_dbsp_ckpt_meta");
     try {
       InternalQueryGuard guard;
       duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
-      auto exists = con.Query(
-          "SELECT 1 FROM information_schema.tables WHERE table_name = "
-          "'_dbsp_ckpt'");
+      // Scope the existence check to the right catalog when one is given.
+      std::string exists_sql;
+      if (catalog.empty()) {
+        exists_sql = "SELECT 1 FROM information_schema.tables WHERE table_name = '_dbsp_ckpt'";
+      } else {
+        exists_sql = "SELECT 1 FROM information_schema.tables WHERE table_catalog = '" +
+                     catalog + "' AND table_name = '_dbsp_ckpt'";
+      }
+      auto exists = con.Query(exists_sql);
       if (exists->HasError() || exists->RowCount() == 0) {
         return false;
       }
       auto meta = con.Query(
-          "SELECT table_name, row_count, row_hash FROM _dbsp_ckpt_meta");
+          "SELECT table_name, row_count, row_hash FROM " + ckpt_meta_tbl);
       if (meta->HasError()) {
         return false;
       }
@@ -539,7 +563,7 @@ public:
           return false; // table gone or changed since save
         }
       }
-      auto rows = con.Query("SELECT kind, name, node_id, data FROM _dbsp_ckpt");
+      auto rows = con.Query("SELECT kind, name, node_id, data FROM " + ckpt_tbl);
       if (rows->HasError()) {
         return false;
       }
@@ -598,12 +622,14 @@ public:
     }
   }
 
-  // Zero-arg dbsp_save(): snapshot all view definitions into the default
-  // catalog's _dbsp_views table, so they travel with the database file
-  // (and its backups). Full rewrite for a consistent snapshot (D3).
+  // Zero-arg dbsp_save(): snapshot all view definitions into a catalog's
+  // _dbsp_views table, so they travel with the database file (and backups).
+  // When `catalog` is non-empty the table is created/read in that attached
+  // database (e.g. "m"."_dbsp_views"). Full rewrite for a consistent snapshot (D3).
   bool save_to_duck_table(duckdb::ClientContext &context,
                           const std::string &storage_table = "_dbsp_views",
-                          const std::string &only_view = "") {
+                          const std::string &only_view = "",
+                          const std::string &catalog = "") {
     if (!is_valid_identifier(storage_table)) {
       last_error_ = "Invalid storage table name: " + storage_table;
       return false;
@@ -612,6 +638,11 @@ public:
       last_error_ = "Invalid view name: " + only_view;
       return false;
     }
+    if (!catalog.empty() && !is_valid_identifier(catalog)) {
+      last_error_ = "Invalid catalog name: " + catalog;
+      return false;
+    }
+    const std::string qtable = qualify(catalog, storage_table);
     std::vector<ViewDefinition> defs;
     {
       std::shared_lock<std::shared_mutex> lock(struct_mutex_);
@@ -635,8 +666,8 @@ public:
       duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
       con.Query("BEGIN");
       auto res = con.Query(
-          "CREATE TABLE IF NOT EXISTS \"" + storage_table +
-          "\" (name VARCHAR PRIMARY KEY, sql VARCHAR, sources VARCHAR, "
+          "CREATE TABLE IF NOT EXISTS " + qtable +
+          " (name VARCHAR PRIMARY KEY, sql VARCHAR, sources VARCHAR, "
           "created_at BIGINT)");
       if (res->HasError()) {
         con.Query("ROLLBACK");
@@ -644,13 +675,13 @@ public:
         return false;
       }
       if (only_view.empty()) {
-        con.Query("DELETE FROM \"" + storage_table + "\"");
+        con.Query("DELETE FROM " + qtable);
       } else {
-        con.Query("DELETE FROM \"" + storage_table + "\" WHERE name = '" +
+        con.Query("DELETE FROM " + qtable + " WHERE name = '" +
                   only_view + "'");
       }
-      auto prep = con.Prepare("INSERT INTO \"" + storage_table +
-                              "\" VALUES ($1, $2, $3, $4)");
+      auto prep = con.Prepare("INSERT INTO " + qtable +
+                              " VALUES ($1, $2, $3, $4)");
       if (!prep || prep->HasError()) {
         con.Query("ROLLBACK");
         last_error_ = prep ? prep->GetError() : "prepare failed";
@@ -664,8 +695,15 @@ public:
           }
           sources_str += def.source_tables[i];
         }
-        auto r = prep->Execute(def.name, def.sql, sources_str,
-                               static_cast<int64_t>(def.created_at));
+        // Use Value(string) constructor (VARCHAR) not CreateValue<string>
+        // (BLOB). When BLOB is stored into a VARCHAR column DuckDB hex-encodes
+        // the bytes (e.g. " → \x22), breaking SQL round-trips on reload.
+        duckdb::vector<duckdb::Value> args;
+        args.push_back(duckdb::Value(def.name));
+        args.push_back(duckdb::Value(def.sql));
+        args.push_back(duckdb::Value(sources_str));
+        args.push_back(duckdb::Value::BIGINT(static_cast<int64_t>(def.created_at)));
+        auto r = prep->Execute(args);
         if (r->HasError()) {
           con.Query("ROLLBACK");
           last_error_ = r->GetError();
@@ -680,41 +718,59 @@ public:
     }
   }
 
-  // Zero-arg dbsp_load(): recreate views from the default catalog's
-  // _dbsp_views table (created by save_to_duck_table / create_view).
-  // Missing table = nothing persisted = success. Must NOT hold
-  // struct_mutex_: create_view acquires it.
+  // Zero-arg dbsp_load(): recreate views from a catalog's _dbsp_views table
+  // (created by save_to_duck_table / create_view). When `catalog` is non-empty,
+  // reads from that attached database (e.g. "m"."_dbsp_views"). Missing default
+  // table = nothing persisted = success. Must NOT hold struct_mutex_: create_view
+  // acquires it.
   bool load_from_duck_table(duckdb::ClientContext &context,
-                            const std::string &storage_table = "_dbsp_views") {
+                            const std::string &storage_table = "_dbsp_views",
+                            const std::string &catalog = "") {
     if (!is_valid_identifier(storage_table)) {
       last_error_ = "Invalid storage table name: " + storage_table;
       return false;
     }
+    if (!catalog.empty() && !is_valid_identifier(catalog)) {
+      last_error_ = "Invalid catalog name: " + catalog;
+      return false;
+    }
+    const std::string qtable = qualify(catalog, storage_table);
     std::vector<std::pair<std::string, std::string>> rows;
     try {
       InternalQueryGuard guard;
       duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
-      auto exists = con.Query(
-          "SELECT 1 FROM information_schema.tables WHERE table_name = '" +
-          storage_table + "'");
+      // Scope the existence check to the right catalog when one is given.
+      std::string exists_sql;
+      if (catalog.empty()) {
+        exists_sql = "SELECT 1 FROM information_schema.tables WHERE table_name = '" +
+                     storage_table + "'";
+      } else {
+        exists_sql = "SELECT 1 FROM information_schema.tables WHERE table_catalog = '" +
+                     catalog + "' AND table_name = '" + storage_table + "'";
+      }
+      auto exists = con.Query(exists_sql);
       if (exists->HasError() || exists->RowCount() == 0) {
         // Missing default table = nothing persisted = success; an
         // explicitly named missing table is an error.
         if (storage_table == "_dbsp_views") {
           return true;
         }
-        last_error_ = "Storage table not found: " + storage_table;
+        last_error_ = "Storage table not found: " + qtable;
         return false;
       }
-      auto res = con.Query("SELECT name, sql FROM \"" + storage_table +
-                           "\" ORDER BY created_at");
+      auto res = con.Query("SELECT name, sql FROM " + qtable +
+                           " ORDER BY created_at");
       if (res->HasError()) {
         last_error_ = res->GetError();
         return false;
       }
       for (duckdb::idx_t i = 0; i < res->RowCount(); i++) {
-        rows.emplace_back(res->GetValue(0, i).ToString(),
-                          res->GetValue(1, i).ToString());
+        // Use StringValue::Get() for raw VARCHAR content — Value::ToString()
+        // escapes characters like " as \x22, which breaks the stored SQL.
+        auto name_val = res->GetValue(0, i);
+        auto sql_val = res->GetValue(1, i);
+        rows.emplace_back(duckdb::StringValue::Get(name_val),
+                          duckdb::StringValue::Get(sql_val));
       }
     } catch (const std::exception &e) {
       last_error_ = std::string("Load failed: ") + e.what();
@@ -725,7 +781,7 @@ public:
     // views (sources tracked + synced + arrangements backfilled, but no
     // circuit replay) and inject their operator state + sink result.
     CkptData ckpt;
-    const bool have_ckpt = checkpoint_valid(context, ckpt);
+    const bool have_ckpt = checkpoint_valid(context, ckpt, catalog);
 
     size_t loaded = 0;
     for (const auto &[name, view_sql] : rows) {

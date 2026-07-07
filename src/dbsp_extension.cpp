@@ -677,6 +677,7 @@ struct SaveBindData : public TableFunctionData {
   string view_name;      // Optional: specific view to save
   string target;         // Table name or file path
   string format;         // "table" or "json"
+  string catalog;        // Optional: attached catalog to save into
   bool save_all = false; // Save all views
   bool done = false;
 };
@@ -709,6 +710,19 @@ unique_ptr<FunctionData> SaveBind(ClientContext &context,
     data->format = input.inputs[2].GetValue<string>();
   }
 
+  // Named parameter: catalog := 'attached_db_name'
+  auto cat_it = input.named_parameters.find("catalog");
+  if (cat_it != input.named_parameters.end()) {
+    data->catalog = cat_it->second.GetValue<string>();
+    // When catalog is given and no target was specified, default to table mode
+    // writing into the named catalog.
+    if (data->format.empty()) {
+      data->save_all = true;
+      data->target = "_dbsp_views";
+      data->format = "table";
+    }
+  }
+
   return_types.push_back(LogicalType::VARCHAR);
   names.push_back("result");
   return std::move(data);
@@ -729,14 +743,15 @@ void SaveFunc(ClientContext &context, TableFunctionInput &input,
     msg =
         ok ? "Saved to file: " + data.target : "Error: " + manager.last_error();
   } else {
-    // Table mode (D3): view definitions into a table in the default
-    // catalog, so they travel with the database file and its backups.
+    // Table mode (D3): view definitions into a table in the target catalog,
+    // so they travel with the database file and its backups.
     // D3b: also snapshot circuit state so the next load can skip replay.
     ok = manager.save_to_duck_table(context, data.target,
-                                    data.save_all ? "" : data.view_name);
+                                    data.save_all ? "" : data.view_name,
+                                    data.catalog);
     std::string ckpt_note;
     if (ok && data.save_all) {
-      ckpt_note = manager.save_checkpoint(context)
+      ckpt_note = manager.save_checkpoint(context, data.catalog)
                       ? " (+ circuit checkpoint)"
                       : " (no circuit checkpoint: " + manager.last_error() +
                             ")";
@@ -761,8 +776,9 @@ void SaveFunc(ClientContext &context, TableFunctionInput &input,
 // ============================================================================
 
 struct LoadBindData : public TableFunctionData {
-  string source; // Table name or file path
-  string format; // "table" or "json"
+  string source;  // Table name or file path
+  string format;  // "table" or "json"
+  string catalog; // Optional: attached catalog to load from
   bool done = false;
 };
 
@@ -786,6 +802,18 @@ unique_ptr<FunctionData> LoadBind(ClientContext &context,
     data->format = input.inputs[1].GetValue<string>();
   }
 
+  // Named parameter: catalog := 'attached_db_name'
+  auto cat_it = input.named_parameters.find("catalog");
+  if (cat_it != input.named_parameters.end()) {
+    data->catalog = cat_it->second.GetValue<string>();
+    // When catalog is given and no source was specified, default to table mode
+    // reading from the named catalog.
+    if (data->format.empty()) {
+      data->source = "_dbsp_views";
+      data->format = "table";
+    }
+  }
+
   return_types.push_back(LogicalType::VARCHAR);
   names.push_back("result");
   return std::move(data);
@@ -806,9 +834,9 @@ void LoadFunc(ClientContext &context, TableFunctionInput &input,
     msg = ok ? "Loaded from file: " + data.source
              : "Error: " + manager.last_error();
   } else {
-    // Table mode (D3): recreate views from a table in the default
-    // catalog (written by dbsp_save() / create_view)
-    ok = manager.load_from_duck_table(context, data.source);
+    // Table mode (D3): recreate views from a table in the target catalog
+    // (written by dbsp_save() / create_view)
+    ok = manager.load_from_duck_table(context, data.source, data.catalog);
     msg = ok ? "Loaded views from " + data.source
              : "Error: " + manager.last_error();
   }
@@ -1506,10 +1534,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 
   TableFunction save_func("dbsp_save", {}, SaveFunc, SaveBind);
   save_func.varargs = LogicalType::VARCHAR;
+  save_func.named_parameters["catalog"] = LogicalType::VARCHAR;
   loader.RegisterFunction(save_func);
 
   TableFunction load_func("dbsp_load", {}, LoadFunc, LoadBind);
   load_func.varargs = LogicalType::VARCHAR;
+  load_func.named_parameters["catalog"] = LogicalType::VARCHAR;
   loader.RegisterFunction(load_func);
 
   TableFunction auto_sync_func("dbsp_auto_sync", {}, AutoSyncFunc,
