@@ -32,6 +32,7 @@
 #include "duckdb/transaction/local_storage.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 #include "duckdb/transaction/transaction_context.hpp"
+#include "duckdb/storage/storage_manager.hpp"
 
 #include <atomic>
 #include <iostream>
@@ -178,13 +179,19 @@ public:
     std::string db_path;
     try {
       auto &db_manager = duckdb::DatabaseManager::Get(context);
-      auto default_db =
-          db_manager.GetDatabase(context, DEFAULT_SCHEMA);
+      // The default catalog's NAME is not its path ("m" for m.duckdb) and
+      // the old lookup by DEFAULT_SCHEMA ("main") never matched anything —
+      // which parked recovery markers in the process CWD for every mode.
+      auto default_db = db_manager.GetDatabase(
+          context, duckdb::DatabaseManager::GetDefaultDatabase(context));
       if (default_db) {
-        db_path = default_db->GetName();
+        auto &storage = default_db->GetStorageManager();
+        if (!storage.InMemory()) {
+          db_path = storage.GetDBPath();
+        }
       }
     } catch (...) {
-      // fall back to the default recovery path
+      // no durable default catalog: markers stay disabled
     }
     recovery_manager.recover_from_crash(context, db_path);
   }

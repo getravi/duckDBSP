@@ -36,34 +36,38 @@ std::string DBSPRecoveryManager::determine_recovery_path(const std::string &db_p
     return recovery_path_;
   }
 
-  // If db_path is provided, use its directory
-  if (!db_path.empty()) {
-    std::filesystem::path db_file_path(db_path);
-    if (db_file_path.has_parent_path()) {
-      return db_file_path.parent_path().string() + "/.dbsp_recovery";
-    }
+  // In-memory instances have no durable state: views die with the process,
+  // so there is nothing crash markers could protect. Returning "" disables
+  // markers entirely — the old fallback littered ./.dbsp_recovery into the
+  // embedding process's CWD (e.g. an API server's repo root).
+  if (db_path.empty() || db_path == "memory" || db_path == ":memory:") {
+    return "";
   }
 
-  // Default to current directory
+  std::filesystem::path db_file_path(db_path);
+  if (db_file_path.has_parent_path()) {
+    return db_file_path.parent_path().string() + "/.dbsp_recovery";
+  }
+  // Relative single-component db filename: markers next to it.
   return ".dbsp_recovery";
 }
 
 void DBSPRecoveryManager::mark_session_start() {
-  if (!recovery_enabled_) return;
+  if (!recovery_enabled_ || recovery_path_.empty()) return;
 
   DBSPCrashMarker::mark_session_start(recovery_path_);
   session_started_ = true;
 }
 
 void DBSPRecoveryManager::mark_session_end() {
-  if (!recovery_enabled_) return;
+  if (!recovery_enabled_ || recovery_path_.empty()) return;
 
   DBSPCrashMarker::mark_session_end(recovery_path_);
   session_started_ = false;
 }
 
 bool DBSPRecoveryManager::check_crash_markers() const {
-  if (!recovery_enabled_) return false;
+  if (!recovery_enabled_ || recovery_path_.empty()) return false;
 
   return DBSPCrashMarker::detect_crash(recovery_path_);
 }
@@ -205,6 +209,10 @@ bool DBSPRecoveryManager::recover_from_crash(duckdb::ClientContext &context,
 
   // Determine final recovery path
   recovery_path_ = determine_recovery_path(db_path);
+  if (std::getenv("DBSP_DEBUG_RECOVERY")) {
+    std::cerr << "[dbsp] recovery db_path='" << db_path << "' recovery_path='"
+              << recovery_path_ << "'" << std::endl;
+  }
 
   // Step 1: Check for crash markers
   bool crashed = check_crash_markers();

@@ -1,5 +1,21 @@
 # Changelog
 
+## Fix: crash-marker hygiene - Jul 2026
+
+- In-memory instances no longer create recovery markers at all: their view
+  state dies with the process, so there is nothing to recover, and the old
+  CWD fallback littered `./.dbsp_recovery` into the embedding process's
+  working directory (e.g. an API server's repo root).
+- Marker path resolution fixed: the old lookup asked for a database named
+  `main` (DEFAULT_SCHEMA), which never matched, so file-backed databases
+  also fell back to the CWD. Markers now live next to the database file.
+- Clean shutdown releases the session lock when the last user connection
+  closes (previously only a global static destructor removed it, which
+  embedders' teardown never runs — every restart falsely claimed
+  "previous session crashed").
+- `DBSP_DEBUG_RECOVERY=1` prints the resolved db/recovery paths.
+- Regression test: test/python/test_recovery_markers.py.
+
 ## Phase D3b: circuit-state checkpointing - Jul 2026
 
 - dbsp_save() now also snapshots per-view operator state (aggregate

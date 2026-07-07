@@ -1429,6 +1429,10 @@ public:
     if (!manager) {
       return;
     }
+    // Clean shutdown: release the crash-marker lock here. Waiting for the
+    // recovery manager's global static destructor never works in embedders
+    // (Python teardown skips it), so every restart claimed a crash.
+    dbsp_native::get_recovery_manager().mark_session_end();
     // Destroy on a detached thread: destroying views destroys their
     // Connections, whose destructors re-enter RemoveConnection and would
     // deadlock on connections_lock if run inline here.
