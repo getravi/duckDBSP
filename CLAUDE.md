@@ -21,3 +21,22 @@ follow-up commit:
 comment-only edits, or test-only fixes that don't change behavior.
 
 Do not mark a major task complete until this checklist is done.
+
+## Scratch & Test Artifact Hygiene
+
+Never accumulate throwaway files. Rules:
+
+1. **Fixed names, overwrite in place** — scratch scripts, profiler
+   samples, probe outputs reuse the same filename every time
+   (`bench_sample.txt`, not `bench_sample_<date>.txt`).
+2. **Scratch goes in the session scratchpad dir**, never `/tmp` or the
+   repo. Anything that must live in the repo temporarily is deleted in
+   the same session.
+3. **ctest only from `test/build_test`** — running it elsewhere plants a
+   junk `Testing/` directory.
+4. **Sanitizer build dirs (`test/build_asan`, `test/build_tsan`) are
+   disposable** — recreate on demand, delete when disk is tight; never
+   treat their absence as breakage.
+5. Runtime spill directories are self-cleaning (dbsp_spill(true) sweeps
+   directories left by dead processes) — don't add manual cleanup steps
+   for them.

@@ -38,6 +38,8 @@
 #include <queue>
 #include <shared_mutex>
 #include <thread>
+#include <cerrno>
+#include <csignal>
 #include <unistd.h>
 #include <sstream>
 #include <string>
@@ -1220,9 +1222,26 @@ public:
     if (enable) {
       namespace fs = std::filesystem;
       std::error_code ec;
-      spill_dir_ = (fs::temp_directory_path(ec) /
-                    ("dbsp_spill_" + std::to_string(::getpid())))
-                       .string();
+      const fs::path tmp = fs::temp_directory_path(ec);
+      // Self-cleaning: sweep spill directories left by processes that
+      // are gone (crashes, kills — normal teardown discards files but
+      // the per-pid directory lingers). Keeps the temp dir from
+      // accumulating one directory per test run.
+      for (const auto &entry : fs::directory_iterator(tmp, ec)) {
+        const std::string name = entry.path().filename().string();
+        if (name.rfind("dbsp_spill_", 0) != 0) {
+          continue;
+        }
+        const pid_t pid =
+            static_cast<pid_t>(std::atoll(name.c_str() + 11));
+        if (pid > 0 && pid != ::getpid() && ::kill(pid, 0) == -1 &&
+            errno == ESRCH) {
+          std::error_code rec;
+          fs::remove_all(entry.path(), rec);
+        }
+      }
+      spill_dir_ =
+          (tmp / ("dbsp_spill_" + std::to_string(::getpid()))).string();
       fs::create_directories(spill_dir_, ec);
       if (ec) {
         last_error_ = "Cannot create spill directory: " + spill_dir_;

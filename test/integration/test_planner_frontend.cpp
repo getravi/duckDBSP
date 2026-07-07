@@ -9,6 +9,8 @@
 #include "../test_helpers.hpp"
 #include "catch.hpp"
 
+#include <filesystem>
+#include <fstream>
 #include <random>
 
 using namespace dbsp_test;
@@ -1951,4 +1953,21 @@ TEST_CASE("zero-ceremony UX: create view, insert, read — no track/sync",
 
   db.exec("UPDATE orders SET amount = 500 WHERE id = 1");
   requireViewMatchesQuery(db, "totals", sql);
+}
+
+TEST_CASE("spill: enabling sweeps dead processes' spill directories",
+          "[integration][spill][cleanup]") {
+  namespace fs = std::filesystem;
+  // Plant a directory that looks abandoned by a long-dead process
+  // (pid far above any live range)
+  const fs::path stale =
+      fs::temp_directory_path() / "dbsp_spill_99999989";
+  fs::create_directories(stale);
+  { std::ofstream(stale / "t.dbspill") << "junk"; }
+  REQUIRE(fs::exists(stale));
+
+  DuckDBTestHarness db;
+  db.exec("SELECT * FROM dbsp_spill(true)");
+  REQUIRE_FALSE(fs::exists(stale));
+  db.exec("SELECT * FROM dbsp_spill(false)");
 }
