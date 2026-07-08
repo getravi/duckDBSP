@@ -2856,7 +2856,11 @@ public:
     }
 
     if (has_deletion) {
-      recompute();
+      if (union_all_) {
+        recompute(); // multiplicity semantics: full recompute (see design)
+      } else {
+        dred(anchor_delta, base_deltas);
+      }
       has_output_ = !output_.empty();
       return;
     }
@@ -2924,6 +2928,117 @@ private:
     }
     for (const auto &[row, w] : old_accumulated) {
       output_.insert(row, -w);
+    }
+  }
+
+  // Delete-Rederive for set-semantics (UNION) recursion. Overdelete
+  // over-approximates the retraction; rederive restores rows that still
+  // have alternative support. Maintains the invariant
+  //   accumulated_ (set) == step_view_ sentinel arrangement
+  // by feeding every accumulated_ change to the sentinel source. output_
+  // is built incrementally (no full diff). See docs spec 2026-07-07.
+  void dred(const DuckDBZSet &anchor_delta,
+            const std::vector<std::pair<std::string, const DuckDBZSet *>>
+                &base_deltas) {
+    // --- Seed: split inputs into retractions (drive overdelete) and
+    //     insertions (seed rederive). ---
+    DuckDBZSet frontier;    // rows being retracted this round (weight 1 each)
+    DuckDBZSet insert_seed; // positive rows to (re)admit during rederive
+    auto retract = [&](const DuckDBRow &row) {
+      if (accumulated_.get(row) != 0) {
+        accumulated_.insert(row, -1); // 1 + (-1) = 0 → removed
+        output_.insert(row, -1);
+        frontier.insert(row, 1);
+      }
+    };
+    auto classify = [&](const DuckDBZSet &z) {
+      for (const auto &[row, w] : z) {
+        if (w < 0)
+          retract(row);
+        else if (w > 0)
+          insert_seed.insert(row, 1);
+      }
+    };
+    classify(anchor_delta);
+    for (const auto &[table, d] : base_deltas) {
+      step_view_->apply_changes(table, *d); // base delta already integrated
+      classify(step_view_->get_delta());    // derived reactions
+    }
+
+    // --- Overdelete: iterate the retraction frontier through the step. ---
+    size_t iter = 0;
+    while (!frontier.empty() && iter++ < max_iterations_) {
+      DuckDBZSet neg;
+      for (const auto &[row, w] : frontier)
+        neg.insert(row, -w); // retract frontier from sentinel arrangement
+      step_view_->apply_changes(sentinel_, neg);
+      DuckDBZSet next;
+      for (const auto &[row, w] : step_view_->get_delta()) {
+        if (w < 0 && accumulated_.get(row) != 0) {
+          accumulated_.insert(row, -1);
+          output_.insert(row, -1);
+          next.insert(row, 1);
+        }
+      }
+      frontier = std::move(next);
+    }
+
+    // --- Rederive: recompute the step's one-step image over survivors, then
+    //     iterate; re-admit any over-deleted row that reappears. ---
+    // Clear the sentinel side (survivors → empty), then re-present survivors
+    // so the resulting get_delta() is the full image I(survivors). Base
+    // arrangements are untouched, so this is a linear round-trip.
+    DuckDBZSet survivors = accumulated_;
+    {
+      DuckDBZSet clear;
+      for (const auto &[row, w] : survivors)
+        clear.insert(row, -1);
+      step_view_->apply_changes(sentinel_, clear); // sentinel → empty (discard)
+    }
+    DuckDBZSet fwd;
+    step_view_->apply_changes(sentinel_, survivors); // sentinel → survivors
+    for (const auto &[row, w] : step_view_->get_delta()) {
+      if (w > 0 && accumulated_.get(row) == 0) {
+        accumulated_.insert(row, 1);
+        output_.insert(row, 1);
+        fwd.insert(row, 1);
+      }
+    }
+    // Also admit directly-seeded insertions absent from accumulated_.
+    for (const auto &[row, w] : insert_seed) {
+      if (accumulated_.get(row) == 0) {
+        accumulated_.insert(row, 1);
+        output_.insert(row, 1);
+        fwd.insert(row, 1);
+      }
+    }
+    // Base facts (anchor_total_, the non-recursive UNION arm) are
+    // unconditional support: a row that is still directly present in the
+    // base term must be re-admitted even when it was not touched by this
+    // round's delta. Cyclic recursion can overdelete a row that is
+    // simultaneously anchor-supported (the join-derived path and the base
+    // fact coincide in value), and nothing else would re-seed it.
+    for (const auto &[row, w] : anchor_total_) {
+      if (w > 0 && accumulated_.get(row) == 0) {
+        accumulated_.insert(row, 1);
+        output_.insert(row, 1);
+        fwd.insert(row, 1);
+      }
+    }
+    // Deeper rederivations: rederived rows are now part of the recursive
+    // relation and may rederive further over-deleted rows.
+    iter = 0;
+    while (!fwd.empty() && iter++ < max_iterations_) {
+      step_view_->apply_changes(sentinel_, fwd);
+      DuckDBZSet next;
+      for (const auto &[row, w] : step_view_->get_delta()) {
+        if (w > 0 && accumulated_.get(row) == 0) {
+          accumulated_.insert(row, 1);
+          output_.insert(row, 1);
+          next.insert(row, 1);
+        }
+      }
+      fwd = std::move(next);
     }
   }
 
