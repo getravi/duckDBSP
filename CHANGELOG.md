@@ -1,5 +1,28 @@
 # Changelog
 
+## Feature: incremental recursive deletion (DRed) - Jul 2026
+
+- `WITH RECURSIVE ... UNION` views now maintain incrementally under
+  DELETIONS via Delete-Rederive (DRed), replacing the previous full
+  fixed-point recompute. Overdelete over-approximates the retraction
+  (negative-frontier fixpoint); rederive restores rows that still have
+  alternative support (`I(survivors)` image + `anchor_total_` re-seed +
+  a bounded forward fixpoint), cycles included. Overdelete is O(affected
+  subgraph); the whole path is strictly cheaper than the recompute it
+  replaces.
+- Correctness gate: a `DRed == oracle` differential test (targeted cases
+  + a 200-round randomized insert/delete/mixed sequence) compares the
+  incremental view against a direct DuckDB recursive query. ASAN clean.
+- Mixed insert+delete deltas in one sync (an `UPDATE`, or batched DML
+  before a single `dbsp_sync`) are handled correctly — an early cut
+  admitted phantom rows here; fixed before ship.
+- On the rare path where a DRed loop exhausts `max_iterations_`, the node
+  restores its pre-delta state and falls back to `recompute()` (correct,
+  self-healing) rather than silently desyncing.
+- Scope: `UNION` (set-semantics) recursion. `UNION ALL` (multiplicity)
+  deletion keeps the full recompute — weighted deletion in a cycle is
+  ill-defined. This was the last non-incremental correctness hole.
+
 ## Fix: crash-marker hygiene - Jul 2026
 
 - In-memory instances no longer create recovery markers at all: their view
