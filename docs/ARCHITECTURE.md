@@ -169,8 +169,11 @@ SourceNode per base table) covering:
 - WITH RECURSIVE — `PlanRecursiveNode`: anchor inline, the recursive step as
   a nested `PlannedCircuitView` iterated to a fixed point; multi-table
   recursive steps supported. Insert-only deltas maintain incrementally;
-  deltas with deletions trigger a full fixed-point recompute from
-  integrated inputs (correct, non-incremental) (C2, hardening)
+  deltas with deletions on UNION (set-semantics) recursion take the
+  incremental DRed (Delete-Rederive) path (overdelete + rederive
+  fixpoints); UNION ALL recursion still falls back to a full fixed-point
+  recompute (weighted deletion in a cycle is ill-defined) (C2, hardening;
+  DRed, 2026-07-07)
 - DISTINCT ON — `NativeDistinctOnView` behind an `EmbeddedViewNode`;
   winner-pick order comes from the DISTINCT node's own order modifier (C3)
 
@@ -224,10 +227,22 @@ delta plus the step's reaction to base-table deltas, then iterates:
 ```
 
 UNION dedup state persists across deltas, so a row that becomes reachable
-again later is not double-counted. Deltas containing deletions fall back to
-a full fixed-point recompute from integrated anchor/base state (a derived
-row may be supported by many recursion paths, so retraction cannot be
-decided locally); the node emits the diff against its previous result.
+again later is not double-counted. Deltas containing deletions take one of
+two paths depending on recursion semantics:
+
+- **UNION (set-semantics) recursion** — the incremental DRed
+  (Delete-Rederive) path: an overdelete fixpoint over-approximates the
+  retraction from the affected subgraph, then a rederive fixpoint re-admits
+  rows that still have alternative support (cycles included) by re-running
+  the step over the surviving relation. `dred()` mirrors every
+  `accumulated_` mutation to the sentinel source so the two stay in sync.
+- **UNION ALL (multiplicity) recursion** — `recompute()`: a full
+  fixed-point recompute from integrated anchor/base state. Weighted
+  deletion in a cycle is ill-defined incrementally, so this path stays
+  non-incremental by design. `recompute()` also serves as the
+  differential-test oracle for DRed.
+
+Both paths emit the diff against the node's previous result.
 
 **Safety**: Maximum iteration limit (default 1000) prevents infinite loops.
 

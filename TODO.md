@@ -54,8 +54,9 @@ subsystem, bespoke parser, standalone Z-set spilling).
   projection, so views needing different column subsets of the same
   table do not share (a maximal-columns arrangement + per-consumer
   projection could lift this).
-- Deletions through recursive views trigger a full fixed-point recompute
-  (correct but non-incremental).
+- UNION ALL recursive deletion still triggers a full fixed-point recompute
+  (multiplicity-in-cycles is ill-defined; UNION recursion is incremental
+  via DRed).
 
 ## Architectural
 

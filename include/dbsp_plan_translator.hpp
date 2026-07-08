@@ -2811,12 +2811,15 @@ private:
 // the step on the frontier until it stops producing new rows (UNION dedup
 // state persists across calls, so later deltas cannot double-count).
 //
-// Deltas containing a deletion fall back to a full fixed-point recompute
-// from integrated anchor/base state: a derived row may be supported by any
-// number of recursion paths, so retraction cannot be decided locally. The
-// node integrates its inputs (anchor_total_, base_totals_) for exactly this
-// purpose and emits the diff against the previous accumulated state.
-// Correct always; O(fixed point) instead of O(delta) when deletions occur.
+// Deltas containing a deletion take the DRed (Delete-Rederive) path for
+// UNION (set-semantics) recursion: an incremental overdelete fixpoint
+// over-approximates the retraction, then a rederive fixpoint re-admits rows
+// that still have alternative support (cycles included). Overdelete is
+// O(affected subgraph); rederive costs one image pass over the surviving
+// relation — still cheaper than the full recompute it replaces. UNION ALL
+// (multiplicity) recursion keeps recompute(): weighted deletion in a cycle
+// is ill-defined. recompute() is retained for that path and as the
+// differential-test oracle.
 class PlanRecursiveNode : public dbsp::Node {
 public:
   using InputFn = std::function<const DuckDBZSet &()>;
