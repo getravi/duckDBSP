@@ -245,6 +245,9 @@ two paths depending on recursion semantics:
 Both paths emit the diff against the node's previous result.
 
 **Safety**: Maximum iteration limit (default 1000) prevents infinite loops.
+If a DRed overdelete or rederive fixpoint hits that cap before converging,
+`dred()` restores the pre-delta state and falls back to the self-healing
+`recompute()` rather than emit a silently corrupted diff.
 
 ### 6. CDC Manager (`src/dbsp_cdc.hpp`)
 

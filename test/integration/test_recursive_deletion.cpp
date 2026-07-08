@@ -129,6 +129,43 @@ TEST_CASE("Recursive deletion: insert then delete round-trip",
   assertViewMatchesOracle(h, "tc", kTcOracle); // back to 3-row state
 }
 
+TEST_CASE("Recursive deletion: mixed insert+delete in one sync (no phantom)",
+          "[integration][recursive][deletion]") {
+  DuckDBTestHarness h;
+  h.exec("CREATE TABLE edges (src INTEGER, dst INTEGER)");
+  h.exec("INSERT INTO edges VALUES (1,2),(2,3)");
+  makeTcView(h);
+  // Disable auto-sync so the batched INSERT+DELETE below coalesce into one
+  // mixed delta at the single manual sync (auto-sync would split them).
+  h.exec("SELECT * FROM dbsp_auto_sync(false)");
+  assertViewMatchesOracle(h, "tc", kTcOracle); // {(1,2),(2,3),(1,3)}
+
+  // Batch an INSERT and a DELETE before a single sync -> one mixed delta.
+  // Oracle after this is {(2,3),(3,4),(2,4)}. The buggy insert_seed path
+  // also emitted a phantom (1,4) (support computed against the pre-delete
+  // sentinel), so this asserts the view equals the oracle exactly.
+  h.exec("INSERT INTO edges VALUES (3,4)");
+  h.exec("DELETE FROM edges WHERE src=1 AND dst=2");
+  h.exec("SELECT * FROM dbsp_sync('edges')");
+  assertViewMatchesOracle(h, "tc", kTcOracle);
+}
+
+TEST_CASE("Recursive deletion: single UPDATE statement (delete+insert delta)",
+          "[integration][recursive][deletion]") {
+  DuckDBTestHarness h;
+  h.exec("CREATE TABLE edges (src INTEGER, dst INTEGER)");
+  h.exec("INSERT INTO edges VALUES (1,2),(2,3),(3,4)");
+  makeTcView(h);
+  h.exec("SELECT * FROM dbsp_auto_sync(false)");
+  assertViewMatchesOracle(h, "tc", kTcOracle);
+
+  // A single UPDATE is a delete-old + insert-new mixed delta on one sync.
+  // Re-point 2->3 to 2->5: reachability from 1 and 2 shifts accordingly.
+  h.exec("UPDATE edges SET dst=5 WHERE src=2 AND dst=3");
+  h.exec("SELECT * FROM dbsp_sync('edges')");
+  assertViewMatchesOracle(h, "tc", kTcOracle);
+}
+
 TEST_CASE("Recursive deletion: randomized differential (DRed == oracle)",
           "[integration][recursive][deletion]") {
   DuckDBTestHarness h;
@@ -152,6 +189,41 @@ TEST_CASE("Recursive deletion: randomized differential (DRed == oracle)",
       present.erase({s, d});
     } else {
       continue; // no-op round
+    }
+    h.exec("SELECT * FROM dbsp_sync('edges')");
+    assertViewMatchesOracle(h, "tc", kTcOracle);
+  }
+}
+
+TEST_CASE("Recursive deletion: randomized MIXED-delta differential (DRed == oracle)",
+          "[integration][recursive][deletion]") {
+  DuckDBTestHarness h;
+  h.exec("CREATE TABLE edges (src INTEGER, dst INTEGER)");
+  makeTcView(h);
+  // Disable auto-sync so multiple ops per round coalesce into one mixed delta.
+  h.exec("SELECT * FROM dbsp_auto_sync(false)");
+
+  std::mt19937 rng(9876);
+  std::uniform_int_distribution<int> node(1, 7);
+  std::uniform_int_distribution<int> opcount(1, 4);
+  std::set<std::pair<int, int>> present;
+
+  for (int round = 0; round < 200; round++) {
+    // Perform a random number (1-4) of mixed INSERT/DELETE ops BEFORE a
+    // single sync, so the scan-diff produces a mixed (insert+delete) delta.
+    int ops = opcount(rng);
+    for (int k = 0; k < ops; k++) {
+      int s = node(rng), d = node(rng);
+      bool insert = (rng() & 1);
+      if (insert && !present.count({s, d})) {
+        h.exec("INSERT INTO edges VALUES (" + std::to_string(s) + "," +
+               std::to_string(d) + ")");
+        present.insert({s, d});
+      } else if (!insert && present.count({s, d})) {
+        h.exec("DELETE FROM edges WHERE src=" + std::to_string(s) +
+               " AND dst=" + std::to_string(d));
+        present.erase({s, d});
+      }
     }
     h.exec("SELECT * FROM dbsp_sync('edges')");
     assertViewMatchesOracle(h, "tc", kTcOracle);

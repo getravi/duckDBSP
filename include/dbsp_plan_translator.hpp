@@ -2816,7 +2816,8 @@ private:
 // over-approximates the retraction, then a rederive fixpoint re-admits rows
 // that still have alternative support (cycles included). Overdelete is
 // O(affected subgraph); rederive costs one image pass over the surviving
-// relation — still cheaper than the full recompute it replaces. UNION ALL
+// relation plus a bounded rederive fixpoint (deeper multi-hop re-admission)
+// — still cheaper than the full recompute it replaces. UNION ALL
 // (multiplicity) recursion keeps recompute(): weighted deletion in a cycle
 // is ill-defined. recompute() is retained for that path and as the
 // differential-test oracle.
@@ -2943,10 +2944,25 @@ private:
   void dred(const DuckDBZSet &anchor_delta,
             const std::vector<std::pair<std::string, const DuckDBZSet *>>
                 &base_deltas) {
+    // Snapshot the true pre-delta state so an iteration-cap exhaustion can
+    // recover safely and loudly (Rule 12) instead of silently desyncing the
+    // accumulated_ == sentinel invariant. At entry accumulated_ is untouched
+    // and output_ is empty (step() cleared it), so these snapshots are the
+    // exact state recompute() must rebuild from.
+    DuckDBZSet accumulated_snapshot = accumulated_;
+    DuckDBZSet output_snapshot = output_;
+    // Restore the true pre-delta state and rebuild via the self-healing full
+    // recompute (which resets step_view_ and re-derives from integrated
+    // inputs). Turns a silent invariant desync into a correct-but-slower diff.
+    auto recover_via_recompute = [&]() {
+      accumulated_ = std::move(accumulated_snapshot);
+      output_ = std::move(output_snapshot);
+      recompute();
+    };
+
     // --- Seed: split inputs into retractions (drive overdelete) and
     //     insertions (seed rederive). ---
-    DuckDBZSet frontier;    // rows being retracted this round (weight 1 each)
-    DuckDBZSet insert_seed; // positive rows to (re)admit during rederive
+    DuckDBZSet frontier; // rows being retracted this round (weight 1 each)
     auto retract = [&](const DuckDBRow &row) {
       if (accumulated_.get(row) != 0) {
         accumulated_.insert(row, -1); // 1 + (-1) = 0 → removed
@@ -2954,12 +2970,16 @@ private:
         frontier.insert(row, 1);
       }
     };
+    // Positive rows in the delta are NOT force-admitted here: their support
+    // was computed against the pre-overdelete sentinel, so seeding them
+    // directly can admit phantoms whose support is later over-deleted. Every
+    // legitimately-new row is recovered by the phantom-free paths below —
+    // the I(survivors) image, the anchor_total_ re-seed, and the fwd
+    // fixpoint. So classify only drives retractions.
     auto classify = [&](const DuckDBZSet &z) {
       for (const auto &[row, w] : z) {
         if (w < 0)
           retract(row);
-        else if (w > 0)
-          insert_seed.insert(row, 1);
       }
     };
     classify(anchor_delta);
@@ -2985,6 +3005,13 @@ private:
       }
       frontier = std::move(next);
     }
+    // Loop exits either on an empty frontier (natural) or on the iteration
+    // cap. A non-empty frontier here means the cap was hit with work pending
+    // and the incremental invariant is unreliable — recover and bail.
+    if (!frontier.empty()) {
+      recover_via_recompute();
+      return;
+    }
 
     // --- Rederive: recompute the step's one-step image over survivors, then
     //     iterate; re-admit any over-deleted row that reappears. ---
@@ -3002,14 +3029,6 @@ private:
     step_view_->apply_changes(sentinel_, survivors); // sentinel → survivors
     for (const auto &[row, w] : step_view_->get_delta()) {
       if (w > 0 && accumulated_.get(row) == 0) {
-        accumulated_.insert(row, 1);
-        output_.insert(row, 1);
-        fwd.insert(row, 1);
-      }
-    }
-    // Also admit directly-seeded insertions absent from accumulated_.
-    for (const auto &[row, w] : insert_seed) {
-      if (accumulated_.get(row) == 0) {
         accumulated_.insert(row, 1);
         output_.insert(row, 1);
         fwd.insert(row, 1);
@@ -3042,6 +3061,12 @@ private:
         }
       }
       fwd = std::move(next);
+    }
+    // Same guard for the rederive fixpoint: a non-empty fwd means the cap
+    // was hit before convergence.
+    if (!fwd.empty()) {
+      recover_via_recompute();
+      return;
     }
   }
 
