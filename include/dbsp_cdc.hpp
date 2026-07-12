@@ -46,8 +46,37 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 namespace dbsp_native {
+
+// DBSP_TIMING=1: emit per-phase wall-clock lines to stderr
+// ("[dbsp-timing] <phase> <detail> ms=..."), for profiling restore cost
+// (source sync / arrangement backfill / blob decode). Off by default.
+inline bool dbsp_timing_enabled() {
+  static const bool on = std::getenv("DBSP_TIMING") != nullptr;
+  return on;
+}
+
+struct DbspScopeTimer {
+  const char *phase;
+  std::string detail;
+  std::chrono::steady_clock::time_point t0;
+  DbspScopeTimer(const char *phase_p, std::string detail_p)
+      : phase(phase_p), detail(std::move(detail_p)),
+        t0(std::chrono::steady_clock::now()) {}
+  ~DbspScopeTimer() {
+    if (!dbsp_timing_enabled()) {
+      return;
+    }
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+    fprintf(stderr, "[dbsp-timing] %s %s ms=%.1f\n", phase, detail.c_str(), ms);
+  }
+};
 
 // Marks queries DBSP issues on internal helper connections. Transaction hooks
 // must not recurse into CDCManager for these (deadlock: the issuing thread may
@@ -511,6 +540,7 @@ public:
         }
       }
       con.Query("COMMIT");
+      last_ckpt_saved_count_ = view_blobs.size();
       return true;
     } catch (const std::exception &e) {
       last_error_ = std::string("checkpoint save failed: ") + e.what();
@@ -591,6 +621,7 @@ public:
   // right after create_view(..., skip_init_replay=true).
   bool restore_view_state(const std::string &view_name,
                           const CkptData &ckpt) {
+    DbspScopeTimer timer("blob_decode", view_name);
     std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
     std::unique_lock<std::shared_mutex> view_lock(view_mutex_);
     auto it = views_.find(view_name);
@@ -784,6 +815,7 @@ public:
     const bool have_ckpt = checkpoint_valid(context, ckpt, catalog);
 
     size_t loaded = 0;
+    size_t ckpt_restored = 0;
     for (const auto &[name, view_sql] : rows) {
       {
         std::shared_lock<std::shared_mutex> lock(struct_mutex_);
@@ -800,16 +832,25 @@ public:
             loaded++;
           }
         } else {
+          if (cold) {
+            ckpt_restored++;
+          }
           loaded++;
         }
       }
       // Continue on individual failures (e.g. a source table was dropped)
     }
     last_loaded_count_ = loaded;
+    last_ckpt_restored_count_ = ckpt_restored;
     return true;
   }
 
   size_t last_loaded_count() const { return last_loaded_count_; }
+  // Views restored from the circuit-state checkpoint (vs full replay) in
+  // the last load_from_duck_table call.
+  size_t last_ckpt_restored_count() const { return last_ckpt_restored_count_; }
+  // Views whose circuit state made it into the last saved checkpoint.
+  size_t last_ckpt_saved_count() const { return last_ckpt_saved_count_; }
 
   // Canonical key for a bare/qualified ref. Prefers catalog resolution;
   // when that is unavailable (autocommit callers have no transaction, and
@@ -1137,21 +1178,24 @@ public:
                             ".dbspill");
         }
         // Backfill full current state so init replay can skip this table
-        if (source_is_table) {
-          DuckDBZSet chunk;
-          tracked_tables_.at(req.table)
-              ->scan_state([&](const DuckDBRow &row, int64_t w) {
-                chunk.insert(row, w);
-                if (chunk.size() >= 65536) {
-                  arr->apply(chunk);
-                  chunk = DuckDBZSet();
-                }
-              });
-          if (!chunk.empty()) {
-            arr->apply(chunk);
+        {
+          DbspScopeTimer timer("arr_backfill", req.table);
+          if (source_is_table) {
+            DuckDBZSet chunk;
+            tracked_tables_.at(req.table)
+                ->scan_state([&](const DuckDBRow &row, int64_t w) {
+                  chunk.insert(row, w);
+                  if (chunk.size() >= 65536) {
+                    arr->apply(chunk);
+                    chunk = DuckDBZSet();
+                  }
+                });
+            if (!chunk.empty()) {
+              arr->apply(chunk);
+            }
+          } else {
+            arr->apply(views_.at(req.table)->get_result());
           }
-        } else {
-          arr->apply(views_.at(req.table)->get_result());
         }
         arrangements_[req.fingerprint] = arr;
         arrangements_by_table_[req.table].push_back(arr);
@@ -2236,20 +2280,13 @@ public:
   }
 
   // Create view with explicit sources (for recovery)
-  bool create_view(const std::string &view_name,
-                   const std::string &sql,
-                   const std::vector<std::string> &sources,
-                   duckdb::ClientContext &context) {
-    // For recovery, we call the normal create_view which will re-parse SQL
-    // The sources parameter is used to validate consistency
-    return create_view(context, view_name, sql);
-  }
-
-  // NOTE: there is deliberately no restore-view-from-checkpoint API.
-  // set_result() fills only a view's sink; internal circuit-node state
-  // (aggregate groups, join indexes, sort/limit multisets, recursive dedup)
-  // cannot be reconstructed from the sink. Recovery rebuilds views by
-  // replaying committed DuckDB storage through create_view instead.
+  // NOTE: set_result() fills only a view's sink; internal circuit-node
+  // state (aggregate groups, join indexes, sort/limit multisets, recursive
+  // dedup) cannot be reconstructed from the sink alone. Checkpoint-covered
+  // views restore circuit state via load_from_duck_table's D3b fast path
+  // (watermark-guarded); everything else rebuilds by replaying committed
+  // DuckDB storage through create_view. Recovery routes through
+  // load_from_duck_table too — same semantics, same fast path.
 
 private:
   // Scan tracked table from DB and compute/apply delta.
@@ -2262,6 +2299,7 @@ private:
       duckdb::ClientContext &context,
       const std::string &table_name,
       duckdb::MetaTransaction *meta_transaction = nullptr) {
+    DbspScopeTimer timer("source_sync", table_name);
 
     auto it = tracked_tables_.find(table_name);
     if (it == tracked_tables_.end()) {
@@ -2890,6 +2928,8 @@ private:
   // for bulk loads (each autocommit write pays a scoped scan-and-diff).
   std::atomic<bool> auto_sync_enabled_{true};
   size_t last_loaded_count_ = 0;
+  size_t last_ckpt_restored_count_ = 0;
+  size_t last_ckpt_saved_count_ = 0;
   std::atomic<uint64_t> captured_delta_syncs_{0};
   std::atomic<uint64_t> scan_syncs_{0};
   bool use_parallel_sync_ = false;

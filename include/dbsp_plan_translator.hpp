@@ -3164,6 +3164,59 @@ public:
   // Circuit size; used by IR-optimizer tests to prove rewrites fired
   size_t node_count() const { return circuit_.node_count(); }
 
+  // --- Circuit-state checkpointing (D3b) -------------------------------
+  // Same contract as SingleSourceCircuitView: a view is checkpointable iff
+  // no node is UNSUPPORTED (value-collecting aggregates, outer/mark joins,
+  // spilled state). D3b shipped the node-level serialize/restore hooks on
+  // PlanAggNode/PlanJoinNode but never overrode these on PlannedCircuitView,
+  // so planner-built views (every join/aggregate view since C5) silently
+  // fell back to rebuild-by-replay and dbsp_save() wrote no circuit rows.
+  bool checkpointable() const override {
+    bool ok = true;
+    circuit_.for_each_node([&](const dbsp::Node &n) {
+      if (n.state_kind() == dbsp::Node::StateKind::UNSUPPORTED) {
+        ok = false;
+      }
+    });
+    return ok;
+  }
+
+  bool serialize_circuit_state(
+      std::vector<std::pair<uint64_t, std::vector<uint8_t>>> &out)
+      const override {
+    if (!checkpointable()) {
+      return false;
+    }
+    circuit_.for_each_node([&](const dbsp::Node &n) {
+      if (n.state_kind() == dbsp::Node::StateKind::SERIALIZABLE) {
+        std::vector<uint8_t> blob;
+        n.serialize_state(blob);
+        out.emplace_back(n.id(), std::move(blob));
+      }
+    });
+    return true;
+  }
+
+  bool restore_circuit_state(
+      const std::unordered_map<uint64_t, std::vector<uint8_t>> &blobs)
+      override {
+    if (!checkpointable()) {
+      return false;
+    }
+    bool ok = true;
+    circuit_.for_each_node([&](dbsp::Node &n) {
+      if (!ok || n.state_kind() != dbsp::Node::StateKind::SERIALIZABLE) {
+        return;
+      }
+      auto it = blobs.find(n.id());
+      if (it == blobs.end() ||
+          !n.restore_state(it->second.data(), it->second.size())) {
+        ok = false;
+      }
+    });
+    return ok;
+  }
+
   // I1 shared arrangements: join sides eligible for a shared, CDC-owned
   // arrangement (resolved by CDCManager after sources are tracked)
   const std::vector<ArrangementRequest> &arrangement_requests() const {

@@ -76,13 +76,18 @@ with tempfile.TemporaryDirectory() as tmp:
 
     msg = conn.execute("SELECT * FROM dbsp_save()").fetchone()[0]
     assert "circuit checkpoint" in msg and "no circuit" not in msg, f"checkpoint not saved: {msg}"
+    # The count is the real assertion: "+ circuit checkpoint" with 0 views
+    # covered is exactly the silent failure that shipped when
+    # PlannedCircuitView lacked the checkpointable() override.
+    assert "circuit checkpoint: 1 views" in msg, f"view not covered by checkpoint: {msg}"
     conn.close()
 
     # Session 2: restore must skip replay and be correct + incremental.
     conn = open_db(path)
     t0 = time.perf_counter()
-    conn.execute("SELECT * FROM dbsp_load()")
+    load_msg = conn.execute("SELECT * FROM dbsp_load()").fetchone()[0]
     restore_s = time.perf_counter() - t0
+    assert "1 from checkpoint" in load_msg, f"checkpoint fast path did not fire: {load_msg}"
     got = view_rows(conn)
     assert got == baseline, "restored view differs from saved state"
 
@@ -112,7 +117,8 @@ with tempfile.TemporaryDirectory() as tmp:
     conn.execute("INSERT INTO li VALUES (7, 1, 123.0)")  # invalidates watermark
     conn.close()
     conn = open_db(path)
-    conn.execute("SELECT * FROM dbsp_load()")
+    stale_msg = conn.execute("SELECT * FROM dbsp_load()").fetchone()[0]
+    assert "0 from checkpoint" in stale_msg, f"stale checkpoint was not rejected: {stale_msg}"
     got = view_rows(conn)
     want = truth(conn)
     assert got == want, "stale-checkpoint fallback produced wrong values"

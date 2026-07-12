@@ -110,3 +110,24 @@ Python regression tests, full ctest green, differential soak
 Exit criterion for the NuEPM consumer: open model file → dbsp_load →
 edit via notify → read dbsp_changes → close, at interactive latency
 (open < 100 ms at 1M rows, edit < 10 ms), two models open concurrently.
+
+## D3b follow-ups (restore perf) — measured 2026-07-11
+
+The codec/arrangement follow-ups the D3b CHANGELOG entry referenced now
+live here, reordered by MEASURED cost (DBSP_TIMING=1 on
+test_checkpoint_restore, 1M rows; restore total 1.32s after the
+PlannedCircuitView checkpointable fix):
+
+1. Source sync — ~1.08s (dominant). Full streaming re-scan of every
+   tracked table to rebuild TrackedTable baselines even when the
+   watermark already proved the table unchanged. Lever: persist baselines
+   at save (or trust the watermark and load the baseline lazily/spilled);
+   a watermark-matched restore should not need to re-read source rows at
+   all.
+2. Arrangement backfill — ~0.36s. Shared arrangements are rebuilt by
+   re-scanning sources and re-extracting keys. Lever: checkpoint
+   arrangement state (spill-mode buckets already sit on disk via K2) or
+   backfill from the restored baseline instead of a fresh table scan.
+3. Blob decode — ~0.014s (negligible). The per-Value BinarySerializer
+   codec is NOT worth replacing on restore-latency grounds; revisit only
+   if checkpoint blob SIZE becomes a problem.

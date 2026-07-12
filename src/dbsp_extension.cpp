@@ -751,8 +751,12 @@ void SaveFunc(ClientContext &context, TableFunctionInput &input,
                                     data.catalog);
     std::string ckpt_note;
     if (ok && data.save_all) {
+      // Report how many views actually made it into the checkpoint —
+      // "0 views" means every view fell back to rebuild-by-replay on load.
       ckpt_note = manager.save_checkpoint(context, data.catalog)
-                      ? " (+ circuit checkpoint)"
+                      ? " (+ circuit checkpoint: " +
+                            std::to_string(manager.last_ckpt_saved_count()) +
+                            " views)"
                       : " (no circuit checkpoint: " + manager.last_error() +
                             ")";
     }
@@ -845,9 +849,15 @@ void LoadFunc(ClientContext &context, TableFunctionInput &input,
     throw InvalidInputException("%s", msg);
   }
 
-  // Count loaded views
+  // Count loaded views; for table mode also say how many restored from the
+  // circuit-state checkpoint (0 = all rebuilt by replay).
   auto views = manager.list_views();
-  msg += " (" + std::to_string(views.size()) + " views)";
+  msg += " (" + std::to_string(views.size()) + " views";
+  if (data.format != "json") {
+    msg += ", " + std::to_string(manager.last_ckpt_restored_count()) +
+           " from checkpoint";
+  }
+  msg += ")";
 
   output.SetCardinality(1);
   output.SetValue(0, 0, Value(msg));

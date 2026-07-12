@@ -1,5 +1,38 @@
 # Changelog
 
+## Fix: D3b checkpointing never fired for planner-built views - Jul 2026
+
+- Root cause: `checkpointable()`/`serialize_circuit_state()`/
+  `restore_circuit_state()` were only overridden on
+  `SingleSourceCircuitView`. `PlannedCircuitView` — every join/aggregate
+  view since C5 made the planner the only frontend, i.e. the views D3b was
+  built for — inherited the base-class `checkpointable() == false`, so
+  `dbsp_save()` wrote watermarks but ZERO circuit rows and every load
+  rebuilt by replay. The D3b regression test kept passing because full
+  replay is equally correct and its speedup assert was direction-only
+  (warm-cache rebuild beat cold build). Found via `DBSP_TIMING=1`
+  instrumentation: no `blob_decode` phase ever ran.
+- Fix 1: `PlannedCircuitView` now carries the same three overrides
+  (walk `circuit_`, serialize/restore SERIALIZABLE nodes, refuse when any
+  node is UNSUPPORTED).
+- Fix 2: recovery's `load_views` routed through `load_from_duck_table` —
+  the hand-rolled loop recreated views unconditionally, so first-query
+  recovery in embedded hosts (the NuEPM pattern) ignored the checkpoint
+  even where it existed. The recovery-only `create_view(name, sql,
+  sources, ctx)` overload (which discarded `sources`) is deleted.
+- Honest messages: `dbsp_save()` reports "circuit checkpoint: N views";
+  `dbsp_load()` reports "M from checkpoint". The regression test now
+  asserts both counts (1 on restore, 0 on stale) — the silent-failure
+  mode cannot ship again.
+- Measured (test_checkpoint_restore, 1M rows): restore 3.17s -> 1.32s,
+  speedup vs cold build 3.1x. Post-fix restore breakdown via DBSP_TIMING:
+  source sync ~1.08s, arrangement backfill ~0.36s, blob decode ~0.014s —
+  source sync is now the dominant follow-up target (baseline
+  persistence / columnar scan), not the blob codec.
+- New: `DBSP_TIMING=1` env flag emits per-phase wall-clock lines
+  (source_sync / arr_backfill / blob_decode) to stderr for restore
+  profiling.
+
 ## Feature: incremental recursive deletion (DRed) - Jul 2026
 
 - `WITH RECURSIVE ... UNION` views now maintain incrementally under

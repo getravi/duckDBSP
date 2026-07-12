@@ -99,57 +99,18 @@ bool DBSPRecoveryManager::load_views(duckdb::ClientContext &context) {
   try {
     auto &cdc_manager = get_cdc_manager(context);
 
-    // Query _dbsp_views table for all view definitions. Fresh connection:
-    // `context` may be mid-query (recovery runs inside table functions).
-    InternalQueryGuard guard;
-    duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
-    auto result = con.Query(
-      "SELECT name, sql, sources FROM _dbsp_views ORDER BY created_at ASC");
-
-    if (result->HasError()) {
-      std::cerr << "Failed to load views: " << result->GetError() << std::endl;
+    // Route through the same loader as dbsp_load(): it reads _dbsp_views in
+    // created_at order (dependency order for stacked views), keeps views
+    // already live in this session, and uses the D3b circuit-state
+    // checkpoint fast path when every source watermark matches (cold-create
+    // + state injection, no replay). Stale/missing checkpoints fall back to
+    // full rebuild-by-replay per view. The previous hand-rolled loop here
+    // recreated views unconditionally, which made recovery ignore the
+    // checkpoint entirely.
+    if (!cdc_manager.load_from_duck_table(context)) {
+      std::cerr << "Failed to load views: " << cdc_manager.last_error() << std::endl;
       return false;
     }
-
-    // Convert to materialized result
-    auto &materialized = result->Cast<duckdb::MaterializedQueryResult>();
-
-    // Recreate each view
-    size_t view_count = 0;
-    for (size_t i = 0; i < materialized.RowCount(); i++) {
-      auto name = materialized.GetValue(0, i).ToString();
-      auto sql = materialized.GetValue(1, i).ToString();
-      auto sources_str = materialized.GetValue(2, i).ToString();
-
-      // Parse sources (comma-separated list)
-      std::vector<std::string> sources;
-      std::istringstream iss(sources_str);
-      std::string source;
-      while (std::getline(iss, source, ',')) {
-        sources.push_back(source);
-      }
-
-      // Recreate view (re-plans the SQL and rebuilds the circuit by
-      // replaying committed table state). Views already live in this
-      // session (created before recovery's deferred first run) are kept
-      // as-is — recreating them would fail and rebuilding is wasted work.
-      if (cdc_manager.get_view(name)) {
-        view_count++;
-        continue;
-      }
-      try {
-        if (cdc_manager.create_view(name, sql, sources, context)) {
-          view_count++;
-        } else {
-          std::cerr << "Failed to recreate view '" << name
-                    << "': " << cdc_manager.last_error() << std::endl;
-        }
-      } catch (const std::exception &e) {
-        std::cerr << "Failed to recreate view '" << name << "': " << e.what() << std::endl;
-        // Continue with other views
-      }
-    }
-
     return true;
 
   } catch (const std::exception &e) {
