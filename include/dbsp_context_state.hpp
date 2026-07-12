@@ -48,15 +48,53 @@ public:
       return;
     }
     maybe_run_recovery(context);
-    if (!get_cdc_manager(context).is_auto_sync_enabled()) {
+    auto &manager = get_cdc_manager(context);
+    // D3c: an out-of-band change invalidated a lazily-restored baseline —
+    // reconciliation is impossible incrementally, so views rebuild from
+    // committed storage at the next statement boundary (here). Runs even
+    // with auto-sync off (the notify path can schedule it too).
+    if (manager.rebuild_pending()) {
+      try {
+        manager.rebuild_all_views(context);
+      } catch (const std::exception &e) {
+        std::cerr << "DBSP: view rebuild failed: " << e.what() << "\n";
+      }
+    }
+    const bool auto_sync = manager.is_auto_sync_enabled();
+    if (!auto_sync && !manager.has_deferred()) {
       stmt_ = {};
       return; // no auto-sync: don't pay the parse on every statement
     }
     // Classify here: GetCurrentQuery() is already cleared by QueryEnd, and
     // for autocommit statements the commit hook fires mid-query — before
     // QueryEnd — so the commit-time sync scoping needs the classification
-    // of the in-flight statement (stmt_), not just per-txn accumulation
+    // of the in-flight statement (stmt_), not just per-txn accumulation.
+    // With auto-sync OFF this parse runs only while baselines are deferred
+    // (D3c) — the write check below is the sole consumer.
     stmt_ = classify(context.GetCurrentQuery());
+    // D3c: a write is about to execute. Deferred (lazy-restored) baselines
+    // must materialize from PRE-write storage: this is the only moment the
+    // scan is guaranteed to equal the restore-time content exactly. (The
+    // notify path can materialize later with pending-delta subtraction,
+    // but only the first fragment of a compound edit is known then —
+    // materializing here keeps SQL-write-then-notify hosts exact.)
+    if ((stmt_.kind == StmtClass::INSERT_OK ||
+         stmt_.kind == StmtClass::WRITE_KNOWN ||
+         stmt_.kind == StmtClass::WRITE_UNKNOWN) &&
+        manager.has_deferred()) {
+      manager.materialize_all_deferred(context);
+      if (manager.rebuild_pending()) {
+        try {
+          manager.rebuild_all_views(context);
+        } catch (const std::exception &e) {
+          std::cerr << "DBSP: view rebuild failed: " << e.what() << "\n";
+        }
+      }
+    }
+    if (!auto_sync) {
+      stmt_ = {}; // hooks are inert without auto-sync
+      return;
+    }
     if (context.transaction.HasActiveTransaction()) {
       fold_into_txn(context, stmt_);
     }
@@ -482,7 +520,7 @@ private:
       }
     }
     for (const auto &[table, slot] : capture_.appends) {
-      if (!manager.apply_captured_delta(table, slot.first)) {
+      if (!manager.apply_captured_delta(table, slot.first, &context)) {
         return false;
       }
     }

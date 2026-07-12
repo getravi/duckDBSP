@@ -410,6 +410,13 @@ public:
     arrangements_by_table_.clear();
     last_error_.clear();
     auto_sync_enabled_ = true; // matches a fresh manager
+    deferred_tables_ = 0;
+    rebuild_pending_ = false;
+    {
+      std::lock_guard<std::mutex> g(seeds_mutex_);
+      deferred_seeds_.clear();
+    }
+    last_deferred_count_ = 0;
   }
 
   // Auto-sync (automatic CDC) control. Flag is atomic so transaction hooks
@@ -440,10 +447,12 @@ public:
   // Persist per-view operator state (aggregate groups, private join
   // indexes) and sink results into _dbsp_ckpt, plus per-source watermarks
   // (COUNT + bit_xor(hash(row))) into _dbsp_ckpt_meta. Baselines and
-  // shared arrangements are NOT persisted: the load fast path rebuilds
-  // them with the typed sync scan (fast), and skips only the expensive
-  // circuit replay. Views with unsupported node kinds are simply not
-  // checkpointed and rebuild normally.
+  // shared arrangements are NOT persisted: with the watermark verified at
+  // load, the baseline is by definition the committed table content, so
+  // the load fast path defers it entirely (D3c) — TrackedTables start
+  // deferred and materialize from a typed storage scan on first need.
+  // Views with unsupported node kinds are simply not checkpointed and
+  // rebuild normally.
   bool save_checkpoint(duckdb::ClientContext &context,
                        const std::string &catalog = "") {
     if (!catalog.empty() && !is_valid_identifier(catalog)) {
@@ -555,6 +564,10 @@ public:
                        std::unordered_map<uint64_t, std::vector<uint8_t>>>
         nodes;
     std::unordered_map<std::string, std::vector<uint8_t>> sinks;
+    // Verified per-source watermarks (COUNT, bit_xor(hash) as VARCHAR) —
+    // seeds for lazy (deferred) baselines on the load fast path (D3c).
+    std::unordered_map<std::string, std::pair<int64_t, std::string>>
+        watermarks;
   };
 
   bool checkpoint_valid(duckdb::ClientContext &context, CkptData &out,
@@ -592,6 +605,8 @@ public:
                 meta->GetValue(2, i).ToString()) {
           return false; // table gone or changed since save
         }
+        out.watermarks[t] = {meta->GetValue(1, i).GetValue<int64_t>(),
+                             meta->GetValue(2, i).ToString()};
       }
       auto rows = con.Query("SELECT kind, name, node_id, data FROM " + ckpt_tbl);
       if (rows->HasError()) {
@@ -814,6 +829,15 @@ public:
     CkptData ckpt;
     const bool have_ckpt = checkpoint_valid(context, ckpt, catalog);
 
+    // D3c: hand the verified watermarks to track_table_internal so sources
+    // auto-tracked during the cold creates below start DEFERRED (no
+    // baseline scan at load). Cleared after the loop — normal DDL paths
+    // never defer.
+    if (have_ckpt) {
+      std::lock_guard<std::mutex> g(seeds_mutex_);
+      deferred_seeds_ = ckpt.watermarks;
+    }
+
     size_t loaded = 0;
     size_t ckpt_restored = 0;
     for (const auto &[name, view_sql] : rows) {
@@ -840,6 +864,22 @@ public:
       }
       // Continue on individual failures (e.g. a source table was dropped)
     }
+    {
+      std::lock_guard<std::mutex> g(seeds_mutex_);
+      deferred_seeds_.clear();
+    }
+    {
+      // Count sources that ended up deferred (observable in the
+      // dbsp_load() message; the regression test asserts on it)
+      size_t deferred_now = 0;
+      std::shared_lock<std::shared_mutex> lock(struct_mutex_);
+      for (const auto &[_, tt] : tracked_tables_) {
+        if (tt->is_deferred()) {
+          deferred_now++;
+        }
+      }
+      last_deferred_count_ = deferred_now;
+    }
     last_loaded_count_ = loaded;
     last_ckpt_restored_count_ = ckpt_restored;
     return true;
@@ -851,6 +891,119 @@ public:
   size_t last_ckpt_restored_count() const { return last_ckpt_restored_count_; }
   // Views whose circuit state made it into the last saved checkpoint.
   size_t last_ckpt_saved_count() const { return last_ckpt_saved_count_; }
+  // Sources whose baselines were left deferred (lazy, D3c) by the last
+  // load_from_duck_table call — a watermark-matched restore reads zero
+  // source rows.
+  size_t last_deferred_sources_count() const { return last_deferred_count_; }
+
+  // --- D3c lazy baselines: cross-cutting hooks ---------------------------
+
+  // True while any tracked table's baseline is deferred (checkpoint fast
+  // path, not yet materialized). Atomic: hot paths check it lock-free.
+  bool has_deferred() const { return deferred_tables_.load() > 0; }
+
+  // True when an out-of-band change was detected against a deferred
+  // baseline: the restore-time baseline is unrecoverable, so dependent
+  // view state cannot be reconciled incrementally. QueryBegin calls
+  // rebuild_all_views at the next statement boundary.
+  bool rebuild_pending() const { return rebuild_pending_.load(); }
+
+  // Materialize every deferred baseline NOW, from pre-write storage.
+  // Called by QueryBegin before a write statement executes: once the
+  // write commits, the restore-time table content is gone and a later
+  // scan-and-diff sync could no longer compute the reconciliation delta.
+  void materialize_all_deferred(duckdb::ClientContext &context) {
+    if (!has_deferred()) {
+      return;
+    }
+    std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    for (const auto &[name, tt] : tracked_tables_) {
+      auto lock_it = table_locks_.find(name);
+      if (lock_it == table_locks_.end()) {
+        continue;
+      }
+      std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
+      if (!tt->is_deferred()) {
+        continue;
+      }
+      try {
+        materialize_deferred_locked(context, name, nullptr, false);
+      } catch (const std::exception &e) {
+        rebuild_pending_ = true;
+        std::cerr << "DBSP: deferred baseline materialization failed for '"
+                  << name << "': " << e.what() << "\n";
+      }
+    }
+  }
+
+  // Drop and recreate every view from its stored definition. Rare
+  // correctness escape hatch: only runs after an out-of-band table change
+  // invalidated a deferred (lazy-restored) baseline. Views are replayed
+  // from committed storage, so the result is exact. Caller must hold no
+  // CDC locks (QueryBegin).
+  void rebuild_all_views(duckdb::ClientContext &context) {
+    if (!rebuild_pending_.exchange(false)) {
+      return;
+    }
+    // Refresh every tracked baseline from committed storage first: after
+    // an out-of-band divergence the in-memory baseline is not trustworthy
+    // (e.g. a trailing notify double-applied against a scan that already
+    // contained it), and the recreated views replay from these baselines.
+    {
+      std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+      for (const auto &[name, tt] : tracked_tables_) {
+        auto lock_it = table_locks_.find(name);
+        if (lock_it == table_locks_.end()) {
+          continue;
+        }
+        std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
+        TrackedTable &table = *tt; // lambda capture (structured bindings
+                                   // are not capturable pre-C++20)
+        const bool was_deferred = table.is_deferred();
+        try {
+          table.begin_rebuild();
+          stream_table_rows(context, name, [&](DuckDBRow &&row) {
+            table.add_scanned_row(std::move(row));
+          });
+          table.install_rebuild();
+          if (was_deferred) {
+            deferred_tables_--;
+          }
+        } catch (const std::exception &e) {
+          std::cerr << "DBSP: baseline refresh failed for '" << name
+                    << "': " << e.what() << "\n";
+        }
+      }
+    }
+    std::vector<ViewDefinition> defs;
+    {
+      std::shared_lock<std::shared_mutex> lock(struct_mutex_);
+      for (const auto &[_, def] : view_definitions_) {
+        defs.push_back(def);
+      }
+    }
+    std::sort(defs.begin(), defs.end(),
+              [](const ViewDefinition &a, const ViewDefinition &b) {
+                return a.created_at < b.created_at;
+              });
+    // Drop dependents first: retry passes until no progress (drop_view
+    // refuses while dependents exist).
+    bool progress = true;
+    while (progress) {
+      progress = false;
+      for (auto it = defs.rbegin(); it != defs.rend(); ++it) {
+        if (is_view_registered(it->name) && drop_view(it->name)) {
+          progress = true;
+        }
+      }
+    }
+    for (const auto &def : defs) {
+      if (!create_view(context, def.name, def.sql)) {
+        std::cerr << "DBSP: rebuild of view '" << def.name
+                  << "' failed: " << last_error_ << "\n";
+      }
+    }
+  }
 
   // Canonical key for a bare/qualified ref. Prefers catalog resolution;
   // when that is unavailable (autocommit callers have no transaction, and
@@ -942,6 +1095,12 @@ public:
   // Untrack a table
   void untrack_table(const std::string &table_name) {
     std::unique_lock<std::shared_mutex> lock(struct_mutex_);
+    {
+      auto it = tracked_tables_.find(table_name);
+      if (it != tracked_tables_.end() && it->second->is_deferred()) {
+        deferred_tables_--;
+      }
+    }
     tracked_tables_.erase(table_name);
     table_schemas_.erase(table_name);
     table_locks_.erase(table_name);
@@ -1097,7 +1256,7 @@ public:
       // replaying it would double-count through Δother ⋈ arrangement)
       auto *pview = dynamic_cast<PlannedCircuitView *>(view.get());
       if (pview) {
-        register_arrangements(*pview);
+        register_arrangements(context, *pview, skip_init_replay);
       }
 
       // Initialize view with current data from sources
@@ -1111,6 +1270,13 @@ public:
           continue;
         }
         if (tracked_tables_.count(source)) {
+          // D3c: replay needs real table state — materialize a deferred
+          // baseline first (struct_mutex_ exclusive: no table lock needed;
+          // view_mutex_ already held)
+          if (tracked_tables_.at(source)->is_deferred()) {
+            materialize_deferred_locked(context, source, nullptr,
+                                        /*view_lock_held=*/true);
+          }
           // Stream the baseline in bounded chunks: deltas are additive,
           // so N smaller applies equal one big one — and spill mode never
           // materializes the whole table in RAM
@@ -1143,13 +1309,28 @@ public:
   // registry holds weak refs — nodes own the arrangement; when the last
   // consuming view is dropped it dies and the entry is pruned lazily.
   // Caller holds struct_mutex_ (exclusive) and view_mutex_ (exclusive).
-  void register_arrangements(PlannedCircuitView &pview) {
+  //
+  // `cold` = checkpoint fast-path create (skip_init_replay): the view's
+  // node state comes from the checkpoint, so arrangements over deferred
+  // tables may stay empty (needs_backfill) until the baseline
+  // materializes. A warm create replays sources through the circuit and
+  // join nodes read arrangements during that replay — deferred sources
+  // must materialize first (D3c).
+  void register_arrangements(duckdb::ClientContext &context,
+                             PlannedCircuitView &pview, bool cold) {
     for (const auto &req : pview.arrangement_requests()) {
       const bool source_is_table = tracked_tables_.count(req.table) > 0;
       const bool source_is_view = views_.count(req.table) > 0;
       if (!source_is_table && !source_is_view) {
         continue; // untracked — node keeps its local index
       }
+      if (source_is_table && !cold &&
+          tracked_tables_.at(req.table)->is_deferred()) {
+        materialize_deferred_locked(context, req.table, nullptr,
+                                    /*view_lock_held=*/true);
+      }
+      const bool defer_fill =
+          source_is_table && tracked_tables_.at(req.table)->is_deferred();
       std::shared_ptr<SharedArrangement> arr;
       auto it = arrangements_.find(req.fingerprint);
       if (it != arrangements_.end()) {
@@ -1177,8 +1358,12 @@ public:
                             std::to_string(arrangement_file_seq_++) +
                             ".dbspill");
         }
-        // Backfill full current state so init replay can skip this table
-        {
+        // Backfill full current state so init replay can skip this table.
+        // D3c: over a still-deferred table (cold create) the backfill is
+        // deferred with the baseline — flagged so materialization fills it.
+        if (defer_fill) {
+          arr->needs_backfill = true;
+        } else {
           DbspScopeTimer timer("arr_backfill", req.table);
           if (source_is_table) {
             DuckDBZSet chunk;
@@ -1300,8 +1485,12 @@ public:
     return views_.erase(view_name) > 0;
   }
 
-  // Record an INSERT
-  void on_insert(const std::string &table_name, const DuckDBRow &row) {
+  // Record an INSERT. `context` enables lazy-baseline materialization
+  // (D3c): the first notified delta after a checkpoint restore triggers
+  // the deferred table scans. Context-less callers on a deferred manager
+  // fall back to a scheduled full rebuild (correct, not incremental).
+  void on_insert(const std::string &table_name, const DuckDBRow &row,
+                 duckdb::ClientContext *context = nullptr) {
     std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
 
     auto it = tracked_tables_.find(table_name);
@@ -1311,6 +1500,14 @@ public:
     auto lock_it = table_locks_.find(table_name);
     if (lock_it == table_locks_.end())
       return;
+
+    if (has_deferred()) {
+      DuckDBZSet pending;
+      pending.insert(row, 1);
+      if (!prepare_deferred_for_delta(context, table_name, pending)) {
+        return;
+      }
+    }
 
     DuckDBZSet delta;
     {
@@ -1325,7 +1522,8 @@ public:
   }
 
   // Record a DELETE
-  void on_delete(const std::string &table_name, const DuckDBRow &row) {
+  void on_delete(const std::string &table_name, const DuckDBRow &row,
+                 duckdb::ClientContext *context = nullptr) {
     std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
 
     auto it = tracked_tables_.find(table_name);
@@ -1335,6 +1533,14 @@ public:
     auto lock_it = table_locks_.find(table_name);
     if (lock_it == table_locks_.end())
       return;
+
+    if (has_deferred()) {
+      DuckDBZSet pending;
+      pending.insert(row, -1);
+      if (!prepare_deferred_for_delta(context, table_name, pending)) {
+        return;
+      }
+    }
 
     DuckDBZSet delta;
     {
@@ -1350,7 +1556,8 @@ public:
 
   // Record an UPDATE
   void on_update(const std::string &table_name, const DuckDBRow &old_row,
-                 const DuckDBRow &new_row) {
+                 const DuckDBRow &new_row,
+                 duckdb::ClientContext *context = nullptr) {
     std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
 
     auto it = tracked_tables_.find(table_name);
@@ -1360,6 +1567,15 @@ public:
     auto lock_it = table_locks_.find(table_name);
     if (lock_it == table_locks_.end())
       return;
+
+    if (has_deferred()) {
+      DuckDBZSet pending;
+      pending.insert(old_row, -1);
+      pending.insert(new_row, 1);
+      if (!prepare_deferred_for_delta(context, table_name, pending)) {
+        return;
+      }
+    }
 
     DuckDBZSet delta;
     {
@@ -1375,7 +1591,8 @@ public:
 
   // Batch insert
   void on_batch_insert(const std::string &table_name,
-                       const std::vector<DuckDBRow> &rows) {
+                       const std::vector<DuckDBRow> &rows,
+                       duckdb::ClientContext *context = nullptr) {
     std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
 
     auto it = tracked_tables_.find(table_name);
@@ -1385,6 +1602,16 @@ public:
     auto lock_it = table_locks_.find(table_name);
     if (lock_it == table_locks_.end())
       return;
+
+    if (has_deferred()) {
+      DuckDBZSet pending;
+      for (const auto &row : rows) {
+        pending.insert(row, 1);
+      }
+      if (!prepare_deferred_for_delta(context, table_name, pending)) {
+        return;
+      }
+    }
 
     DuckDBZSet delta;
     {
@@ -1430,6 +1657,7 @@ public:
     }
 
     if (!delta_opt->empty()) {
+      ensure_no_deferred_before_propagate(context, table_name);
       propagate_changes(table_name, *delta_opt);
     }
 
@@ -1495,6 +1723,7 @@ public:
             return;
 
           if (!delta_opt->empty()) {
+            ensure_no_deferred_before_propagate(context, table_name);
             propagate_changes(table_name, *delta_opt);
           }
         }));
@@ -1522,6 +1751,7 @@ public:
           continue;
 
         if (!delta_opt->empty()) {
+          ensure_no_deferred_before_propagate(context, name);
           propagate_changes(name, *delta_opt);
         }
       }
@@ -2102,8 +2332,11 @@ public:
   // Apply a delta captured from a transaction's local storage (G2 fast
   // path): O(delta) — no table scan, no diff. The caller has already
   // validated the delta against the committed table (count guard).
+  // `context` enables lazy-baseline materialization (D3c); without it a
+  // deferred manager rejects the fast path (caller falls back to sync).
   bool apply_captured_delta(const std::string &table_name,
-                            const DuckDBZSet &delta) {
+                            const DuckDBZSet &delta,
+                            duckdb::ClientContext *context = nullptr) {
     if (delta.empty()) {
       return true;
     }
@@ -2114,6 +2347,12 @@ public:
     }
     auto lock_it = table_locks_.find(table_name);
     if (lock_it == table_locks_.end()) {
+      return false;
+    }
+    if (has_deferred() &&
+        !prepare_deferred_for_delta(context, table_name, delta)) {
+      // Rebuild scheduled (or no context): the committed rows are already
+      // in storage, so the rebuild/scan fallback reconciles them.
       return false;
     }
     {
@@ -2289,6 +2528,132 @@ public:
   // load_from_duck_table too — same semantics, same fast path.
 
 private:
+  // Typed streaming scan of a table's committed rows through a fresh
+  // internal connection; emits each row. Returns the number of rows
+  // emitted. Throws std::runtime_error on scan failure.
+  //
+  // Both paths (commit hook and explicit user call) scan committed state
+  // through a fresh Connection. The commit hook fires after Commit() has
+  // succeeded, so a new transaction sees the committed rows. Scanning
+  // with the just-committed DuckTransaction via the raw storage API
+  // stopped seeing its own rows in DuckDB 1.5 (hook now runs before
+  // Finalize()), so that path was removed.
+  // Guard: OnConnectionOpened must not run first-time recovery here -
+  // the calling thread may hold struct_mutex_ and recovery re-acquires it.
+  static int64_t
+  stream_table_rows(duckdb::ClientContext &context,
+                    const std::string &table_key,
+                    const std::function<void(DuckDBRow &&)> &emit) {
+    InternalQueryGuard guard;
+    auto &fresh_db = duckdb::DatabaseInstance::GetDatabase(context);
+    duckdb::Connection fresh_con(fresh_db);
+    // Streaming execution (H5): rows are consumed chunk by chunk below,
+    // so materializing the whole table into a QueryResult first was one
+    // extra full-table copy per sync
+    auto sql_result =
+        fresh_con.SendQuery("SELECT * FROM " + quote_table_key(table_key));
+    if (!sql_result || sql_result->HasError()) {
+      throw std::runtime_error(
+          "Failed to scan table '" + table_key + "': " +
+          (sql_result ? sql_result->GetError() : "null result"));
+    }
+    int64_t total = 0;
+    while (true) {
+      auto chunk_ptr = sql_result->Fetch();
+      if (!chunk_ptr || chunk_ptr->size() == 0) break;
+      auto &chunk = *chunk_ptr;
+      // Typed column extraction: flatten once, read vector data
+      // directly for common types instead of boxing every cell
+      // through DataChunk::GetValue (same lesson as the D1 batch
+      // evaluator — per-cell Value dispatch dominates)
+      chunk.Flatten();
+      const idx_t n = chunk.size();
+      const idx_t ncols = chunk.ColumnCount();
+      std::vector<std::vector<duckdb::Value>> vals(n);
+      for (auto &r : vals) {
+        r.reserve(ncols);
+      }
+      for (idx_t c = 0; c < ncols; c++) {
+        auto &vec = chunk.data[c];
+        const auto &type = vec.GetType();
+        auto &validity = duckdb::FlatVector::Validity(vec);
+        switch (type.id()) {
+        case duckdb::LogicalTypeId::INTEGER: {
+          auto data = duckdb::FlatVector::GetData<int32_t>(vec);
+          for (idx_t i = 0; i < n; i++) {
+            vals[i].push_back(
+                validity.RowIsValid(i) ? duckdb::Value::INTEGER(data[i])
+                                       : duckdb::Value(type));
+          }
+          break;
+        }
+        case duckdb::LogicalTypeId::BIGINT: {
+          auto data = duckdb::FlatVector::GetData<int64_t>(vec);
+          for (idx_t i = 0; i < n; i++) {
+            vals[i].push_back(
+                validity.RowIsValid(i) ? duckdb::Value::BIGINT(data[i])
+                                       : duckdb::Value(type));
+          }
+          break;
+        }
+        case duckdb::LogicalTypeId::DOUBLE: {
+          auto data = duckdb::FlatVector::GetData<double>(vec);
+          for (idx_t i = 0; i < n; i++) {
+            vals[i].push_back(
+                validity.RowIsValid(i) ? duckdb::Value::DOUBLE(data[i])
+                                       : duckdb::Value(type));
+          }
+          break;
+        }
+        case duckdb::LogicalTypeId::VARCHAR: {
+          auto data = duckdb::FlatVector::GetData<duckdb::string_t>(vec);
+          for (idx_t i = 0; i < n; i++) {
+            vals[i].push_back(
+                validity.RowIsValid(i)
+                    ? duckdb::Value(data[i].GetString())
+                    : duckdb::Value(type));
+          }
+          break;
+        }
+        default:
+          for (idx_t i = 0; i < n; i++) {
+            vals[i].push_back(chunk.GetValue(c, i));
+          }
+          break;
+        }
+      }
+      for (idx_t i = 0; i < n; i++) {
+        DuckDBRow row;
+        row.columns.assign(std::move(vals[i]));
+        emit(std::move(row));
+      }
+      total += static_cast<int64_t>(n);
+    }
+    return total;
+  }
+
+  // Live COUNT(*) + bit_xor(hash) of a table, matching the watermark format
+  // written by save_checkpoint. Returns false on query failure.
+  static bool live_watermark(duckdb::ClientContext &context,
+                             const std::string &table_key, int64_t &count,
+                             std::string &hash) {
+    try {
+      InternalQueryGuard guard;
+      duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+      auto wm = con.Query("SELECT COUNT(*), CAST(bit_xor(hash(t)) AS "
+                          "VARCHAR) FROM " +
+                          quote_table_key(table_key) + " t");
+      if (wm->HasError() || wm->RowCount() != 1) {
+        return false;
+      }
+      count = wm->GetValue(0, 0).GetValue<int64_t>();
+      hash = wm->GetValue(1, 0).ToString();
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+
   // Scan tracked table from DB and compute/apply delta.
   // Must be called with the table's table_lock held exclusively.
   // struct_mutex_ must also be held (shared or exclusive) by the caller.
@@ -2307,121 +2672,43 @@ private:
       return std::nullopt;
     }
 
-    try {
-      // Get table catalog entry using Catalog API (avoid SQL queries)
-      auto &db_instance = duckdb::DatabaseInstance::GetDatabase(context);
-      auto &db_manager = db_instance.GetDatabaseManager();
-      auto dbs = db_manager.GetDatabases();
-      duckdb::AttachedDatabase *target_db = nullptr;
-      for (auto &db_entry : dbs) {
-        if (!db_entry->IsSystem() && !db_entry->IsTemporary()) {
-          target_db = db_entry.get();
-          break;
-        }
+    // D3c deferred baseline: the table was checkpoint-restored and its
+    // baseline never materialized. Recheck the restore-time watermark:
+    // a match proves the table is untouched since save — the delta is
+    // empty and the baseline can STAY deferred (no scan at all). A
+    // mismatch means an out-of-band change happened; the restore-time
+    // baseline is unrecoverable, so the reconciliation delta for the
+    // restored views cannot be computed — install current storage as the
+    // baseline and schedule a full view rebuild (next QueryBegin).
+    if (it->second->is_deferred()) {
+      int64_t live_count = 0;
+      std::string live_hash;
+      if (live_watermark(context, table_name, live_count, live_hash) &&
+          live_count == it->second->deferred_weight() &&
+          live_hash == it->second->deferred_hash()) {
+        return DuckDBZSet(); // unchanged since restore: stay lazy
       }
-      if (!target_db) {
-        target_db = &db_manager.GetSystemCatalog().GetAttached();
+      try {
+        materialize_deferred_locked(context, table_name, nullptr, false);
+      } catch (const std::exception &e) {
+        last_error_ = std::string("Deferred baseline scan failed: ") + e.what();
+        return std::nullopt;
       }
-      auto &catalog = target_db->GetCatalog();
+      rebuild_pending_ = true;
+      record_error_best_effort(
+          "DBSP: table '" + table_name +
+          "' changed out-of-band after a lazy checkpoint restore; "
+          "dependent views scheduled for full rebuild");
+      return DuckDBZSet(); // views untouched here; rebuild reconciles
+    }
 
+    try {
       it->second->begin_rebuild();
       scan_syncs_++;
 
-      {
-        // Both paths (commit hook and explicit user call) scan committed state
-        // through a fresh Connection. The commit hook fires after Commit() has
-        // succeeded, so a new transaction sees the committed rows. Scanning
-        // with the just-committed DuckTransaction via the raw storage API
-        // stopped seeing its own rows in DuckDB 1.5 (hook now runs before
-        // Finalize()), so that path was removed.
-        // Guard: OnConnectionOpened must not run first-time recovery here -
-        // this thread holds struct_mutex_ (via sync_table) and recovery
-        // re-acquires it.
-        InternalQueryGuard guard;
-        auto &fresh_db = duckdb::DatabaseInstance::GetDatabase(context);
-        duckdb::Connection fresh_con(fresh_db);
-        // Streaming execution (H5): rows are consumed chunk by chunk below,
-        // so materializing the whole table into a QueryResult first was one
-        // extra full-table copy per sync
-        auto sql_result =
-            fresh_con.SendQuery("SELECT * FROM " + quote_table_key(table_name));
-        if (!sql_result || sql_result->HasError()) {
-          last_error_ = "Failed to scan table '" + table_name + "': " +
-                        (sql_result ? sql_result->GetError() : "null result");
-          if (std::getenv("DBSP_DEBUG_SYNC")) { std::cerr << "[dbsp] " << last_error_ << "\n"; }
-          return std::nullopt;
-        }
-        while (true) {
-          auto chunk_ptr = sql_result->Fetch();
-          if (!chunk_ptr || chunk_ptr->size() == 0) break;
-          auto &chunk = *chunk_ptr;
-          // Typed column extraction: flatten once, read vector data
-          // directly for common types instead of boxing every cell
-          // through DataChunk::GetValue (same lesson as the D1 batch
-          // evaluator — per-cell Value dispatch dominates)
-          chunk.Flatten();
-          const idx_t n = chunk.size();
-          const idx_t ncols = chunk.ColumnCount();
-          std::vector<std::vector<duckdb::Value>> vals(n);
-          for (auto &r : vals) {
-            r.reserve(ncols);
-          }
-          for (idx_t c = 0; c < ncols; c++) {
-            auto &vec = chunk.data[c];
-            const auto &type = vec.GetType();
-            auto &validity = duckdb::FlatVector::Validity(vec);
-            switch (type.id()) {
-            case duckdb::LogicalTypeId::INTEGER: {
-              auto data = duckdb::FlatVector::GetData<int32_t>(vec);
-              for (idx_t i = 0; i < n; i++) {
-                vals[i].push_back(
-                    validity.RowIsValid(i) ? duckdb::Value::INTEGER(data[i])
-                                           : duckdb::Value(type));
-              }
-              break;
-            }
-            case duckdb::LogicalTypeId::BIGINT: {
-              auto data = duckdb::FlatVector::GetData<int64_t>(vec);
-              for (idx_t i = 0; i < n; i++) {
-                vals[i].push_back(
-                    validity.RowIsValid(i) ? duckdb::Value::BIGINT(data[i])
-                                           : duckdb::Value(type));
-              }
-              break;
-            }
-            case duckdb::LogicalTypeId::DOUBLE: {
-              auto data = duckdb::FlatVector::GetData<double>(vec);
-              for (idx_t i = 0; i < n; i++) {
-                vals[i].push_back(
-                    validity.RowIsValid(i) ? duckdb::Value::DOUBLE(data[i])
-                                           : duckdb::Value(type));
-              }
-              break;
-            }
-            case duckdb::LogicalTypeId::VARCHAR: {
-              auto data = duckdb::FlatVector::GetData<duckdb::string_t>(vec);
-              for (idx_t i = 0; i < n; i++) {
-                vals[i].push_back(
-                    validity.RowIsValid(i)
-                        ? duckdb::Value(data[i].GetString())
-                        : duckdb::Value(type));
-              }
-              break;
-            }
-            default:
-              for (idx_t i = 0; i < n; i++) {
-                vals[i].push_back(chunk.GetValue(c, i));
-              }
-              break;
-            }
-          }
-          for (idx_t i = 0; i < n; i++) {
-            DuckDBRow row;
-            row.columns.assign(std::move(vals[i]));
-            it->second->add_scanned_row(std::move(row));
-          }
-        }
-      }
+      stream_table_rows(context, table_name, [&](DuckDBRow &&row) {
+        it->second->add_scanned_row(std::move(row));
+      });
 
       // Diff against the previous baseline and swap the new one in
       // (spill mode: digest-index compare + on-disk payloads; RAM mode:
@@ -2430,10 +2717,211 @@ private:
 
     } catch (const std::exception &e) {
       last_error_ = std::string("Exception in sync_table_scan_and_consume: ") + e.what();
+      if (std::getenv("DBSP_DEBUG_SYNC")) { std::cerr << "[dbsp] " << last_error_ << "\n"; }
       return std::nullopt;
     } catch (...) {
       last_error_ = "Unknown exception in sync_table_scan_and_consume";
       return std::nullopt;
+    }
+  }
+
+  // ---- D3c deferred-baseline materialization ----------------------------
+  //
+  // Materialize a deferred table's baseline from a typed storage scan and
+  // backfill any deferred shared arrangements over it.
+  //
+  // `pending` (optional) is a delta the caller is ABOUT to apply whose
+  // rows are already committed to storage (notify/captured-delta contract:
+  // the SQL write lands first). The installed baseline is scan − pending,
+  // so the caller's subsequent apply lands the baseline exactly on the
+  // committed content — and arrangements are backfilled from the pre-delta
+  // state (propagation applies the delta to them afterwards, per the
+  // post-delta arrangement convention in propagate_changes).
+  //
+  // Returns true when the scan matched the expected row weight
+  // (restore-time watermark + pending). On mismatch the table changed
+  // out-of-band: current storage is installed verbatim (no subtraction, no
+  // arrangement backfill) and a full view rebuild is scheduled; the caller
+  // must NOT apply/propagate its delta (the rebuild replays storage, which
+  // already contains it).
+  //
+  // Locking: caller holds struct_mutex_ (shared or exclusive) and — unless
+  // it holds struct_mutex_ exclusively — the table's lock exclusively.
+  // view_lock_held says whether view_mutex_ is already held exclusively
+  // (create_view); otherwise it is acquired for the backfill.
+  bool materialize_deferred_locked(duckdb::ClientContext &context,
+                                   const std::string &table_name,
+                                   const DuckDBZSet *pending,
+                                   bool view_lock_held) {
+    auto it = tracked_tables_.find(table_name);
+    if (it == tracked_tables_.end() || !it->second->is_deferred()) {
+      return true;
+    }
+    DbspScopeTimer timer("baseline_materialize", table_name);
+    auto &tt = *it->second;
+
+    int64_t expected = tt.deferred_weight();
+    if (pending) {
+      for (const auto &[row, w] : *pending) {
+        expected += w;
+      }
+    }
+
+    tt.begin_rebuild();
+    const int64_t scanned = stream_table_rows(
+        context, table_name, [&](DuckDBRow &&row) {
+          tt.add_scanned_row(std::move(row));
+        }); // throws on scan failure: baseline stays deferred
+    const bool clean = (scanned == expected);
+
+    tt.install_rebuild();
+    deferred_tables_--;
+
+    if (!clean) {
+      rebuild_pending_ = true;
+      record_error_best_effort(
+          "DBSP: table '" + table_name +
+          "' does not match its lazy-restore watermark (expected weight " +
+          std::to_string(expected) + ", scanned " + std::to_string(scanned) +
+          "); dependent views scheduled for full rebuild");
+      return false;
+    }
+
+    if (pending) {
+      DuckDBZSet neg;
+      for (const auto &[row, w] : *pending) {
+        neg.insert(row, -w);
+      }
+      tt.apply_delta(neg);
+    }
+
+    backfill_deferred_arrangements_locked(table_name, view_lock_held);
+    return true;
+  }
+
+  // Backfill shared arrangements flagged needs_backfill from the (now
+  // materialized) baseline. Caller holds struct_mutex_; acquires
+  // view_mutex_ exclusively unless view_lock_held.
+  void backfill_deferred_arrangements_locked(const std::string &table_name,
+                                             bool view_lock_held) {
+    auto arr_it = arrangements_by_table_.find(table_name);
+    if (arr_it == arrangements_by_table_.end()) {
+      return;
+    }
+    std::unique_lock<std::shared_mutex> view_lock(view_mutex_,
+                                                  std::defer_lock);
+    if (!view_lock_held) {
+      view_lock.lock();
+    }
+    auto tt_it = tracked_tables_.find(table_name);
+    if (tt_it == tracked_tables_.end()) {
+      return;
+    }
+    for (auto &weak : arr_it->second) {
+      auto arr = weak.lock();
+      if (!arr || !arr->needs_backfill) {
+        continue;
+      }
+      DbspScopeTimer timer("arr_backfill", table_name);
+      DuckDBZSet chunk;
+      tt_it->second->scan_state([&](const DuckDBRow &row, int64_t w) {
+        chunk.insert(row, w);
+        if (chunk.size() >= 65536) {
+          arr->apply(chunk);
+          chunk = DuckDBZSet();
+        }
+      });
+      if (!chunk.empty()) {
+        arr->apply(chunk);
+      }
+      arr->needs_backfill = false;
+    }
+  }
+
+  // Materialize every deferred table before a delta on `edited_table` is
+  // applied and propagated: join nodes read arrangements (and dependent
+  // circuits read state) of OTHER tables, so all of them must be real
+  // before the first propagation. Takes each table's lock one at a time
+  // (never nested) so concurrent callers cannot deadlock on sibling table
+  // locks. Caller holds struct_mutex_ shared and NO table locks.
+  //
+  // Returns false when the edited table's watermark guard failed — the
+  // caller must skip its delta (a full rebuild is scheduled).
+  bool materialize_for_delta(duckdb::ClientContext &context,
+                             const std::string &edited_table,
+                             const DuckDBZSet *pending) {
+    for (const auto &[name, tt] : tracked_tables_) {
+      if (name == edited_table) {
+        continue;
+      }
+      auto lock_it = table_locks_.find(name);
+      if (lock_it == table_locks_.end()) {
+        continue;
+      }
+      std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
+      if (tt->is_deferred()) {
+        materialize_deferred_locked(context, name, nullptr, false);
+      }
+    }
+    auto lock_it = table_locks_.find(edited_table);
+    if (lock_it == table_locks_.end()) {
+      return false;
+    }
+    std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
+    auto it = tracked_tables_.find(edited_table);
+    if (it == tracked_tables_.end()) {
+      return false;
+    }
+    if (!it->second->is_deferred()) {
+      return true;
+    }
+    return materialize_deferred_locked(context, edited_table, pending, false);
+  }
+
+  // D3c safety net: a scan-diff delta is about to propagate; join nodes
+  // may read arrangements over OTHER tables, so nothing may stay deferred.
+  // (`edited` itself is never deferred here — the deferred branch of
+  // sync_table_scan_and_consume returns an empty delta.) Caller holds
+  // struct_mutex_ shared and no table locks.
+  void ensure_no_deferred_before_propagate(duckdb::ClientContext &context,
+                                           const std::string &edited) {
+    if (!has_deferred()) {
+      return;
+    }
+    try {
+      materialize_for_delta(context, edited, nullptr);
+    } catch (const std::exception &e) {
+      rebuild_pending_ = true;
+      std::cerr << "DBSP: deferred baseline materialization failed: "
+                << e.what() << "\n";
+    }
+  }
+
+  // Guarded entry for the notify/captured-delta paths: caller holds
+  // struct_mutex_ shared and no table locks. Returns true when the delta
+  // may be applied and propagated. On any failure a full view rebuild is
+  // scheduled and the delta must be dropped (the rebuild replays committed
+  // storage, which already contains it per the notify contract).
+  bool prepare_deferred_for_delta(duckdb::ClientContext *context,
+                                  const std::string &table_name,
+                                  const DuckDBZSet &pending) {
+    if (!has_deferred()) {
+      return true;
+    }
+    if (!context) {
+      rebuild_pending_ = true;
+      std::cerr << "DBSP: delta on '" << table_name
+                << "' while baselines are deferred and no context is "
+                   "available; scheduling full view rebuild\n";
+      return false;
+    }
+    try {
+      return materialize_for_delta(*context, table_name, &pending);
+    } catch (const std::exception &e) {
+      rebuild_pending_ = true;
+      std::cerr << "DBSP: deferred baseline materialization failed: "
+                << e.what() << "\n";
+      return false;
     }
   }
 
@@ -2464,6 +2952,21 @@ private:
     }
     table_schemas_[table_name] = schema;
     table_locks_[table_name] = std::make_unique<std::shared_mutex>();
+
+    // D3c lazy restore: during a checkpoint fast-path load the source's
+    // save-time watermark was just verified against live storage, so the
+    // baseline is by definition the committed table content — defer the
+    // scan until something actually needs table state.
+    {
+      std::lock_guard<std::mutex> g(seeds_mutex_);
+      auto seed = deferred_seeds_.find(table_name);
+      if (seed != deferred_seeds_.end()) {
+        tracked_tables_[table_name]->mark_deferred(seed->second.first,
+                                                   seed->second.second);
+        deferred_tables_++;
+        return true;
+      }
+    }
 
     sync_table_internal(context, table_name);
     // CRITICAL: Clear pending changes from initial sync so they don't get
@@ -2932,6 +3435,17 @@ private:
   size_t last_ckpt_saved_count_ = 0;
   std::atomic<uint64_t> captured_delta_syncs_{0};
   std::atomic<uint64_t> scan_syncs_{0};
+  // D3c lazy baselines: count of deferred tables (lock-free hot-path
+  // check), pending full-rebuild flag (out-of-band change detected against
+  // a deferred baseline; consumed by rebuild_all_views), and the
+  // watermark seeds handed from load_from_duck_table to
+  // track_table_internal during a checkpoint fast-path load.
+  std::atomic<size_t> deferred_tables_{0};
+  std::atomic<bool> rebuild_pending_{false};
+  std::mutex seeds_mutex_;
+  std::unordered_map<std::string, std::pair<int64_t, std::string>>
+      deferred_seeds_;
+  size_t last_deferred_count_ = 0;
   bool use_parallel_sync_ = false;
   bool spill_enabled_ = false;
   std::string spill_dir_;

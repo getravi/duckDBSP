@@ -398,6 +398,42 @@ public:
     }
   }
 
+  // ---- deferred baseline (D3c lazy restore) ----------------------------
+  // A checkpoint-restored table whose save-time watermark matched live
+  // storage does not need its baseline materialized to serve reads: the
+  // restored sink already holds the view results. The baseline (and any
+  // shared arrangements over it) is established lazily by CDCManager on the
+  // first operation that needs table state. While deferred, the baseline is
+  // semantically "exactly the committed table content", summarized by the
+  // restore-time watermark carried here.
+
+  void mark_deferred(int64_t expected_weight, std::string row_hash) {
+    deferred_ = true;
+    deferred_weight_ = expected_weight;
+    deferred_hash_ = std::move(row_hash);
+  }
+
+  bool is_deferred() const { return deferred_; }
+  int64_t deferred_weight() const { return deferred_weight_; }
+  const std::string &deferred_hash() const { return deferred_hash_; }
+
+  // Install the rows fed through begin_rebuild()/add_scanned_row() as the
+  // baseline WITHOUT diffing against the previous one (there is none: the
+  // table was deferred). Clears the deferred flag.
+  void install_rebuild() {
+    if (spill_) {
+      spill_->end_rebuild([](const std::vector<duckdb::Value> &, int64_t) {},
+                          [](const std::vector<duckdb::Value> &, int64_t) {});
+    } else {
+      current_state_ = std::move(rebuild_state_);
+      rebuild_state_ = DuckDBZSet();
+    }
+    pending_changes_.clear();
+    sequence_++;
+    deferred_ = false;
+    deferred_hash_.clear();
+  }
+
   DuckDBZSet finish_rebuild() {
     DuckDBZSet delta;
     if (spill_) {
@@ -452,10 +488,18 @@ public:
   }
 
   size_t state_size() const {
+    if (deferred_) {
+      // Distinct-row count is unknown while deferred; total weight is the
+      // best (upper-bound) answer and exact for duplicate-free tables.
+      return static_cast<size_t>(deferred_weight_);
+    }
     return spill_ ? spill_->distinct_rows() : current_state_.size();
   }
 
   int64_t state_total_weight() const {
+    if (deferred_) {
+      return deferred_weight_; // restore-time COUNT(*), watermark-verified
+    }
     if (spill_) {
       return spill_->total_weight();
     }
@@ -494,6 +538,11 @@ private:
   DuckDBZSet pending_changes_;
   std::unique_ptr<SpilledBaseline> spill_;
   uint64_t sequence_;
+  // Deferred baseline (D3c): true until the first operation that needs
+  // table state materializes it from a storage scan.
+  bool deferred_ = false;
+  int64_t deferred_weight_ = 0; // restore-time COUNT(*)
+  std::string deferred_hash_;   // restore-time bit_xor(hash(row)) as VARCHAR
 };
 
 // Base class for native materialized views

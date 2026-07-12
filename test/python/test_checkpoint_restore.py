@@ -1,12 +1,25 @@
-"""D3b regression test: circuit-state checkpoint restore.
+"""D3b/D3c regression test: circuit-state checkpoint restore + lazy baselines.
 
 dbsp_save() snapshots operator state (aggregate groups, private join
 indexes) and sink results; dbsp_load() cold-creates covered views (no
-circuit replay) and injects that state. The test proves three things the
-sink alone cannot: post-restore incremental edits are CORRECT (internal
-aggregate state was restored), restore is much faster than rebuild, and a
-stale checkpoint (source table changed after save) is detected via
-watermarks and falls back to a full rebuild.
+circuit replay) and injects that state. With D3c, a watermark-matched
+restore also DEFERS tracked-table baselines and shared-arrangement
+backfill: dbsp_load reads zero source rows; the first operation that
+needs table state (notify delta, pre-write hook, replay) materializes
+them from a single typed scan.
+
+Proven here:
+  1. post-restore incremental edits are CORRECT (internal aggregate state
+     restored; deferred baselines materialize with pending-delta
+     subtraction before the first notify delta propagates),
+  2. restore is much faster than rebuild and defers all sources,
+  3. a stale checkpoint (source changed after save) is detected via
+     watermarks at load and falls back to a full rebuild,
+  4. auto-sync SQL writes after a lazy restore stay exact (QueryBegin
+     materializes deferred baselines from pre-write storage),
+  5. an out-of-band write against a deferred baseline (auto-sync off, no
+     notify) is detected at the next sync and self-heals via a full view
+     rebuild at the next statement boundary.
 
 Run: python test_checkpoint_restore.py <path-to-dbsp.duckdb_extension>
 """
@@ -88,6 +101,9 @@ with tempfile.TemporaryDirectory() as tmp:
     load_msg = conn.execute("SELECT * FROM dbsp_load()").fetchone()[0]
     restore_s = time.perf_counter() - t0
     assert "1 from checkpoint" in load_msg, f"checkpoint fast path did not fire: {load_msg}"
+    # D3c: a watermark-matched restore must not scan any source rows —
+    # both tracked tables stay deferred until something needs table state.
+    assert "2 sources deferred" in load_msg, f"lazy baselines did not defer: {load_msg}"
     got = view_rows(conn)
     assert got == baseline, "restored view differs from saved state"
 
@@ -119,10 +135,43 @@ with tempfile.TemporaryDirectory() as tmp:
     conn = open_db(path)
     stale_msg = conn.execute("SELECT * FROM dbsp_load()").fetchone()[0]
     assert "0 from checkpoint" in stale_msg, f"stale checkpoint was not rejected: {stale_msg}"
+    assert "0 sources deferred" in stale_msg, f"stale load must not defer baselines: {stale_msg}"
     got = view_rows(conn)
     want = truth(conn)
     assert got == want, "stale-checkpoint fallback produced wrong values"
+    # Re-checkpoint the rebuilt state for the lazy-restore sessions below.
+    conn.execute("SELECT * FROM dbsp_save()").fetchone()
+    conn.close()
+
+    # Session 4: auto-sync SQL writes after a lazy restore. QueryBegin must
+    # materialize deferred baselines from PRE-write storage; the captured
+    # INSERT and the scan-diff DELETE then reconcile incrementally.
+    conn = open_db(path)
+    load_msg = conn.execute("SELECT * FROM dbsp_load()").fetchone()[0]
+    assert "1 from checkpoint" in load_msg and "2 sources deferred" in load_msg, (
+        f"lazy fast path did not fire on re-checkpoint: {load_msg}"
+    )
+    conn.execute("INSERT INTO li VALUES (8, 2, 77.0)")     # captured append
+    conn.execute("DELETE FROM li WHERE dim_0 = 9 AND dim_1 = 0")  # scan-diff
+    got = view_rows(conn)
+    want = truth(conn)
+    assert got == want, "auto-sync DML after lazy restore diverged"
+    conn.execute("SELECT * FROM dbsp_save()").fetchone()
+    conn.close()
+
+    # Session 5: out-of-band write against a deferred baseline (auto-sync
+    # off, no notify). The explicit sync detects the watermark mismatch;
+    # the next statement boundary rebuilds the views from storage.
+    conn = open_db(path)
+    load_msg = conn.execute("SELECT * FROM dbsp_load()").fetchone()[0]
+    assert "2 sources deferred" in load_msg, f"lazy fast path did not fire: {load_msg}"
+    conn.execute("SELECT * FROM dbsp_auto_sync(false)")
+    conn.execute("DELETE FROM li WHERE dim_0 = 11")  # out-of-band: no notify
+    conn.execute("SELECT * FROM dbsp_sync()")        # detects mismatch
+    got = view_rows(conn)                            # rebuild fires here
+    want = truth(conn)
+    assert got == want, "out-of-band write after lazy restore was not self-healed"
     conn.close()
 
 signal.alarm(0)
-print("PASS: checkpoint restore is fast, correct, incremental-safe, and stale-safe", flush=True)
+print("PASS: checkpoint restore is fast, correct, incremental-safe, stale-safe, and lazy", flush=True)

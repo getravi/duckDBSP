@@ -300,7 +300,8 @@ void NotifyInsertFunc(ClientContext &context, TableFunctionInput &input,
     return;
 
   auto &manager = dbsp_native::get_cdc_manager(context);
-  manager.on_insert(CanonicalTableRef(context, data.table_name), data.row);
+  manager.on_insert(CanonicalTableRef(context, data.table_name), data.row,
+                    &context);
 
   output.SetCardinality(1);
   output.SetValue(0, 0, Value("Notified insert into " + data.table_name));
@@ -315,7 +316,8 @@ void NotifyDeleteFunc(ClientContext &context, TableFunctionInput &input,
     return;
 
   auto &manager = dbsp_native::get_cdc_manager(context);
-  manager.on_delete(CanonicalTableRef(context, data.table_name), data.row);
+  manager.on_delete(CanonicalTableRef(context, data.table_name), data.row,
+                    &context);
 
   output.SetCardinality(1);
   output.SetValue(0, 0, Value("Notified delete from " + data.table_name));
@@ -825,6 +827,10 @@ unique_ptr<FunctionData> LoadBind(ClientContext &context,
 
 void LoadFunc(ClientContext &context, TableFunctionInput &input,
               DataChunk &output) {
+  // Register transaction/query hooks on this connection: the D3c lazy
+  // restore depends on QueryBegin materializing deferred baselines before
+  // the first post-load SQL write executes.
+  EnsureContextState(context);
   auto &data = input.bind_data->CastNoConst<LoadBindData>();
   if (data.done)
     return;
@@ -855,7 +861,9 @@ void LoadFunc(ClientContext &context, TableFunctionInput &input,
   msg += " (" + std::to_string(views.size()) + " views";
   if (data.format != "json") {
     msg += ", " + std::to_string(manager.last_ckpt_restored_count()) +
-           " from checkpoint";
+           " from checkpoint, " +
+           std::to_string(manager.last_deferred_sources_count()) +
+           " sources deferred";
   }
   msg += ")";
 

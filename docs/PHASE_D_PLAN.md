@@ -111,23 +111,44 @@ Exit criterion for the NuEPM consumer: open model file → dbsp_load →
 edit via notify → read dbsp_changes → close, at interactive latency
 (open < 100 ms at 1M rows, edit < 10 ms), two models open concurrently.
 
-## D3b follow-ups (restore perf) — measured 2026-07-11
+## D3b follow-ups (restore perf) — measured 2026-07-11, SHIPPED as D3c 2026-07-12
 
-The codec/arrangement follow-ups the D3b CHANGELOG entry referenced now
-live here, reordered by MEASURED cost (DBSP_TIMING=1 on
-test_checkpoint_restore, 1M rows; restore total 1.32s after the
-PlannedCircuitView checkpointable fix):
+Original measurement (DBSP_TIMING=1 on test_checkpoint_restore, 1M rows;
+restore total 1.32s after the PlannedCircuitView checkpointable fix)
+attributed ~1.08s to "source sync", ~0.36s to arrangement backfill,
+~0.014s to blob decode. Re-instrumentation showed the source_sync bucket
+in the restore log was actually session-1 commit-hook syncs; the real
+load-path cost was the UNTIMED `sync_table_internal` baseline build
+(~0.95s, per-cell GetValue boxing) + arr_backfill (~0.38s) — two full
+source re-reads inside `dbsp_load`.
 
-1. Source sync — ~1.08s (dominant). Full streaming re-scan of every
-   tracked table to rebuild TrackedTable baselines even when the
-   watermark already proved the table unchanged. Lever: persist baselines
-   at save (or trust the watermark and load the baseline lazily/spilled);
-   a watermark-matched restore should not need to re-read source rows at
-   all.
-2. Arrangement backfill — ~0.36s. Shared arrangements are rebuilt by
-   re-scanning sources and re-extracting keys. Lever: checkpoint
-   arrangement state (spill-mode buckets already sit on disk via K2) or
-   backfill from the restored baseline instead of a fresh table scan.
-3. Blob decode — ~0.014s (negligible). The per-Value BinarySerializer
+**Landed (D3c lazy baselines):** items 1+2 closed by deferral, not by
+persistence. A verified watermark means the baseline IS the committed
+table content, so the fast path defers TrackedTable baselines and
+arrangement backfill entirely; one typed scan materializes them on first
+need (pre-write QueryBegin hook / notify with pending-delta subtraction /
+warm replay / scan-diff). Restore: 1.39s → 0.045s (blob decode + watermark
+checks only; zero source rows read) — meets the open < 100 ms exit
+criterion at 1M rows. First post-restore edit pays the scan once (~1.2s
+at 1M); a scan-diff sync on an untouched deferred table is a ~ms
+watermark recheck and stays lazy (post-crash recovery resync included).
+Out-of-band writes against a deferred baseline are unrecoverable by
+design (the restore-time content is gone) → detected by the
+watermark/count guard and self-healed by a full view rebuild at the next
+statement boundary. See CHANGELOG "D3c lazy baselines".
+
+Evaluated and rejected: persisting baselines at save via the spill/blob
+codec — decode extrapolates to ~1.4s per 1M rows (slower than the scan it
+replaces) plus ~2x file bloat; DuckDB's own columnar storage is already
+the optimal at-rest baseline encoding.
+
+Remaining (deprioritized):
+
+1. Blob decode — ~0.015s (negligible). The per-Value BinarySerializer
    codec is NOT worth replacing on restore-latency grounds; revisit only
    if checkpoint blob SIZE becomes a problem.
+2. First-edit latency after a lazy restore (~1.2s at 1M rows) — if the
+   "edit < 10 ms including the very first" target ever hardens, options
+   are background materialization kicked off right after load (off the
+   open path, racing the first edit) or checkpointing arrangement state
+   (K2 spill buckets already sit on disk). Not needed for open < 100 ms.

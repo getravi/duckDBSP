@@ -1,5 +1,67 @@
 # Changelog
 
+## Feature: D3c lazy baselines — watermark-matched restore reads zero source rows - Jul 2026
+
+- `dbsp_load()`'s checkpoint fast path no longer rebuilds `TrackedTable`
+  baselines or shared-arrangement state by re-scanning every source table.
+  With the save-time watermark (COUNT + `bit_xor(hash(row))`) verified
+  against live storage, the baseline is BY DEFINITION the committed table
+  content — so tables auto-tracked during a fast-path load start
+  **deferred** (`TrackedTable::mark_deferred`, watermark carried along),
+  and arrangements registered over them start `needs_backfill`.
+  Materialization happens on first need via one typed streaming scan
+  (`stream_table_rows`, factored out of the sync path) + arrangement
+  backfill from the fresh baseline.
+- Persisting baselines at save was evaluated and REJECTED with evidence:
+  the per-`Value` blob codec decodes at ~1.4 µs/row (13.6 ms for the 10k-row
+  sink), extrapolating to ~1.4 s for 1M rows — slower than the scan it
+  would replace, plus ~2x db-file bloat for content DuckDB already stores
+  compressed. When the watermark matches, the table IS the baseline.
+- Materialization triggers (all paths covered):
+  - `QueryBegin` before any SQL write statement executes (runs even with
+    auto-sync off while anything is deferred) — the only moment storage
+    still equals the restore-time content exactly, which keeps
+    SQL-write-then-notify hosts (NuEPM `UPDATE` → `dbsp_notify_delete` +
+    `dbsp_notify_insert`) exact;
+  - the notify path (`on_insert`/`on_delete`/`on_update`/
+    `on_batch_insert`, now taking an optional `ClientContext *`) and the
+    captured-delta path, with pending-delta subtraction (baseline :=
+    scan − δ, then the normal apply lands it on storage) — first delta
+    also materializes ALL deferred tables, since join propagation reads
+    other tables' arrangements;
+  - warm `create_view` init replay / arrangement registration;
+  - scan-diff sync: a deferred table recheck is a ~ms watermark query —
+    match ⇒ empty delta and the baseline STAYS deferred (recovery's
+    post-crash resync is now near-free on unchanged tables).
+- Safety: stale checkpoints at load are rejected exactly as before (0
+  deferred sources). Post-restore out-of-band changes (a write that
+  bypassed hooks and notify) are detected by the watermark/count guard;
+  since the restore-time baseline is then unrecoverable, views schedule a
+  full rebuild that runs at the next statement boundary
+  (`rebuild_all_views`: refresh all baselines from committed storage,
+  drop dependents-first, recreate from stored definitions) — correct,
+  self-healing, slow only on the broken-contract path.
+- `dbsp_load()` message now reports "N sources deferred"; the regression
+  test asserts 2 on the fast path and 0 on the stale path, plus two new
+  sessions: auto-sync SQL DML after a lazy restore (pre-write
+  materialization) and out-of-band write + `dbsp_sync()` (rebuild
+  self-heal).
+- `LoadFunc` now calls `EnsureContextState` — previously a connection
+  whose first DBSP call was `dbsp_load()` had no QueryBegin/commit hooks
+  at all (recovery, auto-sync and the pre-write materialization silently
+  skipped until some other dbsp_* function ran).
+- Measured (test_checkpoint_restore, 1M rows, DBSP_TIMING=1): restore
+  1.39 s → 0.045 s (~31x; ~90x vs cold build). The old restore window
+  (baseline build ~0.95 s + arr_backfill ~0.38 s + blob_decode ~0.014 s)
+  collapses to blob_decode ~0.015 s + watermark checks. First post-restore
+  edit pays the deferred scan once (~1.2 s at 1M rows;
+  `baseline_materialize` timing phase), steady-state edits unchanged.
+- Timing attribution fix for the D3b plan numbers: the "source_sync
+  ~1.08 s" bucket measured on restore was actually session-1 commit-hook
+  syncs; the load-path cost was the UNTIMED `sync_table_internal` baseline
+  build. `sync_table_scan_and_consume` now shares the typed scan helper,
+  and materialization has its own `baseline_materialize` phase.
+
 ## Fix: D3b checkpointing never fired for planner-built views - Jul 2026
 
 - Root cause: `checkpointable()`/`serialize_circuit_state()`/

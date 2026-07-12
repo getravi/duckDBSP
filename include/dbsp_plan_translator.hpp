@@ -1312,6 +1312,12 @@ struct SharedArrangement {
   int64_t total = 0;
   int64_t nulls = 0;
 
+  // D3c lazy restore: arrangement was registered over a deferred-baseline
+  // table and holds no rows yet. CDCManager backfills it (and clears the
+  // flag) when the table's baseline materializes — always before any delta
+  // is propagated through a consuming join node.
+  bool needs_backfill = false;
+
   // K2: index spilled to a disk bucket log (dbsp_spill). Probes go
   // through probe_spilled() with an internal mutex — concurrent
   // same-level views (I2) may probe simultaneously. Weights/counters
