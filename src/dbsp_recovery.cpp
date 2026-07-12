@@ -79,10 +79,14 @@ void DBSPRecoveryManager::clear_crash_markers() {
 
 bool DBSPRecoveryManager::initialize_persistence(duckdb::ClientContext &context) {
   try {
-    // Ensure recovery directory exists
-    std::filesystem::path recovery_dir(recovery_path_);
-    if (!std::filesystem::exists(recovery_dir)) {
-      std::filesystem::create_directories(recovery_dir);
+    // Ensure the crash-marker directory exists. An empty recovery path means
+    // markers are disabled (no durable default catalog, e.g. in-memory DB) —
+    // the _dbsp_views table lives in the database and needs no directory.
+    if (!recovery_path_.empty()) {
+      std::filesystem::path recovery_dir(recovery_path_);
+      if (!std::filesystem::exists(recovery_dir)) {
+        std::filesystem::create_directories(recovery_dir);
+      }
     }
 
     // Initialize _dbsp_views table via CDC manager

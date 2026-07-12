@@ -188,6 +188,11 @@ TEST_CASE("End-to-end crash recovery across database restarts",
     auto &recovery_manager = get_recovery_manager();
     cdc_manager.reset();
 
+    // Production order: recovery runs first and derives the marker path
+    // from the db file. The process-wide manager may carry
+    // recovery_path_ == "" from an earlier in-memory test case, which
+    // would silently disable the session markers this test asserts on.
+    REQUIRE(recovery_manager.recover_from_crash(*con.context, "test_e2e.db"));
     REQUIRE(recovery_manager.initialize_persistence(*con.context));
     recovery_manager.mark_session_start();
 
