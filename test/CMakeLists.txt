@@ -66,6 +66,7 @@ add_dbsp_test(set_ops unit/test_set_ops.cpp)
 add_dbsp_test(distinct_on unit/test_distinct_on.cpp)
 add_dbsp_test(recursive unit/test_recursive.cpp)
 add_dbsp_test(auto_cdc unit/test_auto_cdc.cpp)
+add_dbsp_test(write_capture unit/test_write_capture.cpp)
 
 # Integration tests (require DuckDB)
 function(add_dbsp_integration_test TEST_NAME SOURCE)
