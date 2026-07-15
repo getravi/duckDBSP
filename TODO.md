@@ -31,13 +31,14 @@ subsystem, bespoke parser, standalone Z-set spilling).
   explicit-txn AND autocommit — commit via captured deltas too (~1.5ms
   for a single-row UPDATE at 1M rows vs ~2.4s scan-diff); the old
   version-info blocker was worked around by capturing pre-images with an
-  internal SELECT before the statement runs. Still scan-diff: autocommit
-  INSERTs (the transaction is destroyed before any extension hook fires —
-  probed empirically; a VALUES-parse capture is a possible follow-up),
-  upserts, UPDATE...FROM / DELETE USING, subqueries or parameters in
-  SET/WHERE, non-CONSISTENT functions, indexed/LIST SET columns
-  (update_is_del_and_insert), multi-statement strings, Appender writes,
-  and same-table-twice transactions.
+  internal SELECT before the statement runs. Autocommit INSERT...VALUES
+  (full-cover column lists) is captured the same way — the VALUES list is
+  evaluated with the INSERT's own casts (~1.0ms at 1M rows). Still
+  scan-diff: INSERT...SELECT autocommits, partial-column-list INSERTs
+  (defaults), upserts, UPDATE...FROM / DELETE USING, subqueries or
+  parameters in expressions, non-CONSISTENT functions, indexed/LIST SET
+  columns (update_is_del_and_insert), multi-statement strings, Appender
+  writes, and same-table-twice transactions.
 - Phase D1 vectorized filter/map/fused evaluation + zero-copy circuit
   deltas: fused filter 259k→644k rows/s, aggregate 770k→1.88M, join delta
   140k→265k. Remaining ~2.4× gap vs a hand-written lambda is Z-set insert

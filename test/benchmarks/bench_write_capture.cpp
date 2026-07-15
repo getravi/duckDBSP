@@ -53,6 +53,37 @@ TEST_CASE("Benchmark: single-row UPDATE capture at 1M rows", "[benchmark]") {
   db.exec("SELECT * FROM dbsp_auto_sync(false)");
 }
 
+TEST_CASE("Benchmark: autocommit INSERT capture at 1M rows", "[benchmark]") {
+  DuckDBTestHarness db;
+
+  db.exec("CREATE TABLE bigi (id INTEGER, grp INTEGER, val DOUBLE)");
+  db.exec("INSERT INTO bigi SELECT i, i % 1000, i * 0.25 "
+          "FROM range(1000000) t(i)");
+  db.exec("SELECT * FROM dbsp_track('bigi')");
+  db.exec("SELECT * FROM dbsp_sync('bigi')");
+  db.exec("SELECT * FROM dbsp_create_view('bigi_agg', "
+          "'SELECT grp, SUM(val) AS s FROM bigi GROUP BY grp')");
+  db.exec("SELECT * FROM dbsp_auto_sync(true)");
+
+  auto &manager = db.manager();
+  const uint64_t caps = manager.captured_delta_syncs();
+  const uint64_t scans = manager.scan_syncs();
+
+  db.exec("INSERT INTO bigi VALUES (2000000, 7, 1.0)"); // warm-up
+  auto start = high_resolution_clock::now();
+  db.exec("INSERT INTO bigi VALUES (2000001, 8, 2.0)");
+  auto end = high_resolution_clock::now();
+  const double ms = duration_cast<microseconds>(end - start).count() / 1000.0;
+
+  std::cout << "[Benchmark] 1M-row autocommit INSERT via capture: " << ms
+            << " ms\n";
+  REQUIRE(manager.captured_delta_syncs() == caps + 2);
+  REQUIRE(manager.scan_syncs() == scans);
+  REQUIRE(ms <= 50.0);
+
+  db.exec("SELECT * FROM dbsp_auto_sync(false)");
+}
+
 TEST_CASE("Benchmark: single-row DELETE capture at 1M rows", "[benchmark]") {
   DuckDBTestHarness db;
 

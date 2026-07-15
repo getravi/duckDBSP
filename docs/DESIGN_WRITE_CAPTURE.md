@@ -103,8 +103,28 @@ Autocommit UPDATE/DELETE is captured too: the capture SELECT needs no
 transaction internals (QueryBegin runs before the statement, and the
 autocommit TransactionCommit hook — which fires mid-statement, post-commit
 — runs the guard and applies, exactly where the scoped-scan fallback runs
-today). Autocommit INSERT stays scan-based (LocalStorage is gone before
-any hook; a VALUES-parse capture is a possible follow-up, out of scope).
+today).
+
+**Autocommit INSERT ... VALUES** (follow-up, shipped with this feature):
+the rows are in the statement itself, so one internal SELECT evaluates the
+VALUES list with the INSERT's own to-column-type casts:
+
+```sql
+-- INSERT INTO t VALUES (e1, e2), ...  becomes
+SELECT CAST(v.c1 AS <type(c1)>), ... FROM (VALUES (e1, e2), ...) v(c1, c2)
+```
+
+Whitelist: plain VALUES source (no `INSERT ... SELECT`, no `BY NAME`, no
+`DEFAULT VALUES`), full-cover column list only (partial lists involve
+column defaults), same expression rules as UPDATE/DELETE. The guard is
+commit-seq + signed COUNT(*) only — rowids are unknowable before the
+insert executes, and predicted rows use the same CAST the INSERT itself
+applies. Explicit-transaction INSERTs stay on G2 (exact LocalStorage scan;
+capturing both would double-count). Gotcha found during implementation:
+autocommit statements DO have an active transaction at QueryBegin
+(`TransactionContext::IsAutoCommit()` distinguishes), and VALUES rows bind
+into `LogicalExpressionGet::expressions` — a member that *shadows* the
+base-class `expressions` — so the stability walk visits it explicitly.
 
 ## Commit guard (replaces count-only guard for write captures)
 

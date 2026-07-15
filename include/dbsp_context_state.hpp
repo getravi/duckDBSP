@@ -14,6 +14,11 @@
 // capture needs no transaction internals; autocommit applies from the
 // mid-statement commit hook, where the fallback sync already runs).
 //
+// Autocommit INSERT ... VALUES (write capture too): the statement's own
+// VALUES list is evaluated via one internal SELECT with the INSERT's
+// to-column-type casts (full-cover column lists only — partial lists
+// involve defaults). Explicit-txn INSERTs stay on G2, which is exact.
+//
 // At commit a guard validates every captured table — commit-sequence
 // conflict check, signed COUNT(*), and rowid re-verification of written
 // rows — and the merged delta is applied in O(delta) via
@@ -110,8 +115,15 @@ public:
     // Write capture must run BEFORE the statement executes: the capture
     // SELECT reads committed (pre-statement) state. It also must precede
     // fold_into_txn, which otherwise poisons WRITE_KNOWN statements.
+    // Autocommit INSERT_OK: the transaction dies before QueryEnd can read
+    // LocalStorage (G2 needs an explicit txn), but a plain VALUES list is
+    // right there in the statement — capture it the same way. Explicit-txn
+    // INSERTs stay on G2 (exact, and capturing both would double-count).
     stmt_write_ = {};
-    if (stmt_.kind == StmtClass::WRITE_KNOWN) {
+    if (stmt_.kind == StmtClass::WRITE_KNOWN ||
+        (stmt_.kind == StmtClass::INSERT_OK &&
+         (!context.transaction.HasActiveTransaction() ||
+          context.transaction.IsAutoCommit()))) {
       try {
         try_write_capture(context, manager);
       } catch (...) {
@@ -559,9 +571,14 @@ private:
       return;
     }
     auto &parsed = *parser.statements[0];
+    const bool is_insert =
+        parsed.type == duckdb::StatementType::INSERT_STATEMENT;
     if (parsed.type != duckdb::StatementType::UPDATE_STATEMENT &&
-        parsed.type != duckdb::StatementType::DELETE_STATEMENT) {
+        parsed.type != duckdb::StatementType::DELETE_STATEMENT && !is_insert) {
       return; // upserts and friends stay on the scan path
+    }
+    if (is_insert && in_txn && !context.transaction.IsAutoCommit()) {
+      return; // explicit-txn INSERTs use the exact G2 LocalStorage scan
     }
 
     InternalQueryGuard guard;
@@ -579,7 +596,8 @@ private:
         key.clear();
         return;
       }
-      plan = plan_write_capture(ictx, parsed, *entry, key);
+      plan = is_insert ? plan_insert_capture(parsed, *entry)
+                       : plan_write_capture(ictx, parsed, *entry, key);
     });
     if (key.empty() || !plan) {
       return;
@@ -613,6 +631,16 @@ private:
         break;
       }
       for (duckdb::idx_t i = 0; i < n; i++) {
+        if (plan->kind == WriteCapturePlan::Kind::Insert) {
+          // projection IS the new row (no rowid — guard is seq + count)
+          DuckDBRow row;
+          row.columns.reserve(plan->n_cols);
+          for (size_t c = 0; c < plan->n_cols; c++) {
+            row.columns.push_back(chunk->GetValue(c, i));
+          }
+          delta.insert(std::move(row), 1);
+          continue;
+        }
         TxnCapture::WriteVerify v;
         v.rowid = chunk->GetValue(0, i).GetValue<int64_t>();
         v.is_delete = !is_update;

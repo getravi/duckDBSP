@@ -542,7 +542,9 @@ every transaction commit without calling `dbsp_sync`.
 Most plain SQL writes commit in **O(delta)** via captured deltas:
 
 - **INSERT** — explicit transactions containing only INSERTs (G2,
-  captured from transaction-local storage).
+  captured from transaction-local storage), and autocommit
+  `INSERT ... VALUES` with a full-cover column list (the VALUES list is
+  evaluated with the INSERT's own casts; ~1.0 ms at 1M rows).
 - **UPDATE / DELETE** — explicit-transaction *and* autocommit statements
   (write capture: one internal SELECT reads the old images and computes
   the new ones before the statement runs; a commit guard — interleaved-
@@ -551,11 +553,12 @@ Most plain SQL writes commit in **O(delta)** via captured deltas:
   1M-row table syncs in ~1.5 ms vs ~2.4 s for scan-and-diff.
 
 Everything else uses scan-and-diff scoped to the tables the transaction
-touched: autocommit INSERTs, upserts, `UPDATE ... FROM`, `DELETE ...
-USING`, CTEs/`RETURNING`, subqueries or prepared parameters in
-SET/WHERE, non-deterministic expressions (`random()`, `now()`), UPDATEs
-of indexed or LIST-typed columns, multi-statement strings, Appender
-writes, and any transaction that writes the same table twice. If any
+touched: `INSERT ... SELECT` autocommits, partial-column-list INSERTs
+(defaults), upserts, `UPDATE ... FROM`, `DELETE ... USING`,
+CTEs/`RETURNING`, subqueries or prepared parameters in expressions,
+non-deterministic expressions (`random()`, `now()`), UPDATEs of indexed
+or LIST-typed columns, multi-statement strings, Appender writes, and any
+transaction that writes the same table twice. If any
 statement in a transaction is un-capturable, the whole transaction falls
 back — captured and scanned deltas never mix for one commit, and guard
 failures fall back loudly (`capture_guard_fallbacks` counter).

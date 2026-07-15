@@ -207,7 +207,7 @@ TEST_CASE("G2: rolled-back txn leaves views untouched",
   db.exec("SELECT * FROM dbsp_auto_sync(false)");
 }
 
-TEST_CASE("G2: autocommit inserts still sync (scan path)",
+TEST_CASE("G2: autocommit VALUES inserts sync via captured deltas",
           "[integration][auto_cdc][capture]") {
   DuckDBTestHarness db;
   db.createTable("ct4", "id INT, val INT", {"(1, 10)"});
@@ -216,9 +216,23 @@ TEST_CASE("G2: autocommit inserts still sync (scan path)",
   db.exec("SELECT * FROM dbsp_create_view('v_cap4', "
           "'SELECT id FROM ct4 WHERE val > 5')");
   db.exec("SELECT * FROM dbsp_auto_sync(true)");
+  auto &manager = db.manager();
 
+  // Plain VALUES: captured (write capture), no scan
+  uint64_t caps = manager.captured_delta_syncs();
+  uint64_t scans = manager.scan_syncs();
   db.exec("INSERT INTO ct4 VALUES (2, 20)");
+  REQUIRE(manager.captured_delta_syncs() == caps + 1);
+  REQUIRE(manager.scan_syncs() == scans);
   db.assertViewRowCount("v_cap4", 2);
+
+  // INSERT ... SELECT cannot be captured: scan path, still correct
+  caps = manager.captured_delta_syncs();
+  scans = manager.scan_syncs();
+  db.exec("INSERT INTO ct4 SELECT id + 10, val + 10 FROM ct4 WHERE id = 2");
+  REQUIRE(manager.captured_delta_syncs() == caps);
+  REQUIRE(manager.scan_syncs() == scans + 1);
+  db.assertViewRowCount("v_cap4", 3);
 
   db.exec("SELECT * FROM dbsp_auto_sync(false)");
 }
@@ -667,5 +681,50 @@ TEST_CASE("write capture: guard fallbacks are counted",
   const uint64_t seq = m.commit_seq();
   fx.db.exec("UPDATE wt SET val = 9 WHERE id = 2");
   REQUIRE(m.commit_seq() > seq);
+  fx.finish();
+}
+
+TEST_CASE("write capture: autocommit INSERT VALUES differential",
+          "[integration][auto_cdc][write_capture]") {
+  WriteCaptureFixture fx;
+  auto &m = fx.db.manager();
+
+  SECTION("multi-row VALUES with expressions and NULLs") {
+    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t scans = m.scan_syncs();
+    fx.db.exec("INSERT INTO wt VALUES (10, 1, 5 * 8), (11, 2, NULL)");
+    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.scan_syncs() == scans);
+    fx.check_views();
+  }
+  SECTION("full-cover permuted column list") {
+    const uint64_t caps = m.captured_delta_syncs();
+    fx.db.exec("INSERT INTO wt (val, id, grp) VALUES (70, 12, 2)");
+    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    fx.check_views();
+  }
+  SECTION("partial column list falls back (defaults)") {
+    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t scans = m.scan_syncs();
+    fx.db.exec("INSERT INTO wt (id, grp) VALUES (13, 1)");
+    REQUIRE(m.captured_delta_syncs() == caps);
+    REQUIRE(m.scan_syncs() == scans + 1);
+    fx.check_views();
+  }
+  SECTION("volatile expression falls back") {
+    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t scans = m.scan_syncs();
+    fx.db.exec("INSERT INTO wt VALUES (14, 1, CAST(random() * 0 AS INT))");
+    REQUIRE(m.captured_delta_syncs() == caps);
+    REQUIRE(m.scan_syncs() == scans + 1);
+    fx.check_views();
+  }
+  SECTION("captured INSERT then captured UPDATE, separate autocommits") {
+    const uint64_t caps = m.captured_delta_syncs();
+    fx.db.exec("INSERT INTO wt VALUES (15, 1, 150)");
+    fx.db.exec("UPDATE wt SET val = 151 WHERE id = 15");
+    REQUIRE(m.captured_delta_syncs() == caps + 2);
+    fx.check_views();
+  }
   fx.finish();
 }

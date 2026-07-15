@@ -28,26 +28,31 @@
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/statement/delete_statement.hpp"
+#include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
+#include "duckdb/parser/tableref/expressionlistref.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/logical_operator.hpp"
+#include "duckdb/planner/operator/logical_expression_get.hpp"
 
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 namespace dbsp_native {
 
 struct WriteCapturePlan {
-  enum class Kind { Update, Delete };
+  enum class Kind { Update, Delete, Insert };
   Kind kind;
   std::string capture_sql;
   size_t n_cols = 0; // physical column count of the target table
   // UPDATE only: (physical column index, capture-projection index) per SET
   // column; projection layout is [0]=rowid, [1..n_cols]=old columns, then
-  // one new value per SET column.
+  // one new value per SET column. INSERT projects the new rows directly
+  // in table column order (no rowid — the commit guard is seq + count).
   std::vector<std::pair<size_t, size_t>> set_cols;
 };
 
@@ -96,6 +101,19 @@ inline bool bound_plan_consistent(const duckdb::LogicalOperator &op) {
   for (auto &expr : op.expressions) {
     if (!bound_expr_consistent(*expr)) {
       return false;
+    }
+  }
+  // VALUES lists live in LogicalExpressionGet::expressions, a
+  // vector-of-rows member that SHADOWS the base-class expressions walked
+  // above — without this a volatile function inside VALUES slips through
+  if (op.type == duckdb::LogicalOperatorType::LOGICAL_EXPRESSION_GET) {
+    auto &get = op.Cast<duckdb::LogicalExpressionGet>();
+    for (auto &row : get.expressions) {
+      for (auto &expr : row) {
+        if (!bound_expr_consistent(*expr)) {
+          return false;
+        }
+      }
     }
   }
   for (auto &child : op.children) {
@@ -216,6 +234,97 @@ plan_write_capture(duckdb::ClientContext &context, duckdb::SQLStatement &stmt,
   if (condition) {
     sql += " WHERE (" + condition->ToString() + ")";
   }
+  plan->capture_sql = std::move(sql);
+  return plan;
+}
+
+// Autocommit INSERT ... VALUES capture: the rows are right there in the
+// statement, so evaluate them (with the INSERT's own to-column-type
+// casts) via one internal SELECT over the VALUES list:
+//   INSERT INTO t VALUES (e1, e2), ...
+//     -> SELECT CAST(v."c1" AS <type(c1)>), ... FROM (VALUES (e1, e2), ...)
+//        v("c1", "c2", ...)
+// A full-cover column list (possibly permuted) is projected back into
+// table order; partial lists involve column defaults and are rejected.
+// nullptr = not capturable. Explicit transactions never need this — the
+// G2 LocalStorage scan is exact there.
+inline std::unique_ptr<WriteCapturePlan>
+plan_insert_capture(duckdb::SQLStatement &stmt,
+                    duckdb::TableCatalogEntry &entry) {
+  if (stmt.type != duckdb::StatementType::INSERT_STATEMENT) {
+    return nullptr;
+  }
+  auto &ins = stmt.Cast<duckdb::InsertStatement>();
+  if (ins.on_conflict_info || !ins.returning_list.empty() ||
+      !ins.cte_map.map.empty() || ins.default_values ||
+      ins.column_order != duckdb::InsertColumnOrder::INSERT_BY_POSITION) {
+    return nullptr;
+  }
+  auto values = ins.GetValuesList();
+  if (!values || values->values.empty()) {
+    return nullptr; // INSERT ... SELECT and friends stay on the scan path
+  }
+
+  std::vector<std::string> table_cols;
+  for (auto &col : entry.GetColumns().Physical()) {
+    table_cols.push_back(col.Name());
+  }
+
+  // VALUES alias names in the order the statement supplies values:
+  // the table's column order, or the statement's column list when it
+  // covers every column (defaults otherwise — reject)
+  std::vector<std::string> value_names = ins.columns;
+  if (value_names.empty()) {
+    value_names = table_cols;
+  } else {
+    if (value_names.size() != table_cols.size()) {
+      return nullptr;
+    }
+    std::unordered_set<std::string> seen;
+    for (const auto &name : value_names) {
+      seen.insert(duckdb::StringUtil::Lower(name));
+    }
+    for (const auto &name : table_cols) {
+      if (seen.find(duckdb::StringUtil::Lower(name)) == seen.end()) {
+        return nullptr; // not a full cover
+      }
+    }
+    if (seen.size() != table_cols.size()) {
+      return nullptr; // duplicate names
+    }
+  }
+
+  std::string rows;
+  for (const auto &row : values->values) {
+    if (row.size() != value_names.size()) {
+      return nullptr;
+    }
+    rows += rows.empty() ? "(" : ", (";
+    for (size_t i = 0; i < row.size(); i++) {
+      if (!parsed_expr_capturable(*row[i])) {
+        return nullptr;
+      }
+      rows += (i ? ", " : "") + row[i]->ToString();
+    }
+    rows += ")";
+  }
+
+  auto plan = std::make_unique<WriteCapturePlan>();
+  plan->kind = WriteCapturePlan::Kind::Insert;
+  plan->n_cols = table_cols.size();
+
+  std::string alias_cols;
+  for (const auto &name : value_names) {
+    alias_cols += (alias_cols.empty() ? "" : ", ") + quote_ident(name);
+  }
+  std::string sql = "SELECT ";
+  bool first = true;
+  for (auto &col : entry.GetColumns().Physical()) {
+    sql += (first ? "" : ", ") + std::string("CAST(v.") +
+           quote_ident(col.Name()) + " AS " + col.Type().ToString() + ")";
+    first = false;
+  }
+  sql += " FROM (VALUES " + rows + ") v(" + alias_cols + ")";
   plan->capture_sql = std::move(sql);
   return plan;
 }

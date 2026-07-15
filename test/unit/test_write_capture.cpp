@@ -184,4 +184,89 @@ TEST_CASE("write capture: bound-plan stability vetting", "[write_capture]") {
   REQUIRE(vet("SELECT rowid, id, CAST((val + 1) AS INTEGER) FROM t"));
   REQUIRE_FALSE(vet("SELECT rowid, id FROM t WHERE random() > 0.5"));
   REQUIRE_FALSE(vet("SELECT rowid, id, CAST((random() * 10) AS INTEGER) FROM t"));
+  // VALUES lists live in LogicalExpressionGet::expressions (shadows the
+  // base member) — volatile functions there must still be caught
+  REQUIRE_FALSE(vet("SELECT * FROM (VALUES (random()), (0.5)) v(x)"));
+  REQUIRE(vet("SELECT * FROM (VALUES (1), (2)) v(x)"));
+}
+
+namespace {
+
+std::unique_ptr<WriteCapturePlan> insert_plan_for(PlanFixture &fx,
+                                                  const std::string &sql,
+                                                  const std::string &table) {
+  duckdb::Parser parser;
+  parser.ParseQuery(sql);
+  REQUIRE(parser.statements.size() == 1);
+  std::unique_ptr<WriteCapturePlan> out;
+  auto &ctx = *fx.con.context;
+  ctx.RunFunctionInTransaction([&] {
+    auto entry = resolve_table_entry(ctx, table);
+    REQUIRE(entry);
+    out = plan_insert_capture(*parser.statements[0], *entry);
+  });
+  return out;
+}
+
+} // namespace
+
+TEST_CASE("insert capture: plain VALUES is capturable", "[write_capture]") {
+  PlanFixture fx;
+  auto plan = insert_plan_for(
+      fx, "INSERT INTO t VALUES (1, 2, 'a'), (3, 4, 'b')", "t");
+  REQUIRE(plan);
+  REQUIRE(plan->kind == WriteCapturePlan::Kind::Insert);
+  REQUIRE(plan->n_cols == 3);
+  REQUIRE(plan->set_cols.empty());
+  auto res = fx.con.Query(plan->capture_sql);
+  REQUIRE_FALSE(res->HasError());
+  REQUIRE(res->RowCount() == 2);
+}
+
+TEST_CASE("insert capture: full-cover permuted column list reorders",
+          "[write_capture]") {
+  PlanFixture fx;
+  auto plan = insert_plan_for(
+      fx, "INSERT INTO t (name, val, id) VALUES ('a', 2, 1)", "t");
+  REQUIRE(plan);
+  auto res = fx.con.Query(plan->capture_sql);
+  REQUIRE_FALSE(res->HasError());
+  // projection is table order: id, val, name
+  REQUIRE(res->GetValue(0, 0).ToString() == "1");
+  REQUIRE(res->GetValue(1, 0).ToString() == "2");
+  REQUIRE(res->GetValue(2, 0).ToString() == "a");
+}
+
+TEST_CASE("insert capture: rejected INSERT shapes", "[write_capture]") {
+  PlanFixture fx;
+  SECTION("INSERT ... SELECT") {
+    REQUIRE_FALSE(insert_plan_for(fx, "INSERT INTO t SELECT * FROM t", "t"));
+  }
+  SECTION("partial column list (defaults involved)") {
+    REQUIRE_FALSE(
+        insert_plan_for(fx, "INSERT INTO t (id) VALUES (1)", "t"));
+  }
+  SECTION("DEFAULT VALUES") {
+    REQUIRE_FALSE(insert_plan_for(fx, "INSERT INTO t DEFAULT VALUES", "t"));
+  }
+  SECTION("DEFAULT inside VALUES") {
+    REQUIRE_FALSE(insert_plan_for(
+        fx, "INSERT INTO t VALUES (1, DEFAULT, 'a')", "t"));
+  }
+  SECTION("RETURNING") {
+    REQUIRE_FALSE(insert_plan_for(
+        fx, "INSERT INTO t VALUES (1, 2, 'a') RETURNING *", "t"));
+  }
+  SECTION("BY NAME") {
+    REQUIRE_FALSE(insert_plan_for(
+        fx, "INSERT INTO t BY NAME (SELECT 1 AS id)", "t"));
+  }
+  SECTION("subquery expression") {
+    REQUIRE_FALSE(insert_plan_for(
+        fx, "INSERT INTO t VALUES ((SELECT 1), 2, 'a')", "t"));
+  }
+  SECTION("parameter") {
+    REQUIRE_FALSE(
+        insert_plan_for(fx, "INSERT INTO t VALUES ($1, 2, 'a')", "t"));
+  }
 }

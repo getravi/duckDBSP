@@ -320,6 +320,7 @@ For the mathematical foundations, see [Theory](docs/THEORY.md).
 | **Delta propagation, 3-level view chain** | ~13 µs/row |
 | **Captured-delta commit (explicit INSERT txn)** | ~0.3 ms |
 | **Captured UPDATE/DELETE commit (1M-row table, single row)** | ~1.5 ms |
+| **Captured autocommit INSERT (1M-row table)** | ~1.0 ms |
 | **Full scan-and-diff sync (50k rows, 3 views)** | ~41 ms |
 
 *Apple M-series, release build (`test/build_test`), 100k-row deltas unless

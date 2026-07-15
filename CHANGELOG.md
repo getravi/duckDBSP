@@ -29,6 +29,11 @@
 - Checkpoint/D3c interplay covered: deferred baselines still materialize
   at QueryBegin before any write; dbsp_save/dbsp_load round-trips with
   captured UPDATE/DELETE history (python checkpoint-restore test).
+- Follow-up in the same release: autocommit `INSERT ... VALUES` (full-cover
+  column lists) is captured too — the VALUES list is evaluated via one
+  internal SELECT with the INSERT's own casts (~1.0 ms at 1M rows); guard
+  is commit-seq + signed COUNT(*). `INSERT ... SELECT`, partial column
+  lists, and explicit-txn INSERTs (G2 is exact there) stay as before.
 - No upstream help available: DuckDB through 1.5.x ships no CDC/changeset
   extension hook (discussion #12408 open); revisit on engine upgrade.
 
