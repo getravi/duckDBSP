@@ -145,17 +145,20 @@ with tempfile.TemporaryDirectory() as tmp:
 
     # Session 4: auto-sync SQL writes after a lazy restore. QueryBegin must
     # materialize deferred baselines from PRE-write storage; the captured
-    # INSERT and the scan-diff DELETE then reconcile incrementally.
+    # INSERT, captured UPDATE/DELETE (write capture), and the re-saved
+    # checkpoint with that captured history then reconcile incrementally.
     conn = open_db(path)
     load_msg = conn.execute("SELECT * FROM dbsp_load()").fetchone()[0]
     assert "1 from checkpoint" in load_msg and "2 sources deferred" in load_msg, (
         f"lazy fast path did not fire on re-checkpoint: {load_msg}"
     )
     conn.execute("INSERT INTO li VALUES (8, 2, 77.0)")     # captured append
-    conn.execute("DELETE FROM li WHERE dim_0 = 9 AND dim_1 = 0")  # scan-diff
+    conn.execute("DELETE FROM li WHERE dim_0 = 9 AND dim_1 = 0")  # captured delete
+    conn.execute("UPDATE li SET value = 501.5 WHERE dim_0 = 8 AND dim_1 = 2")  # captured update
     got = view_rows(conn)
     want = truth(conn)
     assert got == want, "auto-sync DML after lazy restore diverged"
+    # Round-trip: dbsp_save with captured UPDATE/DELETE deltas in history
     conn.execute("SELECT * FROM dbsp_save()").fetchone()
     conn.close()
 
