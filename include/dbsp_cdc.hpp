@@ -945,6 +945,7 @@ public:
     if (!rebuild_pending_.exchange(false)) {
       return;
     }
+    commit_seq_++; // baselines change wholesale: invalidate in-flight captures
     // Refresh every tracked baseline from committed storage first: after
     // an out-of-band divergence the in-memory baseline is not trustworthy
     // (e.g. a trailing notify double-applied against a scan that already
@@ -2368,6 +2369,23 @@ public:
   // (observable so tests can prove the fast path actually ran)
   uint64_t captured_delta_syncs() const { return captured_delta_syncs_; }
 
+  // Monotonic count of baseline mutations; UPDATE/DELETE write-capture
+  // snapshots it at transaction begin and falls back when it moved by
+  // commit time (an interleaved commit may have invalidated the capture's
+  // committed-state read). See docs/DESIGN_WRITE_CAPTURE.md.
+  uint64_t commit_seq() const { return commit_seq_; }
+
+  // Write-capture commit-guard failures (each one fell back to
+  // scan-and-diff — loud, countable, never silent)
+  uint64_t capture_guard_fallbacks() const { return capture_guard_fallbacks_; }
+  void note_capture_guard_fallback() { capture_guard_fallbacks_++; }
+
+  // Test knob: force the scan-and-diff path for differential comparison
+  bool write_capture_enabled() const { return write_capture_enabled_; }
+  void set_write_capture_enabled(bool enabled) {
+    write_capture_enabled_ = enabled;
+  }
+
   // Live shared join arrangements (I1); lets tests prove sharing happened
   size_t shared_arrangement_count() const {
     std::shared_lock<std::shared_mutex> lock(struct_mutex_);
@@ -3128,6 +3146,10 @@ private:
                          const DuckDBZSet &delta) {
     if (delta.empty())
       return;
+    // Every baseline mutation lands here; write-capture commit guards
+    // compare against this to detect interleaved commits (see
+    // docs/DESIGN_WRITE_CAPTURE.md).
+    commit_seq_++;
 
     // Acquire view_mutex_ exclusively for writing view content.
     // Lock ordering: struct_mutex_ (held by caller) → view_mutex_ (acquired here).
@@ -3435,6 +3457,12 @@ private:
   size_t last_ckpt_saved_count_ = 0;
   std::atomic<uint64_t> captured_delta_syncs_{0};
   std::atomic<uint64_t> scan_syncs_{0};
+  // Write-capture (UPDATE/DELETE) observability + conflict detection:
+  // commit_seq_ advances on every propagated baseline mutation and on
+  // full rebuilds; guard failures fall back to scan-and-diff, loudly.
+  std::atomic<uint64_t> commit_seq_{0};
+  std::atomic<uint64_t> capture_guard_fallbacks_{0};
+  std::atomic<bool> write_capture_enabled_{true};
   // D3c lazy baselines: count of deferred tables (lock-free hot-path
   // check), pending full-rebuild flag (out-of-band change detected against
   // a deferred baseline; consumed by rebuild_all_views), and the

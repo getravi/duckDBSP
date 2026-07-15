@@ -1,21 +1,33 @@
-// Per-connection hook state: auto-CDC transaction hooks + the G2
-// captured-delta fast path.
+// Per-connection hook state: auto-CDC transaction hooks + the O(Δ)
+// captured-delta fast paths (G2 inserts, write-capture updates/deletes).
 //
-// Explicit transactions expose their appended rows through the
-// transaction's LocalStorage while the transaction is alive (QueryEnd
-// fires with the transaction still open). Pure-INSERT transactions on
-// tracked tables are therefore captured row-by-row as they execute; at
-// commit, a COUNT(*) guard validates the captured delta against the
-// committed table and it is applied in O(delta) — no scan, no diff.
-// Anything else — autocommit statements (the transaction is already gone
-// at every hook), DELETE/UPDATE/unclassifiable statements (txn marked
-// dirty), guard mismatches — falls back to the scan-and-diff sync_all.
+// INSERT (G2): explicit transactions expose their appended rows through
+// the transaction's LocalStorage while the transaction is alive (QueryEnd
+// fires with the transaction still open); pure-INSERT transactions on
+// tracked tables are captured row-by-row as they execute.
+//
+// UPDATE/DELETE (write capture, docs/DESIGN_WRITE_CAPTURE.md): at
+// QueryBegin a whitelisted statement on a tracked table runs one
+// internal-connection SELECT that reads the old images and computes the
+// new ones (SET expressions projected, cast to column types), yielding a
+// signed delta — works for explicit transactions AND autocommit (the
+// capture needs no transaction internals; autocommit applies from the
+// mid-statement commit hook, where the fallback sync already runs).
+//
+// At commit a guard validates every captured table — commit-sequence
+// conflict check, signed COUNT(*), and rowid re-verification of written
+// rows — and the merged delta is applied in O(delta) via
+// apply_captured_delta. Anything else — autocommit INSERTs (LocalStorage
+// is gone at every hook), non-whitelisted writes (txn marked dirty),
+// guard mismatches (counted loudly) — falls back to the scan-and-diff
+// sync. Captured and scanned deltas are never mixed for one commit.
 // Correctness never depends on capture.
 
 #pragma once
 
 #include "dbsp_cdc.hpp"
 #include "dbsp_recovery.hpp"
+#include "dbsp_write_capture.hpp"
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -95,6 +107,17 @@ public:
       stmt_ = {}; // hooks are inert without auto-sync
       return;
     }
+    // Write capture must run BEFORE the statement executes: the capture
+    // SELECT reads committed (pre-statement) state. It also must precede
+    // fold_into_txn, which otherwise poisons WRITE_KNOWN statements.
+    stmt_write_ = {};
+    if (stmt_.kind == StmtClass::WRITE_KNOWN) {
+      try {
+        try_write_capture(context, manager);
+      } catch (...) {
+        stmt_write_ = {}; // capture is an optimization only
+      }
+    }
     if (context.transaction.HasActiveTransaction()) {
       fold_into_txn(context, stmt_);
     }
@@ -106,6 +129,9 @@ public:
       return;
     }
     capture_ = {};
+    // Write-capture conflict guard: another connection's delta landing
+    // after this moves the seq and poisons this transaction's captures.
+    capture_.seq_snapshot = get_cdc_manager(context).commit_seq();
   }
 
   void QueryEnd(duckdb::ClientContext &context,
@@ -158,6 +184,20 @@ public:
         return; // O(delta) fast path served this commit
       }
 
+      // Autocommit write capture: the commit hook fires mid-statement,
+      // post-commit — guard and apply here, exactly where the scoped
+      // fallback sync would otherwise run.
+      if (!capture_.saw_statements && stmt_write_.pending) {
+        const bool served = apply_stmt_write(context, manager);
+        stmt_write_ = {};
+        if (served) {
+          capture_ = {};
+          return; // O(delta) fast path served this autocommit statement
+        }
+        manager.note_capture_guard_fallback();
+        stmt_.captured = false; // fold below as a normal known write
+      }
+
       // H1: scope the fallback sync to the tables this transaction wrote.
       // Autocommit commits fire mid-statement, before QueryEnd folded the
       // in-flight classification — fold it now.
@@ -199,6 +239,7 @@ public:
       return;
     }
     capture_ = {}; // rolled back: captured rows never happened
+    stmt_write_ = {};
   }
 
   // One-time crash recovery, moved here from OnConnectionOpened: that
@@ -249,8 +290,30 @@ private:
     // per tracked table: captured append delta + local rows consumed so far
     std::unordered_map<std::string, std::pair<DuckDBZSet, duckdb::idx_t>>
         appends;
+    // Write capture (UPDATE/DELETE): signed deltas + the rowids the commit
+    // guard re-verifies against committed storage
+    struct WriteVerify {
+      int64_t rowid;
+      bool is_delete;         // guard expects the rowid to be gone
+      DuckDBRow expected_new; // UPDATE: guard expects exactly this row
+    };
+    std::unordered_map<std::string, DuckDBZSet> write_deltas;
+    std::unordered_map<std::string, std::vector<WriteVerify>> verifies;
+    uint64_t seq_snapshot = 0;
+    bool wrote_capture = false;
   };
   TxnCapture capture_;
+
+  // Autocommit write capture: one statement's worth, applied from the
+  // mid-statement commit hook (no transaction outlives the statement)
+  struct StmtWriteCapture {
+    bool pending = false;
+    std::string table;
+    DuckDBZSet delta;
+    std::vector<TxnCapture::WriteVerify> verifies;
+    uint64_t seq_snapshot = 0;
+  };
+  StmtWriteCapture stmt_write_;
 
   // Classification of one SQL statement (computed at QueryBegin)
   struct StmtClass {
@@ -264,6 +327,7 @@ private:
     Kind kind = NONE;
     std::string table;   // INSERT_OK / WRITE_KNOWN target
     std::string text;    // original statement (INSERT capture needs it)
+    bool captured = false; // WRITE_KNOWN served by write capture: not dirty
   };
   StmtClass stmt_;
 
@@ -369,7 +433,7 @@ private:
         capture_.touched.insert(canonical_table_key(*entry));
       }
     }
-      if (c.kind == StmtClass::WRITE_KNOWN) {
+      if (c.kind == StmtClass::WRITE_KNOWN && !c.captured) {
         capture_.dirty = true; // not capturable, but the target is known
       }
       break;
@@ -468,6 +532,242 @@ private:
     }
   }
 
+  duckdb::Connection &guard_connection(duckdb::ClientContext &context) {
+    if (!guard_con_) {
+      guard_con_ = std::make_unique<duckdb::Connection>(
+          duckdb::DatabaseInstance::GetDatabase(context));
+    }
+    return *guard_con_;
+  }
+
+  // O(Δ) write capture (docs/DESIGN_WRITE_CAPTURE.md): runs BEFORE the
+  // UPDATE/DELETE executes. One internal SELECT captures the old images
+  // and, for UPDATE, computes the new images by projecting the SET
+  // expressions cast to their column types. Declining is always safe —
+  // the statement stays on the scan-and-diff path.
+  void try_write_capture(duckdb::ClientContext &context, CDCManager &manager) {
+    if (!manager.write_capture_enabled()) {
+      return;
+    }
+    const bool in_txn = context.transaction.HasActiveTransaction();
+    if (in_txn && (capture_.dirty || capture_.unknown_writes)) {
+      return; // this transaction already fell off the fast path
+    }
+    duckdb::Parser parser;
+    parser.ParseQuery(stmt_.text);
+    if (parser.statements.size() != 1) {
+      return;
+    }
+    auto &parsed = *parser.statements[0];
+    if (parsed.type != duckdb::StatementType::UPDATE_STATEMENT &&
+        parsed.type != duckdb::StatementType::DELETE_STATEMENT) {
+      return; // upserts and friends stay on the scan path
+    }
+
+    InternalQueryGuard guard;
+    auto &con = guard_connection(context);
+    auto &ictx = *con.context;
+    std::string key;
+    std::unique_ptr<WriteCapturePlan> plan;
+    ictx.RunFunctionInTransaction([&] {
+      auto entry = resolve_table_entry(ictx, stmt_.table);
+      if (!entry) {
+        return;
+      }
+      key = canonical_table_key(*entry);
+      if (!manager.is_table_tracked(key)) {
+        key.clear();
+        return;
+      }
+      plan = plan_write_capture(ictx, parsed, *entry, key);
+    });
+    if (key.empty() || !plan) {
+      return;
+    }
+    // The capture SELECT reads committed state: a target this transaction
+    // already wrote would be read stale — decline.
+    if (in_txn && capture_.touched.count(key)) {
+      return;
+    }
+    // Volatile (or per-query-constant) functions would re-evaluate
+    // differently in the statement itself
+    auto logical = con.ExtractPlan(plan->capture_sql);
+    if (!logical || !bound_plan_consistent(*logical)) {
+      return;
+    }
+    const uint64_t seq = manager.commit_seq();
+    auto res = con.Query(plan->capture_sql);
+    if (!res || res->HasError()) {
+      return;
+    }
+
+    const bool is_update = plan->kind == WriteCapturePlan::Kind::Update;
+    // physical column -> projection slot holding its new value
+    std::unordered_map<size_t, size_t> new_slots(plan->set_cols.begin(),
+                                                 plan->set_cols.end());
+    DuckDBZSet delta;
+    std::vector<TxnCapture::WriteVerify> verifies;
+    while (auto chunk = res->Fetch()) {
+      const duckdb::idx_t n = chunk->size();
+      if (n == 0) {
+        break;
+      }
+      for (duckdb::idx_t i = 0; i < n; i++) {
+        TxnCapture::WriteVerify v;
+        v.rowid = chunk->GetValue(0, i).GetValue<int64_t>();
+        v.is_delete = !is_update;
+        DuckDBRow old_row;
+        old_row.columns.reserve(plan->n_cols);
+        for (size_t c = 0; c < plan->n_cols; c++) {
+          old_row.columns.push_back(chunk->GetValue(c + 1, i));
+        }
+        if (is_update) {
+          DuckDBRow new_row;
+          new_row.columns.reserve(plan->n_cols);
+          for (size_t c = 0; c < plan->n_cols; c++) {
+            auto slot = new_slots.find(c);
+            new_row.columns.push_back(chunk->GetValue(
+                slot == new_slots.end() ? c + 1 : slot->second, i));
+          }
+          v.expected_new = new_row;
+          delta.insert(std::move(new_row), 1);
+        }
+        delta.insert(std::move(old_row), -1);
+        verifies.push_back(std::move(v));
+      }
+    }
+
+    if (in_txn) {
+      auto &slot = capture_.write_deltas[key];
+      for (const auto &[row, w] : delta) {
+        slot.insert(row, w);
+      }
+      auto &vv = capture_.verifies[key];
+      vv.insert(vv.end(), std::make_move_iterator(verifies.begin()),
+                std::make_move_iterator(verifies.end()));
+      capture_.wrote_capture = true;
+      capture_.active = true;
+    } else {
+      stmt_write_.pending = true;
+      stmt_write_.table = key;
+      stmt_write_.delta = std::move(delta);
+      stmt_write_.verifies = std::move(verifies);
+      stmt_write_.seq_snapshot = seq;
+    }
+    stmt_.captured = true;
+  }
+
+  // Commit guard part 3: re-read the captured rowids from committed
+  // storage — deleted rowids must be gone, updated rowids must hold
+  // exactly the predicted post-image. Rowid IN-lists prune, so this is
+  // O(Δ) regardless of table size.
+  bool verify_write_rows(duckdb::ClientContext &context,
+                         const std::string &table,
+                         const std::vector<TxnCapture::WriteVerify> &rows) {
+    if (rows.empty()) {
+      return true;
+    }
+    InternalQueryGuard guard;
+    auto &con = guard_connection(context);
+    const auto *schema = get_cdc_manager(context).get_table_schema(table);
+    if (!schema) {
+      return false;
+    }
+    std::string col_list;
+    for (const auto &col : schema->columns) {
+      col_list += ", " + quote_ident(col.name);
+    }
+    constexpr size_t kBatch = 512;
+    for (size_t start = 0; start < rows.size();) {
+      std::string del_ids, upd_ids;
+      std::unordered_map<int64_t, const DuckDBRow *> expected;
+      const size_t end = std::min(rows.size(), start + kBatch);
+      for (size_t i = start; i < end; i++) {
+        const auto &v = rows[i];
+        std::string &ids = v.is_delete ? del_ids : upd_ids;
+        if (!ids.empty()) {
+          ids += ",";
+        }
+        ids += std::to_string(v.rowid);
+        if (!v.is_delete) {
+          expected[v.rowid] = &v.expected_new;
+        }
+      }
+      start = end;
+      if (!del_ids.empty()) {
+        auto res = con.Query("SELECT COUNT(*) FROM " + quote_table_key(table) +
+                             " WHERE rowid IN (" + del_ids + ")");
+        if (!res || res->HasError()) {
+          return false;
+        }
+        auto chunk = res->Fetch();
+        if (!chunk || chunk->size() == 0 ||
+            chunk->GetValue(0, 0).GetValue<int64_t>() != 0) {
+          return false;
+        }
+      }
+      if (!upd_ids.empty()) {
+        auto res = con.Query("SELECT rowid" + col_list + " FROM " +
+                             quote_table_key(table) + " WHERE rowid IN (" +
+                             upd_ids + ")");
+        if (!res || res->HasError()) {
+          return false;
+        }
+        size_t seen = 0;
+        while (auto chunk = res->Fetch()) {
+          const duckdb::idx_t n = chunk->size();
+          if (n == 0) {
+            break;
+          }
+          for (duckdb::idx_t i = 0; i < n; i++, seen++) {
+            const int64_t rowid = chunk->GetValue(0, i).GetValue<int64_t>();
+            auto it = expected.find(rowid);
+            if (it == expected.end()) {
+              return false;
+            }
+            DuckDBRow got;
+            got.columns.reserve(it->second->columns.size());
+            for (size_t c = 0; c < it->second->columns.size(); c++) {
+              got.columns.push_back(chunk->GetValue(c + 1, i));
+            }
+            if (!(got == *it->second)) {
+              return false;
+            }
+          }
+        }
+        if (seen != expected.size()) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  // Autocommit write capture: guard + apply for the single in-flight
+  // statement (the commit hook fires mid-statement, post-commit)
+  bool apply_stmt_write(duckdb::ClientContext &context, CDCManager &manager) {
+    if (manager.commit_seq() != stmt_write_.seq_snapshot) {
+      return false;
+    }
+    const int64_t actual = committed_count(context, stmt_write_.table);
+    if (actual < 0) {
+      return false;
+    }
+    int64_t captured = 0;
+    for (const auto &[row, w] : stmt_write_.delta) {
+      captured += w;
+    }
+    const int64_t baseline = manager.tracked_total_weight(stmt_write_.table);
+    if (baseline < 0 || baseline + captured != actual) {
+      return false;
+    }
+    if (!verify_write_rows(context, stmt_write_.table, stmt_write_.verifies)) {
+      return false;
+    }
+    return manager.apply_captured_delta(stmt_write_.table, stmt_write_.delta,
+                                        &context);
+  }
+
   // Validate every captured table against the committed COUNT(*) and, if
   // all match, feed the captured deltas straight into propagation
   // Guard COUNT(*) through a cached connection + prepared statements:
@@ -476,10 +776,7 @@ private:
   int64_t committed_count(duckdb::ClientContext &context,
                           const std::string &table) {
     InternalQueryGuard guard;
-    if (!guard_con_) {
-      guard_con_ = std::make_unique<duckdb::Connection>(
-          duckdb::DatabaseInstance::GetDatabase(context));
-    }
+    guard_connection(context);
     auto it = count_stmts_.find(table);
     if (it == count_stmts_.end()) {
       auto prep =
@@ -502,25 +799,58 @@ private:
   }
 
   bool apply_captured(duckdb::ClientContext &context, CDCManager &manager) {
-    if (capture_.appends.empty()) {
+    if (capture_.appends.empty() && capture_.write_deltas.empty()) {
       return true; // clean read-only transaction: nothing to sync
     }
+    const bool wrote = capture_.wrote_capture;
+    auto fail = [&]() {
+      if (wrote) {
+        manager.note_capture_guard_fallback();
+      }
+      return false;
+    };
+    // Guard 1: an interleaved commit invalidates committed-state captures
+    if (wrote && manager.commit_seq() != capture_.seq_snapshot) {
+      return fail();
+    }
+    // Merge appends + write deltas per table: one apply (and one
+    // propagation) per table keeps the commit a single consistent step
+    std::unordered_map<std::string, DuckDBZSet> merged;
     for (const auto &[table, slot] : capture_.appends) {
+      auto &dst = merged[table];
+      for (const auto &[row, w] : slot.first) {
+        dst.insert(row, w);
+      }
+    }
+    for (const auto &[table, delta] : capture_.write_deltas) {
+      auto &dst = merged[table];
+      for (const auto &[row, w] : delta) {
+        dst.insert(row, w);
+      }
+    }
+    // Guard 2: committed COUNT(*) must equal baseline + captured weight
+    for (const auto &[table, delta] : merged) {
       const int64_t actual = committed_count(context, table);
       if (actual < 0) {
-        return false;
+        return fail();
       }
       int64_t captured = 0;
-      for (const auto &[row, w] : slot.first) {
+      for (const auto &[row, w] : delta) {
         captured += w;
       }
       const int64_t baseline = manager.tracked_total_weight(table);
       if (baseline < 0 || baseline + captured != actual) {
-        return false; // something we did not see changed the table
+        return fail(); // something we did not see changed the table
       }
     }
-    for (const auto &[table, slot] : capture_.appends) {
-      if (!manager.apply_captured_delta(table, slot.first, &context)) {
+    // Guard 3: rowid re-verification of updated/deleted rows
+    for (const auto &[table, rows] : capture_.verifies) {
+      if (!verify_write_rows(context, table, rows)) {
+        return fail();
+      }
+    }
+    for (const auto &[table, delta] : merged) {
+      if (!manager.apply_captured_delta(table, delta, &context)) {
         return false;
       }
     }
