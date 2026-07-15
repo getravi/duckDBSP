@@ -537,10 +537,32 @@ SELECT * FROM dbsp_notify_delete('orders', 1, 'Alice', 100.00);
 ### dbsp_auto_sync(enable)
 
 Toggle automatic change capture — **ON by default**: views update on
-every transaction commit without calling `dbsp_sync`. Explicit
-INSERT-only transactions commit in O(delta) via captured deltas; other
-writes use scan-and-diff scoped to the tables the transaction touched.
-Turn it off for bulk loads (each autocommit statement pays a scoped
+every transaction commit without calling `dbsp_sync`.
+
+Most plain SQL writes commit in **O(delta)** via captured deltas:
+
+- **INSERT** — explicit transactions containing only INSERTs (G2,
+  captured from transaction-local storage).
+- **UPDATE / DELETE** — explicit-transaction *and* autocommit statements
+  (write capture: one internal SELECT reads the old images and computes
+  the new ones before the statement runs; a commit guard — interleaved-
+  commit check, signed COUNT(*), rowid re-verification — validates the
+  captured delta against committed storage). A single-row UPDATE on a
+  1M-row table syncs in ~1.5 ms vs ~2.4 s for scan-and-diff.
+
+Everything else uses scan-and-diff scoped to the tables the transaction
+touched: autocommit INSERTs, upserts, `UPDATE ... FROM`, `DELETE ...
+USING`, CTEs/`RETURNING`, subqueries or prepared parameters in
+SET/WHERE, non-deterministic expressions (`random()`, `now()`), UPDATEs
+of indexed or LIST-typed columns, multi-statement strings, Appender
+writes, and any transaction that writes the same table twice. If any
+statement in a transaction is un-capturable, the whole transaction falls
+back — captured and scanned deltas never mix for one commit, and guard
+failures fall back loudly (`capture_guard_fallbacks` counter).
+Correctness never depends on capture; the design is in
+`docs/DESIGN_WRITE_CAPTURE.md`.
+
+Turn auto-sync off for bulk loads (each autocommit INSERT pays a scoped
 scan) and run one `dbsp_sync()` afterwards.
 
 ```sql

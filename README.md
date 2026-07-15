@@ -319,12 +319,14 @@ For the mathematical foundations, see [Theory](docs/THEORY.md).
 | **Incremental join (100k delta vs 100k index)** | ~460,000 rows/s |
 | **Delta propagation, 3-level view chain** | ~13 µs/row |
 | **Captured-delta commit (explicit INSERT txn)** | ~0.3 ms |
+| **Captured UPDATE/DELETE commit (1M-row table, single row)** | ~1.5 ms |
 | **Full scan-and-diff sync (50k rows, 3 views)** | ~41 ms |
 
 *Apple M-series, release build (`test/build_test`), 100k-row deltas unless
-noted; reproduce with `bench_planner_eval`. Explicit INSERT-only
-transactions commit O(Δ) via captured deltas; other writes pay the
-scan-and-diff sync.*
+noted; reproduce with `bench_planner_eval` / `bench_write_capture`.
+Explicit INSERT-only transactions and whitelisted UPDATE/DELETE
+statements (including autocommit) commit O(Δ) via captured deltas; other
+writes pay the scan-and-diff sync (docs/DESIGN_WRITE_CAPTURE.md).*
 
 ## Project Structure
 

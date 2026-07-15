@@ -1,5 +1,37 @@
 # Changelog
 
+## Feature: O(Δ) auto-sync capture for UPDATE and DELETE - Jul 2026
+
+- Whitelisted UPDATE/DELETE statements on tracked tables now commit via
+  captured deltas instead of scan-and-diff — for explicit transactions
+  AND autocommit (the first captured autocommit path; the capture needs
+  no transaction internals). Single-row UPDATE at 1M rows: ~1.5 ms
+  end-to-end vs ~2.4 s scan-and-diff.
+- Mechanism (design 1 of docs/DESIGN_WRITE_CAPTURE.md): at QueryBegin one
+  internal SELECT reads the statement's old images and computes the new
+  ones by projecting the SET expressions cast to column types — no
+  version-chain access needed, which was the 1.5.4 blocker. Deltas enter
+  the existing `apply_captured_delta` path (old −1 / new +1), merged with
+  G2 INSERT captures per table at commit.
+- Whitelist: plain base-table UPDATE (no FROM/RETURNING/CTE/DEFAULT) and
+  DELETE (no USING), no subqueries or parameters in SET/WHERE, all
+  functions CONSISTENT (now()/random() excluded), no indexed or LIST SET
+  columns (DuckDB executes those as delete+re-append — rowids unstable),
+  target not written earlier in the same transaction. Anything else —
+  including any un-capturable statement mid-transaction — falls back to
+  the scoped scan for the WHOLE transaction; captured and scanned deltas
+  never mix.
+- Commit guard generalized (the old COUNT(*) guard is UPDATE-blind):
+  commit-sequence conflict detection (`CDCManager::commit_seq`), signed
+  COUNT(*), and O(Δ) rowid re-verification of written rows (deleted
+  rowids gone, updated rowids hold exactly the predicted post-image).
+  Guard misses fall back loudly (`capture_guard_fallbacks` counter).
+- Checkpoint/D3c interplay covered: deferred baselines still materialize
+  at QueryBegin before any write; dbsp_save/dbsp_load round-trips with
+  captured UPDATE/DELETE history (python checkpoint-restore test).
+- No upstream help available: DuckDB through 1.5.x ships no CDC/changeset
+  extension hook (discussion #12408 open); revisit on engine upgrade.
+
 ## Feature: D3c lazy baselines — watermark-matched restore reads zero source rows - Jul 2026
 
 - `dbsp_load()`'s checkpoint fast path no longer rebuilds `TrackedTable`

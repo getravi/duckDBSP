@@ -26,6 +26,15 @@ Internal design of the DBSP DuckDB extension.
 │  └─────────────────────────────────────────────────────────────┘│
 │                              │                                   │
 │  ┌─────────────────────────────────────────────────────────────┐│
+│  │      Auto-sync hooks (DBSPContextState, per connection)      ││
+│  │  - O(Δ) captured deltas: INSERT txns (LocalStorage scan,    ││
+│  │    G2) + whitelisted UPDATE/DELETE incl. autocommit          ││
+│  │    (pre-image capture SELECT, dbsp_write_capture.hpp)        ││
+│  │  - Commit guard: seq conflict + signed COUNT(*) + rowid      ││
+│  │    re-verify; any miss → scoped scan-and-diff fallback       ││
+│  └─────────────────────────────────────────────────────────────┘│
+│                              │                                   │
+│  ┌─────────────────────────────────────────────────────────────┐│
 │  │            Planner Frontend (the only frontend)              ││
 │  │  - Connection::ExtractPlan (DuckDB optimizer disabled)       ││
 │  │  - Logical ops → PlanOpSpec tree → circuit nodes;            ││
@@ -486,6 +495,8 @@ src/
 ├── dbsp_extension.cpp           # Entry point, function registration
 include/
 ├── dbsp_cdc.hpp                 # CDC manager, dependency graph
+├── dbsp_context_state.hpp       # Auto-sync hooks + captured-delta paths
+├── dbsp_write_capture.hpp       # UPDATE/DELETE capture vetting + SQL builder
 ├── dbsp_duckdb_types.hpp        # DuckDB-native Z-sets and views
 └── dbsp_plan_translator.hpp     # Planner frontend + circuit-IR optimizer
 ```
