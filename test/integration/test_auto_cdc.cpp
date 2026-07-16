@@ -555,13 +555,13 @@ TEST_CASE("write capture: upsert and indexed-column UPDATE fall back",
   db.exec("UPDATE wpk SET val = 50 WHERE id = 2");
   REQUIRE(m.captured_delta_syncs() == caps + 1);
 
-  // Upsert stays on the scan path
+  // Upsert with excluded.-qualified SET: captured (probe LEFT JOIN)
   caps = m.captured_delta_syncs();
   const uint64_t scans = m.scan_syncs();
   db.exec("INSERT INTO wpk VALUES (2, 99) ON CONFLICT (id) "
           "DO UPDATE SET val = excluded.val");
-  REQUIRE(m.captured_delta_syncs() == caps);
-  REQUIRE(m.scan_syncs() == scans + 1);
+  REQUIRE(m.captured_delta_syncs() == caps + 1);
+  REQUIRE(m.scan_syncs() == scans);
 
   auto expected = db.query("SELECT * FROM (SELECT id, val FROM wpk "
                            "WHERE val > 5) ORDER BY ALL");
@@ -744,4 +744,74 @@ TEST_CASE("write capture: autocommit INSERT VALUES differential",
     fx.check_views();
   }
   fx.finish();
+}
+
+TEST_CASE("write capture: upsert differential",
+          "[integration][auto_cdc][write_capture]") {
+  DuckDBTestHarness db;
+  db.createTable("wu", "id INT PRIMARY KEY, grp INT, val INT",
+                 {"(1, 1, 10)", "(2, 1, 20)", "(3, 2, 30)"});
+  db.exec("SELECT * FROM dbsp_track('wu')");
+  db.exec("SELECT * FROM dbsp_sync('wu')");
+  db.exec("SELECT * FROM dbsp_create_view('wv_u', "
+          "'SELECT grp, SUM(val) AS s, COUNT(*) AS n FROM wu GROUP BY grp')");
+  db.exec("SELECT * FROM dbsp_auto_sync(true)");
+  auto &m = db.manager();
+
+  auto check = [&] {
+    auto expected = db.query("SELECT * FROM (SELECT grp, SUM(val) AS s, "
+                             "COUNT(*) AS n FROM wu GROUP BY grp) "
+                             "ORDER BY ALL");
+    auto actual =
+        db.query("SELECT * FROM dbsp_query('wv_u') ORDER BY ALL");
+    REQUIRE_FALSE(expected->HasError());
+    REQUIRE_FALSE(actual->HasError());
+    REQUIRE(actual->RowCount() == expected->RowCount());
+    for (size_t r = 0; r < expected->RowCount(); r++) {
+      for (size_t c = 0; c < expected->ColumnCount(); c++) {
+        REQUIRE(actual->GetValue(c, r).ToString() ==
+                expected->GetValue(c, r).ToString());
+      }
+    }
+  };
+
+  SECTION("mixed insert-part and update-part, single statement") {
+    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t scans = m.scan_syncs();
+    db.exec("INSERT INTO wu VALUES (2, 2, 200), (4, 2, 40) "
+            "ON CONFLICT (id) DO UPDATE SET grp = excluded.grp, "
+            "val = excluded.val");
+    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.scan_syncs() == scans);
+    check();
+  }
+  SECTION("DO NOTHING: matched row unchanged, new row inserted") {
+    const uint64_t caps = m.captured_delta_syncs();
+    db.exec("INSERT INTO wu VALUES (1, 9, 999), (5, 2, 50) "
+            "ON CONFLICT (id) DO NOTHING");
+    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    check();
+  }
+  SECTION("duplicate keys inside a DO NOTHING source: guard falls back") {
+    // both rows miss the table, but only ONE is inserted (the second
+    // conflicts with the first intra-statement) — the capture predicts
+    // two, the COUNT(*) guard catches it, the scan reconciles
+    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t fb = m.capture_guard_fallbacks();
+    db.exec("INSERT INTO wu VALUES (6, 1, 60), (6, 1, 61) "
+            "ON CONFLICT (id) DO NOTHING");
+    REQUIRE(m.captured_delta_syncs() == caps);
+    REQUIRE(m.capture_guard_fallbacks() == fb + 1);
+    check();
+  }
+  SECTION("explicit-txn upsert on an untouched table is captured") {
+    const uint64_t caps = m.captured_delta_syncs();
+    db.exec("BEGIN");
+    db.exec("INSERT INTO wu VALUES (2, 1, 21) ON CONFLICT (id) "
+            "DO UPDATE SET val = excluded.val");
+    db.exec("COMMIT");
+    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    check();
+  }
+  db.exec("SELECT * FROM dbsp_auto_sync(false)");
 }

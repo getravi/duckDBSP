@@ -351,3 +351,101 @@ TEST_CASE("insert capture: INSERT ... SELECT shapes", "[write_capture]") {
         fx, "INSERT INTO ti SELECT * FROM (SELECT id, val FROM t) s", "ti"));
   }
 }
+
+namespace {
+
+std::unique_ptr<WriteCapturePlan> upsert_plan_for(PlanFixture &fx,
+                                                  const std::string &sql,
+                                                  const std::string &table) {
+  duckdb::Parser parser;
+  parser.ParseQuery(sql);
+  REQUIRE(parser.statements.size() == 1);
+  std::unique_ptr<WriteCapturePlan> out;
+  auto &ctx = *fx.con.context;
+  ctx.RunFunctionInTransaction([&] {
+    auto entry = resolve_table_entry(ctx, table);
+    REQUIRE(entry);
+    out = plan_upsert_capture(ctx, *parser.statements[0], *entry,
+                              canonical_table_key(*entry));
+  });
+  return out;
+}
+
+} // namespace
+
+TEST_CASE("upsert capture: DO UPDATE probe plan", "[write_capture]") {
+  PlanFixture fx;
+  fx.exec("INSERT INTO ti VALUES (1, 10)");
+  auto plan = upsert_plan_for(fx,
+                              "INSERT INTO ti VALUES (1, 5), (2, 6) "
+                              "ON CONFLICT (id) DO UPDATE SET "
+                              "val = excluded.val",
+                              "ti");
+  REQUIRE(plan);
+  REQUIRE(plan->kind == WriteCapturePlan::Kind::Upsert);
+  REQUIRE(plan->n_cols == 2);
+  REQUIRE(plan->insert_slot_base == 3);
+  REQUIRE(plan->set_cols.size() == 1);
+  REQUIRE(plan->set_cols[0].first == 1);  // val
+  REQUIRE(plan->set_cols[0].second == 5); // 2n+1
+  auto res = fx.con.Query(plan->capture_sql);
+  REQUIRE_FALSE(res->HasError());
+  REQUIRE(res->RowCount() == 2);
+  // key 1 matches (rowid set), key 2 does not (rowid NULL)
+  size_t matched = 0, unmatched = 0;
+  for (size_t r = 0; r < res->RowCount(); r++) {
+    (res->GetValue(0, r).IsNull() ? unmatched : matched)++;
+  }
+  REQUIRE(matched == 1);
+  REQUIRE(unmatched == 1);
+}
+
+TEST_CASE("upsert capture: DO NOTHING has no SET slots", "[write_capture]") {
+  PlanFixture fx;
+  auto plan = upsert_plan_for(
+      fx, "INSERT INTO ti VALUES (1, 5) ON CONFLICT (id) DO NOTHING", "ti");
+  REQUIRE(plan);
+  REQUIRE(plan->set_cols.empty());
+}
+
+TEST_CASE("upsert capture: rejected shapes", "[write_capture]") {
+  PlanFixture fx;
+  SECTION("OR REPLACE") {
+    REQUIRE_FALSE(
+        upsert_plan_for(fx, "INSERT OR REPLACE INTO ti VALUES (1, 5)", "ti"));
+  }
+  SECTION("no explicit conflict target") {
+    REQUIRE_FALSE(upsert_plan_for(
+        fx, "INSERT INTO ti VALUES (1, 5) ON CONFLICT DO NOTHING", "ti"));
+  }
+  SECTION("DO UPDATE ... WHERE condition") {
+    REQUIRE_FALSE(upsert_plan_for(
+        fx,
+        "INSERT INTO ti VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET "
+        "val = excluded.val WHERE ti.val < 3",
+        "ti"));
+  }
+  SECTION("SET on the (indexed) conflict column") {
+    REQUIRE_FALSE(upsert_plan_for(
+        fx,
+        "INSERT INTO ti VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET "
+        "id = excluded.id + 100",
+        "ti"));
+  }
+  SECTION("conflict column not provided by the source") {
+    REQUIRE_FALSE(upsert_plan_for(
+        fx,
+        "INSERT INTO ti (val) VALUES (5) ON CONFLICT (id) DO NOTHING",
+        "ti"));
+  }
+  SECTION("bare target-column SET declines at query time (ambiguous)") {
+    auto plan = upsert_plan_for(
+        fx,
+        "INSERT INTO ti VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET "
+        "val = val + 1",
+        "ti");
+    REQUIRE(plan); // parse-level plan builds...
+    auto res = fx.con.Query(plan->capture_sql);
+    REQUIRE(res->HasError()); // ...but the ambiguous reference declines it
+  }
+}

@@ -553,11 +553,13 @@ private:
     auto &parsed = *parser.statements[0];
     const bool is_insert =
         parsed.type == duckdb::StatementType::INSERT_STATEMENT;
+    const bool is_upsert =
+        is_insert && parsed.Cast<duckdb::InsertStatement>().on_conflict_info;
     if (parsed.type != duckdb::StatementType::UPDATE_STATEMENT &&
         parsed.type != duckdb::StatementType::DELETE_STATEMENT && !is_insert) {
-      return; // upserts and friends stay on the scan path
+      return;
     }
-    if (is_insert && !context.transaction.IsAutoCommit()) {
+    if (is_insert && !is_upsert && !context.transaction.IsAutoCommit()) {
       return; // explicit-txn INSERTs use the exact G2 LocalStorage scan
     }
 
@@ -576,8 +578,9 @@ private:
         key.clear();
         return;
       }
-      plan = is_insert ? plan_insert_capture(parsed, *entry)
-                       : plan_write_capture(ictx, parsed, *entry, key);
+      plan = is_upsert ? plan_upsert_capture(ictx, parsed, *entry, key)
+             : is_insert ? plan_insert_capture(parsed, *entry)
+                         : plan_write_capture(ictx, parsed, *entry, key);
     });
     if (key.empty() || !plan) {
       return;
@@ -618,6 +621,39 @@ private:
             row.columns.push_back(chunk->GetValue(c, i));
           }
           delta.insert(std::move(row), 1);
+          continue;
+        }
+        if (plan->kind == WriteCapturePlan::Kind::Upsert) {
+          if (chunk->GetValue(0, i).IsNull()) {
+            // no conflict: insert-part row from the padded source image
+            DuckDBRow row;
+            row.columns.reserve(plan->n_cols);
+            for (size_t c = 0; c < plan->n_cols; c++) {
+              row.columns.push_back(
+                  chunk->GetValue(plan->insert_slot_base + c, i));
+            }
+            delta.insert(std::move(row), 1);
+            continue;
+          }
+          if (plan->set_cols.empty()) {
+            continue; // DO NOTHING: matched rows change nothing
+          }
+          TxnCapture::WriteVerify v;
+          v.rowid = chunk->GetValue(0, i).GetValue<int64_t>();
+          v.is_delete = false;
+          DuckDBRow old_row, new_row;
+          old_row.columns.reserve(plan->n_cols);
+          new_row.columns.reserve(plan->n_cols);
+          for (size_t c = 0; c < plan->n_cols; c++) {
+            auto slot = new_slots.find(c);
+            old_row.columns.push_back(chunk->GetValue(c + 1, i));
+            new_row.columns.push_back(chunk->GetValue(
+                slot == new_slots.end() ? c + 1 : slot->second, i));
+          }
+          v.expected_new = new_row;
+          delta.insert(std::move(new_row), 1);
+          delta.insert(std::move(old_row), -1);
+          verifies.push_back(std::move(v));
           continue;
         }
         TxnCapture::WriteVerify v;

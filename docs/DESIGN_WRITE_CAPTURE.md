@@ -92,7 +92,19 @@ DELETE:
   CONSISTENT functions only, target untouched this txn
 - missing WHERE (delete-all) is capturable
 
-Everything else — upsert, UPDATE...FROM, DELETE USING, multi-statement
+**Upserts** (follow-up, same release): `INSERT ... ON CONFLICT (cols)
+DO UPDATE SET` / `DO NOTHING` with an explicit conflict target probes
+committed state with a LEFT JOIN from the row source (aliased `excluded`,
+so the statement's own `excluded.*` references bind unchanged) to the
+target on the conflict columns. NULL probe rowid = insert-part row (+1);
+matched rows emit old/new pairs (rowid-verified) for DO UPDATE and
+nothing for DO NOTHING. Unqualified target columns in SET are ambiguous
+in the probe SELECT and decline via query error; conditional
+`DO ... WHERE`, `OR REPLACE`, implicit conflict targets, and SET on
+indexed columns fall back. Duplicate conflict keys inside a DO NOTHING
+source insert fewer rows than predicted — the COUNT(*) guard catches it.
+
+Everything else — UPDATE...FROM, DELETE USING, multi-statement
 strings, Appender writes, unparseable SQL — keeps today's behavior:
 poison the transaction's capture, scan-and-diff the touched tables at
 commit. If any statement in a transaction is un-capturable the whole

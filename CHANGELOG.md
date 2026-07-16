@@ -38,6 +38,15 @@
   choice depends on scan order), table functions (no stability
   metadata), window functions, or CTEs fall back; explicit-txn INSERTs
   stay on G2 (exact there).
+- Upserts captured too: `INSERT ... ON CONFLICT (cols) DO UPDATE SET`
+  (excluded.-qualified) and `DO NOTHING` probe committed state with a
+  LEFT JOIN from the row source; insert-part rows enter as +1, update-part
+  rows as old/new pairs with rowid re-verification. Unqualified target
+  columns in SET (ambiguous in the probe), conditional DO ... WHERE,
+  OR REPLACE, implicit conflict targets, and SET on indexed columns fall
+  back. Duplicate conflict keys inside a DO NOTHING source insert fewer
+  rows than the capture predicts — the signed COUNT(*) guard catches that
+  case and falls back, loudly.
 - No upstream help available: DuckDB through 1.5.x ships no CDC/changeset
   extension hook (discussion #12408 open); revisit on engine upgrade.
 
