@@ -69,10 +69,14 @@ public:
   struct TeeCapture {
     std::mutex mutex;
     bool armed = false;
+    // an UPDATE ... FROM child emitting two different new images for one
+    // target row is ambiguous — the tee invalidates itself and the
+    // statement takes the scan path
+    bool invalid = false;
     std::string table; // canonical key
     DuckDBZSet delta;
-    // a USING/join-shaped DELETE child can emit one row per MATCH:
-    // dedupe so a twice-matched target row still deletes once
+    // a USING/join-shaped DML child can emit one row per MATCH:
+    // dedupe so a twice-matched target row still counts once
     std::unordered_set<int64_t> seen_rowids;
   };
 
@@ -93,6 +97,23 @@ public:
       return;
     }
     tee_.delta.insert(std::move(row), -1);
+  }
+
+  // Execution threads: one updated row (old image, new image). A repeated
+  // rowid means the plan produced multiple new images for one target row
+  // (UPDATE ... FROM multi-match) — ambiguous, invalidate the tee.
+  void tee_add_update(int64_t rowid, DuckDBRow &&old_row,
+                      DuckDBRow &&new_row) {
+    std::lock_guard<std::mutex> guard(tee_.mutex);
+    if (!tee_.armed) {
+      return;
+    }
+    if (!tee_.seen_rowids.insert(rowid).second) {
+      tee_.invalid = true;
+      return;
+    }
+    tee_.delta.insert(std::move(old_row), -1);
+    tee_.delta.insert(std::move(new_row), 1);
   }
   // ---- end tee surface ----------------------------------------------
 
@@ -262,7 +283,7 @@ public:
         DuckDBZSet tee_delta;
         {
           std::lock_guard<std::mutex> guard(tee_.mutex);
-          if (tee_.armed) {
+          if (tee_.armed && !tee_.invalid) {
             teed = true;
             tee_table = tee_.table;
             tee_delta = std::move(tee_.delta);
@@ -616,6 +637,7 @@ private:
   void clear_tee() {
     std::lock_guard<std::mutex> guard(tee_.mutex);
     tee_.armed = false;
+    tee_.invalid = false;
     tee_.table.clear();
     tee_.delta = DuckDBZSet();
     tee_.seen_rowids.clear();
@@ -628,8 +650,13 @@ private:
   // fold cannot poison the transaction.
   void fold_tee_into_txn() {
     std::lock_guard<std::mutex> guard(tee_.mutex);
-    if (!tee_.armed) {
-      return;
+    if (!tee_.armed || tee_.invalid) {
+      tee_.armed = false;
+      tee_.invalid = false;
+      tee_.table.clear();
+      tee_.delta = DuckDBZSet();
+      tee_.seen_rowids.clear();
+      return; // invalid tee: the fold poisons normally, scan reconciles
     }
     stmt_.captured = true;
     if (!tee_.delta.empty()) {
@@ -644,6 +671,7 @@ private:
     // see this transaction's uncommitted effects)
     capture_.touched.insert(tee_.table);
     tee_.armed = false;
+    tee_.invalid = false;
     tee_.table.clear();
     tee_.delta = DuckDBZSet();
     tee_.seen_rowids.clear();

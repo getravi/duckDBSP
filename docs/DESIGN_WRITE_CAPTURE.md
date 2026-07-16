@@ -97,10 +97,21 @@ Hook-ordering findings from making this production (hard-won, keep):
   statements entirely — folding there re-counts a finished transaction
   and poisons the NEXT statement's commit into a read-only skip.
 
-Remaining for design-2 phase 2 (UPDATE tee): the same child widening
-plus reading SET values from the child projection (already present) and
-handling `update_is_del_and_insert` plans whose child carries all
-columns already.
+**Design-2 phase 2 SHIPPED (same day): the UPDATE tee.** Same child
+widening; the new image overlays the SET values (already computed in the
+child projection) onto the old image. Two extra findings:
+- PhysicalUpdate takes the rowid from the LAST child column BY POSITION —
+  widened columns must never reach it, so the UPDATE tee projects them
+  back out (its output is the child's first n columns).
+- With projection pushdown, `LogicalGet` exposes only `projection_ids`
+  entries as bindings — appended columns must join that list or they are
+  invisible and binding resolution fails downstream.
+An `UPDATE ... FROM` child emitting two different new images for one
+target row (multi-match) is ambiguous: the tee invalidates itself for the
+statement and the scan reconciles. With this, EVERY plain-SQL DML shape
+on a tracked table is O(Δ) except: multi-statement strings, Appender
+writes (no per-statement hooks), and multi-match UPDATE ... FROM
+(ambiguous by SQL semantics).
 
 ### Upstream check
 

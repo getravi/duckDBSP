@@ -540,12 +540,12 @@ TEST_CASE("write capture: fallback shapes take the scan path",
     REQUIRE(m.scan_syncs() == scans);
     fx.check_views();
   }
-  SECTION("non-deterministic predicate") {
-    const uint64_t caps = m.captured_delta_syncs();
+  SECTION("non-deterministic predicate: teed (exact executed rows)") {
+    // design 1 must decline random() — the D2 tee captures what the
+    // plan actually did instead; zero matching rows still skips the scan
     const uint64_t scans = m.scan_syncs();
     fx.db.exec("UPDATE wt SET val = 1 WHERE random() < -1.0");
-    REQUIRE(m.captured_delta_syncs() == caps);
-    REQUIRE(m.scan_syncs() == scans + 1);
+    REQUIRE(m.scan_syncs() == scans);
     fx.check_views();
   }
   fx.finish();
@@ -562,10 +562,12 @@ TEST_CASE("write capture: upsert and indexed-column UPDATE fall back",
   db.exec("SELECT * FROM dbsp_auto_sync(true)");
   auto &m = db.manager();
 
-  // PK column in an index: update_is_del_and_insert, rowids unstable
+  // PK column in an index (update_is_del_and_insert): design 1 declines
+  // (rowids unstable for its guard) but the D2 tee needs no post-rowids —
+  // captured from the executed rows
   uint64_t caps = m.captured_delta_syncs();
   db.exec("UPDATE wpk SET id = id + 10 WHERE val = 10");
-  REQUIRE(m.captured_delta_syncs() == caps);
+  REQUIRE(m.captured_delta_syncs() == caps + 1);
   db.assertViewRowCount("wv_pk", 2);
 
   // Non-indexed column of the same table IS capturable
@@ -607,15 +609,18 @@ TEST_CASE("write capture: mixed INSERT+UPDATE+DELETE transaction",
     REQUIRE(m.scan_syncs() == scans);
     fx.check_views();
   }
-  SECTION("same table written twice: whole txn falls back") {
+  SECTION("same table written twice: teed, stays O(delta)") {
+    // design 1 declines the UPDATE (table already written this txn);
+    // the D2 tee captures the executed rows — including the txn-local
+    // INSERT the UPDATE just modified
     const uint64_t caps = m.captured_delta_syncs();
     const uint64_t scans = m.scan_syncs();
     fx.db.exec("BEGIN");
     fx.db.exec("INSERT INTO wt VALUES (9, 1, 90)");
     fx.db.exec("UPDATE wt SET val = 1 WHERE id = 9");
     fx.db.exec("COMMIT");
-    REQUIRE(m.captured_delta_syncs() == caps);
-    REQUIRE(m.scan_syncs() == scans + 1); // one table touched, one scan
+    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.scan_syncs() == scans);
     fx.check_views();
   }
   fx.finish();

@@ -117,3 +117,83 @@ TEST_CASE("plan tee: zero-match DELETE after write skips the scan",
   fx.check();
   fx.finish();
 }
+
+TEST_CASE("plan tee: UPDATE ... FROM stays O(delta)",
+          "[integration][plan_tee]") {
+  TeeFixture fx;
+  auto &m = fx.db.manager();
+  // design 1 never captures UPDATE ... FROM; the tee observes the
+  // executed old/new rows (single match per target row)
+  const uint64_t caps = m.captured_delta_syncs();
+  const uint64_t scans = m.scan_syncs();
+  fx.db.exec("UPDATE tt SET val = tt.val + tu.id * 100 FROM tu "
+             "WHERE tt.id = tu.id");
+  REQUIRE(m.captured_delta_syncs() == caps + 1);
+  REQUIRE(m.scan_syncs() == scans);
+  fx.check();
+  fx.finish();
+}
+
+TEST_CASE("plan tee: multi-match UPDATE ... FROM invalidates and scans",
+          "[integration][plan_tee]") {
+  TeeFixture fx;
+  auto &m = fx.db.manager();
+  // both tu2 rows match tt.id = 1: two different new images for one
+  // target row — ambiguous, the tee must invalidate and the scan
+  // reconciles whatever DuckDB actually did
+  fx.db.exec("CREATE TABLE tu2 (id INT, add_v INT)");
+  fx.db.exec("INSERT INTO tu2 VALUES (1, 100), (1, 200)");
+  const uint64_t scans = m.scan_syncs();
+  auto res = fx.db.query("UPDATE tt SET val = tt.val + tu2.add_v FROM tu2 "
+                         "WHERE tt.id = tu2.id");
+  if (!res->HasError()) {
+    // DuckDB accepted the ambiguous update: the tee must NOT have served
+    // it — a scan reconciled the actual outcome
+    REQUIRE(m.scan_syncs() == scans + 1);
+  }
+  fx.check(); // either way the view matches the table
+  fx.finish();
+}
+
+TEST_CASE("plan tee: volatile SET expression captured exactly",
+          "[integration][plan_tee]") {
+  TeeFixture fx;
+  auto &m = fx.db.manager();
+  // random() in SET: design 1 cannot re-evaluate it — the tee records
+  // the value the statement actually wrote
+  const uint64_t caps = m.captured_delta_syncs();
+  const uint64_t scans = m.scan_syncs();
+  fx.db.exec("UPDATE tt SET val = CAST(random() * 1000 AS INT) "
+             "WHERE id = 2");
+  REQUIRE(m.captured_delta_syncs() == caps + 1);
+  REQUIRE(m.scan_syncs() == scans);
+  fx.check();
+  fx.finish();
+}
+
+TEST_CASE("plan tee: indexed-column UPDATE (del_and_insert) stays O(delta)",
+          "[integration][plan_tee]") {
+  DuckDBTestHarness db;
+  db.createTable("tpk2", "id INT PRIMARY KEY, val INT",
+                 {"(1, 10)", "(2, 20)"});
+  db.exec("SELECT * FROM dbsp_track('tpk2')");
+  db.exec("SELECT * FROM dbsp_sync('tpk2')");
+  db.exec("SELECT * FROM dbsp_create_view('tv_pk2', "
+          "'SELECT id, val FROM tpk2 WHERE val > 5')");
+  db.exec("SELECT * FROM dbsp_auto_sync(true)");
+  auto &m = db.manager();
+  const uint64_t caps = m.captured_delta_syncs();
+  const uint64_t scans = m.scan_syncs();
+  db.exec("UPDATE tpk2 SET id = id + 100 WHERE val = 10");
+  REQUIRE(m.captured_delta_syncs() == caps + 1);
+  REQUIRE(m.scan_syncs() == scans);
+  auto expected = db.query("SELECT * FROM (SELECT id, val FROM tpk2 "
+                           "WHERE val > 5) ORDER BY ALL");
+  auto actual = db.query("SELECT * FROM dbsp_query('tv_pk2') ORDER BY ALL");
+  REQUIRE(actual->RowCount() == expected->RowCount());
+  for (size_t r = 0; r < expected->RowCount(); r++) {
+    REQUIRE(actual->GetValue(0, r).ToString() ==
+            expected->GetValue(0, r).ToString());
+  }
+  db.exec("SELECT * FROM dbsp_auto_sync(false)");
+}

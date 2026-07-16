@@ -10,9 +10,14 @@
 // to one table in a transaction. Design 1 stays the first choice (no
 // plan mutation); the tee only arms when it declined.
 //
-// Phase 1 covers LogicalDelete. UPDATE needs the same child widening
-// plus the SET-value columns already present in its child projection —
-// tracked in the design doc.
+// DELETE tee: full pass-through, emits (old row, -1).
+// UPDATE tee: the child projection's LAST column is the rowid BY
+// CONVENTION (PhysicalUpdate reads chunk.ColumnCount()-1), so appended
+// old-image columns must never reach the update operator — the tee
+// projects them back out, emitting (old, -1)/(new, +1) where the new
+// image overlays the SET values (already computed in the child
+// projection) onto the old image. A repeated rowid (UPDATE ... FROM
+// multi-match) is ambiguous and invalidates the tee for the statement.
 
 #pragma once
 
@@ -27,6 +32,7 @@
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/operator/logical_update.hpp"
 
 #include <memory>
 #include <string>
@@ -47,14 +53,23 @@ public:
   PhysicalTee(duckdb::PhysicalPlan &physical_plan,
               duckdb::vector<duckdb::LogicalType> types,
               duckdb::idx_t estimated_cardinality, duckdb::idx_t rowid_pos,
-              std::vector<duckdb::idx_t> col_pos)
+              std::vector<duckdb::idx_t> col_pos,
+              std::vector<std::pair<duckdb::idx_t, duckdb::idx_t>> set_map,
+              duckdb::idx_t n_output)
       : duckdb::PhysicalOperator(physical_plan,
                                  duckdb::PhysicalOperatorType::EXTENSION,
                                  std::move(types), estimated_cardinality),
-        rowid_pos(rowid_pos), col_pos(std::move(col_pos)) {}
+        rowid_pos(rowid_pos), col_pos(std::move(col_pos)),
+        set_map(std::move(set_map)), n_output(n_output) {}
 
   duckdb::idx_t rowid_pos;
   std::vector<duckdb::idx_t> col_pos; // old row image, table column order
+  // UPDATE only: (physical column index, child position of its SET value)
+  std::vector<std::pair<duckdb::idx_t, duckdb::idx_t>> set_map;
+  // 0 = full pass-through (DELETE); otherwise emit only the first
+  // n_output input columns so the update operator's rowid-is-last-column
+  // convention survives the widening
+  duckdb::idx_t n_output;
 
   duckdb::unique_ptr<duckdb::OperatorState>
   GetOperatorState(duckdb::ExecutionContext &context) const override {
@@ -67,17 +82,35 @@ public:
           duckdb::OperatorState &state) const override {
     auto ctx_state = tee_context_state(context.client);
     if (ctx_state) {
+      const bool is_update = !set_map.empty();
       for (duckdb::idx_t i = 0; i < input.size(); i++) {
-        DuckDBRow row;
-        row.columns.reserve(col_pos.size());
+        DuckDBRow old_row;
+        old_row.columns.reserve(col_pos.size());
         for (const auto pos : col_pos) {
-          row.columns.push_back(input.GetValue(pos, i));
+          old_row.columns.push_back(input.GetValue(pos, i));
         }
-        ctx_state->tee_add_delete(
-            input.GetValue(rowid_pos, i).GetValue<int64_t>(), std::move(row));
+        const auto rowid =
+            input.GetValue(rowid_pos, i).GetValue<int64_t>();
+        if (is_update) {
+          DuckDBRow new_row = old_row;
+          for (const auto &[col, pos] : set_map) {
+            new_row.columns[col] = input.GetValue(pos, i);
+          }
+          ctx_state->tee_add_update(rowid, std::move(old_row),
+                                    std::move(new_row));
+        } else {
+          ctx_state->tee_add_delete(rowid, std::move(old_row));
+        }
       }
     }
-    chunk.Reference(input); // pass through unchanged
+    if (n_output == 0) {
+      chunk.Reference(input); // DELETE: pass through unchanged
+    } else {
+      for (duckdb::idx_t c = 0; c < n_output; c++) {
+        chunk.data[c].Reference(input.data[c]);
+      }
+      chunk.SetCardinality(input.size());
+    }
     return duckdb::OperatorResultType::NEED_MORE_INPUT;
   }
 
@@ -89,16 +122,25 @@ public:
 class LogicalTee : public duckdb::LogicalExtensionOperator {
 public:
   LogicalTee(duckdb::unique_ptr<duckdb::LogicalOperator> child,
-             duckdb::idx_t rowid_pos, std::vector<duckdb::idx_t> col_pos)
-      : rowid_pos(rowid_pos), col_pos(std::move(col_pos)) {
+             duckdb::idx_t rowid_pos, std::vector<duckdb::idx_t> col_pos,
+             std::vector<std::pair<duckdb::idx_t, duckdb::idx_t>> set_map,
+             duckdb::idx_t n_output)
+      : rowid_pos(rowid_pos), col_pos(std::move(col_pos)),
+        set_map(std::move(set_map)), n_output(n_output) {
     children.push_back(std::move(child));
   }
 
   duckdb::idx_t rowid_pos;
   std::vector<duckdb::idx_t> col_pos;
+  std::vector<std::pair<duckdb::idx_t, duckdb::idx_t>> set_map;
+  duckdb::idx_t n_output;
 
   duckdb::vector<duckdb::ColumnBinding> GetColumnBindings() override {
-    return children[0]->GetColumnBindings();
+    auto bindings = children[0]->GetColumnBindings();
+    if (n_output > 0 && bindings.size() > n_output) {
+      bindings.resize(n_output); // hide the widened old-image columns
+    }
+    return bindings;
   }
 
   duckdb::string GetExtensionName() const override { return "dbsp_tee"; }
@@ -107,14 +149,24 @@ public:
   CreatePlan(duckdb::ClientContext &context,
              duckdb::PhysicalPlanGenerator &planner) override {
     auto &child = planner.CreatePlan(*children[0]);
-    auto &op = planner.Make<PhysicalTee>(
-        child.types, child.estimated_cardinality, rowid_pos, col_pos);
+    auto out_types = child.types;
+    if (n_output > 0 && out_types.size() > n_output) {
+      out_types.resize(n_output);
+    }
+    auto &op = planner.Make<PhysicalTee>(std::move(out_types),
+                                         child.estimated_cardinality,
+                                         rowid_pos, col_pos, set_map, n_output);
     op.children.push_back(child);
     return op;
   }
 
 protected:
-  void ResolveTypes() override { types = children[0]->types; }
+  void ResolveTypes() override {
+    types = children[0]->types;
+    if (n_output > 0 && types.size() > n_output) {
+      types.resize(n_output);
+    }
+  }
 };
 
 // Widen the DELETE child chain so the full old row reaches the tee.
@@ -179,6 +231,12 @@ inline bool widen_delete_child(duckdb::LogicalOperator &child,
   std::vector<duckdb::ColumnBinding> appended;
   for (duckdb::idx_t c = 0; c < n_cols; c++) {
     get.AddColumnId(c);
+    // with projection pushdown the GET exposes only projection_ids
+    // entries (as (table_index, proj_id) bindings) — the appended
+    // columns must join that list to be visible at all
+    if (!get.projection_ids.empty()) {
+      get.projection_ids.push_back(prev + c);
+    }
     appended.emplace_back(get.table_index, prev + c);
   }
 
@@ -263,7 +321,9 @@ inline void tee_walk(duckdb::ClientContext &context, CDCManager &manager,
         for (duckdb::idx_t i = 0; i < bindings.size(); i++) {
           if (bindings[i] == rowid_binding) {
             del.children[0] = duckdb::make_uniq<LogicalTee>(
-                std::move(del.children[0]), i, std::move(col_pos));
+                std::move(del.children[0]), i, std::move(col_pos),
+                std::vector<std::pair<duckdb::idx_t, duckdb::idx_t>>(),
+                /*n_output=*/0);
             del.children[0]->ResolveOperatorTypes();
             state.arm_tee(key);
             break;
@@ -271,6 +331,58 @@ inline void tee_walk(duckdb::ClientContext &context, CDCManager &manager,
         }
       }
     }
+  }
+  if (op->type == duckdb::LogicalOperatorType::LOGICAL_UPDATE) {
+    auto &upd = op->Cast<duckdb::LogicalUpdate>();
+    const std::string key = canonical_table_key(upd.table);
+    do {
+      if (!manager.is_table_tracked(key) || upd.children.empty() ||
+          upd.children[0]->type !=
+              duckdb::LogicalOperatorType::LOGICAL_PROJECTION ||
+          upd.columns.size() != upd.expressions.size()) {
+        break;
+      }
+      auto &proj = upd.children[0]->Cast<duckdb::LogicalProjection>();
+      // PhysicalUpdate takes the rowid from the LAST child column — the
+      // tee will project the widened columns back out to preserve that
+      const auto n_output = proj.GetColumnBindings().size();
+      if (n_output == 0) {
+        break;
+      }
+      const auto rowid_pos = n_output - 1;
+      // every SET value must be a plain reference into the child
+      // projection (DEFAULTs and friends live elsewhere — decline)
+      std::vector<std::pair<duckdb::idx_t, duckdb::idx_t>> set_map;
+      bool ok = true;
+      for (duckdb::idx_t i = 0; i < upd.expressions.size(); i++) {
+        if (upd.expressions[i]->GetExpressionClass() !=
+            duckdb::ExpressionClass::BOUND_COLUMN_REF) {
+          ok = false;
+          break;
+        }
+        const auto binding = upd.expressions[i]
+                                 ->Cast<duckdb::BoundColumnRefExpression>()
+                                 .binding;
+        if (binding.table_index != proj.table_index ||
+            binding.column_index >= n_output) {
+          ok = false;
+          break;
+        }
+        set_map.emplace_back(upd.columns[i].index, binding.column_index);
+      }
+      if (!ok) {
+        break;
+      }
+      std::vector<duckdb::idx_t> col_pos;
+      if (!widen_delete_child(proj, upd.table, col_pos)) {
+        break;
+      }
+      upd.children[0] = duckdb::make_uniq<LogicalTee>(
+          std::move(upd.children[0]), rowid_pos, std::move(col_pos),
+          std::move(set_map), n_output);
+      upd.children[0]->ResolveOperatorTypes();
+      state.arm_tee(key);
+    } while (false);
   }
   for (auto &child : op->children) {
     tee_walk(context, manager, state, child);

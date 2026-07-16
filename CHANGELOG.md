@@ -66,6 +66,19 @@
   QueryBegin (the mid-statement commit hook cannot resolve catalog
   entries — that legacy fold path never actually worked), explicit-txn
   statements fold at QueryEnd so the tee can mark them captured first.
+- Design-2 phase 2: the UPDATE tee. Same widening; the new image overlays
+  the SET values (already computed in the child projection) onto the old
+  image, closing UPDATE ... FROM, prepared parameters, volatile SET
+  expressions, and indexed-column UPDATEs (update_is_del_and_insert —
+  the tee needs no post-rowids). Multi-match UPDATE ... FROM produces two
+  new images for one target row — ambiguous, the tee invalidates itself
+  and the scan reconciles. Implementation findings: PhysicalUpdate takes
+  the rowid from the LAST child column by position (the tee projects the
+  widened columns back out), and a projection-pushdown LogicalGet exposes
+  only projection_ids entries (appended columns must join the list).
+  With this, every plain-SQL DML statement on a tracked table syncs in
+  O(Δ) except multi-statement strings, Appender writes, and multi-match
+  UPDATE ... FROM.
 - No upstream help available: DuckDB through 1.5.x ships no CDC/changeset
   extension hook (discussion #12408 open); revisit on engine upgrade.
 
