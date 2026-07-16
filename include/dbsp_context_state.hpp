@@ -119,15 +119,16 @@ public:
     // LocalStorage (G2 needs an explicit txn), but a plain VALUES list is
     // right there in the statement — capture it the same way. Explicit-txn
     // INSERTs stay on G2 (exact, and capturing both would double-count).
-    stmt_write_ = {};
+    // Autocommit statements already run inside their own transaction here
+    // (probed empirically), so every capture buffers in capture_ and
+    // applies from the TransactionCommit hook.
     if (stmt_.kind == StmtClass::WRITE_KNOWN ||
         (stmt_.kind == StmtClass::INSERT_OK &&
-         (!context.transaction.HasActiveTransaction() ||
-          context.transaction.IsAutoCommit()))) {
+         context.transaction.IsAutoCommit())) {
       try {
         try_write_capture(context, manager);
       } catch (...) {
-        stmt_write_ = {}; // capture is an optimization only
+        // capture is an optimization only; fold below poisons as needed
       }
     }
     if (context.transaction.HasActiveTransaction()) {
@@ -196,20 +197,6 @@ public:
         return; // O(delta) fast path served this commit
       }
 
-      // Autocommit write capture: the commit hook fires mid-statement,
-      // post-commit — guard and apply here, exactly where the scoped
-      // fallback sync would otherwise run.
-      if (!capture_.saw_statements && stmt_write_.pending) {
-        const bool served = apply_stmt_write(context, manager);
-        stmt_write_ = {};
-        if (served) {
-          capture_ = {};
-          return; // O(delta) fast path served this autocommit statement
-        }
-        manager.note_capture_guard_fallback();
-        stmt_.captured = false; // fold below as a normal known write
-      }
-
       // H1: scope the fallback sync to the tables this transaction wrote.
       // Autocommit commits fire mid-statement, before QueryEnd folded the
       // in-flight classification — fold it now.
@@ -251,7 +238,6 @@ public:
       return;
     }
     capture_ = {}; // rolled back: captured rows never happened
-    stmt_write_ = {};
   }
 
   // One-time crash recovery, moved here from OnConnectionOpened: that
@@ -315,17 +301,6 @@ private:
     bool wrote_capture = false;
   };
   TxnCapture capture_;
-
-  // Autocommit write capture: one statement's worth, applied from the
-  // mid-statement commit hook (no transaction outlives the statement)
-  struct StmtWriteCapture {
-    bool pending = false;
-    std::string table;
-    DuckDBZSet delta;
-    std::vector<TxnCapture::WriteVerify> verifies;
-    uint64_t seq_snapshot = 0;
-  };
-  StmtWriteCapture stmt_write_;
 
   // Classification of one SQL statement (computed at QueryBegin)
   struct StmtClass {
@@ -561,8 +536,13 @@ private:
     if (!manager.write_capture_enabled()) {
       return;
     }
-    const bool in_txn = context.transaction.HasActiveTransaction();
-    if (in_txn && (capture_.dirty || capture_.unknown_writes)) {
+    // Captures buffer per-transaction and apply at commit; without a
+    // transaction there is no commit hook to apply from (never observed —
+    // autocommit statements have their transaction by QueryBegin)
+    if (!context.transaction.HasActiveTransaction()) {
+      return;
+    }
+    if (capture_.dirty || capture_.unknown_writes) {
       return; // this transaction already fell off the fast path
     }
     duckdb::Parser parser;
@@ -577,7 +557,7 @@ private:
         parsed.type != duckdb::StatementType::DELETE_STATEMENT && !is_insert) {
       return; // upserts and friends stay on the scan path
     }
-    if (is_insert && in_txn && !context.transaction.IsAutoCommit()) {
+    if (is_insert && !context.transaction.IsAutoCommit()) {
       return; // explicit-txn INSERTs use the exact G2 LocalStorage scan
     }
 
@@ -604,7 +584,7 @@ private:
     }
     // The capture SELECT reads committed state: a target this transaction
     // already wrote would be read stale — decline.
-    if (in_txn && capture_.touched.count(key)) {
+    if (capture_.touched.count(key)) {
       return;
     }
     // Volatile (or per-query-constant) functions would re-evaluate
@@ -613,7 +593,6 @@ private:
     if (!logical || !bound_plan_consistent(*logical)) {
       return;
     }
-    const uint64_t seq = manager.commit_seq();
     auto res = con.Query(plan->capture_sql);
     if (!res || res->HasError()) {
       return;
@@ -665,23 +644,15 @@ private:
       }
     }
 
-    if (in_txn) {
-      auto &slot = capture_.write_deltas[key];
-      for (const auto &[row, w] : delta) {
-        slot.insert(row, w);
-      }
-      auto &vv = capture_.verifies[key];
-      vv.insert(vv.end(), std::make_move_iterator(verifies.begin()),
-                std::make_move_iterator(verifies.end()));
-      capture_.wrote_capture = true;
-      capture_.active = true;
-    } else {
-      stmt_write_.pending = true;
-      stmt_write_.table = key;
-      stmt_write_.delta = std::move(delta);
-      stmt_write_.verifies = std::move(verifies);
-      stmt_write_.seq_snapshot = seq;
+    auto &slot = capture_.write_deltas[key];
+    for (const auto &[row, w] : delta) {
+      slot.insert(row, w);
     }
+    auto &vv = capture_.verifies[key];
+    vv.insert(vv.end(), std::make_move_iterator(verifies.begin()),
+              std::make_move_iterator(verifies.end()));
+    capture_.wrote_capture = true;
+    capture_.active = true;
     stmt_.captured = true;
   }
 
@@ -769,31 +740,6 @@ private:
       }
     }
     return true;
-  }
-
-  // Autocommit write capture: guard + apply for the single in-flight
-  // statement (the commit hook fires mid-statement, post-commit)
-  bool apply_stmt_write(duckdb::ClientContext &context, CDCManager &manager) {
-    if (manager.commit_seq() != stmt_write_.seq_snapshot) {
-      return false;
-    }
-    const int64_t actual = committed_count(context, stmt_write_.table);
-    if (actual < 0) {
-      return false;
-    }
-    int64_t captured = 0;
-    for (const auto &[row, w] : stmt_write_.delta) {
-      captured += w;
-    }
-    const int64_t baseline = manager.tracked_total_weight(stmt_write_.table);
-    if (baseline < 0 || baseline + captured != actual) {
-      return false;
-    }
-    if (!verify_write_rows(context, stmt_write_.table, stmt_write_.verifies)) {
-      return false;
-    }
-    return manager.apply_captured_delta(stmt_write_.table, stmt_write_.delta,
-                                        &context);
   }
 
   // Validate every captured table against the committed COUNT(*) and, if
