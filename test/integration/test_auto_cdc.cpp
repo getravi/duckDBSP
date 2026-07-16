@@ -226,13 +226,21 @@ TEST_CASE("G2: autocommit VALUES inserts sync via captured deltas",
   REQUIRE(manager.scan_syncs() == scans);
   db.assertViewRowCount("v_cap4", 2);
 
-  // INSERT ... SELECT cannot be captured: scan path, still correct
+  // INSERT ... SELECT over base tables: captured too (the deterministic
+  // source is evaluated by the capture SELECT)
   caps = manager.captured_delta_syncs();
   scans = manager.scan_syncs();
   db.exec("INSERT INTO ct4 SELECT id + 10, val + 10 FROM ct4 WHERE id = 2");
+  REQUIRE(manager.captured_delta_syncs() == caps + 1);
+  REQUIRE(manager.scan_syncs() == scans);
+  db.assertViewRowCount("v_cap4", 3);
+
+  // LIMIT makes the row choice scan-order-dependent: scan path
+  caps = manager.captured_delta_syncs();
+  scans = manager.scan_syncs();
+  db.exec("INSERT INTO ct4 SELECT id + 20, val FROM ct4 LIMIT 1");
   REQUIRE(manager.captured_delta_syncs() == caps);
   REQUIRE(manager.scan_syncs() == scans + 1);
-  db.assertViewRowCount("v_cap4", 3);
 
   db.exec("SELECT * FROM dbsp_auto_sync(false)");
 }
@@ -703,12 +711,21 @@ TEST_CASE("write capture: autocommit INSERT VALUES differential",
     REQUIRE(m.captured_delta_syncs() == caps + 1);
     fx.check_views();
   }
-  SECTION("partial column list falls back (defaults)") {
+  SECTION("partial column list captured with NULL/default padding") {
     const uint64_t caps = m.captured_delta_syncs();
     const uint64_t scans = m.scan_syncs();
-    fx.db.exec("INSERT INTO wt (id, grp) VALUES (13, 1)");
-    REQUIRE(m.captured_delta_syncs() == caps);
-    REQUIRE(m.scan_syncs() == scans + 1);
+    fx.db.exec("INSERT INTO wt (id, grp) VALUES (13, 1)"); // val -> NULL
+    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.scan_syncs() == scans);
+    fx.check_views();
+  }
+  SECTION("INSERT ... SELECT differential") {
+    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t scans = m.scan_syncs();
+    fx.db.exec("INSERT INTO wt SELECT id + 100, grp, val * 2 FROM wt "
+               "WHERE grp = 1");
+    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.scan_syncs() == scans);
     fx.check_views();
   }
   SECTION("volatile expression falls back") {

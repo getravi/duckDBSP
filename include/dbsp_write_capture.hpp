@@ -27,10 +27,15 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/query_node/set_operation_node.hpp"
+#include "duckdb/parser/result_modifier.hpp"
 #include "duckdb/parser/statement/delete_statement.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/parser/tableref/expressionlistref.hpp"
+#include "duckdb/parser/tableref/joinref.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/logical_operator.hpp"
@@ -58,12 +63,14 @@ struct WriteCapturePlan {
 
 // Subqueries read other tables (whose transaction-local state the capture
 // SELECT cannot see), parameters have no value at parse time, DEFAULT
-// needs default-expression resolution: all uncapturable.
+// needs default-expression resolution, and window output over tied sort
+// keys depends on scan order: all uncapturable.
 inline bool parsed_expr_capturable(const duckdb::ParsedExpression &expr) {
   const auto cls = expr.GetExpressionClass();
   if (cls == duckdb::ExpressionClass::SUBQUERY ||
       cls == duckdb::ExpressionClass::PARAMETER ||
-      cls == duckdb::ExpressionClass::DEFAULT) {
+      cls == duckdb::ExpressionClass::DEFAULT ||
+      cls == duckdb::ExpressionClass::WINDOW) {
     return false;
   }
   bool ok = true;
@@ -238,14 +245,97 @@ plan_write_capture(duckdb::ClientContext &context, duckdb::SQLStatement &stmt,
   return plan;
 }
 
-// Autocommit INSERT ... VALUES capture: the rows are right there in the
-// statement, so evaluate them (with the INSERT's own to-column-type
-// casts) via one internal SELECT over the VALUES list:
-//   INSERT INTO t VALUES (e1, e2), ...
-//     -> SELECT CAST(v."c1" AS <type(c1)>), ... FROM (VALUES (e1, e2), ...)
-//        v("c1", "c2", ...)
-// A full-cover column list (possibly permuted) is projected back into
-// table order; partial lists involve column defaults and are rejected.
+// Deterministic-source vetting for INSERT ... SELECT capture: the source
+// runs twice (capture SELECT, then the statement), so its ROW SET must be
+// repeatable. LIMIT/SAMPLE pick rows by scan order (parallel scans make
+// that non-repeatable), table functions carry no stability metadata, and
+// CTE/pivot/show refs are out of whitelist scope.
+inline bool source_node_capturable(const duckdb::QueryNode &node);
+
+inline bool source_ref_capturable(const duckdb::TableRef &ref) {
+  if (ref.sample) {
+    return false;
+  }
+  switch (ref.type) {
+  case duckdb::TableReferenceType::BASE_TABLE:
+  case duckdb::TableReferenceType::EMPTY_FROM:
+  case duckdb::TableReferenceType::EXPRESSION_LIST:
+    return true;
+  case duckdb::TableReferenceType::JOIN: {
+    auto &join = ref.Cast<duckdb::JoinRef>();
+    if (join.condition && !parsed_expr_capturable(*join.condition)) {
+      return false;
+    }
+    return source_ref_capturable(*join.left) &&
+           source_ref_capturable(*join.right);
+  }
+  case duckdb::TableReferenceType::SUBQUERY: {
+    auto &sub = ref.Cast<duckdb::SubqueryRef>();
+    return sub.subquery && sub.subquery->node &&
+           source_node_capturable(*sub.subquery->node);
+  }
+  default:
+    return false;
+  }
+}
+
+inline bool source_node_capturable(const duckdb::QueryNode &node) {
+  if (!node.cte_map.map.empty()) {
+    return false;
+  }
+  for (auto &mod : node.modifiers) {
+    if (mod->type == duckdb::ResultModifierType::LIMIT_MODIFIER ||
+        mod->type == duckdb::ResultModifierType::LIMIT_PERCENT_MODIFIER) {
+      return false; // which rows survive depends on scan order
+    }
+  }
+  if (node.type == duckdb::QueryNodeType::SELECT_NODE) {
+    auto &sel = node.Cast<duckdb::SelectNode>();
+    if (sel.sample) {
+      return false;
+    }
+    for (auto &expr : sel.select_list) {
+      if (!parsed_expr_capturable(*expr)) {
+        return false;
+      }
+    }
+    if (sel.where_clause && !parsed_expr_capturable(*sel.where_clause)) {
+      return false;
+    }
+    if (sel.having && !parsed_expr_capturable(*sel.having)) {
+      return false;
+    }
+    if (sel.qualify && !parsed_expr_capturable(*sel.qualify)) {
+      return false;
+    }
+    for (auto &expr : sel.groups.group_expressions) {
+      if (!parsed_expr_capturable(*expr)) {
+        return false;
+      }
+    }
+    return !sel.from_table || source_ref_capturable(*sel.from_table);
+  }
+  if (node.type == duckdb::QueryNodeType::SET_OPERATION_NODE) {
+    auto &setop = node.Cast<duckdb::SetOperationNode>();
+    for (auto &child : setop.children) {
+      if (!child || !source_node_capturable(*child)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  return false; // recursive CTE nodes and friends
+}
+
+// Autocommit INSERT capture: evaluate the statement's row source (a
+// VALUES list or a whitelisted deterministic SELECT) via one internal
+// SELECT, projected into table column order with the INSERT's own
+// to-column-type casts. Columns missing from a partial column list take
+// their declared DEFAULT (or NULL) — volatile defaults like nextval()
+// fail the bound-plan stability check downstream.
+//   INSERT INTO t (b, a) VALUES (e1, e2), ...
+//     -> SELECT CAST(v."a" AS ...), CAST(v."b" AS ...), <default/NULL...>
+//        FROM (VALUES (e1, e2), ...) v("b", "a")
 // nullptr = not capturable. Explicit transactions never need this — the
 // G2 LocalStorage scan is exact there.
 inline std::unique_ptr<WriteCapturePlan>
@@ -257,12 +347,9 @@ plan_insert_capture(duckdb::SQLStatement &stmt,
   auto &ins = stmt.Cast<duckdb::InsertStatement>();
   if (ins.on_conflict_info || !ins.returning_list.empty() ||
       !ins.cte_map.map.empty() || ins.default_values ||
-      ins.column_order != duckdb::InsertColumnOrder::INSERT_BY_POSITION) {
+      ins.column_order != duckdb::InsertColumnOrder::INSERT_BY_POSITION ||
+      !ins.select_statement || !ins.select_statement->node) {
     return nullptr;
-  }
-  auto values = ins.GetValuesList();
-  if (!values || values->values.empty()) {
-    return nullptr; // INSERT ... SELECT and friends stay on the scan path
   }
 
   std::vector<std::string> table_cols;
@@ -270,43 +357,50 @@ plan_insert_capture(duckdb::SQLStatement &stmt,
     table_cols.push_back(col.Name());
   }
 
-  // VALUES alias names in the order the statement supplies values:
-  // the table's column order, or the statement's column list when it
-  // covers every column (defaults otherwise — reject)
+  // Names for the row source's columns, in statement order; lowercased
+  // set marks which table columns the statement provides
   std::vector<std::string> value_names = ins.columns;
+  std::unordered_set<std::string> provided;
   if (value_names.empty()) {
     value_names = table_cols;
-  } else {
-    if (value_names.size() != table_cols.size()) {
+  }
+  for (const auto &name : value_names) {
+    if (!entry.ColumnExists(name) || entry.GetColumn(name).Generated()) {
       return nullptr;
     }
-    std::unordered_set<std::string> seen;
-    for (const auto &name : value_names) {
-      seen.insert(duckdb::StringUtil::Lower(name));
-    }
-    for (const auto &name : table_cols) {
-      if (seen.find(duckdb::StringUtil::Lower(name)) == seen.end()) {
-        return nullptr; // not a full cover
-      }
-    }
-    if (seen.size() != table_cols.size()) {
-      return nullptr; // duplicate names
+    if (!provided.insert(duckdb::StringUtil::Lower(name)).second) {
+      return nullptr; // duplicate column name
     }
   }
 
-  std::string rows;
-  for (const auto &row : values->values) {
-    if (row.size() != value_names.size()) {
+  std::string source;
+  auto values = ins.GetValuesList();
+  if (values) {
+    if (values->values.empty()) {
       return nullptr;
     }
-    rows += rows.empty() ? "(" : ", (";
-    for (size_t i = 0; i < row.size(); i++) {
-      if (!parsed_expr_capturable(*row[i])) {
+    std::string rows;
+    for (const auto &row : values->values) {
+      if (row.size() != value_names.size()) {
         return nullptr;
       }
-      rows += (i ? ", " : "") + row[i]->ToString();
+      rows += rows.empty() ? "(" : ", (";
+      for (size_t i = 0; i < row.size(); i++) {
+        if (!parsed_expr_capturable(*row[i])) {
+          return nullptr;
+        }
+        rows += (i ? ", " : "") + row[i]->ToString();
+      }
+      rows += ")";
     }
-    rows += ")";
+    source = "(VALUES " + rows + ")";
+  } else {
+    if (!source_node_capturable(*ins.select_statement->node)) {
+      return nullptr;
+    }
+    // A source-arity/column-list mismatch makes the capture SELECT (or
+    // the statement itself) error out — declined at execution, no risk
+    source = "(" + ins.select_statement->node->ToString() + ")";
   }
 
   auto plan = std::make_unique<WriteCapturePlan>();
@@ -320,11 +414,22 @@ plan_insert_capture(duckdb::SQLStatement &stmt,
   std::string sql = "SELECT ";
   bool first = true;
   for (auto &col : entry.GetColumns().Physical()) {
-    sql += (first ? "" : ", ") + std::string("CAST(v.") +
-           quote_ident(col.Name()) + " AS " + col.Type().ToString() + ")";
+    sql += first ? "" : ", ";
     first = false;
+    if (provided.count(duckdb::StringUtil::Lower(col.Name()))) {
+      sql += "CAST(v." + quote_ident(col.Name()) + " AS " +
+             col.Type().ToString() + ")";
+    } else if (col.HasDefaultValue()) {
+      if (!parsed_expr_capturable(col.DefaultValue())) {
+        return nullptr;
+      }
+      sql += "CAST((" + col.DefaultValue().ToString() + ") AS " +
+             col.Type().ToString() + ")";
+    } else {
+      sql += "CAST(NULL AS " + col.Type().ToString() + ")";
+    }
   }
-  sql += " FROM (VALUES " + rows + ") v(" + alias_cols + ")";
+  sql += " FROM " + source + " v(" + alias_cols + ")";
   plan->capture_sql = std::move(sql);
   return plan;
 }

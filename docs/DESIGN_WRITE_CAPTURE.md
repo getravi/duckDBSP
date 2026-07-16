@@ -105,22 +105,30 @@ autocommit TransactionCommit hook — which fires mid-statement, post-commit
 — runs the guard and applies, exactly where the scoped-scan fallback runs
 today).
 
-**Autocommit INSERT ... VALUES** (follow-up, shipped with this feature):
-the rows are in the statement itself, so one internal SELECT evaluates the
-VALUES list with the INSERT's own to-column-type casts:
+**Autocommit INSERT** (follow-up, shipped with this feature): the row
+source — a VALUES list or a whitelisted deterministic SELECT — is
+evaluated by one internal SELECT with the INSERT's own to-column-type
+casts, projected into table column order; columns missing from a partial
+column list take their declared DEFAULT (or NULL):
 
 ```sql
--- INSERT INTO t VALUES (e1, e2), ...  becomes
-SELECT CAST(v.c1 AS <type(c1)>), ... FROM (VALUES (e1, e2), ...) v(c1, c2)
+-- INSERT INTO t (b, a) VALUES (e1, e2), ...  becomes
+SELECT CAST(v.a AS ...), CAST(v.b AS ...), <default/NULL...>
+FROM (VALUES (e1, e2), ...) v(b, a)
+-- INSERT INTO t SELECT ... uses the SELECT itself as the source
 ```
 
-Whitelist: plain VALUES source (no `INSERT ... SELECT`, no `BY NAME`, no
-`DEFAULT VALUES`), full-cover column list only (partial lists involve
-column defaults), same expression rules as UPDATE/DELETE. The guard is
-commit-seq + signed COUNT(*) only — rowids are unknowable before the
-insert executes, and predicted rows use the same CAST the INSERT itself
-applies. Explicit-transaction INSERTs stay on G2 (exact LocalStorage scan;
-capturing both would double-count). Gotcha found during implementation:
+Whitelist: no `BY NAME`, no `DEFAULT VALUES` form, same expression rules
+as UPDATE/DELETE. SELECT sources must produce a REPEATABLE row set (they
+run twice — capture, then the statement): no LIMIT/SAMPLE (row choice
+depends on scan order under parallel scans), no table functions (no
+stability metadata), no window functions (tie order), no CTEs. Volatile
+column defaults (`nextval()`) fail the bound-plan stability check. The
+guard is commit-seq + signed COUNT(*) only — rowids are unknowable before
+the insert executes, and predicted rows use the same CAST the INSERT
+itself applies. Explicit-transaction INSERTs stay on G2 (exact
+LocalStorage scan; capturing both would double-count). Gotcha found
+during implementation:
 autocommit statements DO have an active transaction at QueryBegin
 (`TransactionContext::IsAutoCommit()` distinguishes), and VALUES rows bind
 into `LogicalExpressionGet::expressions` — a member that *shadows* the

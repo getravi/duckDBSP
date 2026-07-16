@@ -239,12 +239,11 @@ TEST_CASE("insert capture: full-cover permuted column list reorders",
 
 TEST_CASE("insert capture: rejected INSERT shapes", "[write_capture]") {
   PlanFixture fx;
-  SECTION("INSERT ... SELECT") {
-    REQUIRE_FALSE(insert_plan_for(fx, "INSERT INTO t SELECT * FROM t", "t"));
+  SECTION("INSERT ... SELECT over a base table is now capturable") {
+    REQUIRE(insert_plan_for(fx, "INSERT INTO t SELECT * FROM t", "t"));
   }
-  SECTION("partial column list (defaults involved)") {
-    REQUIRE_FALSE(
-        insert_plan_for(fx, "INSERT INTO t (id) VALUES (1)", "t"));
+  SECTION("partial column list is now capturable (defaults resolved)") {
+    REQUIRE(insert_plan_for(fx, "INSERT INTO t (id) VALUES (1)", "t"));
   }
   SECTION("DEFAULT VALUES") {
     REQUIRE_FALSE(insert_plan_for(fx, "INSERT INTO t DEFAULT VALUES", "t"));
@@ -268,5 +267,87 @@ TEST_CASE("insert capture: rejected INSERT shapes", "[write_capture]") {
   SECTION("parameter") {
     REQUIRE_FALSE(
         insert_plan_for(fx, "INSERT INTO t VALUES ($1, 2, 'a')", "t"));
+  }
+}
+
+TEST_CASE("insert capture: partial column list pads defaults and NULLs",
+          "[write_capture]") {
+  PlanFixture fx;
+  fx.exec("CREATE TABLE td (id INTEGER, val INTEGER DEFAULT 42, "
+          "name VARCHAR)");
+  auto plan = insert_plan_for(fx, "INSERT INTO td (id) VALUES (7)", "td");
+  REQUIRE(plan);
+  auto res = fx.con.Query(plan->capture_sql);
+  REQUIRE_FALSE(res->HasError());
+  REQUIRE(res->GetValue(0, 0).ToString() == "7");
+  REQUIRE(res->GetValue(1, 0).ToString() == "42"); // declared DEFAULT
+  REQUIRE(res->GetValue(2, 0).IsNull());           // no default -> NULL
+}
+
+TEST_CASE("insert capture: volatile default expression is caught downstream",
+          "[write_capture]") {
+  PlanFixture fx;
+  fx.exec("CREATE SEQUENCE sq");
+  fx.exec("CREATE TABLE ts (id INTEGER DEFAULT nextval('sq'), val INTEGER)");
+  auto plan = insert_plan_for(fx, "INSERT INTO ts (val) VALUES (1)", "ts");
+  // the parse-level walk cannot see stability; the bound-plan check must
+  REQUIRE(plan);
+  auto logical = fx.con.ExtractPlan(plan->capture_sql);
+  REQUIRE(logical);
+  REQUIRE_FALSE(bound_plan_consistent(*logical));
+}
+
+TEST_CASE("insert capture: INSERT ... SELECT shapes", "[write_capture]") {
+  PlanFixture fx;
+  SECTION("plain SELECT over a base table is capturable") {
+    auto plan = insert_plan_for(
+        fx, "INSERT INTO t SELECT id + 100, val, name FROM t WHERE val > 0",
+        "t");
+    REQUIRE(plan);
+    auto res = fx.con.Query(plan->capture_sql);
+    REQUIRE_FALSE(res->HasError());
+  }
+  SECTION("join + aggregate source is capturable") {
+    REQUIRE(insert_plan_for(
+        fx,
+        "INSERT INTO ti SELECT t.id, SUM(t.val) FROM t "
+        "JOIN ti ON t.id = ti.id GROUP BY t.id",
+        "ti"));
+  }
+  SECTION("UNION source is capturable") {
+    REQUIRE(insert_plan_for(
+        fx, "INSERT INTO ti SELECT 1, 2 UNION SELECT 3, 4", "ti"));
+  }
+  SECTION("LIMIT rejected: row choice depends on scan order") {
+    REQUIRE_FALSE(insert_plan_for(
+        fx, "INSERT INTO t SELECT * FROM t LIMIT 1", "t"));
+  }
+  SECTION("TABLESAMPLE rejected") {
+    REQUIRE_FALSE(insert_plan_for(
+        fx, "INSERT INTO t SELECT * FROM t TABLESAMPLE 50%", "t"));
+  }
+  SECTION("USING SAMPLE rejected") {
+    REQUIRE_FALSE(insert_plan_for(
+        fx, "INSERT INTO t SELECT * FROM t USING SAMPLE 1", "t"));
+  }
+  SECTION("table function rejected (no stability metadata)") {
+    REQUIRE_FALSE(insert_plan_for(
+        fx, "INSERT INTO ti SELECT i, i FROM range(3) r(i)", "ti"));
+  }
+  SECTION("window function rejected (tie order not repeatable)") {
+    REQUIRE_FALSE(insert_plan_for(
+        fx, "INSERT INTO ti SELECT id, row_number() OVER (ORDER BY val) "
+            "FROM t",
+        "ti"));
+  }
+  SECTION("CTE inside the SELECT rejected") {
+    REQUIRE_FALSE(insert_plan_for(
+        fx, "INSERT INTO ti WITH c AS (SELECT 1 a, 2 b FROM t) "
+            "SELECT * FROM c",
+        "ti"));
+  }
+  SECTION("subquery source ref is capturable") {
+    REQUIRE(insert_plan_for(
+        fx, "INSERT INTO ti SELECT * FROM (SELECT id, val FROM t) s", "ti"));
   }
 }

@@ -542,9 +542,11 @@ every transaction commit without calling `dbsp_sync`.
 Most plain SQL writes commit in **O(delta)** via captured deltas:
 
 - **INSERT** — explicit transactions containing only INSERTs (G2,
-  captured from transaction-local storage), and autocommit
-  `INSERT ... VALUES` with a full-cover column list (the VALUES list is
-  evaluated with the INSERT's own casts; ~1.0 ms at 1M rows).
+  captured from transaction-local storage), and autocommit INSERTs from a
+  VALUES list or a deterministic SELECT (evaluated with the INSERT's own
+  casts; partial column lists take their declared DEFAULTs; ~1.0 ms at
+  1M rows). SELECT sources must be repeatable: no LIMIT/SAMPLE, no table
+  functions, no window functions, no CTEs.
 - **UPDATE / DELETE** — explicit-transaction *and* autocommit statements
   (write capture: one internal SELECT reads the old images and computes
   the new ones before the statement runs; a commit guard — interleaved-
@@ -553,8 +555,7 @@ Most plain SQL writes commit in **O(delta)** via captured deltas:
   1M-row table syncs in ~1.5 ms vs ~2.4 s for scan-and-diff.
 
 Everything else uses scan-and-diff scoped to the tables the transaction
-touched: `INSERT ... SELECT` autocommits, partial-column-list INSERTs
-(defaults), upserts, `UPDATE ... FROM`, `DELETE ... USING`,
+touched: upserts, `UPDATE ... FROM`, `DELETE ... USING`,
 CTEs/`RETURNING`, subqueries or prepared parameters in expressions,
 non-deterministic expressions (`random()`, `now()`), UPDATEs of indexed
 or LIST-typed columns, multi-statement strings, Appender writes, and any
