@@ -47,6 +47,14 @@
   back. Duplicate conflict keys inside a DO NOTHING source insert fewer
   rows than the capture predicts — the signed COUNT(*) guard catches that
   case and falls back, loudly.
+- Subquery predicates in UPDATE/DELETE and `DELETE ... USING` (rewritten
+  to a correlated EXISTS probe) are captured when the statement's view is
+  pure committed state — autocommit, or an explicit transaction before
+  its first write (a new wrote_any flag gates it; a prior write to ANY
+  table would make the probe read stale state). Subquery row sources are
+  vetted with the same repeatability rules as INSERT ... SELECT.
+  UPDATE ... FROM stays scan-diff: with multiple FROM matches per target
+  row the SET result is nondeterministic.
 - No upstream help available: DuckDB through 1.5.x ships no CDC/changeset
   extension hook (discussion #12408 open); revisit on engine upgrade.
 

@@ -36,10 +36,13 @@ subsystem, bespoke parser, standalone Z-set spilling).
   DEFAULTs) are captured the same way — evaluated with the INSERT's own
   casts (~1.0ms at 1M rows). Upserts with an explicit
   conflict target and excluded.-qualified SET are captured via a LEFT
-  JOIN probe. Still scan-diff: UPDATE...FROM /
-  DELETE USING, LIMIT/SAMPLE/table-function/window/CTE INSERT sources
-  (row set not repeatable or no stability metadata), subqueries or
-  parameters in UPDATE/DELETE expressions, non-CONSISTENT functions,
+  JOIN probe. Subquery predicates and
+  DELETE USING (EXISTS-probe rewrite) capture too when the statement sees
+  pure committed state (autocommit, or explicit txn before its first
+  write). Still scan-diff: UPDATE...FROM (multi-match SET is
+  nondeterministic), LIMIT/SAMPLE/table-function/window/CTE INSERT
+  sources (row set not repeatable or no stability metadata), prepared
+  parameters, subqueries after a same-txn write, non-CONSISTENT functions,
   indexed/LIST SET columns (update_is_del_and_insert), multi-statement
   strings, Appender writes, and same-table-twice transactions.
 - Phase D1 vectorized filter/map/fused evaluation + zero-copy circuit

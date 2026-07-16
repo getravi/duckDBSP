@@ -506,20 +506,35 @@ TEST_CASE("write capture: fallback shapes take the scan path",
   WriteCaptureFixture fx;
   auto &m = fx.db.manager();
 
-  SECTION("DELETE with subquery WHERE") {
+  SECTION("DELETE with subquery WHERE: captured (committed-state view)") {
     const uint64_t caps = m.captured_delta_syncs();
     const uint64_t scans = m.scan_syncs();
     fx.db.exec(
         "DELETE FROM wt WHERE grp IN (SELECT grp FROM wd WHERE name = 'a')");
-    REQUIRE(m.captured_delta_syncs() == caps);
-    REQUIRE(m.scan_syncs() == scans + 1);
+    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.scan_syncs() == scans);
     fx.check_views();
   }
-  SECTION("DELETE USING") {
+  SECTION("DELETE USING: captured via EXISTS probe") {
     const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t scans = m.scan_syncs();
     fx.db.exec("DELETE FROM wt USING wd WHERE wt.grp = wd.grp "
                "AND wd.name = 'b'");
+    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.scan_syncs() == scans);
+    fx.check_views();
+  }
+  SECTION("subquery predicate after a write in the same txn: falls back") {
+    // the INSERT changes we; the DELETE's subquery reads we — the capture
+    // probe would see stale committed state, so it must decline
+    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t scans = m.scan_syncs();
+    fx.db.exec("BEGIN");
+    fx.db.exec("INSERT INTO we VALUES (3, 'z')");
+    fx.db.exec("DELETE FROM wt WHERE id IN (SELECT id FROM we)");
+    fx.db.exec("COMMIT");
     REQUIRE(m.captured_delta_syncs() == caps);
+    REQUIRE(m.scan_syncs() >= scans + 1);
     fx.check_views();
   }
   SECTION("non-deterministic predicate") {

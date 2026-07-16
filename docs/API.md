@@ -555,12 +555,15 @@ Most plain SQL writes commit in **O(delta)** via captured deltas:
   (write capture: one internal SELECT reads the old images and computes
   the new ones before the statement runs; a commit guard — interleaved-
   commit check, signed COUNT(*), rowid re-verification — validates the
-  captured delta against committed storage). A single-row UPDATE on a
+  captured delta against committed storage). Subquery predicates and
+  `DELETE ... USING` (rewritten to a correlated EXISTS probe) capture
+  too, when the statement sees pure committed state: autocommit, or an
+  explicit transaction before its first write. A single-row UPDATE on a
   1M-row table syncs in ~1.5 ms vs ~2.4 s for scan-and-diff.
 
 Everything else uses scan-and-diff scoped to the tables the transaction
-touched: `UPDATE ... FROM`, `DELETE ... USING`,
-CTEs/`RETURNING`, subqueries or prepared parameters in expressions,
+touched: `UPDATE ... FROM` (multi-match SET is nondeterministic),
+CTEs/`RETURNING`, prepared parameters, subqueries after a same-txn write,
 non-deterministic expressions (`random()`, `now()`), UPDATEs of indexed
 or LIST-typed columns, multi-statement strings, Appender writes, and any
 transaction that writes the same table twice. If any

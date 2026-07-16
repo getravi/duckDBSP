@@ -27,8 +27,10 @@ struct PlanFixture {
     REQUIRE_FALSE(res->HasError());
   }
 
+  // allow_subqueries=false models a transaction that already wrote
   std::unique_ptr<WriteCapturePlan> plan_for(const std::string &sql,
-                                             const std::string &table) {
+                                             const std::string &table,
+                                             bool allow_subqueries = false) {
     duckdb::Parser parser;
     parser.ParseQuery(sql);
     REQUIRE(parser.statements.size() == 1);
@@ -38,7 +40,7 @@ struct PlanFixture {
       auto entry = resolve_table_entry(ctx, table);
       REQUIRE(entry);
       out = plan_write_capture(ctx, *parser.statements[0], *entry,
-                               canonical_table_key(*entry));
+                               canonical_table_key(*entry), allow_subqueries);
     });
     return out;
   }
@@ -447,5 +449,70 @@ TEST_CASE("upsert capture: rejected shapes", "[write_capture]") {
     REQUIRE(plan); // parse-level plan builds...
     auto res = fx.con.Query(plan->capture_sql);
     REQUIRE(res->HasError()); // ...but the ambiguous reference declines it
+  }
+}
+
+TEST_CASE("write capture: subquery predicates with a committed-state view",
+          "[write_capture]") {
+  PlanFixture fx;
+  SECTION("UPDATE with IN-subquery WHERE") {
+    auto plan = fx.plan_for(
+        "UPDATE t SET val = 1 WHERE id IN (SELECT id FROM ti)", "t", true);
+    REQUIRE(plan);
+    auto res = fx.con.Query(plan->capture_sql);
+    REQUIRE_FALSE(res->HasError());
+  }
+  SECTION("scalar subquery in SET") {
+    auto plan = fx.plan_for(
+        "UPDATE t SET val = (SELECT MAX(val) FROM ti) WHERE id = 1", "t",
+        true);
+    REQUIRE(plan);
+    auto res = fx.con.Query(plan->capture_sql);
+    REQUIRE_FALSE(res->HasError());
+  }
+  SECTION("DELETE with subquery WHERE") {
+    REQUIRE(fx.plan_for(
+        "DELETE FROM t WHERE id IN (SELECT id FROM ti)", "t", true));
+  }
+  SECTION("LIMIT inside the subquery still rejects") {
+    REQUIRE_FALSE(fx.plan_for(
+        "DELETE FROM t WHERE id IN (SELECT id FROM ti LIMIT 1)", "t", true));
+  }
+  SECTION("table function inside the subquery still rejects") {
+    REQUIRE_FALSE(fx.plan_for(
+        "DELETE FROM t WHERE id IN (SELECT i FROM range(3) r(i))", "t",
+        true));
+  }
+  SECTION("dirty transaction view still rejects subqueries") {
+    REQUIRE_FALSE(fx.plan_for(
+        "UPDATE t SET val = 1 WHERE id IN (SELECT id FROM ti)", "t", false));
+  }
+}
+
+TEST_CASE("write capture: DELETE USING rewrites to an EXISTS probe",
+          "[write_capture]") {
+  PlanFixture fx;
+  auto plan = fx.plan_for(
+      "DELETE FROM t USING ti WHERE t.id = ti.id AND ti.val > 0", "t", true);
+  REQUIRE(plan);
+  REQUIRE(plan->capture_sql.find("WHERE EXISTS (SELECT 1 FROM ti") !=
+          std::string::npos);
+  auto res = fx.con.Query(plan->capture_sql);
+  REQUIRE_FALSE(res->HasError());
+
+  SECTION("committed-state view required") {
+    REQUIRE_FALSE(fx.plan_for(
+        "DELETE FROM t USING ti WHERE t.id = ti.id", "t", false));
+  }
+  SECTION("table-function USING ref rejects") {
+    REQUIRE_FALSE(fx.plan_for(
+        "DELETE FROM t USING range(3) r(i) WHERE t.id = r.i", "t", true));
+  }
+  SECTION("aliased target correlates into the probe") {
+    auto p = fx.plan_for(
+        "DELETE FROM t AS x USING ti WHERE x.id = ti.id", "t", true);
+    REQUIRE(p);
+    auto r = fx.con.Query(p->capture_sql);
+    REQUIRE_FALSE(r->HasError());
   }
 }

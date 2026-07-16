@@ -26,6 +26,7 @@
 #include "dbsp_qualified_name.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
@@ -66,26 +67,46 @@ struct WriteCapturePlan {
   size_t insert_slot_base = 0;
 };
 
-// Subqueries read other tables (whose transaction-local state the capture
-// SELECT cannot see), parameters have no value at parse time, DEFAULT
-// needs default-expression resolution, and window output over tied sort
-// keys depends on scan order: all uncapturable.
-inline bool parsed_expr_capturable(const duckdb::ParsedExpression &expr) {
+inline bool source_node_capturable(const duckdb::QueryNode &node);
+inline bool source_ref_capturable(const duckdb::TableRef &ref);
+
+// Parameters have no value at parse time, DEFAULT needs default-
+// expression resolution, and window output over tied sort keys depends
+// on scan order: always uncapturable. Subqueries read OTHER tables —
+// capturable only when the statement sees pure committed state
+// (autocommit, or an explicit transaction with no prior writes) AND the
+// subquery's own row source is repeatable.
+inline bool parsed_expr_capturable_ex(const duckdb::ParsedExpression &expr,
+                                      bool allow_subqueries) {
   const auto cls = expr.GetExpressionClass();
-  if (cls == duckdb::ExpressionClass::SUBQUERY ||
-      cls == duckdb::ExpressionClass::PARAMETER ||
+  if (cls == duckdb::ExpressionClass::PARAMETER ||
       cls == duckdb::ExpressionClass::DEFAULT ||
       cls == duckdb::ExpressionClass::WINDOW) {
     return false;
   }
+  if (cls == duckdb::ExpressionClass::SUBQUERY) {
+    if (!allow_subqueries) {
+      return false;
+    }
+    auto &sub = expr.Cast<duckdb::SubqueryExpression>();
+    if (!sub.subquery || !sub.subquery->node ||
+        !source_node_capturable(*sub.subquery->node)) {
+      return false;
+    }
+    // fall through: EnumerateChildren covers the IN/comparison child
+  }
   bool ok = true;
   duckdb::ParsedExpressionIterator::EnumerateChildren(
       expr, [&](const duckdb::ParsedExpression &child) {
-        if (ok && !parsed_expr_capturable(child)) {
+        if (ok && !parsed_expr_capturable_ex(child, allow_subqueries)) {
           ok = false;
         }
       });
   return ok;
+}
+
+inline bool parsed_expr_capturable(const duckdb::ParsedExpression &expr) {
+  return parsed_expr_capturable_ex(expr, false);
 }
 
 // True when every scalar function in a bound plan is CONSISTENT — i.e.
@@ -142,14 +163,19 @@ inline std::string quote_ident(const std::string &name) {
 
 // nullptr = shape not capturable (caller falls back to scan-and-diff).
 // `context` needs an active transaction (GetStorageInfo reads the catalog).
+// `allow_subqueries` = the statement sees pure committed state (autocommit
+// or a write-free transaction so far): subqueries in WHERE/SET and DELETE
+// ... USING (rewritten to a correlated EXISTS probe) become capturable.
 inline std::unique_ptr<WriteCapturePlan>
 plan_write_capture(duckdb::ClientContext &context, duckdb::SQLStatement &stmt,
                    duckdb::TableCatalogEntry &entry,
-                   const std::string &table_key) {
+                   const std::string &table_key, bool allow_subqueries) {
   auto plan = std::make_unique<WriteCapturePlan>();
   const duckdb::ParsedExpression *condition = nullptr;
   const duckdb::TableRef *target = nullptr;
   duckdb::UpdateSetInfo *set_info = nullptr;
+  const std::vector<duckdb::unique_ptr<duckdb::TableRef>> *using_refs =
+      nullptr;
 
   switch (stmt.type) {
   case duckdb::StatementType::UPDATE_STATEMENT: {
@@ -166,9 +192,21 @@ plan_write_capture(duckdb::ClientContext &context, duckdb::SQLStatement &stmt,
   }
   case duckdb::StatementType::DELETE_STATEMENT: {
     auto &del = stmt.Cast<duckdb::DeleteStatement>();
-    if (!del.using_clauses.empty() || !del.returning_list.empty() ||
-        !del.cte_map.map.empty()) {
+    if (!del.returning_list.empty() || !del.cte_map.map.empty()) {
       return nullptr;
+    }
+    if (!del.using_clauses.empty()) {
+      // DELETE ... USING is a semi-join delete: rewritable as EXISTS,
+      // but only with a committed-state view of the USING tables
+      if (!allow_subqueries) {
+        return nullptr;
+      }
+      for (auto &ref : del.using_clauses) {
+        if (!ref || !source_ref_capturable(*ref)) {
+          return nullptr;
+        }
+      }
+      using_refs = &del.using_clauses;
     }
     plan->kind = WriteCapturePlan::Kind::Delete;
     target = del.table.get();
@@ -182,7 +220,7 @@ plan_write_capture(duckdb::ClientContext &context, duckdb::SQLStatement &stmt,
   if (!target || target->type != duckdb::TableReferenceType::BASE_TABLE) {
     return nullptr;
   }
-  if (condition && !parsed_expr_capturable(*condition)) {
+  if (condition && !parsed_expr_capturable_ex(*condition, allow_subqueries)) {
     return nullptr;
   }
 
@@ -209,7 +247,8 @@ plan_write_capture(duckdb::ClientContext &context, duckdb::SQLStatement &stmt,
     }
     duckdb::TableStorageInfo storage_info = entry.GetStorageInfo(context);
     for (size_t j = 0; j < set_info->columns.size(); j++) {
-      if (!parsed_expr_capturable(*set_info->expressions[j])) {
+      if (!parsed_expr_capturable_ex(*set_info->expressions[j],
+                                     allow_subqueries)) {
         return nullptr;
       }
       if (!entry.ColumnExists(set_info->columns[j])) {
@@ -243,7 +282,21 @@ plan_write_capture(duckdb::ClientContext &context, duckdb::SQLStatement &stmt,
   if (!alias.empty()) {
     sql += " AS " + quote_ident(alias);
   }
-  if (condition) {
+  if (using_refs) {
+    // DELETE t USING u WHERE cond  ==  delete every t row with at least
+    // one matching u row: EXISTS(SELECT 1 FROM u WHERE cond), with the
+    // full condition (it references both sides) inside the probe
+    sql += " WHERE EXISTS (SELECT 1 FROM ";
+    bool first = true;
+    for (auto &ref : *using_refs) {
+      sql += (first ? "" : ", ") + ref->ToString();
+      first = false;
+    }
+    if (condition) {
+      sql += " WHERE (" + condition->ToString() + ")";
+    }
+    sql += ")";
+  } else if (condition) {
     sql += " WHERE (" + condition->ToString() + ")";
   }
   plan->capture_sql = std::move(sql);

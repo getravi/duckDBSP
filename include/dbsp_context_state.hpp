@@ -284,6 +284,10 @@ private:
     // bypasses query hooks entirely) also forces a full sync.
     bool saw_statements = false;
     bool unknown_writes = false;
+    // any write statement folded this txn (tracked or not): subquery
+    // predicates and DELETE USING probes read committed state only, so
+    // they are safe solely before the transaction's first write
+    bool wrote_any = false;
     std::unordered_set<std::string> touched;
     // per tracked table: captured append delta + local rows consumed so far
     std::unordered_map<std::string, std::pair<DuckDBZSet, duckdb::idx_t>>
@@ -406,6 +410,9 @@ private:
       return;
     }
     capture_.saw_statements = true;
+    if (c.kind != StmtClass::READ) {
+      capture_.wrote_any = true;
+    }
     switch (c.kind) {
     case StmtClass::READ:
       break;
@@ -578,9 +585,14 @@ private:
         key.clear();
         return;
       }
+      // Subqueries and USING probes read committed state — only exact
+      // when this statement's view IS committed state
+      const bool clean_view =
+          context.transaction.IsAutoCommit() || !capture_.wrote_any;
       plan = is_upsert ? plan_upsert_capture(ictx, parsed, *entry, key)
-             : is_insert ? plan_insert_capture(parsed, *entry)
-                         : plan_write_capture(ictx, parsed, *entry, key);
+             : is_insert
+                 ? plan_insert_capture(parsed, *entry)
+                 : plan_write_capture(ictx, parsed, *entry, key, clean_view);
     });
     if (key.empty() || !plan) {
       return;

@@ -88,9 +88,21 @@ UPDATE:
 
 DELETE:
 - single statement, plain tracked base-table target
-- no `USING`, no `RETURNING`, no CTEs, no subqueries/parameters in WHERE,
-  CONSISTENT functions only, target untouched this txn
+- no `RETURNING`, no CTEs, no parameters, CONSISTENT functions only,
+  target untouched this txn
 - missing WHERE (delete-all) is capturable
+- `USING` refs and subquery predicates: see below
+
+**Subquery predicates and DELETE USING** (follow-up, same release): a
+subquery in WHERE/SET reads OTHER tables, which the capture probe sees at
+committed state — exact only when the statement's own view IS committed
+state: autocommit, or an explicit transaction before its FIRST write
+(`wrote_any` gate; a prior write to any table poisons it). Subquery row
+sources are vetted with the INSERT ... SELECT repeatability rules.
+`DELETE t USING u WHERE cond` is a semi-join delete and rewrites to
+`WHERE EXISTS (SELECT 1 FROM u WHERE cond)` in the capture probe, same
+visibility gate. `UPDATE ... FROM` stays out: with multiple FROM matches
+per target row the SET result is nondeterministic.
 
 **Upserts** (follow-up, same release): `INSERT ... ON CONFLICT (cols)
 DO UPDATE SET` / `DO NOTHING` with an explicit conflict target probes
