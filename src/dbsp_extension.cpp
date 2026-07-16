@@ -49,6 +49,7 @@
 #include "dbsp_context_state.hpp"
 #include "dbsp_instance_registry.hpp"
 #include "dbsp_parser_extension.hpp"
+#include "dbsp_plan_tee.hpp"
 #include "dbsp_recovery.hpp"
 #include "duckdb/main/connection_manager.hpp"
 #include "duckdb/planner/extension_callback.hpp"
@@ -1492,6 +1493,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 
   // Register extension callback
   ExtensionCallback::Register(config, make_shared_ptr<DBSPExtensionCallback>());
+
+  // D2 spike: optimizer-extension DML tee (inert unless DBSP_TEE_SPIKE set)
+  dbsp_native::register_tee_spike(config);
 
   // Register table functions
   TableFunction track_func("dbsp_track", {LogicalType::VARCHAR}, TrackFunc,

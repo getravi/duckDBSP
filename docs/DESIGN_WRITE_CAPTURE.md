@@ -61,6 +61,26 @@ Rejected for now:
   dominate real workloads: it is exact, captures what actually executed,
   and tolerates non-determinism. Nothing in design 1 blocks it later.
 
+**Design-2 feasibility spike (2026-07-15, `include/dbsp_plan_tee.hpp` +
+`test/integration/test_plan_tee.cpp`): VIABLE on pinned v1.5.4.** Proven:
+`OptimizerExtension::Register` fires per statement; a
+`LogicalExtensionOperator` injected above a bound `LogicalDelete`'s child
+survives ColumnBindingResolver and physical planning; its
+`PhysicalOperator` observes the exact deleted rowids at execution with
+statement behavior unchanged (autocommit, explicit txn, rollback).
+Gotcha: at optimize time the DELETE's rowid expression is a
+`BOUND_COLUMN_REF` (binding-based) — `BOUND_REF` indexes exist only after
+the resolver — so injection maps bindings to child output positions. The
+spike is env-gated (`DBSP_TEE_SPIKE`) and feeds no sync machinery.
+Remaining for a full design-2 implementation: widen DELETE/UPDATE child
+projections to old row images (append columns to the LogicalGet +
+projection; appended trailing columns are ignored by PhysicalDelete/
+PhysicalUpdate, which address their inputs by bound index), key the tee
+buffer per ClientContext instead of process-global, route teed rows into
+the per-transaction capture buffer at commit, and define guard semantics
+(teed rows ARE what executed, so the count guard degenerates to a
+consistency assert).
+
 ### Upstream check
 
 No changeset/CDC extension hook exists in DuckDB through the 1.5.x line.

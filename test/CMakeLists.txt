@@ -102,6 +102,7 @@ add_dbsp_integration_test(distinct_ddl integration/test_distinct_ddl.cpp)
 add_dbsp_integration_test(set_ops_integration integration/test_set_ops.cpp)
 add_dbsp_integration_test(crash_recovery_phase1 integration/test_crash_recovery_phase1.cpp)
 add_dbsp_integration_test(crash_recovery_phase2 integration/test_crash_recovery_phase2.cpp)
+add_dbsp_integration_test(plan_tee integration/test_plan_tee.cpp)
 
 # Benchmarks (not part of ctest; run manually: ./bench_planner_eval)
 add_executable(bench_planner_eval
