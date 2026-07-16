@@ -1494,8 +1494,9 @@ static void LoadInternal(ExtensionLoader &loader) {
   // Register extension callback
   ExtensionCallback::Register(config, make_shared_ptr<DBSPExtensionCallback>());
 
-  // D2 spike: optimizer-extension DML tee (inert unless DBSP_TEE_SPIKE set)
-  dbsp_native::register_tee_spike(config);
+  // D2 plan tee: exact captured deltas for DML shapes the design-1
+  // pre-image SELECT declines (docs/DESIGN_WRITE_CAPTURE.md)
+  dbsp_native::register_plan_tee(config);
 
   // Register table functions
   TableFunction track_func("dbsp_track", {LogicalType::VARCHAR}, TrackFunc,

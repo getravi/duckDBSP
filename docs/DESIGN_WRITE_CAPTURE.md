@@ -72,14 +72,35 @@ Gotcha: at optimize time the DELETE's rowid expression is a
 `BOUND_COLUMN_REF` (binding-based) — `BOUND_REF` indexes exist only after
 the resolver — so injection maps bindings to child output positions. The
 spike is env-gated (`DBSP_TEE_SPIKE`) and feeds no sync machinery.
-Remaining for a full design-2 implementation: widen DELETE/UPDATE child
-projections to old row images (append columns to the LogicalGet +
-projection; appended trailing columns are ignored by PhysicalDelete/
-PhysicalUpdate, which address their inputs by bound index), key the tee
-buffer per ClientContext instead of process-global, route teed rows into
-the per-transaction capture buffer at commit, and define guard semantics
-(teed rows ARE what executed, so the count guard degenerates to a
-consistency assert).
+**Design-2 phase 1 SHIPPED (same day): the DELETE tee is production.**
+`include/dbsp_plan_tee.hpp` widens a tracked-table DELETE's child chain
+({FILTER | PROJECTION | left side of any join}* over the target GET) to
+carry full old row images, injects the pass-through extension operator,
+and streams (rowid, old row) into the connection's `DBSPContextState`
+(rowid-deduped: join-shaped USING deletes emit one row per MATCH). Teed
+rows are exact — they capture every DELETE shape design 1 declines:
+post-write subqueries, parameters, volatile predicates, same-table-twice
+transactions. Explicit transactions fold teed rows into the capture
+buffer at QueryEnd; autocommit applies them from the commit hook with no
+guard (they ARE what executed). Design 1 stays first choice; the tee
+arms only when it declined.
+
+Hook-ordering findings from making this production (hard-won, keep):
+- Autocommit statements HAVE an active transaction at QueryBegin AND at
+  QueryEnd (`TransactionContext::IsAutoCommit()` distinguishes) — but
+  their commit hook fires mid-statement, and catalog resolution inside
+  that hook FAILS (the old "fold it now" hook path never actually
+  resolved; the QueryBegin fold always served autocommit). Consequently:
+  autocommit statements fold at QueryBegin, explicit-txn statements fold
+  at QueryEnd (so the optimizer tee, which runs between the hooks, can
+  mark the statement captured first), and QueryEnd must skip autocommit
+  statements entirely — folding there re-counts a finished transaction
+  and poisons the NEXT statement's commit into a read-only skip.
+
+Remaining for design-2 phase 2 (UPDATE tee): the same child widening
+plus reading SET values from the child projection (already present) and
+handling `update_is_del_and_insert` plans whose child carries all
+columns already.
 
 ### Upstream check
 

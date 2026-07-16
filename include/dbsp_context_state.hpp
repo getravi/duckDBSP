@@ -60,6 +60,42 @@ namespace dbsp_native {
 
 class DBSPContextState : public duckdb::ClientContextState {
 public:
+  // ---- D2 plan-tee surface (dbsp_plan_tee.hpp) ----------------------
+  // The optimizer tee observes rows a DML plan actually processed:
+  // exact regardless of predicates, parameters, volatility, or prior
+  // transaction-local writes. Armed per statement by the optimizer
+  // extension; execution threads add rows; QueryEnd (explicit txn) or
+  // the autocommit commit hook consumes.
+  struct TeeCapture {
+    std::mutex mutex;
+    bool armed = false;
+    std::string table; // canonical key
+    DuckDBZSet delta;
+    // a USING/join-shaped DELETE child can emit one row per MATCH:
+    // dedupe so a twice-matched target row still deletes once
+    std::unordered_set<int64_t> seen_rowids;
+  };
+
+  // Optimizer callback: is the in-flight statement already served by
+  // the design-1 capture? (then the tee would double-count)
+  bool current_stmt_captured() const { return stmt_.captured; }
+
+  void arm_tee(const std::string &table_key) {
+    std::lock_guard<std::mutex> guard(tee_.mutex);
+    tee_.armed = true;
+    tee_.table = table_key;
+  }
+
+  // Execution threads: one deleted row (old image), deduped by rowid
+  void tee_add_delete(int64_t rowid, DuckDBRow &&row) {
+    std::lock_guard<std::mutex> guard(tee_.mutex);
+    if (!tee_.armed || !tee_.seen_rowids.insert(rowid).second) {
+      return;
+    }
+    tee_.delta.insert(std::move(row), -1);
+  }
+  // ---- end tee surface ----------------------------------------------
+
   void QueryBegin(duckdb::ClientContext &context) override {
     if (internal_query_depth > 0) {
       return;
@@ -108,13 +144,13 @@ public:
         }
       }
     }
+    clear_tee(); // new statement: any stale tee rows are dead
     if (!auto_sync) {
       stmt_ = {}; // hooks are inert without auto-sync
       return;
     }
     // Write capture must run BEFORE the statement executes: the capture
-    // SELECT reads committed (pre-statement) state. It also must precede
-    // fold_into_txn, which otherwise poisons WRITE_KNOWN statements.
+    // SELECT reads committed (pre-statement) state.
     // Autocommit INSERT_OK: the transaction dies before QueryEnd can read
     // LocalStorage (G2 needs an explicit txn), but a plain VALUES list is
     // right there in the statement — capture it the same way. Explicit-txn
@@ -128,10 +164,18 @@ public:
       try {
         try_write_capture(context, manager);
       } catch (...) {
-        // capture is an optimization only; fold below poisons as needed
+        // capture is an optimization only; the QueryEnd fold poisons
       }
     }
-    if (context.transaction.HasActiveTransaction()) {
+    // Autocommit statements fold NOW: their commit hook fires mid-
+    // statement when the catalog view is already unusable (resolve
+    // fails), and their QueryEnd runs post-commit — this is the only
+    // hook where scoping resolution works. Explicit-txn statements fold
+    // at QueryEnd instead, so the optimizer tee (which runs between
+    // these hooks) can mark the statement captured before the fold
+    // decides whether to poison the transaction.
+    if (context.transaction.HasActiveTransaction() &&
+        context.transaction.IsAutoCommit()) {
       fold_into_txn(context, stmt_);
     }
   }
@@ -159,13 +203,24 @@ public:
     if (error && error->HasError()) {
       return; // failed statement changed nothing
     }
-    // Autocommit: the transaction is finished before any hook fires —
-    // nothing to capture; the commit hook already ran sync_all
-    if (!context.transaction.HasActiveTransaction()) {
+    // Autocommit: the mid-statement commit hook already consumed the
+    // statement (capture, tee, or scoped scan) and reset capture_ —
+    // folding here would re-count it against a finished transaction
+    // whose catalog view is gone (resolve fails, touched stays empty)
+    // and poison the NEXT statement's commit into a read-only skip.
+    if (!context.transaction.HasActiveTransaction() ||
+        context.transaction.IsAutoCommit()) {
       return;
     }
 
     try {
+      // D2 tee first: exact rows the DML plan processed. Marks the
+      // statement captured so the fold below cannot poison it.
+      fold_tee_into_txn();
+      // Fold moved here from QueryBegin (the optimizer tee runs between
+      // the hooks); failed statements never fold — the transaction is
+      // invalidated anyway
+      fold_into_txn(context, stmt_);
       classify_and_capture(context);
     } catch (const std::exception &) {
       // Capture is an optimization only: on any surprise, poison the
@@ -195,6 +250,35 @@ public:
           apply_captured(context, manager)) {
         capture_ = {};
         return; // O(delta) fast path served this commit
+      }
+
+      // Autocommit D2 tee: execution finished before this hook fired, so
+      // the teed rows are the complete, exact delta — apply directly, no
+      // guard needed (they ARE what the statement did). Not gated on
+      // saw_statements: the QueryBegin fold already ran for autocommit.
+      {
+        bool teed = false;
+        std::string tee_table;
+        DuckDBZSet tee_delta;
+        {
+          std::lock_guard<std::mutex> guard(tee_.mutex);
+          if (tee_.armed) {
+            teed = true;
+            tee_table = tee_.table;
+            tee_delta = std::move(tee_.delta);
+            tee_.armed = false;
+            tee_.delta = DuckDBZSet();
+            tee_.seen_rowids.clear();
+          }
+        }
+        if (teed) {
+          if (tee_delta.empty() ||
+              manager.apply_captured_delta(tee_table, tee_delta, &context)) {
+            capture_ = {};
+            return; // O(delta): the plan's own rows served this commit
+          }
+          // deferred-baseline rebuild scheduled: scan reconciles below
+        }
       }
 
       // H1: scope the fallback sync to the tables this transaction wrote.
@@ -238,6 +322,7 @@ public:
       return;
     }
     capture_ = {}; // rolled back: captured rows never happened
+    clear_tee();
   }
 
   // One-time crash recovery, moved here from OnConnectionOpened: that
@@ -524,6 +609,44 @@ private:
       slot.second = total;
       return;
     }
+  }
+
+  TeeCapture tee_;
+
+  void clear_tee() {
+    std::lock_guard<std::mutex> guard(tee_.mutex);
+    tee_.armed = false;
+    tee_.table.clear();
+    tee_.delta = DuckDBZSet();
+    tee_.seen_rowids.clear();
+  }
+
+  // Explicit txn, QueryEnd of a successful teed statement: the teed rows
+  // are exact even for shapes design 1 declines (post-write subqueries,
+  // parameters, volatile predicates, same-table-twice) — merge them into
+  // the per-transaction buffer and mark the statement captured so the
+  // fold cannot poison the transaction.
+  void fold_tee_into_txn() {
+    std::lock_guard<std::mutex> guard(tee_.mutex);
+    if (!tee_.armed) {
+      return;
+    }
+    stmt_.captured = true;
+    if (!tee_.delta.empty()) {
+      auto &slot = capture_.write_deltas[tee_.table];
+      for (const auto &[row, w] : tee_.delta) {
+        slot.insert(row, w);
+      }
+      capture_.wrote_capture = true;
+      capture_.active = true;
+    }
+    // later design-1 captures on this table must decline (they cannot
+    // see this transaction's uncommitted effects)
+    capture_.touched.insert(tee_.table);
+    tee_.armed = false;
+    tee_.table.clear();
+    tee_.delta = DuckDBZSet();
+    tee_.seen_rowids.clear();
   }
 
   duckdb::Connection &guard_connection(duckdb::ClientContext &context) {

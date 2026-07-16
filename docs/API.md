@@ -561,9 +561,16 @@ Most plain SQL writes commit in **O(delta)** via captured deltas:
   explicit transaction before its first write. A single-row UPDATE on a
   1M-row table syncs in ~1.5 ms vs ~2.4 s for scan-and-diff.
 
+- **Any other DELETE** — a plan tee (optimizer extension) observes the
+  exact rows the DELETE processed, covering what the pre-image capture
+  declines: prepared parameters, volatile or post-write subquery
+  predicates, `USING` over transaction-local state, repeated writes to
+  one table in a transaction.
+
 Everything else uses scan-and-diff scoped to the tables the transaction
 touched: `UPDATE ... FROM` (multi-match SET is nondeterministic),
-CTEs/`RETURNING`, prepared parameters, subqueries after a same-txn write,
+CTEs/`RETURNING`, prepared parameters and post-write subqueries in
+UPDATE (the DELETE tee handles those),
 non-deterministic expressions (`random()`, `now()`), UPDATEs of indexed
 or LIST-typed columns, multi-statement strings, Appender writes, and any
 transaction that writes the same table twice. If any

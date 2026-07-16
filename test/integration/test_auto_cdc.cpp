@@ -158,7 +158,7 @@ TEST_CASE("G2: explicit-txn inserts sync via captured deltas",
   db.exec("SELECT * FROM dbsp_auto_sync(false)");
 }
 
-TEST_CASE("G2: txn with a delete falls back to scan-and-diff",
+TEST_CASE("G2: txn mixing insert and same-table delete stays captured",
           "[integration][auto_cdc][capture]") {
   DuckDBTestHarness db;
   db.createTable("ct2", "id INT, val INT", {"(1, 10)", "(2, 20)"});
@@ -173,11 +173,13 @@ TEST_CASE("G2: txn with a delete falls back to scan-and-diff",
 
   db.exec("BEGIN");
   db.exec("INSERT INTO ct2 VALUES (3, 30)");
-  db.exec("DELETE FROM ct2 WHERE id = 1"); // poisons capture
+  // design 1 declines the DELETE (table already written this txn) but
+  // the D2 plan tee captures the executed rows — still one O(delta) apply
+  db.exec("DELETE FROM ct2 WHERE id = 1");
   db.exec("COMMIT");
 
-  REQUIRE(manager.captured_delta_syncs() == before); // no fast path
-  db.assertViewRowCount("v_cap2", 2);                // but still correct
+  REQUIRE(manager.captured_delta_syncs() == before + 1);
+  db.assertViewRowCount("v_cap2", 2);
 
   db.exec("SELECT * FROM dbsp_auto_sync(false)");
 }
@@ -524,17 +526,18 @@ TEST_CASE("write capture: fallback shapes take the scan path",
     REQUIRE(m.scan_syncs() == scans);
     fx.check_views();
   }
-  SECTION("subquery predicate after a write in the same txn: falls back") {
-    // the INSERT changes we; the DELETE's subquery reads we — the capture
-    // probe would see stale committed state, so it must decline
+  SECTION("subquery predicate after a write in the same txn: teed") {
+    // the INSERT changes we, so design 1's committed-state probe must
+    // decline the DELETE — the D2 plan tee captures the executed rows
+    // instead (one apply per table: we insert + wt delete), no scan
     const uint64_t caps = m.captured_delta_syncs();
     const uint64_t scans = m.scan_syncs();
     fx.db.exec("BEGIN");
     fx.db.exec("INSERT INTO we VALUES (3, 'z')");
     fx.db.exec("DELETE FROM wt WHERE id IN (SELECT id FROM we)");
     fx.db.exec("COMMIT");
-    REQUIRE(m.captured_delta_syncs() == caps);
-    REQUIRE(m.scan_syncs() >= scans + 1);
+    REQUIRE(m.captured_delta_syncs() == caps + 2);
+    REQUIRE(m.scan_syncs() == scans);
     fx.check_views();
   }
   SECTION("non-deterministic predicate") {

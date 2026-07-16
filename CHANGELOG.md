@@ -55,6 +55,17 @@
   vetted with the same repeatability rules as INSERT ... SELECT.
   UPDATE ... FROM stays scan-diff: with multiple FROM matches per target
   row the SET result is nondeterministic.
+- Design-2 phase 1: a plan tee (OptimizerExtension + injected extension
+  operator) captures ANY remaining DELETE shape from the rows the plan
+  actually processed — prepared parameters, volatile predicates,
+  post-write subqueries, USING over transaction-local state, repeated
+  writes to one table. The DELETE child chain is widened to carry full
+  old row images (through filters, projections, and join left sides);
+  teed rows are exact, so no commit guard applies to them. Hook-ordering
+  fix on the way: autocommit statements fold their sync scope at
+  QueryBegin (the mid-statement commit hook cannot resolve catalog
+  entries — that legacy fold path never actually worked), explicit-txn
+  statements fold at QueryEnd so the tee can mark them captured first.
 - No upstream help available: DuckDB through 1.5.x ships no CDC/changeset
   extension hook (discussion #12408 open); revisit on engine upgrade.
 
