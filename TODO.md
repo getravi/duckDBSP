@@ -72,6 +72,14 @@ subsystem, bespoke parser, standalone Z-set spilling).
   (multiplicity-in-cycles is ill-defined; UNION recursion is incremental
   via DRed).
 
+- **Engine-hook fork proposal** (docs/DESIGN_ENGINE_HOOK.md): a single
+  ~300-line patch to the pinned engine (commit-time modification
+  callback walking the UndoBuffer) would replace the entire capture
+  stack with exact per-commit deltas — 100% write coverage incl.
+  Appender, ~0.3ms per statement, guards deleted, upgrade cost collapsed
+  to one rebaseable commit. Unscheduled; dual-mode design keeps
+  official-build hosts on the shipped stack.
+
 ## Architectural
 
 - Spill mode (K1+K2+N2-N4) covers baselines, shared arrangements,
