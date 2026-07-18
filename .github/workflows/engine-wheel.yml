@@ -1,0 +1,51 @@
+# Build the patched (dbsp engine-hook) DuckDB wheel for the SaaS backend image.
+# Single server target — NOT a distribution matrix. Manual/tag trigger only, so
+# normal pushes never run it. Consumes patches/v1.5.4-dbsp-txn-callback.patch
+# (generated once the A3 StreamModifications body is written — see
+# docs/superpowers/plans/2026-07-18-engine-hook-impl.md).
+name: dbsp-duckdb-wheel
+on:
+  workflow_dispatch: {}
+  push:
+    tags: ["engine-*"]
+
+jobs:
+  wheel:
+    runs-on: ubuntu-22.04 # the SaaS server target; add an arm64 runner if needed
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Verify engine patch exists
+        run: |
+          test -f patches/v1.5.4-dbsp-txn-callback.patch || {
+            echo "::error::patches/v1.5.4-dbsp-txn-callback.patch missing — "\
+                 "generate it after implementing A3 (StreamModifications)."; exit 1; }
+
+      - name: Apply engine patch to pinned submodule
+        run: git -C duckdb apply --3way ../patches/v1.5.4-dbsp-txn-callback.patch
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build patched wheel (single target)
+        working-directory: duckdb
+        env:
+          BUILD_PYTHON: "1"
+          SETUPTOOLS_SCM_PRETEND_VERSION: "1.5.4+dbsp"
+        run: |
+          pip install build
+          python -m build --wheel tools/pythonpkg
+
+      - name: Smoke check
+        run: |
+          pip install duckdb/tools/pythonpkg/dist/*.whl
+          python -c "import duckdb; print(duckdb.__version__); assert 'dbsp' in duckdb.__version__"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: duckdb-dbsp-wheel
+          path: duckdb/tools/pythonpkg/dist/*.whl
+          retention-days: 30
