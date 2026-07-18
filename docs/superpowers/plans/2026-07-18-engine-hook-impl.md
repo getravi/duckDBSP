@@ -24,14 +24,23 @@ commit; any second engine change is a rebase liability.
 
 ### A1. Surface — `src/include/duckdb/main/config.hpp` (CONCRETE)
 
+> **Signature change during A3 (2026-07-18):** the callback receives
+> `DataTableInfo &` (schema/table names), NOT `TableCatalogEntry &`. There is
+> no `DataTable → TableCatalogEntry` pointer in the engine; resolving the
+> entry by catalog lookup inside `Commit` is fragile (a table CREATEd in the
+> same txn is invisible post-stamp because its catalog entry is stamped with
+> `commit_id > start_time`; dropped entries throw; extra locking). The
+> consumer only needs the table name; column types travel in
+> `TransactionModifications::types`.
+
 ```cpp
-struct TransactionModifications;  // defined alongside undo_buffer
+struct TransactionModifications;  // defined in undo_buffer.hpp
 struct TransactionModificationCallback {
   // Fired in DuckTransaction::Commit after undo_buffer.Commit succeeds and
   // before FlushCommit — snapshot + version info still valid. One call per
   // modified table; `mods` streams old images (delete/update) and new images
   // (insert/update), full-width, in table column order.
-  std::function<void(ClientContext &, TableCatalogEntry &,
+  std::function<void(ClientContext &, DataTableInfo &,
                      TransactionModifications &)> on_commit;
 };
 // in struct DBConfig (near the other registries):
@@ -62,7 +71,38 @@ already holds the context it was constructed with (`undo_buffer(transaction,
 context)`); thread that through `StreamModifications` (add a `context_` member
 to `UndoBuffer` or pass `DuckTransaction`'s context). Resolve when writing A3.
 
-### A3. Walk — new `UndoBuffer::StreamModifications` (`undo_buffer.cpp/.hpp`) — SCAFFOLD (the work item)
+### A3. Walk — `UndoBuffer::StreamModifications` — **DONE 2026-07-18** (differential tests: `test/unit/test_engine_hook.cpp`, 11 cases)
+
+Implementation notes (how it actually works — supersedes the sketch below):
+- **Timing is the trick.** The hook runs *after* `undo_buffer.Commit` has stamped
+  every undo entry with `commit_id`. For the committing transaction's own
+  snapshot (`start_time S`, `transaction_id T`): `commit_id > S && commit_id != T`,
+  so its stamped deletes read as *another, future* transaction's deletes (row
+  still visible) and stamped update chains resolve to the *old* versions.
+  Hence **old images = plain transactional `DataTable::Fetch`** with the
+  committing transaction — no undo-payload reassembly, no per-column merging.
+  Conversely its own inserts read as future-committed (invisible) on that path,
+  so **new images = `DataTable::FetchCommitted`** (committed reader,
+  `TransactionData(MAX_TRANSACTION_ID, TRANSACTION_ID_START-1)`), which sees
+  stamped inserts + base (new) update values and drops same-txn-deleted rows.
+- Pass 1 walks the entries (same `IterateEntries` as `WriteToWAL`) collecting
+  per-`DataTable*` row ids: `AppendInfo` ranges; `DeleteInfo` ids
+  (`base_row + i` if `is_consecutive` else `base_row + rows[i]`); `UpdateInfo`
+  ids (`row_group_start + vector_index*STANDARD_VECTOR_SIZE + tuples[i]`).
+- Net-effect rules applied in code: update ids deduped (one `UpdateInfo` per
+  column per vector); updated∩deleted removed (delete pre-image is the whole
+  story — the transactional fetch would return a pre-image for these too, so
+  fetch-time filtering can NOT handle it); updated∩own-insert-range removed
+  (insert-range committed fetch already carries final values). insert∩delete
+  nets to zero automatically (both fetch paths drop the row).
+- The context comes from `transaction.context.lock()` (the pattern
+  `CommitState` already uses); bail out if expired. Temporary tables skipped,
+  same as the WAL. Tables with no surviving images fire no callback.
+- Callback payload: `DataTableInfo&` (names) + `TransactionModifications`
+  {types, old_rows CDC (weight −1), new_rows CDC (weight +1)} defined in
+  `undo_buffer.hpp`.
+
+Original scaffold sketch (historical):
 
 ```cpp
 // Route per-table modifications to callbacks. This is a PORT of the existing

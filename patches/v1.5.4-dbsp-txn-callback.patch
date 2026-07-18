@@ -1,5 +1,5 @@
 diff --git a/src/include/duckdb/main/config.hpp b/src/include/duckdb/main/config.hpp
-index 15c4d1d..17f8d1b 100644
+index 15c4d1d..6514495 100644
 --- a/src/include/duckdb/main/config.hpp
 +++ b/src/include/duckdb/main/config.hpp
 @@ -36,6 +36,7 @@
@@ -10,19 +10,21 @@ index 15c4d1d..17f8d1b 100644
  
  namespace duckdb {
  
-@@ -176,6 +177,19 @@ struct DBConfigOptions {
+@@ -176,6 +177,21 @@ struct DBConfigOptions {
  	bool operator==(const DBConfigOptions &other) const;
  };
  
 +class ClientContext;
-+class TableCatalogEntry;
++struct DataTableInfo;
 +struct TransactionModifications;
 +
 +//! DBSP engine hook: fired inside DuckTransaction::Commit (after the undo
 +//! commit, before WAL flush) with the exact per-table modifications of the
 +//! committing transaction. Empty registry = feature off (zero overhead).
++//! DataTableInfo carries the schema/table names; TransactionModifications
++//! carries full-width old/new images in physical column order.
 +struct TransactionModificationCallback {
-+	std::function<void(ClientContext &, TableCatalogEntry &,
++	std::function<void(ClientContext &, DataTableInfo &,
 +	                   TransactionModifications &)>
 +	    on_commit;
 +};
@@ -30,7 +32,7 @@ index 15c4d1d..17f8d1b 100644
  struct DBConfig {
  	friend class DatabaseInstance;
  	friend class StorageManager;
-@@ -216,6 +230,11 @@ public:
+@@ -216,6 +232,11 @@ public:
  	shared_ptr<DatabaseFilePathManager> path_manager;
  	//! Database configuration variables as controlled by SET
  	GlobalUserSettings user_settings;
@@ -43,18 +45,39 @@ index 15c4d1d..17f8d1b 100644
  public:
  	DUCKDB_API static DBConfig &GetConfig(ClientContext &context);
 diff --git a/src/include/duckdb/transaction/undo_buffer.hpp b/src/include/duckdb/transaction/undo_buffer.hpp
-index b4e4342..095f32f 100644
+index b4e4342..b3270a1 100644
 --- a/src/include/duckdb/transaction/undo_buffer.hpp
 +++ b/src/include/duckdb/transaction/undo_buffer.hpp
-@@ -20,6 +20,7 @@ class StorageCommitState;
+@@ -10,6 +10,7 @@
+ 
+ #include "duckdb/common/common.hpp"
+ #include "duckdb/common/enums/undo_flags.hpp"
++#include "duckdb/common/types/column/column_data_collection.hpp"
+ #include "duckdb/transaction/undo_buffer_allocator.hpp"
+ #include "duckdb/common/enums/active_transaction_state.hpp"
+ 
+@@ -20,6 +21,20 @@ class StorageCommitState;
  class WriteAheadLog;
  struct UndoBufferPointer;
  struct CommitInfo;
 +struct TransactionModificationCallback;
++
++//! DBSP engine hook payload: one committing transaction's net tuple
++//! modifications for a single table, full-width in physical column order
++//! (DataTable::GetTypes()). old_rows are pre-transaction images of deleted
++//! and updated rows (Z-weight -1); new_rows are post-transaction images of
++//! inserted and updated rows (Z-weight +1). A row both updated and deleted
++//! in the transaction appears once, in old_rows, with its pre-transaction
++//! image; a row inserted and deleted in the transaction appears nowhere.
++struct TransactionModifications {
++	vector<LogicalType> types;
++	unique_ptr<ColumnDataCollection> old_rows;
++	unique_ptr<ColumnDataCollection> new_rows;
++};
  
  struct UndoBufferProperties {
  	idx_t estimated_size = 0;
-@@ -58,6 +59,9 @@ public:
+@@ -58,6 +73,9 @@ public:
  	void WriteToWAL(WriteAheadLog &wal, optional_ptr<StorageCommitState> commit_state);
  	//! Commit the changes made in the UndoBuffer: should be called on commit
  	void Commit(UndoBuffer::IteratorState &iterator_state, CommitInfo &info);
@@ -82,29 +105,198 @@ index 70a8d09..7b4bf93 100644
  		// 	throw InvalidInputException("Force revert");
  		// }
 diff --git a/src/transaction/undo_buffer.cpp b/src/transaction/undo_buffer.cpp
-index c1776f5..10773c3 100644
+index c1776f5..7dca16e 100644
 --- a/src/transaction/undo_buffer.cpp
 +++ b/src/transaction/undo_buffer.cpp
-@@ -16,6 +16,7 @@
+@@ -16,6 +16,12 @@
  #include "duckdb/transaction/rollback_state.hpp"
  #include "duckdb/transaction/wal_write_state.hpp"
  #include "duckdb/transaction/duck_transaction.hpp"
 +#include "duckdb/main/config.hpp"
++#include "duckdb/common/algorithm.hpp"
++#include "duckdb/common/map.hpp"
++#include "duckdb/storage/table/scan_state.hpp"
++#include "duckdb/transaction/append_info.hpp"
++#include "duckdb/transaction/update_info.hpp"
  
  namespace duckdb {
  constexpr uint32_t UNDO_ENTRY_HEADER_SIZE = sizeof(UndoFlags) + sizeof(uint32_t);
-@@ -214,4 +215,14 @@ void UndoBuffer::Rollback() {
+@@ -214,4 +220,178 @@ void UndoBuffer::Rollback() {
  	RollbackState state(transaction);
  	ReverseIterateEntries([&](UndoFlags type, data_ptr_t data) { state.RollbackEntry(type, data); });
  }
 +
++namespace {
++
++// Batched full-width row fetch into a ColumnDataCollection. When `transaction`
++// is set, uses the committing transaction's own snapshot: because commit ids
++// are already stamped (StreamModifications runs after UndoBuffer::Commit),
++// this returns PRE-transaction images — stamped deletes look like a future
++// transaction's deletes (row still visible) and stamped update chains resolve
++// to the old versions. Rows the transaction inserted itself are invisible on
++// this path and get silently dropped, which is exactly right for old images.
++// When `transaction` is null, uses the committed reader (FetchCommitted):
++// post-transaction images — sees the stamped inserts and base (new) update
++// values, and drops rows the transaction itself deleted.
++void FetchRowsInto(DataTable &table, const vector<LogicalType> &types, const vector<StorageIndex> &column_ids,
++                   const vector<row_t> &row_ids, optional_ptr<DuckTransaction> transaction, Allocator &allocator,
++                   ColumnDataCollection &out) {
++	if (row_ids.empty()) {
++		return;
++	}
++	DataChunk chunk;
++	chunk.Initialize(allocator, types);
++	for (idx_t offset = 0; offset < row_ids.size(); offset += STANDARD_VECTOR_SIZE) {
++		idx_t count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, row_ids.size() - offset);
++		Vector rid_vec(LogicalType::ROW_TYPE,
++		               data_ptr_cast(const_cast<row_t *>(row_ids.data() + offset))); // NOLINT: read-only view
++		ColumnFetchState fetch_state;
++		chunk.Reset();
++		if (transaction) {
++			table.Fetch(*transaction, chunk, column_ids, rid_vec, count, fetch_state);
++		} else {
++			table.FetchCommitted(chunk, column_ids, rid_vec, count, fetch_state);
++		}
++		if (chunk.size() > 0) {
++			out.Append(chunk);
++		}
++	}
++}
++
++} // namespace
++
 +void UndoBuffer::StreamModifications(const vector<TransactionModificationCallback> &cbs) {
-+	// TODO(dbsp): port WriteToWAL()'s per-entry extraction (same file) and route
-+	// per-table modifications to `cbs` instead of the WAL:
-+	//   INSERT_TUPLE -> new-image rows; DELETE_TUPLE -> old-image rows by rowid;
-+	//   UPDATE_TUPLE -> old image (undo changed cols + Fetch untouched) + new.
-+	// Empty no-op scaffold: the hook is present but emits nothing, so the
-+	// extension consumer stays on its fallback until this is filled in.
-+	(void)cbs;
++	// This is WriteToWAL()'s traversal with a different sink: instead of
++	// serializing operations, assemble full-width old/new row images per table
++	// and hand them to the registered callbacks.
++	auto context_ptr = transaction.context.lock();
++	if (!context_ptr) {
++		return;
++	}
++	auto &context = *context_ptr;
++
++	// Pass 1: collect per-table modified row ids from the undo entries.
++	struct TableMods {
++		vector<pair<idx_t, idx_t>> insert_ranges; // (start_row, count)
++		vector<row_t> deleted;
++		vector<row_t> updated;
++	};
++	map<DataTable *, TableMods> tables;
++	UndoBuffer::IteratorState iterator_state;
++	IterateEntries(iterator_state, [&](UndoFlags type, data_ptr_t data) {
++		switch (type) {
++		case UndoFlags::INSERT_TUPLE: {
++			auto info = reinterpret_cast<AppendInfo *>(data);
++			if (!info->table->IsTemporary()) {
++				tables[info->table].insert_ranges.emplace_back(info->start_row, info->count);
++			}
++			break;
++		}
++		case UndoFlags::DELETE_TUPLE: {
++			auto info = reinterpret_cast<DeleteInfo *>(data);
++			if (info->table->IsTemporary()) {
++				break;
++			}
++			auto &mods = tables[info->table];
++			if (info->is_consecutive) {
++				for (idx_t i = 0; i < info->count; i++) {
++					mods.deleted.push_back(UnsafeNumericCast<row_t>(info->base_row + i));
++				}
++			} else {
++				auto rows = info->GetRows();
++				for (idx_t i = 0; i < info->count; i++) {
++					mods.deleted.push_back(UnsafeNumericCast<row_t>(info->base_row) + rows[i]);
++				}
++			}
++			break;
++		}
++		case UndoFlags::UPDATE_TUPLE: {
++			auto info = reinterpret_cast<UpdateInfo *>(data);
++			if (info->table->IsTemporary()) {
++				break;
++			}
++			auto &mods = tables[info->table];
++			idx_t start = info->row_group_start + info->vector_index * STANDARD_VECTOR_SIZE;
++			auto tuples = info->GetTuples();
++			for (idx_t i = 0; i < info->N; i++) {
++				mods.updated.push_back(UnsafeNumericCast<row_t>(start + tuples[i]));
++			}
++			break;
++		}
++		default:
++			break;
++		}
++	});
++	if (tables.empty()) {
++		return;
++	}
++
++	auto &allocator = Allocator::Get(context);
++	for (auto &table_entry : tables) {
++		auto &table = *table_entry.first;
++		auto &mods = table_entry.second;
++
++		// Dedupe update row ids (one UpdateInfo per updated column per vector).
++		std::sort(mods.updated.begin(), mods.updated.end());
++		mods.updated.erase(std::unique(mods.updated.begin(), mods.updated.end()), mods.updated.end());
++		std::sort(mods.deleted.begin(), mods.deleted.end());
++		// Rows both updated and deleted net to the delete's pre-image alone —
++		// the transactional fetch below would happily return a pre-image for
++		// them too (the stamped delete is invisible to the committing reader),
++		// so they must be removed here, not left to fetch-time filtering.
++		// Rows updated inside this transaction's own insert ranges are covered
++		// by the insert-range committed fetch (final values) — drop those too.
++		vector<row_t> updated;
++		updated.reserve(mods.updated.size());
++		for (auto row_id : mods.updated) {
++			if (std::binary_search(mods.deleted.begin(), mods.deleted.end(), row_id)) {
++				continue;
++			}
++			bool in_own_insert = false;
++			for (auto &range : mods.insert_ranges) {
++				if (row_id >= UnsafeNumericCast<row_t>(range.first) &&
++				    row_id < UnsafeNumericCast<row_t>(range.first + range.second)) {
++					in_own_insert = true;
++					break;
++				}
++			}
++			if (!in_own_insert) {
++				updated.push_back(row_id);
++			}
++		}
++
++		TransactionModifications result;
++		result.types = table.GetTypes();
++		vector<StorageIndex> column_ids;
++		for (idx_t i = 0; i < result.types.size(); i++) {
++			column_ids.emplace_back(i);
++		}
++		result.old_rows = make_uniq<ColumnDataCollection>(allocator, result.types);
++		result.new_rows = make_uniq<ColumnDataCollection>(allocator, result.types);
++
++		// Old images: pre-transaction rows for deletes and updates.
++		FetchRowsInto(table, result.types, column_ids, mods.deleted, &transaction, allocator, *result.old_rows);
++		FetchRowsInto(table, result.types, column_ids, updated, &transaction, allocator, *result.old_rows);
++		// New images: post-transaction rows for updates and inserts.
++		FetchRowsInto(table, result.types, column_ids, updated, nullptr, allocator, *result.new_rows);
++		for (auto &range : mods.insert_ranges) {
++			vector<row_t> insert_rows;
++			insert_rows.reserve(range.second);
++			for (idx_t i = 0; i < range.second; i++) {
++				insert_rows.push_back(UnsafeNumericCast<row_t>(range.first + i));
++			}
++			FetchRowsInto(table, result.types, column_ids, insert_rows, nullptr, allocator, *result.new_rows);
++		}
++
++		if (result.old_rows->Count() == 0 && result.new_rows->Count() == 0) {
++			continue;
++		}
++		auto &table_info = *table.GetDataTableInfo();
++		for (auto &cb : cbs) {
++			if (cb.on_commit) {
++				cb.on_commit(context, table_info, result);
++			}
++		}
++	}
 +}
  } // namespace duckdb
