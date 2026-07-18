@@ -78,12 +78,216 @@ private:
 
   std::map<PartitionKey, PartitionState> partitions_;
   std::vector<NativeSortView::SortColumn> primary_sort_columns_;
-  std::map<PartitionKey, DuckDBZSet> partition_outputs_;
+  // Rendered output row per partition, index-aligned with the sorted
+  // partition, so individual rows can be retracted/re-emitted (fast paths).
+  std::map<PartitionKey, std::vector<DuckDBRow>> partition_outputs_;
 
   // Output state
   DuckDBZSet result_;
   DuckDBZSet delta_;
   TableSchema result_schema_;
+
+  // Render the full output row (source columns + every window column) for one
+  // ordered index. Ranking scalars (row_number/rank/dense_rank) are passed in
+  // by the caller (running sweep on the full path; unused on fast paths, which
+  // the eligibility gate guarantees carry no ranking windows). peer_start /
+  // peer_end are only read by RANGE/GROUPS frames and rank windows, so fast
+  // paths may pass empty vectors.
+  DuckDBRow render_row(const std::vector<DuckDBRow> &rows, size_t row_idx,
+                       const std::vector<size_t> &peer_start,
+                       const std::vector<size_t> &peer_end,
+                       int64_t current_row_number, int64_t current_rank,
+                       int64_t current_dense_rank) const {
+    DuckDBRow out_row = rows[row_idx];
+    for (size_t i = 0; i < windows_.size(); ++i) {
+      const auto &win = windows_[i];
+
+      if (win.function == "ROW_NUMBER") {
+        out_row.columns.push_back(duckdb::Value(current_row_number));
+      } else if (win.function == "RANK") {
+        out_row.columns.push_back(duckdb::Value(current_rank));
+      } else if (win.function == "DENSE_RANK") {
+        out_row.columns.push_back(duckdb::Value(current_dense_rank));
+      } else if (win.function == "LAG") {
+        int offset = win.offset;
+        if (row_idx >= (size_t)offset && win.arg_column_idx >= 0) {
+          out_row.columns.push_back(
+              rows[row_idx - offset].columns[win.arg_column_idx]);
+        } else {
+          out_row.columns.push_back(duckdb::Value());
+        }
+      } else if (win.function == "LEAD") {
+        int offset = win.offset;
+        if (row_idx + offset < rows.size() && win.arg_column_idx >= 0) {
+          out_row.columns.push_back(
+              rows[row_idx + offset].columns[win.arg_column_idx]);
+        } else {
+          out_row.columns.push_back(duckdb::Value());
+        }
+      } else if (win.function == "FIRST_VALUE") {
+        if (!rows.empty() && win.arg_column_idx >= 0 &&
+            (size_t)win.arg_column_idx < rows[0].columns.size()) {
+          out_row.columns.push_back(rows[0].columns[win.arg_column_idx]);
+        } else {
+          out_row.columns.push_back(duckdb::Value());
+        }
+      } else if (win.function == "LAST_VALUE") {
+        if (!rows.empty() && win.arg_column_idx >= 0) {
+          size_t frame_end_idx = row_idx; // default CURRENT_ROW
+          if (win.end == duckdb::WindowBoundary::UNBOUNDED_FOLLOWING) {
+            frame_end_idx = rows.size() - 1;
+          } else if (win.end == duckdb::WindowBoundary::EXPR_FOLLOWING_ROWS) {
+            frame_end_idx =
+                std::min(row_idx + (size_t)win.end_offset, rows.size() - 1);
+          }
+          if ((size_t)win.arg_column_idx < rows[frame_end_idx].columns.size()) {
+            out_row.columns.push_back(
+                rows[frame_end_idx].columns[win.arg_column_idx]);
+          } else {
+            out_row.columns.push_back(duckdb::Value());
+          }
+        } else {
+          out_row.columns.push_back(duckdb::Value());
+        }
+      } else if (win.function == "NTH_VALUE") {
+        int n = win.offset;
+        if (n > 0 && (size_t)(n - 1) < rows.size() && win.arg_column_idx >= 0 &&
+            (size_t)win.arg_column_idx < rows[n - 1].columns.size()) {
+          out_row.columns.push_back(rows[n - 1].columns[win.arg_column_idx]);
+        } else {
+          out_row.columns.push_back(duckdb::Value());
+        }
+      } else if (win.function == "NTILE") {
+        int num_buckets = win.offset;
+        if (num_buckets <= 0)
+          num_buckets = 1;
+        int64_t total = rows.size();
+        int64_t bucket = ((int64_t)row_idx * num_buckets) / total + 1;
+        out_row.columns.push_back(duckdb::Value(bucket));
+      } else {
+        // Aggregates over frame [frame_start, frame_end]
+        size_t frame_start = 0;
+        switch (win.start) {
+        case duckdb::WindowBoundary::UNBOUNDED_PRECEDING:
+          frame_start = 0;
+          break;
+        case duckdb::WindowBoundary::CURRENT_ROW_ROWS:
+          frame_start = row_idx;
+          break;
+        case duckdb::WindowBoundary::CURRENT_ROW_RANGE:
+        case duckdb::WindowBoundary::CURRENT_ROW_GROUPS:
+          frame_start = peer_start[row_idx];
+          break;
+        case duckdb::WindowBoundary::EXPR_PRECEDING_ROWS:
+          frame_start =
+              row_idx >= (size_t)win.start_offset ? row_idx - win.start_offset : 0;
+          break;
+        case duckdb::WindowBoundary::EXPR_FOLLOWING_ROWS:
+          frame_start = std::min(row_idx + win.start_offset, rows.size() - 1);
+          break;
+        default:
+          frame_start = 0;
+        }
+
+        size_t frame_end = rows.size() - 1;
+        switch (win.end) {
+        case duckdb::WindowBoundary::UNBOUNDED_FOLLOWING:
+          frame_end = rows.size() - 1;
+          break;
+        case duckdb::WindowBoundary::CURRENT_ROW_ROWS:
+          frame_end = row_idx;
+          break;
+        case duckdb::WindowBoundary::CURRENT_ROW_RANGE:
+        case duckdb::WindowBoundary::CURRENT_ROW_GROUPS:
+          frame_end = peer_end[row_idx];
+          break;
+        case duckdb::WindowBoundary::EXPR_PRECEDING_ROWS:
+          frame_end =
+              row_idx >= (size_t)win.end_offset ? row_idx - win.end_offset : 0;
+          break;
+        case duckdb::WindowBoundary::EXPR_FOLLOWING_ROWS:
+          frame_end = std::min(row_idx + win.end_offset, rows.size() - 1);
+          break;
+        default:
+          frame_end = row_idx;
+        }
+
+        if (frame_start > frame_end) {
+          out_row.columns.push_back(duckdb::Value());
+          continue;
+        }
+
+        double sum = 0;
+        int64_t count = 0;
+        duckdb::Value min_val, max_val;
+        for (size_t f = frame_start; f <= frame_end; ++f) {
+          const auto &frow = rows[f];
+          if (win.arg_column_idx >= 0 &&
+              (size_t)win.arg_column_idx < frow.columns.size()) {
+            const auto &val = frow.columns[win.arg_column_idx];
+            if (!val.IsNull()) {
+              count++;
+              if (win.function == "SUM" || win.function == "AVG") {
+                sum +=
+                    val.DefaultCastAs(duckdb::LogicalType::DOUBLE).GetValue<double>();
+              }
+              if (win.function == "MIN") {
+                if (min_val.IsNull() || val < min_val)
+                  min_val = val;
+              }
+              if (win.function == "MAX") {
+                if (max_val.IsNull() || val > max_val)
+                  max_val = val;
+              }
+            }
+          } else {
+            count++;
+          }
+        }
+
+        if (win.function == "SUM") {
+          out_row.columns.push_back(duckdb::Value(sum));
+        } else if (win.function == "COUNT") {
+          out_row.columns.push_back(duckdb::Value(count));
+        } else if (win.function == "AVG") {
+          double avg = count > 0 ? sum / count : 0;
+          out_row.columns.push_back(duckdb::Value(avg));
+        } else if (win.function == "MIN") {
+          out_row.columns.push_back(min_val);
+        } else if (win.function == "MAX") {
+          out_row.columns.push_back(max_val);
+        } else {
+          out_row.columns.push_back(duckdb::Value());
+        }
+      }
+    }
+    return out_row;
+  }
+
+  // True iff every window is a fast-pathable shape: offset (LAG/LEAD),
+  // ROWS-frame aggregate (SUM/COUNT/AVG/MIN/MAX), or LAST_VALUE. Any
+  // RANK/DENSE_RANK/ROW_NUMBER/NTILE/NTH_VALUE/FIRST_VALUE, or any
+  // RANGE/GROUPS boundary, forces the full-partition renderer.
+  bool all_windows_fast_eligible() const {
+    for (const auto &w : windows_) {
+      const bool offset = (w.function == "LAG" || w.function == "LEAD");
+      const bool fill = (w.function == "LAST_VALUE");
+      const bool agg = (w.function == "SUM" || w.function == "COUNT" ||
+                        w.function == "AVG" || w.function == "MIN" ||
+                        w.function == "MAX");
+      auto rows_boundary = [](duckdb::WindowBoundary b) {
+        return b == duckdb::WindowBoundary::UNBOUNDED_PRECEDING ||
+               b == duckdb::WindowBoundary::UNBOUNDED_FOLLOWING ||
+               b == duckdb::WindowBoundary::CURRENT_ROW_ROWS ||
+               b == duckdb::WindowBoundary::EXPR_PRECEDING_ROWS ||
+               b == duckdb::WindowBoundary::EXPR_FOLLOWING_ROWS;
+      };
+      const bool rows_frame = rows_boundary(w.start) && rows_boundary(w.end);
+      if (!(offset || fill || (agg && rows_frame)))
+        return false;
+    }
+    return true;
+  }
 
 public:
   NativeWindowView(std::string view_name, std::string sql,
@@ -157,15 +361,13 @@ public:
 
     // 2. Recompute window functions for affected partitions
     for (const auto &key : affected_partitions) {
-      // Retract old output for this partition
-      auto &old_out = partition_outputs_[key];
-      for (const auto &[row, w] : old_out) {
-        if (w > 0) {
-          delta_.insert(row, -w);
-          result_.insert(row, -w);
-        }
+      // Retract old output for this partition (per-index cache)
+      auto &cache = partition_outputs_[key];
+      for (const auto &row : cache) {
+        delta_.insert(row, -1);
+        result_.insert(row, -1);
       }
-      old_out.clear();
+      cache.clear();
 
       // Compute new output
       auto it = partitions_.find(key);
@@ -175,6 +377,7 @@ public:
       auto &state = it->second;
       if (state.sorted_rows.empty()) {
         partitions_.erase(it);
+        partition_outputs_.erase(key);
         continue;
       }
 
@@ -422,7 +625,7 @@ public:
         // Emit
         delta_.insert(out_row, 1);
         result_.insert(out_row, 1);
-        old_out.insert(out_row, 1);
+        cache.push_back(out_row);
       }
     }
 
