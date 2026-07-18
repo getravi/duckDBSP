@@ -1,5 +1,29 @@
 # Changelog
 
+## Perf/coverage: spill codec 12x + bounded percentage limits - Jul 2026
+
+- Spill row codec: duckdb's BinarySerializer cost ~650ns/row with a
+  fresh MemoryStream per row. New typed fast-path codec (tag byte + raw
+  payload for INTEGER/BIGINT/DOUBLE/VARCHAR/BOOLEAN and primitive typed
+  NULLs; BinarySerializer as the length-prefixed fallback for everything
+  else) with a reused scratch buffer: serialize 12x faster, deserialize
+  3.8x, files 2.1x smaller. Spill files are process-disposable, so the
+  format change carries no compatibility burden. Spilled RESYNC drops
+  from ~2.8x of the RAM path to ~1.3x — spill mode is now nearly free at
+  steady state; roundtrip pinned across every value shape incl. nested
+  types and typed NULLs.
+- LIMIT p% views join spill mode: the percentage cutoff needs the total
+  input count, which previously forced the full sorted multiset into
+  RAM. total_weight_ now carries the count as a scalar; the bounded
+  window cap tracks the moving cutoff and the existing overflow-log
+  refill absorbs cutoff growth (and shrink-on-delete). Window stays
+  ~2x the result size regardless of table size (unit-tested incl.
+  deletion-driven refill).
+- Plain ORDER BY / window views documented as the true memory floor:
+  the result Z-set returned by reference IS the answer, and payloads
+  are COW-shared with upstream state — recorded in TODO.md with the
+  weight-collapse follow-up.
+
 ## Perf: joins 2x + CI - Jul 2026
 
 - Join-path profiling repeated the filter story: MAP_COLS survives under

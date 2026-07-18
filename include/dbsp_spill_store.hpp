@@ -73,32 +73,147 @@ inline RowDigest digest_bytes(const uint8_t *data, size_t len) {
 // Serialize a row (vector of Values) into `out`. Each value uses DuckDB's
 // own binary serialization — full type fidelity for every type DuckDB
 // supports, at the cost of per-value framing bytes.
+// Row codec: typed fast paths (tag byte + raw payload) for the common
+// scalar types, duckdb's BinarySerializer as the fallback tag. Spill
+// files are process-disposable (runtime dirs are swept, never reloaded
+// across code versions), so this format carries no compatibility burden
+// — both codec halves always change together. The duckdb serializer
+// costs ~650ns/row on a 3-column row (object framing per Value); the
+// fast paths are ~10x cheaper, and generational rebuilds pay the codec
+// for EVERY row of the table on EVERY spilled sync.
+namespace rowcodec {
+enum : uint8_t {
+  kFallback = 0, // u32 length + BinarySerializer blob
+  kNull = 1,     // u8 LogicalTypeId (primitive ids only)
+  kInt32 = 2,
+  kInt64 = 3,
+  kDouble = 4,
+  kVarchar = 5, // u32 length + bytes
+  kBool = 6,
+};
+
+template <typename T> inline void put_raw(std::vector<uint8_t> &out, T v) {
+  const auto *p = reinterpret_cast<const uint8_t *>(&v);
+  out.insert(out.end(), p, p + sizeof(T));
+}
+template <typename T> inline T get_raw(const uint8_t *&p) {
+  T v;
+  std::memcpy(&v, p, sizeof(T));
+  p += sizeof(T);
+  return v;
+}
+} // namespace rowcodec
+
 inline void serialize_row(const std::vector<duckdb::Value> &row,
                           std::vector<uint8_t> &out) {
-  duckdb::MemoryStream stream;
+  using namespace rowcodec;
+  out.clear();
   const uint32_t n = static_cast<uint32_t>(row.size());
-  stream.WriteData(duckdb::const_data_ptr_cast(&n), sizeof(n));
+  put_raw(out, n);
   for (const auto &v : row) {
+    const auto id = v.type().id();
+    if (v.IsNull()) {
+      switch (id) {
+      case duckdb::LogicalTypeId::INTEGER:
+      case duckdb::LogicalTypeId::BIGINT:
+      case duckdb::LogicalTypeId::DOUBLE:
+      case duckdb::LogicalTypeId::VARCHAR:
+      case duckdb::LogicalTypeId::BOOLEAN:
+      case duckdb::LogicalTypeId::SQLNULL: {
+        out.push_back(kNull);
+        out.push_back(static_cast<uint8_t>(id));
+        continue;
+      }
+      default:
+        break; // typed NULLs of complex types take the fallback
+      }
+    } else {
+      switch (id) {
+      case duckdb::LogicalTypeId::INTEGER:
+        out.push_back(kInt32);
+        put_raw(out, duckdb::IntegerValue::Get(v));
+        continue;
+      case duckdb::LogicalTypeId::BIGINT:
+        out.push_back(kInt64);
+        put_raw(out, duckdb::BigIntValue::Get(v));
+        continue;
+      case duckdb::LogicalTypeId::DOUBLE:
+        out.push_back(kDouble);
+        put_raw(out, duckdb::DoubleValue::Get(v));
+        continue;
+      case duckdb::LogicalTypeId::VARCHAR: {
+        out.push_back(kVarchar);
+        const auto &str = duckdb::StringValue::Get(v);
+        put_raw(out, static_cast<uint32_t>(str.size()));
+        out.insert(out.end(), str.begin(), str.end());
+        continue;
+      }
+      case duckdb::LogicalTypeId::BOOLEAN:
+        out.push_back(kBool);
+        out.push_back(duckdb::BooleanValue::Get(v) ? 1 : 0);
+        continue;
+      default:
+        break;
+      }
+    }
+    // fallback: duckdb's own serializer, length-prefixed
+    out.push_back(kFallback);
+    duckdb::MemoryStream stream;
     duckdb::BinarySerializer::Serialize(v, stream);
+    put_raw(out, static_cast<uint32_t>(stream.GetPosition()));
+    out.insert(out.end(), stream.GetData(),
+               stream.GetData() + stream.GetPosition());
   }
-  out.assign(stream.GetData(), stream.GetData() + stream.GetPosition());
 }
 
 inline std::vector<duckdb::Value> deserialize_row(const uint8_t *data,
                                                   size_t len) {
-  duckdb::MemoryStream stream(
-      reinterpret_cast<duckdb::data_ptr_t>(const_cast<uint8_t *>(data)),
-      len);
-  uint32_t n = 0;
-  stream.ReadData(duckdb::data_ptr_cast(&n), sizeof(n));
+  using namespace rowcodec;
+  const uint8_t *p = data;
+  const uint32_t n = get_raw<uint32_t>(p);
   std::vector<duckdb::Value> row;
   row.reserve(n);
   for (uint32_t i = 0; i < n; i++) {
-    duckdb::BinaryDeserializer des(stream);
-    des.Begin();
-    row.push_back(duckdb::Value::Deserialize(des));
-    des.End();
+    const uint8_t tag = *p++;
+    switch (tag) {
+    case kNull:
+      row.push_back(duckdb::Value(
+          duckdb::LogicalType(static_cast<duckdb::LogicalTypeId>(*p++))));
+      break;
+    case kInt32:
+      row.push_back(duckdb::Value::INTEGER(get_raw<int32_t>(p)));
+      break;
+    case kInt64:
+      row.push_back(duckdb::Value::BIGINT(get_raw<int64_t>(p)));
+      break;
+    case kDouble:
+      row.push_back(duckdb::Value::DOUBLE(get_raw<double>(p)));
+      break;
+    case kVarchar: {
+      const uint32_t sz = get_raw<uint32_t>(p);
+      row.push_back(duckdb::Value(
+          std::string(reinterpret_cast<const char *>(p), sz)));
+      p += sz;
+      break;
+    }
+    case kBool:
+      row.push_back(duckdb::Value::BOOLEAN(*p++ != 0));
+      break;
+    default: { // kFallback
+      const uint32_t sz = get_raw<uint32_t>(p);
+      duckdb::MemoryStream stream(
+          reinterpret_cast<duckdb::data_ptr_t>(const_cast<uint8_t *>(p)),
+          sz);
+      duckdb::BinaryDeserializer des(stream);
+      des.Begin();
+      row.push_back(duckdb::Value::Deserialize(des));
+      des.End();
+      p += sz;
+      break;
+    }
+    }
   }
+  (void)len;
   return row;
 }
 
@@ -140,7 +255,7 @@ public:
   // Add one scanned row (weight w) to the new generation. Returns the
   // digest so callers can avoid recomputing it.
   RowDigest add(const std::vector<duckdb::Value> &row, int64_t w = 1) {
-    std::vector<uint8_t> bytes;
+    std::vector<uint8_t> &bytes = scratch_bytes_;
     serialize_row(row, bytes);
     const RowDigest d = digest_bytes(bytes.data(), bytes.size());
     auto &slot = pending_[d];
@@ -360,6 +475,7 @@ private:
   uint64_t append_offset_ = 0;
   int64_t total_weight_ = 0;
   std::unordered_map<RowDigest, Slot, RowDigestHash> index_;
+  std::vector<uint8_t> scratch_bytes_;
   std::unordered_map<RowDigest, Slot, RowDigestHash> pending_;
 };
 

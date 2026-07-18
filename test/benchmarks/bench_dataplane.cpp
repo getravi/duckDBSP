@@ -113,3 +113,35 @@ TEST_CASE("Benchmark: chunk ingestion cost split", "[benchmark][dataplane]") {
   // DP1 gate: pre-seeded ingestion must beat the legacy split soundly
   REQUIRE(t_vectorized * 1.5 < t_legacy);
 }
+
+TEST_CASE("Benchmark: spill row codec", "[benchmark][dataplane]") {
+  // serialize_row/deserialize_row cost — the per-row constant multiplying
+  // every spilled sync (generational rebuilds re-serialize the table)
+  std::vector<std::vector<duckdb::Value>> rows;
+  rows.reserve(200000);
+  for (int i = 0; i < 200000; i++) {
+    rows.push_back({duckdb::Value::INTEGER(i),
+                    duckdb::Value::BIGINT(i * 31),
+                    duckdb::Value("v_" + std::to_string(i % 977))});
+  }
+  size_t total = 0;
+  std::vector<uint8_t> bytes;
+  const double t_ser = ms([&] {
+    for (auto &r : rows) {
+      dbsp_native::serialize_row(r, bytes);
+      total += bytes.size();
+    }
+  });
+  dbsp_native::serialize_row(rows[0], bytes);
+  size_t sink = 0;
+  const double t_des = ms([&] {
+    for (int i = 0; i < 200000; i++) {
+      auto r = dbsp_native::deserialize_row(bytes.data(), bytes.size());
+      sink += r.size();
+    }
+  });
+  std::cout << "[dataplane] spill codec 200k x 3 cols: serialize " << t_ser
+            << " ms, deserialize " << t_des << " ms (bytes=" << total
+            << " sink=" << sink << ")\n";
+  REQUIRE(total > 0);
+}

@@ -262,3 +262,39 @@ TEST_CASE("spill: bucket index property test vs oracle incl. compaction",
   }
   REQUIRE(idx.key_count() == oracle.size());
 }
+
+TEST_CASE("row codec roundtrips every value shape", "[spill][codec]") {
+  using duckdb::Value;
+  // fast-path types, fallback types, and typed NULLs — the codec must
+  // reproduce values that hash and compare identically
+  std::vector<duckdb::Value> row = {
+      Value::INTEGER(42),
+      Value::BIGINT(-7),
+      Value::DOUBLE(3.25),
+      Value("plain string"),
+      Value(""),
+      Value::BOOLEAN(true),
+      Value(duckdb::LogicalType::INTEGER),  // typed NULL, fast path
+      Value(duckdb::LogicalType::VARCHAR),  // typed NULL, fast path
+      Value::DECIMAL(int64_t(12345), 12, 3),
+      Value::DATE(duckdb::date_t(19000)),
+      Value::TIMESTAMP(duckdb::timestamp_t(1700000000000000)),
+      Value(duckdb::LogicalType::DECIMAL(10, 2)), // typed NULL, fallback
+      Value::LIST({Value::INTEGER(1), Value::INTEGER(2)}),
+      Value::STRUCT({{"a", Value::INTEGER(9)}, {"b", Value("x")}}),
+  };
+  std::vector<uint8_t> bytes;
+  dbsp_native::serialize_row(row, bytes);
+  auto back = dbsp_native::deserialize_row(bytes.data(), bytes.size());
+  REQUIRE(back.size() == row.size());
+  for (size_t i = 0; i < row.size(); i++) {
+    INFO("column " << i << ": " << row[i].ToString());
+    REQUIRE(row[i].IsNull() == back[i].IsNull());
+    if (!row[i].IsNull()) {
+      REQUIRE(row[i] == back[i]);
+      REQUIRE(row[i].type() == back[i].type());
+    } else {
+      REQUIRE(row[i].type() == back[i].type());
+    }
+  }
+}

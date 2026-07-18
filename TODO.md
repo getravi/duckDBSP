@@ -92,13 +92,19 @@ subsystem, bespoke parser, standalone Z-set spilling).
 ## Architectural
 
 - Spill mode (K1+K2+N2-N4) covers baselines, shared arrangements,
-  local probe-target join indexes, bounded top-K sort views, and
-  oversized holistic groups. Still RAM-resident: self-padding join
-  sides (pad/weight/mark reconciliation walks full-row structures),
-  mode value-counts, ordered-aggregate (string_agg) entries, plain
-  ORDER BY / window views (the answer IS the total order), and
-  percentage-limit views (cutoff needs total count — could bound with a
-  count-only overflow later).
+  local probe-target join indexes, bounded top-K sort views (constant
+  AND percentage limits — the percentage cutoff now rides a scalar
+  total-count with a dynamic window cap; the overflow-log refill absorbs
+  cutoff growth), and oversized holistic groups. Still RAM-resident:
+  self-padding join sides (pad/weight/mark reconciliation walks full-row
+  structures), mode value-counts, ordered-aggregate (string_agg)
+  entries, and plain ORDER BY / window views — for those the answer IS
+  the total order: the result Z-set the view interface returns by
+  reference is the memory floor, and row payloads are already COW-shared
+  with upstream state, so a payload-spill would save little beyond node
+  overhead. A known residual: sorted multisets duplicate entries per
+  weight unit (weight w = w nodes, shared payload) — a weight-collapsed
+  ordered map is the cheap fix if a weighty workload shows up.
 - Cross-projection arrangement sharing shipped (O4): full-row
   arrangements + canonical key fingerprints + probe-time consumer
   projection; bench-gated (no regression). Fingerprints no longer

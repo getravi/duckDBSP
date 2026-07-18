@@ -1,4 +1,5 @@
 #include "catch.hpp"
+#include <filesystem>
 #include "dbsp_duckdb_types.hpp"
 #include <string>
 #include <vector>
@@ -173,4 +174,78 @@ TEST_CASE("NativeLimitView - Incremental Updates", "[limit]") {
   REQUIRE(results2[0].id == 1);
   REQUIRE(results2[1].id == 2);
   REQUIRE(results2[2].id == 3);
+}
+
+TEST_CASE("NativeLimitView - bounded percentage limit (spill mode)",
+          "[limit][spill]") {
+  // LIMIT p% used to force the full sorted multiset even in spill mode
+  // (the cutoff needs the total count). total_weight_ now carries the
+  // count as a scalar and the window cap tracks the moving cutoff, with
+  // the existing overflow-log refill absorbing cutoff growth.
+  namespace dn = dbsp_native;
+  const bool was_spill = dn::g_spill_mode.load();
+  const std::string was_dir = dn::g_spill_dir;
+  dn::g_spill_dir = "/tmp/dbsp_test_pctlimit";
+  std::filesystem::create_directories(dn::g_spill_dir);
+  dn::g_spill_mode.store(true);
+
+  {
+    TableSchema schema;
+    schema.columns.push_back({"id", duckdb::LogicalType::INTEGER});
+    schema.columns.push_back({"name", duckdb::LogicalType::VARCHAR});
+    std::vector<NativeSortView::SortColumn> sort_cols;
+    sort_cols.push_back({0, true, true});
+
+    // LIMIT 10 PERCENT
+    NativeLimitView view("pct_bounded", "SELECT...", "source", schema, -1,
+                         0, sort_cols, nullptr, 10.0);
+    REQUIRE(view.bounded());
+
+    // 1000 rows in batches: result must be the smallest 10% at each step
+    int next_id = 0;
+    for (int batch = 0; batch < 10; batch++) {
+      DuckDBZSet changes;
+      for (int i = 0; i < 100; i++) {
+        // insert in DESCENDING id order so the window churns
+        changes.insert(make_row(100000 - next_id, "r"), 1);
+        next_id++;
+      }
+      view.apply_changes("source", changes);
+      const int total = next_id;
+      const size_t expected = static_cast<size_t>(total / 10);
+      REQUIRE(view.get_result().size() == expected);
+    }
+    // window stays bounded: ~2x the 100-row result, nowhere near 1000
+    REQUIRE(view.window_size() < 400);
+
+    // smallest 10% of ids 99001..100000 => 99001..99100
+    {
+      auto &res = view.get_result();
+      size_t n_low = 0;
+      for (const auto &[row, w] : res) {
+        if (row.columns[0].GetValue<int32_t>() <= 99100) {
+          n_low++;
+        }
+      }
+      REQUIRE(n_low == res.size());
+    }
+
+    // Delete half the low end: cutoff shrinks, refill must keep the
+    // result exact
+    DuckDBZSet dels;
+    for (int i = 0; i < 500; i++) {
+      dels.insert(make_row(99001 + i, "r"), -1);
+    }
+    view.apply_changes("source", dels);
+    // 500 remaining rows -> 10% = 50; they are ids 99501..99550
+    REQUIRE(view.get_result().size() == 50);
+    for (const auto &[row, w] : view.get_result()) {
+      const auto id = row.columns[0].GetValue<int32_t>();
+      REQUIRE(id >= 99501);
+      REQUIRE(id <= 99550);
+    }
+  }
+
+  dn::g_spill_mode.store(was_spill);
+  dn::g_spill_dir = was_dir;
 }

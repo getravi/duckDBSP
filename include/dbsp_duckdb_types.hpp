@@ -1361,9 +1361,8 @@ public:
     // window from the log when deletions shrink it (rare full log pass).
     // Mode fixed at construction; the flag is read under the same CDC
     // lock that guards set_spill.
-    if (g_spill_mode.load() && limit_ >= 0 && limit_percent_ < 0) {
-      window_cap_ = static_cast<size_t>(offset_ + limit_) +
-                    std::max<size_t>(64, static_cast<size_t>(limit_));
+    if (g_spill_mode.load() && (limit_ >= 0 || limit_percent_ >= 0)) {
+      window_cap_ = desired_cap();
       overflow_ = std::make_unique<SpilledBaseline>(
           g_spill_dir + "/limit_" +
           std::to_string(g_spill_file_seq.fetch_add(1)) + ".dbspill");
@@ -1371,16 +1370,37 @@ public:
   }
 
   bool bounded() const { return overflow_ != nullptr; }
+  // Observability for tests: rows currently held in RAM (bounded mode
+  // keeps this near offset+limit regardless of table size)
+  size_t window_size() const { return sorted_rows_.size(); }
 
   // LIMIT p% counts against the CURRENT input size — recomputed on every
-  // apply, so membership tracks table growth/shrinkage incrementally
+  // apply, so membership tracks table growth/shrinkage incrementally.
+  // Bounded mode cannot count sorted_rows_ (the window is a subset):
+  // total_weight_ tracks the full input cardinality as a scalar.
   int64_t effective_limit() const {
     if (limit_percent_ < 0) {
       return limit_;
     }
     // DuckDB truncates: idx_t(percent / 100 * count)
-    return static_cast<int64_t>(limit_percent_ / 100.0 *
-                                static_cast<double>(sorted_rows_.size()));
+    const double count = overflow_
+                             ? static_cast<double>(total_weight_)
+                             : static_cast<double>(sorted_rows_.size());
+    return static_cast<int64_t>(limit_percent_ / 100.0 * count);
+  }
+
+  // Bounded-window size: result reach (offset + effective limit) plus
+  // slack so churn near the cutoff stays off the overflow log. For
+  // percentage limits this is DYNAMIC — the cutoff grows with the
+  // table, and the existing refill pass promotes rows from the log
+  // whenever the window falls below the new cap.
+  size_t desired_cap() const {
+    const int64_t eff =
+        limit_percent_ >= 0 ? effective_limit() : limit_;
+    const size_t reach = static_cast<size_t>(
+        std::max<int64_t>(0, offset_) + std::max<int64_t>(0, eff));
+    return reach + std::max<size_t>(64, static_cast<size_t>(
+                                            std::max<int64_t>(1, eff)));
   }
 
   void apply_changes(const std::string &table_name,
@@ -1557,6 +1577,7 @@ private:
 
   void apply_bounded(const DuckDBZSet &changes) {
     for (const auto &[row, weight] : changes) {
+      total_weight_ += weight;
       if (weight > 0) {
         for (Weight i = 0; i < weight; ++i) {
           // Below the current cutoff → overflow log; else into the window
@@ -1584,8 +1605,15 @@ private:
       }
     }
 
-    // Refill from the log when deletions dug into the window (rare:
-    // one full log pass, smallest rows promoted, log rewritten)
+    // Percentage limits: the cutoff moved with the table size — grow (or
+    // shrink) the window cap; the refill below covers growth
+    if (limit_percent_ >= 0) {
+      window_cap_ = desired_cap();
+    }
+
+    // Refill from the log when deletions dug into the window (or the
+    // percentage cutoff grew past it): one full log pass, smallest rows
+    // promoted, log rewritten
     if (sorted_rows_.size() < window_cap_ && !overflow_->empty()) {
       std::multiset<DuckDBRow, RowComparator> all(comparator_);
       overflow_->scan([&](const std::vector<duckdb::Value> &vals,
@@ -1639,6 +1667,7 @@ private:
   int64_t limit_;
   int64_t offset_;
   double limit_percent_ = -1;
+  int64_t total_weight_ = 0; // full input cardinality (bounded mode)
   std::vector<SortColumn> sort_columns_;
   RowComparator comparator_;
   std::multiset<DuckDBRow, RowComparator> sorted_rows_;
