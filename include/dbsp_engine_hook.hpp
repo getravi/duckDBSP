@@ -49,16 +49,71 @@ inline EngineHookStats &engine_hook_stats() {
 
 #ifdef DBSP_ENGINE_HOOK
 
+// Vectorized chunk→Z-set conversion — the stream_table_rows idiom
+// (dbsp_cdc.hpp): flatten once, read typed vector data directly for the
+// common types instead of boxing every cell through DataChunk::GetValue,
+// and pre-seed each row's hash cache from the vectorized chunk_row_hashes
+// (lazy per-Value hashing is ~2/3 of ingestion time, and the pre-seeded
+// hash keeps paying in every downstream Z-set map operation).
 inline void engine_cdc_to_zset(duckdb::ColumnDataCollection &cdc, int64_t weight, DuckDBZSet &out) {
-  for (auto &chunk : cdc.Chunks()) {
+  duckdb::ColumnDataScanState scan;
+  cdc.InitializeScan(scan);
+  duckdb::DataChunk chunk;
+  cdc.InitializeScanChunk(chunk);
+  while (cdc.Scan(scan, chunk)) {
+    chunk.Flatten();
     const duckdb::idx_t n = chunk.size();
-    const duckdb::idx_t cols = chunk.ColumnCount();
+    const duckdb::idx_t ncols = chunk.ColumnCount();
+    std::vector<std::vector<duckdb::Value>> vals(n);
+    for (auto &r : vals) {
+      r.reserve(ncols);
+    }
+    for (duckdb::idx_t c = 0; c < ncols; c++) {
+      auto &vec = chunk.data[c];
+      const auto &type = vec.GetType();
+      auto &validity = duckdb::FlatVector::Validity(vec);
+      switch (type.id()) {
+      case duckdb::LogicalTypeId::INTEGER: {
+        auto data = duckdb::FlatVector::GetData<int32_t>(vec);
+        for (duckdb::idx_t i = 0; i < n; i++) {
+          vals[i].push_back(validity.RowIsValid(i) ? duckdb::Value::INTEGER(data[i]) : duckdb::Value(type));
+        }
+        break;
+      }
+      case duckdb::LogicalTypeId::BIGINT: {
+        auto data = duckdb::FlatVector::GetData<int64_t>(vec);
+        for (duckdb::idx_t i = 0; i < n; i++) {
+          vals[i].push_back(validity.RowIsValid(i) ? duckdb::Value::BIGINT(data[i]) : duckdb::Value(type));
+        }
+        break;
+      }
+      case duckdb::LogicalTypeId::DOUBLE: {
+        auto data = duckdb::FlatVector::GetData<double>(vec);
+        for (duckdb::idx_t i = 0; i < n; i++) {
+          vals[i].push_back(validity.RowIsValid(i) ? duckdb::Value::DOUBLE(data[i]) : duckdb::Value(type));
+        }
+        break;
+      }
+      case duckdb::LogicalTypeId::VARCHAR: {
+        auto data = duckdb::FlatVector::GetData<duckdb::string_t>(vec);
+        for (duckdb::idx_t i = 0; i < n; i++) {
+          vals[i].push_back(validity.RowIsValid(i) ? duckdb::Value(data[i].GetString()) : duckdb::Value(type));
+        }
+        break;
+      }
+      default:
+        for (duckdb::idx_t i = 0; i < n; i++) {
+          vals[i].push_back(chunk.GetValue(c, i));
+        }
+        break;
+      }
+    }
+    std::vector<size_t> row_hashes;
+    chunk_row_hashes(chunk, row_hashes);
     for (duckdb::idx_t i = 0; i < n; i++) {
       DuckDBRow row;
-      row.columns.reserve(cols);
-      for (duckdb::idx_t c = 0; c < cols; c++) {
-        row.columns.push_back(chunk.GetValue(c, i));
-      }
+      row.columns.assign(std::move(vals[i]));
+      row.columns.set_hash(row_hashes[i]);
       out.insert(std::move(row), weight);
     }
   }
