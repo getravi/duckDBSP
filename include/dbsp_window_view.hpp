@@ -2,6 +2,7 @@
 
 #include "dbsp_duckdb_types.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
+#include <algorithm>
 #include <map>
 #include <set>
 #include <vector>
@@ -70,10 +71,14 @@ private:
   };
 
   struct PartitionState {
-    std::multiset<DuckDBRow, RowComparator> sorted_rows;
+    // Kept sorted by `cmp` (the ORDER BY comparator). A vector (not a
+    // multiset) gives O(1) positional/random access so fast paths can
+    // re-render only the affected rows without copying the whole partition.
+    std::vector<DuckDBRow> sorted_rows;
+    RowComparator cmp;
 
     PartitionState(const std::vector<NativeSortView::SortColumn> &c)
-        : sorted_rows(RowComparator{c}) {}
+        : cmp(RowComparator{c}) {}
   };
 
   std::map<PartitionKey, PartitionState> partitions_;
@@ -344,16 +349,28 @@ public:
                  .first;
       }
 
-      // Apply change to state
+      // Apply change to the sorted vector (keep it ordered by cmp).
+      auto &vec = it->second.sorted_rows;
+      const auto &cmp = it->second.cmp;
       if (weight > 0) {
-        for (Weight i = 0; i < weight; ++i)
-          it->second.sorted_rows.insert(row);
+        for (Weight i = 0; i < weight; ++i) {
+          auto pos = std::lower_bound(vec.begin(), vec.end(), row, cmp);
+          vec.insert(pos, row);
+        }
       } else {
         for (Weight i = 0; i > weight; --i) {
-          auto row_it = it->second.sorted_rows.find(row);
-          if (row_it != it->second.sorted_rows.end()) {
-            it->second.sorted_rows.erase(row_it);
-          }
+          auto lo = std::lower_bound(vec.begin(), vec.end(), row, cmp);
+          auto hi = std::upper_bound(vec.begin(), vec.end(), row, cmp);
+          auto match = hi;
+          for (auto j = lo; j != hi; ++j)
+            if (*j == row) {
+              match = j;
+              break;
+            }
+          if (match != hi)
+            vec.erase(match);
+          else if (lo != hi)
+            vec.erase(lo);
         }
       }
       affected_partitions.insert(key);
@@ -381,11 +398,8 @@ public:
         continue;
       }
 
-      // Convert multiset to vector for random access
-      std::vector<DuckDBRow> partition_rows;
-      for (const auto &row : state.sorted_rows) {
-        partition_rows.push_back(row);
-      }
+      // Persistent sorted vector — direct positional access, no copy.
+      const std::vector<DuckDBRow> &partition_rows = state.sorted_rows;
 
       // Pre-calculate peer boundaries for RANGE/GROUPS
       std::vector<size_t> peer_start(partition_rows.size());
