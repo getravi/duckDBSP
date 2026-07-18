@@ -1,6 +1,9 @@
 # Data-plane roadmap: from Value rows toward columnar deltas
 
-Status: DP1 shipped 2026-07-17. Later phases unscheduled, workload-gated.
+Status: DP1 shipped 2026-07-17. Profiling 2026-07-17 (bench_planner_eval)
+reclassified DP2 — keys/args are already vectorized; only residual
+predicates remain — and promoted DP3 as the measured lever for a 14.4x
+row<->chunk marshaling overhead. Later phases workload-gated.
 
 ## Measured baseline (bench_dataplane, 1M rows x 3 cols, M-series)
 
@@ -39,25 +42,63 @@ Any change to either hash path must keep the equality suite green.
 Deliberately NOT wired: per-statement capture/tee sites (deltas are a
 few rows; hash cost is noise there).
 
-## DP2: batched key/argument evaluation (next, moderate)
+## Profiling harness (bench_planner_eval)
 
-Aggregate keys/arguments, join keys, and join residual predicates still
-evaluate per row through RowExprEval (known TODO). The D1
-BatchEvaluator already does vectorized filter/projection — extend it to
-key extraction: evaluate key expressions over the delta as chunks, then
-hash keys with chunk_row_hashes. Expected win bounded by how
-key-heavy the workload is; profile bench_planner_eval aggregate/join
-cases first.
+The planner-eval throughput benches had silently rotted: PlanTranslator
+now reports fully-qualified sources (`memory.main.t`) and `apply_changes`
+routes only on an exact `source_table_` match, so feeding the bare SQL
+name (`"t"`) stepped the circuit empty — `get_result()` returned 0 and the
+filter/aggregate/join result-size REQUIREs failed unnoticed (the benches
+were manual-only, never in ctest). Fixed (feed each view its own
+`source_tables()` name) and gated in ctest (`planner_eval_smoke`,
+`[planner_eval],[shard_bench]`) so the numbers below are reproducible and
+the gate cannot rot again. Restored (M-series, 100k-row delta): aggregate
+~2.5M rows/s, join delta ~530k rows/s, fused filter ~1.0M rows/s.
 
-## DP3: late materialization (large)
+## DP2: batched key/argument evaluation — LARGELY SHIPPED (residuals only)
 
-Deltas flow between linear operators as (DataChunk, weight vector)
-pairs; DuckDBRow materializes only at stateful boundaries (Z-set/
-arrangement insertion). Removes the remaining Value boxing (~15%) from
-pass-through operators entirely and lets filters/projections run on
-native vectors end to end. Touches the circuit node interfaces —
-propagate_changes, every PlannedCircuitView node's consume path. Do not
-start without a workload where linear-chain propagation dominates.
+Reclassified 2026-07-17 by profiling. The original premise was stale:
+aggregate group keys + arguments, join keys, and filter/projection
+expressions ALREADY run through the D1 `BatchEvaluator`
+(STANDARD_VECTOR_SIZE-batched `ExpressionExecutor`) — see its construction
+sites in `dbsp_plan_translator.hpp` (FILTER_MAP node; the aggregate node's
+`fill`/`execute`; join `batch_left_keys_`/`batch_right_keys_`). Measured
+confirmation:
+
+- aggregate `SUM(id)` vs `SUM(id*2+1)` (identical key/plan, only the arg
+  expression differs): ~-0.7% median-of-7 — argument eval is already
+  batched; no per-row cost to recover.
+- bare-column vs expression `GROUP BY` could NOT isolate key eval: the two
+  produce different planner circuits (expression key reproducibly
+  *faster*), so an SQL A/B measures plan shape, not eval. There is no
+  per-row key-eval cost left — it is already batched.
+
+REMAINING — the only per-row `RowExprEval` still on a hot path: join /
+complex-filter RESIDUAL predicates (the residual `left`/`right`
+`RowExprEval` members in `dbsp_plan_translator.hpp`). Defer per `TODO.md`:
+batch only if residual-heavy joins show up in a profile.
+
+## DP3: late materialization (large) — THE measured next lever
+
+Promoted 2026-07-17. The filter bench ("RowExprEval vs hand-written lambda
+on filter path") measures the fused FILTER_MAP path — already on
+`BatchEvaluator` — at **14.4x slower than a hand lambda** doing the same
+predicate + projection. That gap is NOT expression eval; it is row<->chunk
+MARSHALING. Every operator builds a DataChunk from `DuckDBRow`s (per-cell
+Value boxing), batch-executes, then reads results back per row
+(`read_result` -> `std::vector<Value>`) and re-materializes a `DuckDBRow`
+per row (confirmed in the aggregate node's `step()` and the FILTER_MAP
+consume path). The batched execute is bracketed by scalar boxing on both
+ends; the hand lambda reads `row.columns[1]` directly and skips all of it.
+
+DP3 removes exactly this: deltas flow between linear operators as
+(DataChunk, weight vector) pairs; `DuckDBRow` materializes only at stateful
+boundaries (Z-set / arrangement insertion). Filters/projections then run
+on native vectors end to end, deleting the read-back boxing that IS the
+14.4x. Touches the circuit node interfaces — `propagate_changes`, every
+PlannedCircuitView node's consume path. The gating workload the phase
+required now exists and is measured: the pure linear filter/projection
+bench at 14.4x is precisely linear-chain-propagation-dominant.
 
 ## DP4: columnar state (research-scale)
 
