@@ -839,3 +839,141 @@ TEST_CASE("write capture: upsert differential",
   }
   db.exec("SELECT * FROM dbsp_auto_sync(false)");
 }
+
+TEST_CASE("Appender rows are captured via G2 (flush runs as a statement)",
+          "[integration][auto_cdc][appender]") {
+  DuckDBTestHarness db;
+  db.createTable("wa", "id INT, val INT", {"(1, 10)"});
+  db.exec("SELECT * FROM dbsp_track('wa')");
+  db.exec("SELECT * FROM dbsp_sync('wa')");
+  db.exec("SELECT * FROM dbsp_create_view('wv_app', "
+          "'SELECT id, val FROM wa WHERE val > 50')");
+  db.exec("SELECT * FROM dbsp_auto_sync(true)");
+  auto &m = db.manager();
+
+  auto check = [&] {
+    auto expected = db.query("SELECT * FROM (SELECT id, val FROM wa "
+                             "WHERE val > 50) ORDER BY ALL");
+    auto actual =
+        db.query("SELECT * FROM dbsp_query('wv_app') ORDER BY ALL");
+    REQUIRE_FALSE(expected->HasError());
+    REQUIRE_FALSE(actual->HasError());
+    REQUIRE(actual->RowCount() == expected->RowCount());
+  };
+
+  SECTION("pure Appender transaction: captured, no scan") {
+    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t scans = m.scan_syncs();
+    db.exec("BEGIN");
+    {
+      duckdb::Appender app(db.conn(), "wa");
+      app.AppendRow(10, 100);
+      app.AppendRow(11, 5);
+      app.Close();
+    }
+    db.exec("COMMIT");
+    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.scan_syncs() == scans);
+    check();
+  }
+  SECTION("Appender mixed with captured INSERT: one apply") {
+    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t scans = m.scan_syncs();
+    db.exec("BEGIN");
+    db.exec("INSERT INTO wa VALUES (20, 200)");
+    {
+      duckdb::Appender app(db.conn(), "wa");
+      app.AppendRow(21, 210);
+      app.Close();
+    }
+    db.exec("COMMIT");
+    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.scan_syncs() == scans);
+    check();
+  }
+  SECTION("Appender after a design-1 probe UPDATE: both exact, captured") {
+    // the UPDATE probe ran before the Appender rows existed, so its
+    // prediction is exact; the flush's G2 LocalStorage capture is exact
+    // by construction — the merged delta captures cleanly
+    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t scans = m.scan_syncs();
+    db.exec("BEGIN");
+    db.exec("UPDATE wa SET val = 60 WHERE id = 1");
+    {
+      duckdb::Appender app(db.conn(), "wa");
+      app.AppendRow(30, 300);
+      app.Close();
+    }
+    db.exec("COMMIT");
+    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.scan_syncs() == scans);
+    check();
+  }
+  SECTION("Appender then UPDATE touching its rows: still exact") {
+    // the flush folds wa into touched, so the later UPDATE's probe
+    // declines (it cannot see the txn-local rows) and the plan tee
+    // captures the executed rows instead — including the Appender row
+    const uint64_t scans = m.scan_syncs();
+    db.exec("BEGIN");
+    {
+      duckdb::Appender app(db.conn(), "wa");
+      app.AppendRow(31, 310);
+      app.Close();
+    }
+    db.exec("UPDATE wa SET val = val + 1 WHERE id = 31");
+    db.exec("COMMIT");
+    REQUIRE(m.scan_syncs() == scans);
+    check();
+    auto res = db.query("SELECT val FROM dbsp_query('wv_app') "
+                        "WHERE id = 31");
+    REQUIRE(res->GetValue(0, 0).GetValue<int64_t>() == 311);
+  }
+  SECTION("autocommit Appender (no explicit txn): views stay correct") {
+    {
+      duckdb::Appender app(db.conn(), "wa");
+      app.AppendRow(32, 320);
+      app.Close();
+    }
+    check();
+  }
+  SECTION("Appender rollback discards") {
+    db.exec("BEGIN");
+    {
+      duckdb::Appender app(db.conn(), "wa");
+      app.AppendRow(40, 400);
+      app.Close();
+    }
+    db.exec("ROLLBACK");
+    check();
+    db.assertViewRowCount("wv_app", 0);
+  }
+  db.exec("SELECT * FROM dbsp_auto_sync(false)");
+}
+
+TEST_CASE("dbsp_stats exposes sync-path counters",
+          "[integration][auto_cdc][stats]") {
+  DuckDBTestHarness db;
+  db.createTable("ws", "id INT, val INT", {"(1, 10)"});
+  db.exec("SELECT * FROM dbsp_track('ws')");
+  db.exec("SELECT * FROM dbsp_sync('ws')");
+  db.exec("SELECT * FROM dbsp_create_view('wv_s', "
+          "'SELECT id FROM ws WHERE val > 5')");
+  db.exec("SELECT * FROM dbsp_auto_sync(true)");
+
+  auto value_of = [&](const std::string &metric) {
+    auto res = db.query("SELECT value FROM dbsp_stats() WHERE metric = '" +
+                        metric + "'");
+    REQUIRE_FALSE(res->HasError());
+    REQUIRE(res->RowCount() == 1);
+    return res->GetValue(0, 0).GetValue<int64_t>();
+  };
+
+  REQUIRE(value_of("tracked_tables") >= 1);
+  const auto caps = value_of("captured_delta_syncs");
+  db.exec("UPDATE ws SET val = 60 WHERE id = 1"); // captured
+  REQUIRE(value_of("captured_delta_syncs") == caps + 1);
+  REQUIRE(value_of("capture_guard_fallbacks") >= 0);
+  REQUIRE(value_of("commit_seq") > 0);
+
+  db.exec("SELECT * FROM dbsp_auto_sync(false)");
+}

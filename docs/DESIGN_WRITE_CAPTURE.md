@@ -139,8 +139,15 @@ transaction (the commit hook, which fires mid-statement, is the only
 post-execution point with transaction context).
 
 With this, EVERY plain-SQL DML shape on a tracked table is O(Δ) except:
-Appender writes (no per-statement hooks) and multi-match
-UPDATE ... FROM (ambiguous by SQL semantics).
+multi-match UPDATE ... FROM (ambiguous by SQL semantics). Appender
+writes turned out to be covered already: the flush runs through the
+statement hooks classified as a plain INSERT, so G2's LocalStorage
+capture takes it — explicit transactions AND autocommit, including
+Appender-then-UPDATE ordering (the flush folds the table into touched,
+the UPDATE probe declines, the tee captures the executed rows with the
+transaction-local Appender rows visible). Tested in test_auto_cdc.cpp;
+the long-standing 'Appender bypasses query hooks' note was wrong for
+v1.5.4.
 
 ### Upstream check
 

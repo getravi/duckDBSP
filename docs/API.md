@@ -573,7 +573,7 @@ touched: multi-match `UPDATE ... FROM` (two new images for one row —
 ambiguous, the tee detects it and steps aside), CTEs/`RETURNING` on
 non-teeable shapes,
 non-deterministic expressions (`random()`, `now()`), UPDATEs of indexed
-or LIST-typed columns, multi-statement strings, Appender writes, and any
+or LIST-typed columns, multi-statement strings, and any
 transaction that writes the same table twice. If any
 statement in a transaction is un-capturable, the whole transaction falls
 back — captured and scanned deltas never mix for one commit, and guard
@@ -588,6 +588,21 @@ scan) and run one `dbsp_sync()` afterwards.
 SELECT * FROM dbsp_auto_sync(true);   -- Enable
 SELECT * FROM dbsp_auto_sync(false);  -- Disable
 SELECT * FROM dbsp_auto_sync();       -- Query status
+```
+
+### dbsp_stats()
+
+Sync-path observability counters, for monitoring which ingestion path
+serves a workload:
+
+```sql
+SELECT * FROM dbsp_stats();
+-- metric                  | value
+-- captured_delta_syncs    | 1042   -- O(Δ) captured applies (per table)
+-- scan_syncs              | 3      -- scan-and-diff fallbacks
+-- capture_guard_fallbacks | 0      -- guard-rejected captures (loud)
+-- commit_seq              | 1045   -- monotonic baseline mutations
+-- tracked_tables          | 4
 ```
 
 ### dbsp_parallel(enable)

@@ -49,8 +49,11 @@ subsystem, bespoke parser, standalone Z-set spilling).
   sub-statement tees as its own autocommit txn). Still scan-diff:
   multi-match UPDATE...FROM (ambiguous; tee detects and steps aside),
   DEFAULT-filled partial-column INSERTs from non-repeatable sources
-  (defaults resolve in a physical projection above the tee), and Appender
-  writes (no per-statement hooks). Engine-behavior assumptions are pinned
+  (defaults resolve in a physical projection above the tee). Appender
+  writes ARE captured: the flush runs through the statement hooks as a
+  plain INSERT and G2's LocalStorage capture takes it (probed
+  empirically; tested incl. Appender-then-UPDATE ordering).
+  Engine-behavior assumptions are pinned
   by test/integration/test_engine_assumptions.cpp — run it FIRST on any
   engine bump.
 - Phase D1 vectorized filter/map/fused evaluation + zero-copy circuit

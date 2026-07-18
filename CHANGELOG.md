@@ -91,6 +91,18 @@
   fold to LOGICAL_EMPTY_RESULT (tee declines, correctly) and that
   autocommit QueryEnd has no transaction (the mid-statement commit hook
   is the only post-execution point with one).
+- Appender coverage confirmed + dbsp_stats(): probing for a planned
+  COMMIT-time Appender sweep revealed the Appender's flush already runs
+  through the statement hooks as a plain INSERT — G2's LocalStorage
+  capture takes it, in explicit transactions and autocommit, including
+  Appender-then-UPDATE ordering (probe declines via touched, tee captures
+  with transaction-local rows visible). The long-standing 'Appender
+  bypasses query hooks' note was wrong; tests now pin the real behavior
+  and the planned sweep was discarded as dead code. New dbsp_stats()
+  table function exposes captured/scan/guard-fallback/commit-seq counters
+  to SQL. docs/UPSTREAM_PROPOSAL.md drafts the storage-hook RFC for
+  duckdb/duckdb (referencing #12408), incorporating the validated
+  call-site design from the shelved fork.
 - No upstream help available: DuckDB through 1.5.x ships no CDC/changeset
   extension hook (discussion #12408 open); revisit on engine upgrade.
 

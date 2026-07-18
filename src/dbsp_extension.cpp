@@ -638,6 +638,57 @@ void ListTablesFunc(ClientContext &context, TableFunctionInput &input,
 }
 
 // ============================================================================
+// dbsp_stats - Sync-path observability counters
+// ============================================================================
+
+struct StatsBindData : public TableFunctionData {
+  vector<pair<string, int64_t>> metrics;
+  idx_t current = 0;
+};
+
+unique_ptr<FunctionData> StatsBind(ClientContext &context,
+                                   TableFunctionBindInput &input,
+                                   vector<LogicalType> &return_types,
+                                   vector<string> &names) {
+  auto data = make_uniq<StatsBindData>();
+  auto &manager = dbsp_native::get_cdc_manager(context);
+  data->metrics = {
+      // commits served by captured deltas (design-1 probes, plan tee,
+      // G2 LocalStorage) — one count per applied table delta
+      {"captured_delta_syncs",
+       NumericCast<int64_t>(manager.captured_delta_syncs())},
+      // scan-and-diff table scans (the fallback path)
+      {"scan_syncs", NumericCast<int64_t>(manager.scan_syncs())},
+      // capture commit-guard rejections (each fell back to a scan)
+      {"capture_guard_fallbacks",
+       NumericCast<int64_t>(manager.capture_guard_fallbacks())},
+      // monotonic baseline-mutation counter (conflict detection)
+      {"commit_seq", NumericCast<int64_t>(manager.commit_seq())},
+      {"tracked_tables",
+       NumericCast<int64_t>(manager.list_tracked_tables().size())},
+  };
+  return_types.push_back(LogicalType::VARCHAR);
+  names.push_back("metric");
+  return_types.push_back(LogicalType::BIGINT);
+  names.push_back("value");
+  return std::move(data);
+}
+
+void StatsFunc(ClientContext &context, TableFunctionInput &input,
+               DataChunk &output) {
+  auto &data = input.bind_data->CastNoConst<StatsBindData>();
+  idx_t count = 0;
+  while (data.current < data.metrics.size() && count < STANDARD_VECTOR_SIZE) {
+    output.SetValue(0, count, Value(data.metrics[data.current].first));
+    output.SetValue(1, count,
+                    Value::BIGINT(data.metrics[data.current].second));
+    data.current++;
+    count++;
+  }
+  output.SetCardinality(count);
+}
+
+// ============================================================================
 // dbsp_drop - Drop a view
 // ============================================================================
 
@@ -1550,6 +1601,9 @@ static void LoadInternal(ExtensionLoader &loader) {
   TableFunction list_tables_func("dbsp_tables", {}, ListTablesFunc,
                                  ListTablesBind);
   loader.RegisterFunction(list_tables_func);
+
+  TableFunction stats_func("dbsp_stats", {}, StatsFunc, StatsBind);
+  loader.RegisterFunction(stats_func);
 
   TableFunction deps_func("dbsp_deps", {LogicalType::VARCHAR}, DepsFunc,
                           DepsBind);
