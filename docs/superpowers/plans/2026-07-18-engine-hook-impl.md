@@ -22,7 +22,21 @@ Generate the patch by applying A1–A3 to the submodule and
 `git -C duckdb diff > patches/v1.5.4-dbsp-txn-callback.patch`. Keep it ONE
 commit; any second engine change is a rebase liability.
 
-### A1. Surface — `src/include/duckdb/main/config.hpp` (CONCRETE)
+### A1. Surface — REWORKED 2026-07-18: side registry in `undo_buffer.{hpp,cpp}`, `config.hpp` is now UNTOUCHED
+
+> **ABI lesson (found by the prebuilt quack extension failing to LOAD with
+> "Missing DB manager"):** the original surface added a vector member to
+> `DBConfig`. `DBConfig` is EMBEDDED in `DatabaseInstance`, so growing it
+> shifts every later member (`db_manager`, ...) and breaks every extension
+> binary compiled against stock headers. Fix: callbacks live in an
+> engine-internal side registry `static map<DatabaseInstance*,
+> vector<TransactionModificationCallback>>` (undo_buffer.cpp) with free
+> functions `RegisterTxnModificationCallback(db, cb)` /
+> `GetTxnModificationCallbacks(db)` declared in undo_buffer.hpp, and an
+> erase call in `~DatabaseInstance` (database.cpp) so a recycled instance
+> address can never inherit dead callbacks. Stock-header extension binaries
+> (quack et al.) load into the patched engine unchanged; only hook-built
+> extensions reference the new symbols.
 
 > **Signature change during A3 (2026-07-18):** the callback receives
 > `DataTableInfo &` (schema/table names), NOT `TableCatalogEntry &`. There is
@@ -32,6 +46,8 @@ commit; any second engine change is a rebase liability.
 > `commit_id > start_time`; dropped entries throw; extra locking). The
 > consumer only needs the table name; column types travel in
 > `TransactionModifications::types`.
+
+Original DBConfig-member sketch below is historical.
 
 ```cpp
 struct TransactionModifications;  // defined in undo_buffer.hpp

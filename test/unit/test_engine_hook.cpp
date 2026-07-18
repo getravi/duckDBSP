@@ -85,7 +85,6 @@ struct HookedDB {
 	std::vector<HookEvent> events;
 
 	HookedDB() : db(nullptr), con(db) {
-		auto &cfg = DBConfig::GetConfig(*db.instance);
 		TransactionModificationCallback cb;
 		cb.on_commit = [this](duckdb::ClientContext &, DataTableInfo &info, TransactionModifications &m) {
 			HookEvent ev;
@@ -98,7 +97,8 @@ struct HookedDB {
 			}
 			events.push_back(std::move(ev));
 		};
-		cfg.RegisterTxnModificationCallback(std::move(cb));
+		// side registry (ABI-neutral surface); erased in ~DatabaseInstance
+		duckdb::RegisterTxnModificationCallback(*db.instance, std::move(cb));
 	}
 
 	void q(const std::string &sql) {

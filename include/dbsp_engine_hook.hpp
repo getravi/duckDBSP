@@ -28,7 +28,6 @@
 
 #ifdef DBSP_ENGINE_HOOK
 #include "duckdb/main/attached_database.hpp"
-#include "duckdb/main/config.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/transaction/undo_buffer.hpp"
 #endif
@@ -101,13 +100,14 @@ inline void ingest_engine_modifications(duckdb::ClientContext &context, duckdb::
 }
 
 inline bool register_engine_hook(duckdb::DatabaseInstance &db) {
-  auto &config = duckdb::DBConfig::GetConfig(db);
   duckdb::TransactionModificationCallback cb;
   cb.on_commit = [](duckdb::ClientContext &context, duckdb::DataTableInfo &info,
                     duckdb::TransactionModifications &mods) {
     ingest_engine_modifications(context, info, mods);
   };
-  config.RegisterTxnModificationCallback(std::move(cb));
+  // Side registry keyed by instance (ABI-neutral engine surface); the engine
+  // erases the entry in ~DatabaseInstance.
+  duckdb::RegisterTxnModificationCallback(db, std::move(cb));
   engine_hook_flag().store(true, std::memory_order_relaxed);
   return true;
 }
