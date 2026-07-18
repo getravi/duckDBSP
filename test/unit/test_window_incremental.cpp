@@ -172,3 +172,54 @@ TEST_CASE("window fast CUMSUM (unbounded preceding) == full",
   deltas.push_back(upd);
   REQUIRE(zset_equal(run_incremental(defs, deltas), run_full(defs, deltas)));
 }
+
+TEST_CASE("window fillforward (LAST_VALUE IGNORE NULLS) correctness",
+          "[window][incremental]") {
+  NativeWindowView::WindowDef w;
+  w.function = "LAST_VALUE";
+  w.partition_indices = {0};
+  w.sort_columns = {{1, true, true}};
+  w.arg_column_idx = 2;
+  w.start = duckdb::WindowBoundary::UNBOUNDED_PRECEDING;
+  w.end = duckdb::WindowBoundary::CURRENT_ROW_ROWS;
+  std::vector<NativeWindowView::WindowDef> defs{w};
+  DuckDBZSet d0; // values: 5, NULL, NULL, 9 -> fillforward 5,5,5,9
+  d0.insert(src(1, 0, Value::INTEGER(5)), 1);
+  d0.insert(src(1, 1, Value(duckdb::LogicalType::INTEGER)), 1);
+  d0.insert(src(1, 2, Value(duckdb::LogicalType::INTEGER)), 1);
+  d0.insert(src(1, 3, Value::INTEGER(9)), 1);
+  NativeWindowView v("ff", "", "t", TableSchema{}, TableSchema{}, defs);
+  v.apply_changes("t", d0);
+  bool found = false; // ord=2 must carry forward the last non-null (5)
+  for (const auto &[row, wt] : v.get_result())
+    if (wt > 0 && row.columns[1].GetValue<int32_t>() == 2) {
+      REQUIRE(row.columns.back().GetValue<int32_t>() == 5);
+      found = true;
+    }
+  REQUIRE(found);
+}
+
+TEST_CASE("window fast fillforward value update == full",
+          "[window][incremental]") {
+  NativeWindowView::WindowDef w;
+  w.function = "LAST_VALUE";
+  w.partition_indices = {0};
+  w.sort_columns = {{1, true, true}};
+  w.arg_column_idx = 2;
+  w.start = duckdb::WindowBoundary::UNBOUNDED_PRECEDING;
+  w.end = duckdb::WindowBoundary::CURRENT_ROW_ROWS;
+  std::vector<NativeWindowView::WindowDef> defs{w};
+  std::vector<DuckDBZSet> deltas;
+  DuckDBZSet d0; // 5, NULL, 7, NULL, 9
+  d0.insert(src(1, 0, Value::INTEGER(5)), 1);
+  d0.insert(src(1, 1, Value(duckdb::LogicalType::INTEGER)), 1);
+  d0.insert(src(1, 2, Value::INTEGER(7)), 1);
+  d0.insert(src(1, 3, Value(duckdb::LogicalType::INTEGER)), 1);
+  d0.insert(src(1, 4, Value::INTEGER(9)), 1);
+  deltas.push_back(d0);
+  DuckDBZSet upd; // ord=2: 7 -> NULL (extends the run carrying 5 forward)
+  upd.insert(src(1, 2, Value::INTEGER(7)), -1);
+  upd.insert(src(1, 2, Value(duckdb::LogicalType::INTEGER)), 1);
+  deltas.push_back(upd);
+  REQUIRE(zset_equal(run_incremental(defs, deltas), run_full(defs, deltas)));
+}

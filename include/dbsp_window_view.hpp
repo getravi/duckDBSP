@@ -137,23 +137,32 @@ private:
           out_row.columns.push_back(duckdb::Value());
         }
       } else if (win.function == "LAST_VALUE") {
+        // LAST_VALUE ... IGNORE NULLS (fillforward): last non-null value in
+        // the frame, scanning backward from the frame end to the frame start.
+        duckdb::Value result;
         if (!rows.empty() && win.arg_column_idx >= 0) {
           size_t frame_end_idx = row_idx; // default CURRENT_ROW
-          if (win.end == duckdb::WindowBoundary::UNBOUNDED_FOLLOWING) {
+          if (win.end == duckdb::WindowBoundary::UNBOUNDED_FOLLOWING)
             frame_end_idx = rows.size() - 1;
-          } else if (win.end == duckdb::WindowBoundary::EXPR_FOLLOWING_ROWS) {
+          else if (win.end == duckdb::WindowBoundary::EXPR_FOLLOWING_ROWS)
             frame_end_idx =
                 std::min(row_idx + (size_t)win.end_offset, rows.size() - 1);
+          size_t scan_lo = 0;
+          if (win.start == duckdb::WindowBoundary::CURRENT_ROW_ROWS)
+            scan_lo = row_idx;
+          else if (win.start == duckdb::WindowBoundary::EXPR_PRECEDING_ROWS)
+            scan_lo = row_idx >= (size_t)win.start_offset
+                          ? row_idx - (size_t)win.start_offset
+                          : 0;
+          for (size_t f = frame_end_idx + 1; f-- > scan_lo;) {
+            if ((size_t)win.arg_column_idx < rows[f].columns.size() &&
+                !rows[f].columns[win.arg_column_idx].IsNull()) {
+              result = rows[f].columns[win.arg_column_idx];
+              break;
+            }
           }
-          if ((size_t)win.arg_column_idx < rows[frame_end_idx].columns.size()) {
-            out_row.columns.push_back(
-                rows[frame_end_idx].columns[win.arg_column_idx]);
-          } else {
-            out_row.columns.push_back(duckdb::Value());
-          }
-        } else {
-          out_row.columns.push_back(duckdb::Value());
         }
+        out_row.columns.push_back(result);
       } else if (win.function == "NTH_VALUE") {
         int n = win.offset;
         if (n > 0 && (size_t)(n - 1) < rows.size() && win.arg_column_idx >= 0 &&
@@ -296,8 +305,10 @@ private:
 
   // Union of output-row indices dirtied by changes at `anchors`, per window
   // shape. Returns false if any window lacks a fast rule (caller full-renders).
-  bool affected_indices(size_t n, const std::vector<size_t> &anchors,
+  bool affected_indices(const std::vector<DuckDBRow> &rows,
+                        const std::vector<size_t> &anchors,
                         std::vector<size_t> &out) const {
+    const size_t n = rows.size();
     for (const auto &win : windows_) {
       const size_t off = (size_t)win.offset;
       if (win.function == "LAG") {
@@ -363,8 +374,22 @@ private:
           for (int64_t r = rlo; r <= rhi; ++r)
             out.push_back((size_t)r);
         }
+      } else if (win.function == "LAST_VALUE") {
+        // fillforward: value at r = last non-null in the frame. A change at p
+        // affects the forward run until the next non-null value (including
+        // that row is harmless — it re-renders to its own value).
+        for (size_t p : anchors) {
+          out.push_back(p);
+          for (size_t r = p + 1; r < n; ++r) {
+            out.push_back(r);
+            if (win.arg_column_idx >= 0 &&
+                (size_t)win.arg_column_idx < rows[r].columns.size() &&
+                !rows[r].columns[win.arg_column_idx].IsNull())
+              break;
+          }
+        }
       } else {
-        return false; // shape not yet fast-handled (fillforward = Task 6)
+        return false; // shape not yet fast-handled
       }
     }
     return true;
@@ -578,7 +603,7 @@ public:
           anchors.push_back(idx);
         }
         std::vector<size_t> affected;
-        if (affected_indices(partition_rows.size(), anchors, affected)) {
+        if (affected_indices(partition_rows, anchors, affected)) {
           emit_affected(key, partition_rows, affected);
           continue;
         }
@@ -680,26 +705,33 @@ public:
               out_row.columns.push_back(duckdb::Value());
             }
           } else if (win.function == "LAST_VALUE") {
+            // LAST_VALUE ... IGNORE NULLS (fillforward): last non-null value
+            // in the frame, scanning backward from the frame end.
+            duckdb::Value ff_result;
             if (!partition_rows.empty() && win.arg_column_idx >= 0) {
-              // LAST_VALUE uses the frame end (default: CURRENT ROW)
               size_t frame_end_idx = row_idx; // default CURRENT_ROW
-              if (win.end == duckdb::WindowBoundary::UNBOUNDED_FOLLOWING) {
+              if (win.end == duckdb::WindowBoundary::UNBOUNDED_FOLLOWING)
                 frame_end_idx = partition_rows.size() - 1;
-              } else if (win.end ==
-                         duckdb::WindowBoundary::EXPR_FOLLOWING_ROWS) {
+              else if (win.end == duckdb::WindowBoundary::EXPR_FOLLOWING_ROWS)
                 frame_end_idx = std::min(row_idx + (size_t)win.end_offset,
                                          partition_rows.size() - 1);
+              size_t scan_lo = 0;
+              if (win.start == duckdb::WindowBoundary::CURRENT_ROW_ROWS)
+                scan_lo = row_idx;
+              else if (win.start == duckdb::WindowBoundary::EXPR_PRECEDING_ROWS)
+                scan_lo = row_idx >= (size_t)win.start_offset
+                              ? row_idx - (size_t)win.start_offset
+                              : 0;
+              for (size_t f = frame_end_idx + 1; f-- > scan_lo;) {
+                if ((size_t)win.arg_column_idx <
+                        partition_rows[f].columns.size() &&
+                    !partition_rows[f].columns[win.arg_column_idx].IsNull()) {
+                  ff_result = partition_rows[f].columns[win.arg_column_idx];
+                  break;
+                }
               }
-              if ((size_t)win.arg_column_idx <
-                  partition_rows[frame_end_idx].columns.size()) {
-                out_row.columns.push_back(
-                    partition_rows[frame_end_idx].columns[win.arg_column_idx]);
-              } else {
-                out_row.columns.push_back(duckdb::Value());
-              }
-            } else {
-              out_row.columns.push_back(duckdb::Value());
             }
+            out_row.columns.push_back(ff_result);
           } else if (win.function == "NTH_VALUE") {
             int n = win.offset; // NTH_VALUE uses offset as N
             if (n > 0 && (size_t)(n - 1) < partition_rows.size() &&

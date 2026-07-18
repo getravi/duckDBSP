@@ -154,14 +154,16 @@ row); it now re-emits only the output rows a delta dirties.
 - `affected_indices` computes, per window shape, the dirtied rows: offset
   LAG/LEAD O(1) (reader r±k); ROWS-frame SUM/COUNT/AVG/MIN/MAX O(frame) via
   frame(r)=[r+lo_off, r+hi_off] → affected r ∈ [p-hi_off, p-lo_off], which
-  covers bounded rolling AND unbounded-preceding running sums (suffix).
+  covers bounded rolling AND unbounded-preceding running sums (suffix);
+  LAST_VALUE/fillforward O(run) (forward to the next non-null). LAST_VALUE
+  now implements IGNORE NULLS, fixing a latent correctness bug (the old
+  renderer returned the frame-end value, not the last non-null).
 - `emit_affected` retracts each cached row, renders the new one
   (`render_row`), re-inserts, and updates the cache slot.
 
 Fallback (always correct — it is the prior behavior): RANK/DENSE_RANK/
 ROW_NUMBER/NTILE, RANGE/GROUPS frames, and any structural (size-changing)
-delta fall through to the full-partition re-render. LAST_VALUE / fillforward
-still uses the full path pending its own increment.
+delta fall through to the full-partition re-render.
 
 Gates (both in ctest): `test_window_incremental` (incremental == full
 differential per shape) and `bench_window` (single-row update flat vs
