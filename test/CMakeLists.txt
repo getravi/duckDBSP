@@ -106,7 +106,7 @@ add_dbsp_integration_test(crash_recovery_phase2 integration/test_crash_recovery_
 add_dbsp_integration_test(plan_tee integration/test_plan_tee.cpp)
 add_dbsp_integration_test(engine_assumptions integration/test_engine_assumptions.cpp)
 
-# Benchmarks (not part of ctest; run manually: ./bench_planner_eval)
+# Benchmarks (throughput printed manually: ./bench_planner_eval)
 add_executable(bench_planner_eval
     benchmarks/bench_planner_eval.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_extension.cpp
@@ -115,6 +115,13 @@ add_executable(bench_planner_eval
 target_link_libraries(bench_planner_eval catch2_main duckdb_static
                       duckdb_generated_extension_loader
                       core_functions_extension parquet_extension)
+# Correctness gate (in ctest): the [planner_eval]/[shard_bench] cases assert
+# result sizes, so an API drift that empties results (e.g. source-name
+# qualification: apply_changes routes only on an exact source_table_ match)
+# fails ctest loudly instead of silently rotting a manual-only benchmark.
+# ~1s; throughput printing is untimed here and ignored.
+add_test(NAME planner_eval_smoke
+         COMMAND bench_planner_eval "[planner_eval],[shard_bench]")
 
 # Write-capture perf gate (run manually: ./bench_write_capture)
 add_executable(bench_write_capture

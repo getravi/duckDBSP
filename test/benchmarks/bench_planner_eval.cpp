@@ -71,17 +71,23 @@ TEST_CASE("Benchmark: RowExprEval vs hand-written lambda on filter path",
 
   // (a) planner view, IR optimizer ON (FILTER_MAP fused: 1 predicate +
   //     3 projection RowExprEvals per surviving row)
+  // PlanTranslator reports sources fully qualified (catalog.schema.table,
+  // e.g. "memory.main.t"); apply_changes routes only when the name matches
+  // source_table_ exactly, so feed the view's own reported source, never the
+  // bare SQL name.
   auto planner_fused = translate_view(db, "bench_fused", sql);
+  const std::string fused_src = planner_fused->source_tables()[0];
   double fused_us = measure_us(
-      [&]() { planner_fused->apply_changes("t", delta); });
+      [&]() { planner_fused->apply_changes(fused_src, delta); });
   REQUIRE(planner_fused->get_result().size() == expected);
 
   // (b) planner view, IR optimizer OFF (separate filter + map nodes)
   dbsp_native::g_plan_ir_optimize = false;
   auto planner_raw = translate_view(db, "bench_raw", sql);
   dbsp_native::g_plan_ir_optimize = true;
+  const std::string raw_src = planner_raw->source_tables()[0];
   double raw_us =
-      measure_us([&]() { planner_raw->apply_changes("t", delta); });
+      measure_us([&]() { planner_raw->apply_changes(raw_src, delta); });
   REQUIRE(planner_raw->get_result().size() == expected);
 
   // (c) hand-written lambda baseline: same predicate, no projection copy
@@ -121,7 +127,8 @@ TEST_CASE("Benchmark: planner aggregate throughput",
   const DuckDBZSet delta = build_delta();
   auto agg = translate_view(db, "bench_agg",
                             "SELECT tag, SUM(val), COUNT(*) FROM t GROUP BY tag");
-  double agg_us = measure_us([&]() { agg->apply_changes("t", delta); });
+  const std::string agg_src = agg->source_tables()[0];
+  double agg_us = measure_us([&]() { agg->apply_changes(agg_src, delta); });
   REQUIRE(agg->get_result().size() == 3); // tags a, b, c
 
   std::cout << "[bench] aggregate " << kRows << " rows: " << agg_us
@@ -142,8 +149,9 @@ TEST_CASE("Benchmark: planner join delta throughput",
   // Preload one side, then time the other side's delta (u-rows arrive
   // against a populated t index)
   const DuckDBZSet delta = build_delta();
-  join->apply_changes("t", delta);
-  double join_us = measure_us([&]() { join->apply_changes("u", delta); });
+  const auto join_srcs = join->source_tables(); // [0]=t (build), [1]=u (probe)
+  join->apply_changes(join_srcs[0], delta);
+  double join_us = measure_us([&]() { join->apply_changes(join_srcs[1], delta); });
   REQUIRE(join->get_result().size() == kRows);
 
   std::cout << "[bench] join delta " << kRows << " rows vs " << kRows
@@ -365,8 +373,9 @@ TEST_CASE("Benchmark: sharded join probes", "[benchmark][shard_bench]") {
         db, "bench_shard_join",
         "SELECT t.id, u.val FROM t JOIN u ON t.id = u.id");
     const DuckDBZSet delta = build_delta();
-    join->apply_changes("t", delta);
-    double us = measure_us([&]() { join->apply_changes("u", delta); });
+    const auto join_srcs = join->source_tables(); // [0]=t (build), [1]=u (probe)
+    join->apply_changes(join_srcs[0], delta);
+    double us = measure_us([&]() { join->apply_changes(join_srcs[1], delta); });
     REQUIRE(join->get_result().size() == kRows);
     return us;
   };
