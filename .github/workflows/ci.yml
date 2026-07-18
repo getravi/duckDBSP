@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ci-${{ runner.os }}
+          max-size: 2G
+
+      - name: Configure
+        run: |
+          cmake -S test -B test/build_test \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_UBSAN=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        run: cmake --build test/build_test -j $(nproc)
+
+      # Engine-assumption canaries FIRST: on a DuckDB bump these fail with
+      # a named assumption instead of downstream view corruption
+      - name: Engine assumption canaries
+        working-directory: test/build_test
+        run: ./test_engine_assumptions
+
+      - name: Full test suite
+        working-directory: test/build_test
+        run: ctest --output-on-failure
+
+      # Perf gates (assert-bearing benches; throughput prints land in logs)
+      - name: Bench gates
+        working-directory: test/build_test
+        run: |
+          ./bench_dataplane
+          ./bench_write_capture
