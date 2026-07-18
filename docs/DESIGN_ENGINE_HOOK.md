@@ -138,7 +138,8 @@ one release cycle; worst case we carry one rebaseable commit.
 throughput (1–2M rows/s aggregates, ~460k rows/s joins) is bounded by
 the `DuckDBRow`/`Value` data plane; spill coverage gaps, E110 SQL gaps,
 and ORDER BY/window view memory are untouched. Those are separate
-(columnar data plane) projects.
+(columnar data plane) projects — see `DESIGN_DATA_PLANE.md` (DP1 vectorized
+row hashing shipped; DP2–DP4 workload-gated).
 
 ## Costs and risks
 
