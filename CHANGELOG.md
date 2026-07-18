@@ -1,5 +1,20 @@
 # Changelog
 
+## Perf: joins 2x + CI - Jul 2026
+
+- Join-path profiling repeated the filter story: MAP_COLS survives under
+  joins (fusion can't elide it — the join needs the projected layout) at
+  56ms/100k, and plan_join spent ~half its 134ms lazy-hashing concat
+  output rows. New PlanMapColsNode (typed column-map chunk fill +
+  vectorized output hashes, COW value copies) and buffered inner-join
+  emits with pre-seeded hashes: join delta 454k -> 925k rows/s,
+  aggregate throughput 4.1M rows/s, filter overhead vs a hand lambda
+  ~1.2x. Sharded probes stay on the lazy path and now lose to serial at
+  100k scale (noted in DESIGN_DATA_PLANE.md).
+- CI: GitHub Actions (build + engine-assumption canaries first + full
+  ctest + bench gates), duckdb tree converted to a proper submodule
+  pinned at upstream v1.5.4. First run green in ~16 minutes.
+
 ## Perf: DP3a — MAP_COLS fusion + operator output-hash preseed - Jul 2026
 
 - Per-node step profiling (DBSP_STEP_PROF) showed the filter-path cost was

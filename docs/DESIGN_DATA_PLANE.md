@@ -117,6 +117,29 @@ payoff no longer clears the architectural cost on current evidence;
 revisit only if a workload shows linear-chain propagation dominating
 after DP3a.
 
+## DP3a follow-up (SHIPPED 2026-07-18): joins + MAP_COLS everywhere
+
+The join bench under DBSP_STEP_PROF repeated the filter-path story: of a
+220ms 100k-row join sync, 56ms was plan_scan_cols (MAP_COLS survives
+under joins — the fuse_map_cols pass cannot elide it there because the
+join needs the projected layout) and 134ms was plan_join, roughly half
+of it lazy-hashing the concat output rows at insert.
+
+1. **PlanMapColsNode** replaces the per-row RowMap wherever MAP_COLS
+   survives: typed chunk fill of the selected columns (BatchEvaluator
+   gains a column-map fill), fold_vector_hashes for the output hashes,
+   output values as COW copies of the source Values. 56 -> 20ms.
+2. **Buffered join emits**: the serial inner-join try_emit path buffers
+   concat rows and flushes through a typed chunk fill + hash fold +
+   pre-seeded insert. plan_join 134 -> 66ms.
+
+Results: join delta 454k -> 925k rows/s (2x); aggregate throughput
+4.1M rows/s (MAP_COLS feeds aggregate pipelines too); filter overhead
+vs hand lambda ~1.2x. Known trade: intra-op SHARDED probes emit into
+shard-local Z-sets on the lazy-hash path, so sharding now loses to
+serial at 100k-row scale — revisit the shard threshold only if a
+workload shards at sizes where it used to win.
+
 ## DP4: columnar state (research-scale)
 
 Replace hash-map Z-sets/arrangements with sorted columnar runs and

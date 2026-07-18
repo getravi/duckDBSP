@@ -198,15 +198,24 @@ public:
     return exprs_[e]->return_type;
   }
 
-  // Fill the shared input chunk once per batch (count <= kBatch)
-  void fill(const DuckDBRow *const *rows, duckdb::idx_t count) {
+  // Fill the shared input chunk once per batch (count <= kBatch).
+  // `col_map`, when given, maps chunk column c to source row column
+  // col_map[c] (out-of-range entries fill NULL) — the batched MAP_COLS
+  // node projects arbitrary column selections this way.
+  void fill(const DuckDBRow *const *rows, duckdb::idx_t count,
+            const std::vector<duckdb::idx_t> *col_map = nullptr) {
     chunk_.Reset();
     for (duckdb::idx_t c = 0; c < input_types_.size(); c++) {
-      fill_column(chunk_.data[c], input_types_[c], rows, count, c);
+      const duckdb::idx_t src = col_map ? (*col_map)[c] : c;
+      fill_column(chunk_.data[c], input_types_[c], rows, count, src);
     }
     chunk_.SetCardinality(count);
     count_ = count;
   }
+
+  // The shared input chunk (valid after fill until the next fill/slice) —
+  // the MAP_COLS node hashes its columns directly
+  duckdb::DataChunk &input_chunk() { return chunk_; }
 
   // Restrict the filled chunk to selected rows without refilling
   void slice(duckdb::SelectionVector &sel, duckdb::idx_t count) {
@@ -1708,6 +1717,7 @@ public:
         null_safe_keys_(null_safe_keys) {
     // H4: whole-delta key extraction runs batched; the per-row KeyPair
     // evals stay for point lookups (match counts, pads, marks)
+    keep_alive_join_ = keep_alive;
     if (keep_alive && !left_key_exprs.empty()) {
       batch_left_keys_ = std::make_unique<BatchEvaluator>(
           keep_alive, std::move(left_key_exprs), left_types_);
@@ -1900,6 +1910,8 @@ public:
       }
     }
 
+    flush_emits(); // batched output-hash preseed for everything buffered
+
     // Integrate deltas into the LOCAL side indexes (shared sides are
     // maintained by the CDC layer)
     if (!shared_left_) {
@@ -2080,7 +2092,63 @@ private:
     vals.insert(vals.end(), rrow.columns.begin(), rrow.columns.end());
     DuckDBRow combined;
     combined.columns.assign(std::move(vals));
-    output_.insert(std::move(combined), weight);
+    // buffer for a batched, vectorized output-hash preseed (flush_emits);
+    // inserting here would pay the lazy per-Value hash per match
+    pending_rows_.push_back(std::move(combined));
+    pending_weights_.push_back(weight);
+    if (pending_rows_.size() == BatchEvaluator::kBatch) {
+      flush_emits();
+    }
+  }
+
+  // DP3a for join outputs: fill a typed chunk from the buffered concat
+  // rows, fold per-column hash vectors (exact lazy-formula replication,
+  // same test_row_hash contract), pre-seed, insert. Serial path only —
+  // sharded probes emit into shard-local Z-sets elsewhere.
+  void flush_emits() {
+    if (pending_rows_.empty()) {
+      return;
+    }
+    if (!keep_alive_join_) {
+      // legacy construction without a keep-alive: no evaluator possible,
+      // insert with the lazy hash path
+      for (size_t i = 0; i < pending_rows_.size(); i++) {
+        output_.insert(std::move(pending_rows_[i]), pending_weights_[i]);
+      }
+      pending_rows_.clear();
+      pending_weights_.clear();
+      return;
+    }
+    if (!out_eval_) {
+      duckdb::vector<duckdb::LogicalType> types;
+      for (const auto &t : left_types_) {
+        types.push_back(t);
+      }
+      for (const auto &t : right_types_) {
+        types.push_back(t);
+      }
+      out_eval_ = std::make_unique<BatchEvaluator>(
+          keep_alive_join_, std::vector<const duckdb::Expression *>{},
+          std::move(types));
+    }
+    const duckdb::idx_t n = pending_rows_.size();
+    std::vector<const DuckDBRow *> ptrs(n);
+    for (duckdb::idx_t i = 0; i < n; i++) {
+      ptrs[i] = &pending_rows_[i];
+    }
+    out_eval_->fill(ptrs.data(), n);
+    auto &chunk = out_eval_->input_chunk();
+    std::vector<size_t> hashes(n, 0);
+    duckdb::Vector hash_scratch(duckdb::LogicalType::HASH);
+    for (duckdb::idx_t c = 0; c < chunk.ColumnCount(); c++) {
+      fold_vector_hashes(chunk.data[c], n, hash_scratch, hashes);
+    }
+    for (duckdb::idx_t i = 0; i < n; i++) {
+      pending_rows_[i].columns.set_hash(hashes[i]);
+      output_.insert(std::move(pending_rows_[i]), pending_weights_[i]);
+    }
+    pending_rows_.clear();
+    pending_weights_.clear();
   }
 
   // One side's delta with batch-evaluated keys. valid[i] == false means a
@@ -2557,6 +2625,11 @@ public:
 
 private:
   duckdb::JoinType join_type_;
+  // Buffered inner-join emits for the vectorized output-hash preseed
+  std::shared_ptr<PlanKeepAlive> keep_alive_join_;
+  std::vector<DuckDBRow> pending_rows_;
+  std::vector<int64_t> pending_weights_;
+  std::unique_ptr<BatchEvaluator> out_eval_;
   duckdb::vector<duckdb::LogicalType> left_types_, right_types_;
   bool pads_left_ = false, pads_right_ = false;
   bool marks_ = false;
@@ -2916,6 +2989,101 @@ public:
 private:
   InputFn input_fn_;
   size_t num_filters_;
+  std::unique_ptr<BatchEvaluator> eval_;
+  DuckDBZSet output_;
+  bool has_output_ = false;
+};
+
+// Batched MAP_COLS: projects a column selection (GET's column_ids order)
+// out of full CDC rows. Replaces the per-row RowMap that paid per-Value
+// copies plus a lazily hashed output insert for EVERY source row —
+// measured at ~56ms per 100k rows under joins, where the fuse_map_cols
+// IR pass cannot elide it (the join needs the projected layout). Output
+// values are COW copies of the source row's Values; hashes come from a
+// typed chunk fill + fold_vector_hashes (same lazy-formula equality
+// contract as DP1/DP3a).
+class PlanMapColsNode : public dbsp::Node {
+public:
+  using InputFn = std::function<const DuckDBZSet &()>;
+
+  PlanMapColsNode(dbsp::NodeId id, InputFn input_fn,
+                  std::shared_ptr<PlanKeepAlive> keep_alive,
+                  std::vector<duckdb::idx_t> idxs,
+                  duckdb::vector<duckdb::LogicalType> out_types)
+      : dbsp::Node(id, "plan_scan_cols"), input_fn_(std::move(input_fn)),
+        idxs_(std::move(idxs)) {
+    eval_ = std::make_unique<BatchEvaluator>(
+        std::move(keep_alive), std::vector<const duckdb::Expression *>{},
+        std::move(out_types));
+  }
+
+  StateKind state_kind() const override { return StateKind::STATELESS; }
+
+  void step() override {
+    output_.clear();
+    const DuckDBZSet &input = input_fn_();
+
+    std::vector<const DuckDBRow *> rows;
+    std::vector<int64_t> weights;
+    rows.reserve(BatchEvaluator::kBatch);
+    weights.reserve(BatchEvaluator::kBatch);
+
+    const size_t k = idxs_.size();
+    std::vector<size_t> row_hashes;
+    duckdb::Vector hash_scratch(duckdb::LogicalType::HASH);
+
+    auto flush = [&]() {
+      if (rows.empty()) {
+        return;
+      }
+      const duckdb::idx_t n = rows.size();
+      // typed fill of the SELECTED columns (native-array fast paths),
+      // purely to hash them vectorized
+      eval_->fill(rows.data(), n, &idxs_);
+      auto &chunk = eval_->input_chunk();
+      row_hashes.assign(n, 0);
+      for (size_t c = 0; c < k; c++) {
+        fold_vector_hashes(chunk.data[c], n, hash_scratch, row_hashes);
+      }
+      // output values are COW copies of the source Values — no boxing
+      for (duckdb::idx_t i = 0; i < n; i++) {
+        const auto &cols = rows[i]->columns;
+        std::vector<duckdb::Value> vals;
+        vals.reserve(k);
+        for (size_t c = 0; c < k; c++) {
+          vals.push_back(idxs_[c] < cols.size() ? cols[idxs_[c]]
+                                                : duckdb::Value());
+        }
+        DuckDBRow row;
+        row.columns.assign(std::move(vals));
+        row.columns.set_hash(row_hashes[i]);
+        output_.insert(std::move(row), weights[i]);
+      }
+      rows.clear();
+      weights.clear();
+    };
+
+    for (const auto &[row, w] : input) {
+      rows.push_back(&row);
+      weights.push_back(w);
+      if (rows.size() == BatchEvaluator::kBatch) {
+        flush();
+      }
+    }
+    flush();
+    has_output_ = !output_.empty();
+  }
+
+  void reset() override {
+    output_.clear();
+    has_output_ = false;
+  }
+  bool has_output() const override { return has_output_; }
+  const DuckDBZSet &output() const { return output_; }
+
+private:
+  InputFn input_fn_;
+  std::vector<duckdb::idx_t> idxs_;
   std::unique_ptr<BatchEvaluator> eval_;
   DuckDBZSet output_;
   bool has_output_ = false;
@@ -3529,6 +3697,22 @@ private:
     case PlanOpSpec::Kind::MAP_COLS: {
       OutputFn child = build(*spec.children[0], keep_alive);
       auto idxs = spec.column_idxs;
+      if (!spec.input_types.empty()) {
+        // batched projection with vectorized output hashing (virtual /
+        // out-of-range entries fill NULL; BOOLEAN is a placeholder chunk
+        // type — the column is all-NULL and NULLs hash as kNullHash
+        // regardless of type)
+        duckdb::vector<duckdb::LogicalType> out_types;
+        for (auto idx : idxs) {
+          out_types.push_back(idx < spec.input_types.size()
+                                  ? spec.input_types[idx]
+                                  : duckdb::LogicalType::BOOLEAN);
+        }
+        auto *node = circuit_.add_node(std::make_unique<PlanMapColsNode>(
+            circuit_.next_node_id(), std::move(child), keep_alive,
+            std::move(idxs), std::move(out_types)));
+        return [node]() -> const DuckDBZSet & { return node->output(); };
+      }
       auto *node = circuit_.add_node(std::make_unique<RowMap>(
           circuit_.next_node_id(), std::move(child),
           [idxs](const DuckDBRow &row) {
