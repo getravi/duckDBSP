@@ -294,6 +294,54 @@ private:
     return true;
   }
 
+  // Union of output-row indices dirtied by changes at `anchors`, per window
+  // shape. Returns false if any window lacks a fast rule (caller full-renders).
+  bool affected_indices(size_t n, const std::vector<size_t> &anchors,
+                        std::vector<size_t> &out) const {
+    for (const auto &win : windows_) {
+      const size_t off = (size_t)win.offset;
+      if (win.function == "LAG") {
+        for (size_t p : anchors) {
+          out.push_back(p);
+          if (p + off < n)
+            out.push_back(p + off); // reader r where r-off == p
+        }
+      } else if (win.function == "LEAD") {
+        for (size_t p : anchors) {
+          out.push_back(p);
+          if (p >= off)
+            out.push_back(p - off); // reader r where r+off == p
+        }
+      } else {
+        return false; // shape not yet fast-handled (Tasks 4-6)
+      }
+    }
+    return true;
+  }
+
+  // Re-emit only `affected` output rows: retract the cached row, render the
+  // new one, insert it, update the cache slot. Requires the cache to be
+  // index-aligned with `rows` (caller guarantees size unchanged).
+  void emit_affected(const PartitionKey &key, const std::vector<DuckDBRow> &rows,
+                     std::vector<size_t> affected) {
+    std::sort(affected.begin(), affected.end());
+    affected.erase(std::unique(affected.begin(), affected.end()),
+                   affected.end());
+    static const std::vector<size_t> kNoPeers;
+    auto &cache = partition_outputs_[key];
+    for (size_t idx : affected) {
+      if (idx >= rows.size() || idx >= cache.size())
+        continue;
+      delta_.insert(cache[idx], -1);
+      result_.insert(cache[idx], -1);
+      DuckDBRow nr = render_row(rows, idx, kNoPeers, kNoPeers,
+                               (int64_t)idx + 1, 0, 0);
+      delta_.insert(nr, 1);
+      result_.insert(nr, 1);
+      cache[idx] = nr;
+    }
+  }
+
 public:
   NativeWindowView(std::string view_name, std::string sql,
                    std::string source_table, TableSchema result_schema,
@@ -332,6 +380,8 @@ public:
 
     // 1. Identify affected partitions
     std::set<PartitionKey> affected_partitions;
+    std::map<PartitionKey, size_t> size_before;              // pre-delta size
+    std::map<PartitionKey, std::vector<DuckDBRow>> anchors_by_part; // inserts
 
     for (const auto &[row, weight] : changes) {
       PartitionKey key;
@@ -348,6 +398,8 @@ public:
         it = partitions_.emplace(key, PartitionState(primary_sort_columns_))
                  .first;
       }
+      if (!size_before.count(key))
+        size_before[key] = it->second.sorted_rows.size();
 
       // Apply change to the sorted vector (keep it ordered by cmp).
       auto &vec = it->second.sorted_rows;
@@ -373,33 +425,66 @@ public:
             vec.erase(lo);
         }
       }
+      if (weight > 0)
+        anchors_by_part[key].push_back(row);
       affected_partitions.insert(key);
     }
 
     // 2. Recompute window functions for affected partitions
     for (const auto &key : affected_partitions) {
-      // Retract old output for this partition (per-index cache)
       auto &cache = partition_outputs_[key];
-      for (const auto &row : cache) {
-        delta_.insert(row, -1);
-        result_.insert(row, -1);
-      }
-      cache.clear();
-
-      // Compute new output
       auto it = partitions_.find(key);
-      if (it == partitions_.end())
-        continue;
 
-      auto &state = it->second;
-      if (state.sorted_rows.empty()) {
-        partitions_.erase(it);
+      // Partition emptied: retract all cached output and drop it.
+      if (it == partitions_.end() || it->second.sorted_rows.empty()) {
+        for (const auto &row : cache) {
+          delta_.insert(row, -1);
+          result_.insert(row, -1);
+        }
+        cache.clear();
+        if (it != partitions_.end())
+          partitions_.erase(it);
         partition_outputs_.erase(key);
         continue;
       }
 
       // Persistent sorted vector — direct positional access, no copy.
-      const std::vector<DuckDBRow> &partition_rows = state.sorted_rows;
+      const std::vector<DuckDBRow> &partition_rows = it->second.sorted_rows;
+
+      // FAST PATH: size unchanged (pure value updates) and cache index-aligned
+      // — re-emit only the rows each window makes dirty. affected_indices
+      // returns false if any window shape has no fast rule, in which case we
+      // fall through to the full re-render below.
+      if (cache.size() == partition_rows.size() &&
+          size_before[key] == partition_rows.size()) {
+        RowComparator cmp{primary_sort_columns_};
+        std::vector<size_t> anchors;
+        for (const auto &r : anchors_by_part[key]) {
+          auto lo = std::lower_bound(partition_rows.begin(),
+                                     partition_rows.end(), r, cmp);
+          auto hi = std::upper_bound(partition_rows.begin(),
+                                     partition_rows.end(), r, cmp);
+          size_t idx = (size_t)(lo - partition_rows.begin());
+          for (auto j = lo; j != hi; ++j)
+            if (*j == r) {
+              idx = (size_t)(j - partition_rows.begin());
+              break;
+            }
+          anchors.push_back(idx);
+        }
+        std::vector<size_t> affected;
+        if (affected_indices(partition_rows.size(), anchors, affected)) {
+          emit_affected(key, partition_rows, affected);
+          continue;
+        }
+      }
+
+      // FULL PATH: retract all cached output, then re-render every row.
+      for (const auto &row : cache) {
+        delta_.insert(row, -1);
+        result_.insert(row, -1);
+      }
+      cache.clear();
 
       // Pre-calculate peer boundaries for RANGE/GROUPS
       std::vector<size_t> peer_start(partition_rows.size());

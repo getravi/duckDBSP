@@ -84,3 +84,46 @@ TEST_CASE("window incremental == full: LAG baseline", "[window][incremental]") {
   REQUIRE(zset_equal(run_incremental(lag1_def(), deltas),
                      run_full(lag1_def(), deltas)));
 }
+
+TEST_CASE("window fast LAG/LEAD value update == full", "[window][incremental]") {
+  std::vector<NativeWindowView::WindowDef> defs;
+  {
+    NativeWindowView::WindowDef lag;
+    lag.function = "LAG";
+    lag.partition_indices = {0};
+    lag.sort_columns = {{1, true, true}};
+    lag.arg_column_idx = 2;
+    lag.offset = 2;
+    NativeWindowView::WindowDef lead;
+    lead.function = "LEAD";
+    lead.partition_indices = {0};
+    lead.sort_columns = {{1, true, true}};
+    lead.arg_column_idx = 2;
+    lead.offset = 1;
+    defs = {lag, lead};
+  }
+  std::vector<DuckDBZSet> deltas;
+  DuckDBZSet d0;
+  for (int o = 0; o < 8; o++)
+    d0.insert(src(1, o, Value::INTEGER(o)), 1);
+  deltas.push_back(d0);
+  DuckDBZSet upd; // value update mid-partition (size unchanged -> fast path)
+  upd.insert(src(1, 4, Value::INTEGER(4)), -1);
+  upd.insert(src(1, 4, Value::INTEGER(400)), 1);
+  deltas.push_back(upd);
+  REQUIRE(zset_equal(run_incremental(defs, deltas), run_full(defs, deltas)));
+}
+
+TEST_CASE("window incremental == full: structural insert (fallback)",
+          "[window][incremental]") {
+  std::vector<DuckDBZSet> deltas;
+  DuckDBZSet d0;
+  for (int o = 0; o < 5; o++)
+    d0.insert(src(1, o, Value::INTEGER(o)), 1);
+  deltas.push_back(d0);
+  DuckDBZSet ins; // new ordinal -> size changes -> full re-render path
+  ins.insert(src(1, 5, Value::INTEGER(50)), 1);
+  deltas.push_back(ins);
+  REQUIRE(zset_equal(run_incremental(lag1_def(), deltas),
+                     run_full(lag1_def(), deltas)));
+}
