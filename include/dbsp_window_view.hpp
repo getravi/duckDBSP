@@ -312,8 +312,59 @@ private:
           if (p >= off)
             out.push_back(p - off); // reader r where r+off == p
         }
+      } else if (win.function == "SUM" || win.function == "COUNT" ||
+                 win.function == "AVG" || win.function == "MIN" ||
+                 win.function == "MAX") {
+        // ROWS frame(r) = [r+lo_off, r+hi_off]; p is in frame(r) iff
+        // p-hi_off <= r <= p-lo_off. Unbounded ends use sentinels. This one
+        // formula covers bounded rolling frames AND unbounded-preceding
+        // running sums (suffix) AND unbounded-following (prefix).
+        const int64_t NEG = -(1LL << 60), POS = (1LL << 60);
+        int64_t lo_off, hi_off;
+        switch (win.start) {
+        case duckdb::WindowBoundary::UNBOUNDED_PRECEDING:
+          lo_off = NEG;
+          break;
+        case duckdb::WindowBoundary::CURRENT_ROW_ROWS:
+          lo_off = 0;
+          break;
+        case duckdb::WindowBoundary::EXPR_PRECEDING_ROWS:
+          lo_off = -(int64_t)win.start_offset;
+          break;
+        case duckdb::WindowBoundary::EXPR_FOLLOWING_ROWS:
+          lo_off = (int64_t)win.start_offset;
+          break;
+        default:
+          return false; // RANGE/GROUPS not fast
+        }
+        switch (win.end) {
+        case duckdb::WindowBoundary::UNBOUNDED_FOLLOWING:
+          hi_off = POS;
+          break;
+        case duckdb::WindowBoundary::CURRENT_ROW_ROWS:
+          hi_off = 0;
+          break;
+        case duckdb::WindowBoundary::EXPR_FOLLOWING_ROWS:
+          hi_off = (int64_t)win.end_offset;
+          break;
+        case duckdb::WindowBoundary::EXPR_PRECEDING_ROWS:
+          hi_off = -(int64_t)win.end_offset;
+          break;
+        default:
+          return false;
+        }
+        for (size_t p : anchors) {
+          int64_t rlo = (hi_off >= POS) ? 0 : (int64_t)p - hi_off;
+          int64_t rhi = (lo_off <= NEG) ? (int64_t)n - 1 : (int64_t)p - lo_off;
+          if (rlo < 0)
+            rlo = 0;
+          if (rhi > (int64_t)n - 1)
+            rhi = (int64_t)n - 1;
+          for (int64_t r = rlo; r <= rhi; ++r)
+            out.push_back((size_t)r);
+        }
       } else {
-        return false; // shape not yet fast-handled (Tasks 4-6)
+        return false; // shape not yet fast-handled (fillforward = Task 6)
       }
     }
     return true;

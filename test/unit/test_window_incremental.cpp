@@ -127,3 +127,48 @@ TEST_CASE("window incremental == full: structural insert (fallback)",
   REQUIRE(zset_equal(run_incremental(lag1_def(), deltas),
                      run_full(lag1_def(), deltas)));
 }
+
+TEST_CASE("window fast ROLLING (ROWS 2 preceding) == full",
+          "[window][incremental]") {
+  NativeWindowView::WindowDef w;
+  w.function = "SUM";
+  w.partition_indices = {0};
+  w.sort_columns = {{1, true, true}};
+  w.arg_column_idx = 2;
+  w.start = duckdb::WindowBoundary::EXPR_PRECEDING_ROWS;
+  w.start_offset = 2; // 3-row trailing frame
+  w.end = duckdb::WindowBoundary::CURRENT_ROW_ROWS;
+  std::vector<NativeWindowView::WindowDef> defs{w};
+  std::vector<DuckDBZSet> deltas;
+  DuckDBZSet d0;
+  for (int o = 0; o < 10; o++)
+    d0.insert(src(1, o, Value::INTEGER(o)), 1);
+  deltas.push_back(d0);
+  DuckDBZSet upd;
+  upd.insert(src(1, 5, Value::INTEGER(5)), -1);
+  upd.insert(src(1, 5, Value::INTEGER(500)), 1);
+  deltas.push_back(upd);
+  REQUIRE(zset_equal(run_incremental(defs, deltas), run_full(defs, deltas)));
+}
+
+TEST_CASE("window fast CUMSUM (unbounded preceding) == full",
+          "[window][incremental]") {
+  NativeWindowView::WindowDef w;
+  w.function = "SUM";
+  w.partition_indices = {0};
+  w.sort_columns = {{1, true, true}};
+  w.arg_column_idx = 2;
+  w.start = duckdb::WindowBoundary::UNBOUNDED_PRECEDING;
+  w.end = duckdb::WindowBoundary::CURRENT_ROW_ROWS;
+  std::vector<NativeWindowView::WindowDef> defs{w};
+  std::vector<DuckDBZSet> deltas;
+  DuckDBZSet d0;
+  for (int o = 0; o < 10; o++)
+    d0.insert(src(1, o, Value::INTEGER(o)), 1);
+  deltas.push_back(d0);
+  DuckDBZSet upd; // edit at o=3 -> suffix [3..9] re-emits
+  upd.insert(src(1, 3, Value::INTEGER(3)), -1);
+  upd.insert(src(1, 3, Value::INTEGER(300)), 1);
+  deltas.push_back(upd);
+  REQUIRE(zset_equal(run_incremental(defs, deltas), run_full(defs, deltas)));
+}
