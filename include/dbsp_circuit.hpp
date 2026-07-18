@@ -6,6 +6,7 @@
 #include "dbsp_stream.hpp"
 #include "dbsp_zset.hpp"
 
+#include <chrono>
 #include <any>
 #include <cstdint>
 #include <functional>
@@ -504,8 +505,19 @@ public:
 
     // Execute one step of the circuit
     void step() {
+        static const bool prof = std::getenv("DBSP_STEP_PROF") != nullptr;
         for (auto& node : nodes_) {
-            node->step();
+            if (prof) {
+                auto t0 = std::chrono::steady_clock::now();
+                node->step();
+                auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - t0)
+                              .count();
+                fprintf(stderr, "[stepprof] %s %lld us\n",
+                        node->name().c_str(), (long long)(ns / 1000));
+            } else {
+                node->step();
+            }
         }
         ++time_;
     }

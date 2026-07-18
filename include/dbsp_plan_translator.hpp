@@ -222,6 +222,13 @@ public:
     return results_[e];
   }
 
+  // The (flattened) result vector of expression e — valid after
+  // execute(e) until the next execute(e). Each expression owns its own
+  // result storage, so multiple slots stay valid simultaneously (the
+  // DP3a output-hash preseed folds across them after all executes).
+  duckdb::Vector &result_vector(size_t e) { return results_[e]; }
+  duckdb::idx_t current_count() const { return count_; }
+
   // Read one entry of a flattened evaluation result as a Value, with typed
   // fast paths for common types (Vector::GetValue dispatches per call)
   static duckdb::Value read_result(duckdb::Vector &vec,
@@ -591,11 +598,92 @@ inline void fuse_filter_map(std::unique_ptr<PlanOpSpec> &spec) {
   spec->children[0] = std::move(grandchild);
 }
 
+// Clone a bound expression and remap every BOUND_REF leaf through the
+// MAP_COLS column selection. Returns nullptr when any referenced column
+// cannot be remapped (out-of-range / virtual-rowid entries).
+inline duckdb::unique_ptr<duckdb::Expression>
+remap_bound_refs(const duckdb::Expression &expr,
+                 const std::vector<duckdb::idx_t> &idxs,
+                 duckdb::idx_t source_arity) {
+  auto clone = expr.Copy();
+  bool ok = true;
+  std::function<void(duckdb::Expression &)> walk =
+      [&](duckdb::Expression &e) {
+        if (e.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+          auto &ref = e.Cast<duckdb::BoundReferenceExpression>();
+          if (ref.index >= idxs.size() || idxs[ref.index] >= source_arity) {
+            ok = false;
+            return;
+          }
+          ref.index = idxs[ref.index];
+          return;
+        }
+        duckdb::ExpressionIterator::EnumerateChildren(
+            e, [&](duckdb::Expression &child) { walk(child); });
+      };
+  walk(*clone);
+  return ok ? std::move(clone) : nullptr;
+}
+
+// FILTER_MAP/FILTER_EXPR/MAP_EXPR over MAP_COLS(x): remap the consumer's
+// bound refs through the column selection and drop the MAP_COLS node.
+// MAP_COLS re-materializes every input row (per-Value copies + a lazily
+// hashed output Z-set insert) — measured as the DOMINANT cost of simple
+// filter/projection views (~72ms of a 90ms 100k-row sync), so eliding it
+// matters more than batching it.
+inline void fuse_map_cols(std::unique_ptr<PlanOpSpec> &spec,
+                          PlanKeepAlive &keep_alive) {
+  if (spec->kind != PlanOpSpec::Kind::FILTER_MAP &&
+      spec->kind != PlanOpSpec::Kind::FILTER_EXPR &&
+      spec->kind != PlanOpSpec::Kind::MAP_EXPR) {
+    return;
+  }
+  if (spec->children.size() != 1 ||
+      spec->children[0]->kind != PlanOpSpec::Kind::MAP_COLS) {
+    return;
+  }
+  auto &map_cols = spec->children[0];
+  if (map_cols->input_types.empty()) {
+    return; // legacy spec without source layout: leave as-is
+  }
+  const auto &idxs = map_cols->column_idxs;
+  const auto arity = map_cols->input_types.size();
+
+  // clone+remap everything first; bail wholesale on any failure
+  std::vector<duckdb::unique_ptr<duckdb::Expression>> remapped;
+  std::vector<const duckdb::Expression *> new_filters, new_exprs;
+  for (const auto *e : spec->filter_exprs) {
+    auto r = remap_bound_refs(*e, idxs, arity);
+    if (!r) {
+      return;
+    }
+    new_filters.push_back(r.get());
+    remapped.push_back(std::move(r));
+  }
+  for (const auto *e : spec->exprs) {
+    auto r = remap_bound_refs(*e, idxs, arity);
+    if (!r) {
+      return;
+    }
+    new_exprs.push_back(r.get());
+    remapped.push_back(std::move(r));
+  }
+
+  for (auto &r : remapped) {
+    keep_alive.rewritten_exprs.push_back(std::move(r));
+  }
+  spec->filter_exprs = std::move(new_filters);
+  spec->exprs = std::move(new_exprs);
+  spec->input_types = map_cols->input_types; // chunk layout = full CDC row
+  spec->children[0] = std::move(map_cols->children[0]);
+}
+
 inline void optimize(std::unique_ptr<PlanOpSpec> &spec,
                      PlanKeepAlive &keep_alive) {
   combine_filters(spec);
   pushdown_filters(spec, keep_alive);
   fuse_filter_map(spec);
+  fuse_map_cols(spec, keep_alive);
   for (auto &child : spec->children) {
     optimize(child, keep_alive);
   }
@@ -700,8 +788,19 @@ public:
             key_vals[i].push_back(BatchEvaluator::read_result(v, type, i));
           }
         }
+        // DP3a: fold the executed key vectors into per-row hashes so the
+        // bucket map lookups below never pay the per-Value lazy hash
+        std::vector<size_t> key_hashes(n, 0);
+        {
+          duckdb::Vector hash_scratch(duckdb::LogicalType::HASH);
+          for (size_t g = 0; g < num_groups_; g++) {
+            fold_vector_hashes(eval_->result_vector(g), n, hash_scratch,
+                               key_hashes);
+          }
+        }
         for (duckdb::idx_t i = 0; i < n; i++) {
           keys[i].columns.assign(std::move(key_vals[i]));
+          keys[i].columns.set_hash(key_hashes[i]);
         }
         std::vector<std::vector<duckdb::Value>> args(n);
         for (size_t a = 0; a < num_args; a++) {
@@ -2769,9 +2868,23 @@ public:
             out[i].push_back(BatchEvaluator::read_result(v, type, i));
           }
         }
+        // DP3a: the projection result vectors are already flat — fold
+        // them into per-row hashes (exact lazy-formula replication, see
+        // chunk_row_hashes) so output_.insert never pays the per-Value
+        // lazy hash. Each expression owns its result storage, so every
+        // slot is still valid here.
+        std::vector<size_t> row_hashes(m, 0);
+        {
+          duckdb::Vector hash_scratch(duckdb::LogicalType::HASH);
+          for (size_t p = 0; p < num_projs; p++) {
+            fold_vector_hashes(eval_->result_vector(num_filters_ + p), m,
+                               hash_scratch, row_hashes);
+          }
+        }
         for (duckdb::idx_t i = 0; i < m; i++) {
           DuckDBRow row;
           row.columns.assign(std::move(out[i]));
+          row.columns.set_hash(row_hashes[i]);
           output_.insert(std::move(row), weights[sel.get_index(i)]);
         }
       }
@@ -5106,6 +5219,11 @@ private:
       auto select = std::make_unique<PlanOpSpec>();
       select->kind = PlanOpSpec::Kind::MAP_COLS;
       select->column_idxs = std::move(idxs);
+      // CDC full-row layout (declared column order): the fuse_map_cols IR
+      // pass needs the source arity and the fused node needs this as its
+      // chunk layout
+      select->input_types.assign(op.returned_types.begin(),
+                                 op.returned_types.end());
       select->children.push_back(std::move(source));
       return select;
     }

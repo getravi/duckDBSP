@@ -78,27 +78,44 @@ complex-filter RESIDUAL predicates (the residual `left`/`right`
 `RowExprEval` members in `dbsp_plan_translator.hpp`). Defer per `TODO.md`:
 batch only if residual-heavy joins show up in a profile.
 
-## DP3: late materialization (large) — THE measured next lever
+## DP3a (SHIPPED 2026-07-17): output-hash preseed + MAP_COLS fusion
 
-Promoted 2026-07-17. The filter bench ("RowExprEval vs hand-written lambda
-on filter path") measures the fused FILTER_MAP path — already on
-`BatchEvaluator` — at **14.4x slower than a hand lambda** doing the same
-predicate + projection. That gap is NOT expression eval; it is row<->chunk
-MARSHALING. Every operator builds a DataChunk from `DuckDBRow`s (per-cell
-Value boxing), batch-executes, then reads results back per row
-(`read_result` -> `std::vector<Value>`) and re-materializes a `DuckDBRow`
-per row (confirmed in the aggregate node's `step()` and the FILTER_MAP
-consume path). The batched execute is bracketed by scalar boxing on both
-ends; the hand lambda reads `row.columns[1]` directly and skips all of it.
+Per-node step profiling (env DBSP_STEP_PROF, kept in Circuit::step) broke
+the 14.4x down differently than assumed: the fused FILTER_MAP node was
+only ~15ms of the 90ms sync — **72ms was a hidden `plan_scan_cols`
+(MAP_COLS) node**: a per-row RowMap projecting GET's column permutation,
+paying per-Value copies plus a lazily hashed output Z-set insert for
+every input row before the filter even ran.
 
-DP3 removes exactly this: deltas flow between linear operators as
-(DataChunk, weight vector) pairs; `DuckDBRow` materializes only at stateful
-boundaries (Z-set / arrangement insertion). Filters/projections then run
-on native vectors end to end, deleting the read-back boxing that IS the
-14.4x. Touches the circuit node interfaces — `propagate_changes`, every
-PlannedCircuitView node's consume path. The gating workload the phase
-required now exists and is measured: the pure linear filter/projection
-bench at 14.4x is precisely linear-chain-propagation-dominant.
+Two fixes shipped:
+
+1. **fuse_map_cols IR pass**: FILTER_MAP/FILTER_EXPR/MAP_EXPR over
+   MAP_COLS(x) clones the consumer's bound expressions, remaps their
+   BOUND_REF leaves through the column selection, and drops the MAP_COLS
+   node (declines wholesale on out-of-range/virtual-rowid entries).
+   MAP_COLS creation now records the CDC full-row types so the fused
+   node's chunk layout and arity checks are exact.
+2. **DP3a output-hash preseed**: PlanBatchNode folds its (already flat)
+   projection result vectors into per-row hashes via fold_vector_hashes
+   and pre-seeds output rows; PlanAggregateNode does the same for group
+   keys before bucket-map lookups. Same lazy-formula replication as DP1;
+   same test_row_hash equality gate.
+
+Filter bench: 90ms -> 20ms per 100k rows (4.9M rows/s), overhead vs the
+hand lambda 13.4x -> **2.06x**. planner_frontend (5.48M assertions),
+full suite, soak, ASAN, TSAN clean.
+
+## DP3b: full late materialization (remaining, workload-gated)
+
+The remaining 2x vs the hand lambda is the true row<->chunk marshaling:
+chunk fill from Value rows, read_result boxing of projection outputs, and
+Z-set iteration. Removing it means deltas flowing between linear
+operators as (DataChunk, weight vector) pairs with DuckDBRow
+materializing only at stateful boundaries — a circuit-interface change
+(`propagate_changes`, every node's consume path). At 2x residual the
+payoff no longer clears the architectural cost on current evidence;
+revisit only if a workload shows linear-chain propagation dominating
+after DP3a.
 
 ## DP4: columnar state (research-scale)
 

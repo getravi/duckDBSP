@@ -1,5 +1,21 @@
 # Changelog
 
+## Perf: DP3a — MAP_COLS fusion + operator output-hash preseed - Jul 2026
+
+- Per-node step profiling (DBSP_STEP_PROF) showed the filter-path cost was
+  NOT the FILTER_MAP node (~15ms/100k) but a hidden plan_scan_cols
+  projection (~72ms/100k): a per-row RowMap materializing GET's column
+  permutation with lazily hashed Z-set output. New fuse_map_cols IR pass
+  clones the consumer's bound expressions, remaps BOUND_REF leaves through
+  the column selection, and deletes the node from FILTER_MAP/FILTER/MAP
+  chains. PlanBatchNode and PlanAggregateNode now also pre-seed output-row
+  and group-key hashes from their already-flat result vectors
+  (fold_vector_hashes — same exact lazy-formula replication and equality
+  gate as DP1).
+- Filter view sync: 90ms -> 20ms per 100k rows (4.9M rows/s); overhead vs
+  a hand-written lambda 13.4x -> 2.06x. DP3b (full chunk-through) demoted:
+  at 2x residual it no longer clears its architectural cost.
+
 ## Perf: DP1 vectorized row hashing - Jul 2026
 
 - Lazy per-Value row hashing was 68% of chunk->Z-set ingestion time

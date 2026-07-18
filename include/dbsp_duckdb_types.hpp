@@ -248,6 +248,24 @@ struct DuckDBRowHash {
 // per row in column order with the exact lazy-path formula. Rows built
 // from these chunks may pre-seed their cache via ColumnVec::set_hash.
 // `cols` selects and orders the chunk columns making up each row.
+// Fold one vector's hashes into per-row accumulators (out must hold n
+// zeros initially; call once per row column, in row column order)
+inline void fold_vector_hashes(duckdb::Vector &vec, duckdb::idx_t n,
+                               duckdb::Vector &hash_scratch,
+                               std::vector<size_t> &out) {
+  duckdb::VectorOperations::Hash(vec, hash_scratch, n);
+  hash_scratch.Flatten(n);
+  auto hash_data = duckdb::FlatVector::GetData<duckdb::hash_t>(hash_scratch);
+  duckdb::UnifiedVectorFormat uvf;
+  vec.ToUnifiedFormat(n, uvf);
+  for (duckdb::idx_t i = 0; i < n; i++) {
+    const size_t col_hash = uvf.validity.RowIsValid(uvf.sel->get_index(i))
+                                ? static_cast<size_t>(hash_data[i])
+                                : ColumnVec::kNullHash;
+    out[i] ^= col_hash + 0x9e3779b9 + (out[i] << 6) + (out[i] >> 2);
+  }
+}
+
 inline void chunk_row_hashes(duckdb::DataChunk &chunk,
                              const std::vector<duckdb::idx_t> &cols,
                              std::vector<size_t> &out) {
@@ -255,19 +273,7 @@ inline void chunk_row_hashes(duckdb::DataChunk &chunk,
   out.assign(n, 0);
   duckdb::Vector hashes(duckdb::LogicalType::HASH);
   for (const auto c : cols) {
-    auto &vec = chunk.data[c];
-    duckdb::VectorOperations::Hash(vec, hashes, n);
-    hashes.Flatten(n);
-    auto hash_data = duckdb::FlatVector::GetData<duckdb::hash_t>(hashes);
-    duckdb::UnifiedVectorFormat uvf;
-    vec.ToUnifiedFormat(n, uvf);
-    for (duckdb::idx_t i = 0; i < n; i++) {
-      const size_t col_hash =
-          uvf.validity.RowIsValid(uvf.sel->get_index(i))
-              ? static_cast<size_t>(hash_data[i])
-              : ColumnVec::kNullHash;
-      out[i] ^= col_hash + 0x9e3779b9 + (out[i] << 6) + (out[i] >> 2);
-    }
+    fold_vector_hashes(chunk.data[c], n, hashes, out);
   }
 }
 
