@@ -96,6 +96,16 @@ public:
     p_->v = std::move(v);
   }
 
+  // Pre-seed the hash cache (vectorized chunk hashing computes the same
+  // value ~40x cheaper than the lazy per-Value path). ONLY valid with a
+  // hash produced by chunk_row_hashes() for exactly this content — a
+  // wrong seed corrupts every Z-set the row enters.
+  void set_hash(size_t h) {
+    if (p_) {
+      p_->hash.store(h, std::memory_order_relaxed);
+    }
+  }
+
   // --- mutating API (clones a shared payload, invalidates the cache) ---
   void push_back(const duckdb::Value &v) { mutate().push_back(v); }
   void push_back(duckdb::Value &&v) { mutate().push_back(std::move(v)); }
@@ -230,6 +240,45 @@ struct DuckDBRowHash {
     return row.columns.hash();
   }
 };
+
+// Vectorized replication of ColumnVec::hash for whole chunks: one
+// VectorOperations::Hash per column (Value::Hash is IMPLEMENTED as a
+// 1-element VectorOperations::Hash, so per-element equality holds by
+// construction), NULL positions substituted with kNullHash, combined
+// per row in column order with the exact lazy-path formula. Rows built
+// from these chunks may pre-seed their cache via ColumnVec::set_hash.
+// `cols` selects and orders the chunk columns making up each row.
+inline void chunk_row_hashes(duckdb::DataChunk &chunk,
+                             const std::vector<duckdb::idx_t> &cols,
+                             std::vector<size_t> &out) {
+  const duckdb::idx_t n = chunk.size();
+  out.assign(n, 0);
+  duckdb::Vector hashes(duckdb::LogicalType::HASH);
+  for (const auto c : cols) {
+    auto &vec = chunk.data[c];
+    duckdb::VectorOperations::Hash(vec, hashes, n);
+    hashes.Flatten(n);
+    auto hash_data = duckdb::FlatVector::GetData<duckdb::hash_t>(hashes);
+    duckdb::UnifiedVectorFormat uvf;
+    vec.ToUnifiedFormat(n, uvf);
+    for (duckdb::idx_t i = 0; i < n; i++) {
+      const size_t col_hash =
+          uvf.validity.RowIsValid(uvf.sel->get_index(i))
+              ? static_cast<size_t>(hash_data[i])
+              : ColumnVec::kNullHash;
+      out[i] ^= col_hash + 0x9e3779b9 + (out[i] << 6) + (out[i] >> 2);
+    }
+  }
+}
+
+inline void chunk_row_hashes(duckdb::DataChunk &chunk,
+                             std::vector<size_t> &out) {
+  std::vector<duckdb::idx_t> cols;
+  for (duckdb::idx_t c = 0; c < chunk.ColumnCount(); c++) {
+    cols.push_back(c);
+  }
+  chunk_row_hashes(chunk, cols, out);
+}
 
 // JOIN-specific equality: NULL never matches NULL (SQL standard for JOINs)
 struct JoinRowEqual {

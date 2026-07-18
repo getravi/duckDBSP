@@ -2640,9 +2640,15 @@ private:
           break;
         }
       }
+      // Vectorized row hashes (lazy per-Value hashing was ~2/3 of
+      // ingestion time); pre-seeds each row's cache with the identical
+      // value the lazy path would compute
+      std::vector<size_t> row_hashes;
+      chunk_row_hashes(chunk, row_hashes);
       for (idx_t i = 0; i < n; i++) {
         DuckDBRow row;
         row.columns.assign(std::move(vals[i]));
+        row.columns.set_hash(row_hashes[i]);
         emit(std::move(row));
       }
       total += static_cast<int64_t>(n);

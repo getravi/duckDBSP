@@ -67,6 +67,7 @@ add_dbsp_test(distinct_on unit/test_distinct_on.cpp)
 add_dbsp_test(recursive unit/test_recursive.cpp)
 add_dbsp_test(auto_cdc unit/test_auto_cdc.cpp)
 add_dbsp_test(write_capture unit/test_write_capture.cpp)
+add_dbsp_test(row_hash unit/test_row_hash.cpp)
 
 # Integration tests (require DuckDB)
 function(add_dbsp_integration_test TEST_NAME SOURCE)
@@ -122,6 +123,16 @@ add_executable(bench_write_capture
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_recovery.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_crash_marker.cpp)
 target_link_libraries(bench_write_capture catch2_main duckdb_static
+                      duckdb_generated_extension_loader
+                      core_functions_extension parquet_extension)
+
+# Data-plane micro-benchmarks (run manually: ./bench_dataplane)
+add_executable(bench_dataplane
+    benchmarks/bench_dataplane.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_extension.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_recovery.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_crash_marker.cpp)
+target_link_libraries(bench_dataplane catch2_main duckdb_static
                       duckdb_generated_extension_loader
                       core_functions_extension parquet_extension)
 

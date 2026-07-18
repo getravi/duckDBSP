@@ -1,5 +1,19 @@
 # Changelog
 
+## Perf: DP1 vectorized row hashing - Jul 2026
+
+- Lazy per-Value row hashing was 68% of chunk->Z-set ingestion time
+  (each Value::Hash constructs two Vectors internally).
+  chunk_row_hashes() computes whole-chunk row hashes via one
+  VectorOperations::Hash per column, replicating the lazy combine
+  exactly (equality by construction — Value::Hash IS a 1-element
+  VectorOperations::Hash — pinned across types/NULLs/nested/subsets by
+  test_row_hash.cpp, 3.8k assertions). stream_table_rows pre-seeds row
+  caches: ingestion 684->304 ms per 1M rows (2.25x), scan-path sync
+  ~0.27 us/row. bench_dataplane records the cost split and gates the
+  win. Roadmap for DP2-DP4 (batched key eval, late materialization,
+  columnar state) in docs/DESIGN_DATA_PLANE.md.
+
 ## Feature: O(Δ) auto-sync capture for UPDATE and DELETE - Jul 2026
 
 - Whitelisted UPDATE/DELETE statements on tracked tables now commit via

@@ -58,9 +58,10 @@ subsystem, bespoke parser, standalone Z-set spilling).
   engine bump.
 - Phase D1 vectorized filter/map/fused evaluation + zero-copy circuit
   deltas: fused filter 259k→644k rows/s, aggregate 770k→1.88M, join delta
-  140k→265k. Remaining ~2.4× gap vs a hand-written lambda is Z-set insert
-  hashing (DuckDBRow hashes every column Value) — candidate: cache row
-  hashes. See test/benchmarks/bench_planner_eval.cpp.
+  140k→265k. The Z-set ingestion hash cost is now FIXED (DP1 vectorized
+  row hashing, 2.25× ingestion; docs/DESIGN_DATA_PLANE.md). Remaining
+  data-plane phases (batched key eval, late materialization, columnar
+  state) are scoped there, workload-gated.
 - Aggregate keys/args, join keys, and residuals still evaluate per-row
   (RowExprEval); batch if profiles demand.
 - Row-hash caching: DONE (G1, ColumnVec; H3 dense-map storage on top).
