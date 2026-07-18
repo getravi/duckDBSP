@@ -58,6 +58,19 @@
 
 namespace dbsp_native {
 
+// Engine-hook (SaaS fork) runtime flag. Set by register_engine_hook
+// (dbsp_engine_hook.hpp) when the patched engine's txn-modification callback
+// is registered. While true, the design-1/plan-tee capture stack stays
+// disarmed: the engine reports exact per-commit deltas, so predictive
+// capture would only duplicate the work its guards exist to distrust.
+inline std::atomic<bool> &engine_hook_flag() {
+  static std::atomic<bool> flag{false};
+  return flag;
+}
+inline bool engine_hook_active() {
+  return engine_hook_flag().load(std::memory_order_relaxed);
+}
+
 class DBSPContextState : public duckdb::ClientContextState {
 public:
   // ---- D2 plan-tee surface (dbsp_plan_tee.hpp) ----------------------
@@ -85,6 +98,9 @@ public:
   bool current_stmt_captured() const { return stmt_.captured; }
 
   void arm_tee(const std::string &table_key) {
+    if (engine_hook_active()) {
+      return; // engine reports exact deltas: the tee would double-count
+    }
     std::lock_guard<std::mutex> guard(tee_.mutex);
     tee_.armed = true;
     tee_.table = table_key;
@@ -126,6 +142,34 @@ public:
     tee_.delta.insert(std::move(new_row), 1);
   }
   // ---- end tee surface ----------------------------------------------
+
+  // ---- engine-hook surface (dbsp_engine_hook.hpp, SaaS fork) ---------
+  // Called from the engine's txn-modification callback, inside
+  // DuckTransaction::Commit. Buffer only — application happens in
+  // TransactionCommit, where running SQL is safe. The caller has already
+  // filtered untracked tables.
+  void engine_buffer_delta(const std::string &table_key, DuckDBZSet &&delta) {
+    capture_.engine_fed = true;
+    if (delta.empty()) {
+      return;
+    }
+    auto &dst = capture_.engine_deltas[table_key];
+    if (dst.empty()) {
+      dst = std::move(delta);
+      return;
+    }
+    for (const auto &[row, w] : delta) {
+      dst.insert(row, w);
+    }
+  }
+
+  // Conversion failed mid-buffer: the engine picture is incomplete, so the
+  // commit must reconcile by scan instead of applying a partial delta.
+  void engine_mark_unknown() {
+    capture_.engine_fed = true;
+    capture_.unknown_writes = true;
+  }
+  // ---- end engine-hook surface ----------------------------------------
 
   void QueryBegin(duckdb::ClientContext &context) override {
     if (internal_query_depth > 0) {
@@ -189,9 +233,10 @@ public:
     // Autocommit statements already run inside their own transaction here
     // (probed empirically), so every capture buffers in capture_ and
     // applies from the TransactionCommit hook.
-    if (stmt_.kind == StmtClass::WRITE_KNOWN ||
-        (stmt_.kind == StmtClass::INSERT_OK &&
-         context.transaction.IsAutoCommit())) {
+    if (!engine_hook_active() &&
+        (stmt_.kind == StmtClass::WRITE_KNOWN ||
+         (stmt_.kind == StmtClass::INSERT_OK &&
+          context.transaction.IsAutoCommit()))) {
       try {
         try_write_capture(context, manager);
       } catch (...) {
@@ -252,7 +297,9 @@ public:
       // the hooks); failed statements never fold — the transaction is
       // invalidated anyway
       fold_into_txn(context, stmt_);
-      classify_and_capture(context);
+      if (!engine_hook_active()) {
+        classify_and_capture(context); // G2 appends: engine hook covers these
+      }
     } catch (const std::exception &) {
       // Capture is an optimization only: on any surprise, poison the
       // transaction so commit falls back to scan-and-diff
@@ -277,6 +324,35 @@ public:
     }
 
     try {
+      // Engine-hook fast path (SaaS fork): the engine reported this
+      // transaction's exact per-table images — facts need no guards.
+      // unknown_writes still forces a scan: DDL (ALTER rewrites, etc.)
+      // produces no tuple undo entries, so the engine deltas alone can be
+      // an incomplete picture of such a transaction.
+      if (capture_.engine_fed) {
+        const bool unknown = capture_.unknown_writes;
+        auto deltas = std::move(capture_.engine_deltas);
+        capture_ = {};
+        clear_tee();
+        std::vector<std::string> failed;
+        for (auto &[table, delta] : deltas) {
+          if (!manager.apply_captured_delta(table, delta, &context)) {
+            // untracked-by-now or deferred-baseline rebuild scheduled:
+            // reconcile that table by scan below
+            failed.push_back(table);
+          }
+        }
+        if (unknown) {
+          manager.sync_all(context, &transaction);
+        } else if (!failed.empty()) {
+          manager.sync_tables(context, failed,
+                              manager.parallel_sync_enabled() &&
+                                  failed.size() > 1,
+                              &transaction);
+        }
+        return;
+      }
+
       if (capture_.active && !capture_.dirty && !capture_.unknown_writes &&
           apply_captured(context, manager)) {
         capture_ = {};
@@ -419,6 +495,11 @@ private:
     std::unordered_map<std::string, std::vector<WriteVerify>> verifies;
     uint64_t seq_snapshot = 0;
     bool wrote_capture = false;
+    // Engine-hook (SaaS fork): exact per-table deltas the patched engine
+    // reported for this transaction (dbsp_engine_hook.hpp buffers them
+    // during DuckTransaction::Commit; TransactionCommit applies guard-free)
+    std::unordered_map<std::string, DuckDBZSet> engine_deltas;
+    bool engine_fed = false;
   };
   TxnCapture capture_;
 

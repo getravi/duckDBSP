@@ -175,12 +175,36 @@ rather than mis-binding.
 
 ## Work items (tracked)
 
-1. **A3 `StreamModifications`** — port `WriteToWAL` extraction (~1-2 days). The
-   only real engineering left.
-2. `ingest_engine_modifications` — chunks → `TxnCapture` → `apply_captured_delta`
-   (reuses existing ingestion; small).
-3. Generate + commit `patches/v1.5.4-dbsp-txn-callback.patch` once A3 compiles.
-4. Wire `DBSP_ENGINE_HOOK` define into the patched-engine build only.
+1. **A3 `StreamModifications`** — **DONE 2026-07-18** (see A3 notes above;
+   11 differential tests in `test/unit/test_engine_hook.cpp`).
+2. `ingest_engine_modifications` — **DONE 2026-07-18**
+   (`include/dbsp_engine_hook.hpp` + gating in `dbsp_context_state.hpp`;
+   e2e tests `test/integration/test_engine_hook_consumer.cpp`). Key choices:
+   - **Buffer in the engine callback, apply in `TransactionCommit`.** The
+     callback fires inside `DuckTransaction::Commit` (locks held, re-entrant
+     SQL unsafe); apply can run SQL (deferred-baseline prep). Buffered into
+     `TxnCapture::engine_deltas`; rollback clears it for free.
+   - Guard-free apply (`engine_fed` branch): facts need no seq/COUNT/rowid
+     guards. `unknown_writes` still forces `sync_all` — DDL (ALTER rewrites)
+     produces no tuple undo entries, so engine deltas alone can be
+     incomplete for such transactions.
+   - Capture stack disarmed while `engine_hook_active()`:
+     `try_write_capture` / `arm_tee` / `classify_and_capture` gate on the
+     flag. Appender-API writes (formerly always `sync_all`) now ride the
+     exact engine delta.
+   - Untracked tables dropped at ingest (`is_table_tracked` on the
+     `catalog.schema.table` key built from `DataTableInfo` +
+     `GetDB().GetName()` — never a catalog lookup inside Commit).
+3. Generate + commit `patches/v1.5.4-dbsp-txn-callback.patch` — **DONE**
+   (regenerated with the full A3 body).
+4. `DBSP_ENGINE_HOOK` define — **DONE**: root CMake option (default ON,
+   in-tree submodule is patched) on the loadable extension +
+   benchmark_runner; in test/ it is deliberately per-target (only
+   `test_engine_hook_consumer`) so plan-tee/write-capture tests keep
+   exercising the legacy paths — the flag is process-sticky.
+   Stock-mode build: clean submodule + `-DDBSP_ENGINE_HOOK=OFF`.
 5. Once prod is on the fork: delete the capture stack (`dbsp_write_capture.hpp`,
    `dbsp_plan_tee.hpp`, guard machinery) — ~1,500 lines.
 6. Optional: file the upstream PR (MV primitive) to shrink rebases to zero.
+7. Open: runtime engine-version tag (`'dbsp' in duckdb.__version__` covers the
+   wheel; an in-process probe would harden LOAD-into-stock misconfigs).

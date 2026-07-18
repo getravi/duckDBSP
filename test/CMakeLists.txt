@@ -22,6 +22,15 @@ if(NOT TARGET duckdb_static)
     add_subdirectory(${DUCKDB_SOURCE_DIR} duckdb EXCLUDE_FROM_ALL)
 endif()
 
+# SaaS-fork engine hook consumer (see root CMakeLists.txt). ON requires the
+# patched submodule; OFF = stock-mode build (hook test excluded).
+# Deliberately NOT a global compile definition: the hook-active flag is
+# process-sticky, so defining it everywhere would stop the plan-tee and
+# write-capture tests from exercising the legacy capture paths. Only the
+# dedicated consumer test builds with the define (see below); every other
+# binary keeps testing the stock-mode stack.
+option(DBSP_ENGINE_HOOK "Consume the patched engine's txn-modification callback" ON)
+
 # Include directories
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/..
@@ -87,6 +96,10 @@ function(add_dbsp_integration_test TEST_NAME SOURCE)
 endfunction()
 
 add_dbsp_integration_test(extension_basic integration/test_extension_basic.cpp)
+if(DBSP_ENGINE_HOOK)
+    add_dbsp_integration_test(engine_hook_consumer integration/test_engine_hook_consumer.cpp)
+    target_compile_definitions(test_engine_hook_consumer PRIVATE DBSP_ENGINE_HOOK)
+endif()
 add_dbsp_integration_test(planner_frontend integration/test_planner_frontend.cpp)
 add_dbsp_integration_test(extension_cdc integration/test_extension_cdc.cpp)
 add_dbsp_integration_test(cascading_views integration/test_cascading_views.cpp)

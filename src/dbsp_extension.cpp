@@ -49,6 +49,7 @@
 #include "dbsp_context_state.hpp"
 #include "dbsp_instance_registry.hpp"
 #include "dbsp_parser_extension.hpp"
+#include "dbsp_engine_hook.hpp"
 #include "dbsp_plan_tee.hpp"
 #include "dbsp_recovery.hpp"
 #include "duckdb/main/connection_manager.hpp"
@@ -1548,6 +1549,12 @@ static void LoadInternal(ExtensionLoader &loader) {
   // D2 plan tee: exact captured deltas for DML shapes the design-1
   // pre-image SELECT declines (docs/DESIGN_WRITE_CAPTURE.md)
   dbsp_native::register_plan_tee(config);
+
+  // SaaS-fork engine hook: exact commit deltas straight from the patched
+  // engine (patches/v1.5.4-dbsp-txn-callback.patch). Returns false (no-op)
+  // when built without DBSP_ENGINE_HOOK; while active, the capture stack
+  // above stays disarmed (dbsp_context_state.hpp gates on the flag).
+  dbsp_native::register_engine_hook(instance);
 
   // Register table functions
   TableFunction track_func("dbsp_track", {LogicalType::VARCHAR}, TrackFunc,
