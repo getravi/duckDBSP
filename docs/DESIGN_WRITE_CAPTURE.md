@@ -108,10 +108,39 @@ child projection) onto the old image. Two extra findings:
   invisible and binding resolution fails downstream.
 An `UPDATE ... FROM` child emitting two different new images for one
 target row (multi-match) is ambiguous: the tee invalidates itself for the
-statement and the scan reconciles. With this, EVERY plain-SQL DML shape
-on a tracked table is O(Δ) except: multi-statement strings, Appender
-writes (no per-statement hooks), and multi-match UPDATE ... FROM
-(ambiguous by SQL semantics).
+statement and the scan reconciles.
+
+**Design-2 phase 3: the INSERT tee.** Autocommit INSERTs whose child
+already emits final table-order rows are teed as +1 appends (no rowid
+exists yet; duplicates are real inserts, no dedupe). Gates: autocommit
+only (explicit-txn INSERTs are G2's LocalStorage scan — teeing both would
+double-count), no ON CONFLICT (the insert operator resolves conflicts
+internally), and identity or pure-permutation `column_index_map` — any
+DEFAULT-filled column is resolved by a PHYSICAL projection injected ABOVE
+the tee at plan time, and replicating default evaluation would run
+sequences twice (canary-tested: a nextval() default declines the tee and
+advances exactly once). This closes non-repeatable INSERT sources
+(LIMIT/SAMPLE/table functions) and, combined with per-sub-statement
+optimizer passes, multi-statement DML strings (each sub-statement is its
+own autocommit transaction and tees independently — tested).
+
+**Engine-assumption canaries** (`test/integration/test_engine_assumptions.cpp`):
+every empirically probed engine behavior the capture stack stands on is
+pinned by a named test — BOUND_COLUMN_REF timing (observed via a probe
+OptimizerExtension at the tee's own pipeline point; ExtractPlan returns
+the RESOLVED plan and cannot stand in), UPDATE child projection with
+rowid last, projection-pushdown GET binding rules, update_is_del_and_insert
+conditions, INSERT column_index_map semantics, and autocommit hook
+ordering. On an engine upgrade these fail FIRST with a readable name.
+Writing them surfaced two refinements: a provably-empty DML predicate
+folds the child to LOGICAL_EMPTY_RESULT (the tee correctly declines —
+zero rows anyway), and QueryEnd for autocommit statements sees NO active
+transaction (the commit hook, which fires mid-statement, is the only
+post-execution point with transaction context).
+
+With this, EVERY plain-SQL DML shape on a tracked table is O(Δ) except:
+Appender writes (no per-statement hooks) and multi-match
+UPDATE ... FROM (ambiguous by SQL semantics).
 
 ### Upstream check
 

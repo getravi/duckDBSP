@@ -79,6 +79,18 @@
   With this, every plain-SQL DML statement on a tracked table syncs in
   O(Δ) except multi-statement strings, Appender writes, and multi-match
   UPDATE ... FROM.
+- Design-2 phase 3: the INSERT tee + engine-assumption canaries.
+  Autocommit INSERTs tee their child rows as exact +1 appends (identity/
+  permutation column maps only — DEFAULTs resolve in a physical
+  projection above the tee, so a nextval() default declines rather than
+  double-advancing; canary-tested). Closes LIMIT/SAMPLE/table-function
+  INSERT sources and multi-statement DML strings. A new canary suite
+  (test_engine_assumptions.cpp) pins every empirically probed engine
+  behavior by name so engine upgrades fail readably instead of as view
+  corruption; writing it surfaced that provably-empty DML predicates
+  fold to LOGICAL_EMPTY_RESULT (tee declines, correctly) and that
+  autocommit QueryEnd has no transaction (the mid-statement commit hook
+  is the only post-execution point with one).
 - No upstream help available: DuckDB through 1.5.x ships no CDC/changeset
   extension hook (discussion #12408 open); revisit on engine upgrade.
 

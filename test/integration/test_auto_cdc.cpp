@@ -237,12 +237,13 @@ TEST_CASE("G2: autocommit VALUES inserts sync via captured deltas",
   REQUIRE(manager.scan_syncs() == scans);
   db.assertViewRowCount("v_cap4", 3);
 
-  // LIMIT makes the row choice scan-order-dependent: scan path
+  // LIMIT source: design 1 declines (row choice depends on scan order)
+  // but the D2 INSERT tee records the rows actually appended
   caps = manager.captured_delta_syncs();
   scans = manager.scan_syncs();
   db.exec("INSERT INTO ct4 SELECT id + 20, val FROM ct4 LIMIT 1");
-  REQUIRE(manager.captured_delta_syncs() == caps);
-  REQUIRE(manager.scan_syncs() == scans + 1);
+  REQUIRE(manager.captured_delta_syncs() == caps + 1);
+  REQUIRE(manager.scan_syncs() == scans);
 
   db.exec("SELECT * FROM dbsp_auto_sync(false)");
 }
@@ -751,12 +752,12 @@ TEST_CASE("write capture: autocommit INSERT VALUES differential",
     REQUIRE(m.scan_syncs() == scans);
     fx.check_views();
   }
-  SECTION("volatile expression falls back") {
+  SECTION("volatile expression: teed (records the value inserted)") {
     const uint64_t caps = m.captured_delta_syncs();
     const uint64_t scans = m.scan_syncs();
     fx.db.exec("INSERT INTO wt VALUES (14, 1, CAST(random() * 0 AS INT))");
-    REQUIRE(m.captured_delta_syncs() == caps);
-    REQUIRE(m.scan_syncs() == scans + 1);
+    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.scan_syncs() == scans);
     fx.check_views();
   }
   SECTION("captured INSERT then captured UPDATE, separate autocommits") {

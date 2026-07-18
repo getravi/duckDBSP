@@ -43,11 +43,16 @@ subsystem, bespoke parser, standalone Z-set spilling).
   extension): any remaining UPDATE or DELETE shape is captured from the
   rows the plan actually processed — UPDATE...FROM, parameters, volatile
   expressions, post-write subqueries, indexed-column UPDATEs,
-  same-table-twice txns. Still scan-diff: multi-match UPDATE...FROM (two
-  new images for one row — ambiguous; the tee detects and steps aside),
-  LIMIT/SAMPLE/table-function/window/CTE INSERT sources (row set not
-  repeatable or no stability metadata), multi-statement strings, and
-  Appender writes (no per-statement hooks).
+  same-table-twice txns. The INSERT tee covers
+  autocommit INSERTs with full-cover column maps (any source shape, incl.
+  LIMIT/SAMPLE/table functions) and multi-statement DML strings (each
+  sub-statement tees as its own autocommit txn). Still scan-diff:
+  multi-match UPDATE...FROM (ambiguous; tee detects and steps aside),
+  DEFAULT-filled partial-column INSERTs from non-repeatable sources
+  (defaults resolve in a physical projection above the tee), and Appender
+  writes (no per-statement hooks). Engine-behavior assumptions are pinned
+  by test/integration/test_engine_assumptions.cpp — run it FIRST on any
+  engine bump.
 - Phase D1 vectorized filter/map/fused evaluation + zero-copy circuit
   deltas: fused filter 259k→644k rows/s, aggregate 770k→1.88M, join delta
   140k→265k. Remaining ~2.4× gap vs a hand-written lambda is Z-set insert

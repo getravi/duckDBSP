@@ -31,6 +31,7 @@
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 
@@ -61,15 +62,20 @@ public:
                                  std::move(types), estimated_cardinality),
         rowid_pos(rowid_pos), col_pos(std::move(col_pos)),
         set_map(std::move(set_map)), n_output(n_output) {}
+  // set after Make<> for INSERT-mode tees
+
 
   duckdb::idx_t rowid_pos;
-  std::vector<duckdb::idx_t> col_pos; // old row image, table column order
+  std::vector<duckdb::idx_t> col_pos; // row image positions, table order
   // UPDATE only: (physical column index, child position of its SET value)
   std::vector<std::pair<duckdb::idx_t, duckdb::idx_t>> set_map;
-  // 0 = full pass-through (DELETE); otherwise emit only the first
+  // 0 = full pass-through (DELETE/INSERT); otherwise emit only the first
   // n_output input columns so the update operator's rowid-is-last-column
   // convention survives the widening
   duckdb::idx_t n_output;
+  // INSERT mode: no rowid exists yet — col_pos maps the child's columns
+  // (already cast to table types by the binder) into table order
+  bool is_insert = false;
 
   duckdb::unique_ptr<duckdb::OperatorState>
   GetOperatorState(duckdb::ExecutionContext &context) const override {
@@ -88,6 +94,11 @@ public:
         old_row.columns.reserve(col_pos.size());
         for (const auto pos : col_pos) {
           old_row.columns.push_back(input.GetValue(pos, i));
+        }
+        if (is_insert) {
+          // appended row: no rowid yet, duplicates are real inserts
+          ctx_state->tee_add_insert(std::move(old_row));
+          continue;
         }
         const auto rowid =
             input.GetValue(rowid_pos, i).GetValue<int64_t>();
@@ -134,6 +145,7 @@ public:
   std::vector<duckdb::idx_t> col_pos;
   std::vector<std::pair<duckdb::idx_t, duckdb::idx_t>> set_map;
   duckdb::idx_t n_output;
+  bool is_insert = false;
 
   duckdb::vector<duckdb::ColumnBinding> GetColumnBindings() override {
     auto bindings = children[0]->GetColumnBindings();
@@ -156,6 +168,7 @@ public:
     auto &op = planner.Make<PhysicalTee>(std::move(out_types),
                                          child.estimated_cardinality,
                                          rowid_pos, col_pos, set_map, n_output);
+    op.Cast<PhysicalTee>().is_insert = is_insert;
     op.children.push_back(child);
     return op;
   }
@@ -381,6 +394,64 @@ inline void tee_walk(duckdb::ClientContext &context, CDCManager &manager,
           std::move(upd.children[0]), rowid_pos, std::move(col_pos),
           std::move(set_map), n_output);
       upd.children[0]->ResolveOperatorTypes();
+      state.arm_tee(key);
+    } while (false);
+  }
+  if (op->type == duckdb::LogicalOperatorType::LOGICAL_INSERT) {
+    auto &ins = op->Cast<duckdb::LogicalInsert>();
+    const std::string key = canonical_table_key(ins.table);
+    do {
+      // Explicit-transaction INSERTs are G2's job (LocalStorage scan is
+      // exact there; teeing both would double-count). ON CONFLICT rows
+      // are resolved inside the insert operator — child rows are not the
+      // final effect. Defaults and partial column lists resolve in a
+      // PHYSICAL projection injected ABOVE this tee at plan time, so
+      // only identity or pure-permutation column maps are teeable
+      // (replicating default evaluation would run sequences twice).
+      if (!manager.is_table_tracked(key) ||
+          !context.transaction.IsAutoCommit() || ins.children.empty() ||
+          ins.on_conflict_info.action_type !=
+              duckdb::OnConflictAction::THROW) {
+        break;
+      }
+      auto &table_cols = ins.table.GetColumns();
+      const auto n_cols = table_cols.PhysicalColumnCount();
+      if (n_cols != table_cols.LogicalColumnCount()) {
+        break; // generated columns: child order diverges from row layout
+      }
+      std::vector<duckdb::idx_t> col_pos;
+      if (ins.column_index_map.empty()) {
+        // no column list: the binder cast the source to table order
+        if (ins.children[0]->GetColumnBindings().size() != n_cols) {
+          break;
+        }
+        for (duckdb::idx_t c = 0; c < n_cols; c++) {
+          col_pos.push_back(c);
+        }
+      } else {
+        // full-cover (possibly permuted) column list: map back to table
+        // order; any INVALID entry means a DEFAULT would fill it — the
+        // physical defaults projection sits above us, decline
+        bool ok = true;
+        for (auto &col : table_cols.Physical()) {
+          const auto mapped = ins.column_index_map[col.Physical()];
+          if (mapped == duckdb::DConstants::INVALID_INDEX) {
+            ok = false;
+            break;
+          }
+          col_pos.push_back(mapped);
+        }
+        if (!ok || col_pos.size() != n_cols) {
+          break;
+        }
+      }
+      auto tee = duckdb::make_uniq<LogicalTee>(
+          std::move(ins.children[0]), /*rowid_pos=*/0, std::move(col_pos),
+          std::vector<std::pair<duckdb::idx_t, duckdb::idx_t>>(),
+          /*n_output=*/0);
+      tee->is_insert = true;
+      ins.children[0] = std::move(tee);
+      ins.children[0]->ResolveOperatorTypes();
       state.arm_tee(key);
     } while (false);
   }

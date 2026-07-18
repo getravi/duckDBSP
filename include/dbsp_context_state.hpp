@@ -99,6 +99,16 @@ public:
     tee_.delta.insert(std::move(row), -1);
   }
 
+  // Execution threads: one appended row (no rowid exists yet; duplicate
+  // rows are real duplicate inserts — no dedupe)
+  void tee_add_insert(DuckDBRow &&row) {
+    std::lock_guard<std::mutex> guard(tee_.mutex);
+    if (!tee_.armed) {
+      return;
+    }
+    tee_.delta.insert(std::move(row), 1);
+  }
+
   // Execution threads: one updated row (old image, new image). A repeated
   // rowid means the plan produced multiple new images for one target row
   // (UPDATE ... FROM multi-match) — ambiguous, invalidate the tee.

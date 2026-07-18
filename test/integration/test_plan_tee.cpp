@@ -197,3 +197,65 @@ TEST_CASE("plan tee: indexed-column UPDATE (del_and_insert) stays O(delta)",
   }
   db.exec("SELECT * FROM dbsp_auto_sync(false)");
 }
+
+TEST_CASE("plan tee: non-repeatable INSERT sources stay O(delta)",
+          "[integration][plan_tee]") {
+  TeeFixture fx;
+  auto &m = fx.db.manager();
+
+  SECTION("table-function source") {
+    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t scans = m.scan_syncs();
+    fx.db.exec("INSERT INTO tt SELECT 100 + i, 3, CAST(i AS INT) "
+               "FROM range(3) r(i)");
+    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.scan_syncs() == scans);
+    fx.check();
+  }
+  SECTION("USING SAMPLE source") {
+    const uint64_t caps = m.captured_delta_syncs();
+    fx.db.exec("INSERT INTO tt SELECT id + 200, grp, val FROM tt "
+               "USING SAMPLE 2");
+    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    fx.check();
+  }
+  SECTION("permuted full column list") {
+    const uint64_t caps = m.captured_delta_syncs();
+    fx.db.exec("INSERT INTO tt (val, id, grp) VALUES (77, 300, 1)");
+    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    fx.check();
+  }
+  SECTION("sequence DEFAULT declines the tee, sequence advances once") {
+    // partial column list => the physical defaults projection sits above
+    // the tee; teeing would evaluate nextval twice. Must scan instead.
+    fx.db.exec("CREATE SEQUENCE tsq");
+    fx.db.exec("CREATE TABLE tseq (id INT DEFAULT nextval('tsq'), v INT)");
+    fx.db.exec("SELECT * FROM dbsp_track('tseq')");
+    fx.db.exec("SELECT * FROM dbsp_sync('tseq')");
+    const uint64_t scans = m.scan_syncs();
+    fx.db.exec("INSERT INTO tseq (v) VALUES (1)");
+    REQUIRE(m.scan_syncs() == scans + 1);
+    auto res = fx.db.query("SELECT MAX(id), COUNT(*) FROM tseq");
+    REQUIRE(res->GetValue(0, 0).GetValue<int64_t>() == 1); // advanced once
+    REQUIRE(res->GetValue(1, 0).GetValue<int64_t>() == 1);
+  }
+  fx.finish();
+}
+
+TEST_CASE("plan tee: multi-statement string DML stays O(delta)",
+          "[integration][plan_tee]") {
+  TeeFixture fx;
+  auto &m = fx.db.manager();
+  // classification calls this WRITE_UNKNOWN, design 1 never captures —
+  // but each sub-statement runs as its own autocommit txn with its own
+  // optimizer pass, so the tee serves each one
+  const uint64_t caps = m.captured_delta_syncs();
+  const uint64_t scans = m.scan_syncs();
+  fx.db.exec("INSERT INTO tt VALUES (400, 1, 40); "
+             "DELETE FROM tt WHERE id = 400; "
+             "UPDATE tt SET val = val + 1 WHERE id = 2");
+  REQUIRE(m.captured_delta_syncs() == caps + 3);
+  REQUIRE(m.scan_syncs() == scans);
+  fx.check();
+  fx.finish();
+}
