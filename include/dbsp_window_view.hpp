@@ -429,45 +429,96 @@ public:
     if (table_name != source_table_)
       return;
 
-    // 1. Identify affected partitions
-    std::set<PartitionKey> affected_partitions;
-    std::map<PartitionKey, size_t> size_before;              // pre-delta size
-    std::map<PartitionKey, std::vector<DuckDBRow>> anchors_by_part; // inserts
-
+    // 1. Group the delta by partition into inserts / deletes.
+    struct PartDelta {
+      std::vector<DuckDBRow> inserts;
+      std::vector<DuckDBRow> deletes;
+    };
+    std::map<PartitionKey, PartDelta> by_part;
     for (const auto &[row, weight] : changes) {
       PartitionKey key;
       if (!windows_.empty()) {
-        for (size_t idx : windows_[0].partition_indices) {
+        for (size_t idx : windows_[0].partition_indices)
           if (idx < row.columns.size())
             key.push_back(row.columns[idx]);
-        }
       }
+      if (weight > 0)
+        for (Weight i = 0; i < weight; ++i)
+          by_part[key].inserts.push_back(row);
+      else
+        for (Weight i = 0; i > weight; --i)
+          by_part[key].deletes.push_back(row);
+    }
 
-      // Find or create partition
+    // 2. Apply per partition. A PURE VALUE UPDATE — every delete pairs with an
+    // insert of the same sort key — overwrites rows in place (O(k log n)),
+    // leaving positions and size unchanged, so the output cache stays aligned
+    // and the fast path can re-emit only affected rows. Anything else shifts
+    // the vector (O(n)) and is marked structural -> full re-render.
+    std::set<PartitionKey> affected_partitions;
+    std::map<PartitionKey, size_t> size_before;
+    std::map<PartitionKey, std::vector<DuckDBRow>> anchors_by_part;
+    std::map<PartitionKey, bool> structural_change;
+
+    for (auto &kv : by_part) {
+      const PartitionKey &key = kv.first;
+      PartDelta &pd = kv.second;
       auto it = partitions_.find(key);
-      if (it == partitions_.end()) {
+      if (it == partitions_.end())
         it = partitions_.emplace(key, PartitionState(primary_sort_columns_))
                  .first;
-      }
-      if (!size_before.count(key))
-        size_before[key] = it->second.sorted_rows.size();
-
-      // Apply change to the sorted vector (keep it ordered by cmp).
       auto &vec = it->second.sorted_rows;
       const auto &cmp = it->second.cmp;
-      if (weight > 0) {
-        for (Weight i = 0; i < weight; ++i) {
-          auto pos = std::lower_bound(vec.begin(), vec.end(), row, cmp);
-          vec.insert(pos, row);
-        }
-      } else {
-        for (Weight i = 0; i > weight; --i) {
-          auto lo = std::lower_bound(vec.begin(), vec.end(), row, cmp);
-          auto hi = std::upper_bound(vec.begin(), vec.end(), row, cmp);
+      size_before[key] = vec.size();
+      affected_partitions.insert(key);
+
+      bool structural = pd.inserts.size() != pd.deletes.size();
+      std::vector<bool> ins_used(pd.inserts.size(), false);
+      std::vector<std::pair<size_t, size_t>> overwrites; // (vec_idx, ins_idx)
+      if (!structural) {
+        for (const auto &d : pd.deletes) {
+          size_t m = pd.inserts.size();
+          for (size_t j = 0; j < pd.inserts.size(); ++j)
+            if (!ins_used[j] && !cmp(d, pd.inserts[j]) &&
+                !cmp(pd.inserts[j], d)) { // equal sort key
+              m = j;
+              break;
+            }
+          if (m == pd.inserts.size()) {
+            structural = true;
+            break;
+          }
+          auto lo = std::lower_bound(vec.begin(), vec.end(), d, cmp);
+          auto hi = std::upper_bound(vec.begin(), vec.end(), d, cmp);
           auto match = hi;
-          for (auto j = lo; j != hi; ++j)
-            if (*j == row) {
-              match = j;
+          for (auto k = lo; k != hi; ++k)
+            if (*k == d) {
+              match = k;
+              break;
+            }
+          if (match == hi) {
+            structural = true;
+            break;
+          }
+          ins_used[m] = true;
+          overwrites.push_back({(size_t)(match - vec.begin()), m});
+        }
+      }
+
+      if (!structural) {
+        for (const auto &ow : overwrites) {
+          vec[ow.first] = pd.inserts[ow.second];
+          anchors_by_part[key].push_back(pd.inserts[ow.second]);
+        }
+        structural_change[key] = false;
+      } else {
+        for (const auto &d : pd.deletes) {
+          auto lo = std::lower_bound(vec.begin(), vec.end(), d, cmp);
+          auto hi = std::upper_bound(vec.begin(), vec.end(), d, cmp);
+          auto match = hi;
+          for (auto k = lo; k != hi; ++k)
+            if (*k == d) {
+              match = k;
               break;
             }
           if (match != hi)
@@ -475,10 +526,13 @@ public:
           else if (lo != hi)
             vec.erase(lo);
         }
+        for (const auto &ins : pd.inserts) {
+          auto pos = std::lower_bound(vec.begin(), vec.end(), ins, cmp);
+          vec.insert(pos, ins);
+          anchors_by_part[key].push_back(ins);
+        }
+        structural_change[key] = true;
       }
-      if (weight > 0)
-        anchors_by_part[key].push_back(row);
-      affected_partitions.insert(key);
     }
 
     // 2. Recompute window functions for affected partitions
@@ -506,7 +560,7 @@ public:
       // — re-emit only the rows each window makes dirty. affected_indices
       // returns false if any window shape has no fast rule, in which case we
       // fall through to the full re-render below.
-      if (cache.size() == partition_rows.size() &&
+      if (!structural_change[key] && cache.size() == partition_rows.size() &&
           size_before[key] == partition_rows.size()) {
         RowComparator cmp{primary_sort_columns_};
         std::vector<size_t> anchors;

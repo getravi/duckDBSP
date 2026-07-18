@@ -134,6 +134,17 @@ target_link_libraries(bench_write_capture catch2_main duckdb_static
                       duckdb_generated_extension_loader
                       core_functions_extension parquet_extension)
 
+# Window-delta throughput gate (in ctest: window_bench asserts O(affected))
+add_executable(bench_window
+    benchmarks/bench_window.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_extension.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_recovery.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_crash_marker.cpp)
+target_link_libraries(bench_window catch2_main duckdb_static
+                      duckdb_generated_extension_loader
+                      core_functions_extension parquet_extension)
+add_test(NAME window_bench COMMAND bench_window "[window_bench]")
+
 # Data-plane micro-benchmarks (run manually: ./bench_dataplane)
 add_executable(bench_dataplane
     benchmarks/bench_dataplane.cpp

@@ -140,6 +140,37 @@ shard-local Z-sets on the lazy-hash path, so sharding now loses to
 serial at 100k-row scale — revisit the shard threshold only if a
 workload shards at sizes where it used to win.
 
+## Incremental window maintenance (SHIPPED 2026-07-18)
+
+Separate from DP1-DP4 (which target the linear data plane), this makes
+NativeWindowView O(affected) instead of O(partition). It previously
+recomputed a whole partition on any delta (retract all + re-render every
+row); it now re-emits only the output rows a delta dirties.
+
+- `PartitionState` is a persistent sorted `vector` (was `multiset`) — O(1)
+  positional access. A value update (same ORDER BY key) overwrites in place
+  (O(k log n), no shift), leaving positions and size unchanged so the
+  per-index output cache stays aligned.
+- `affected_indices` computes, per window shape, the dirtied rows: offset
+  LAG/LEAD O(1) (reader r±k); ROWS-frame SUM/COUNT/AVG/MIN/MAX O(frame) via
+  frame(r)=[r+lo_off, r+hi_off] → affected r ∈ [p-hi_off, p-lo_off], which
+  covers bounded rolling AND unbounded-preceding running sums (suffix).
+- `emit_affected` retracts each cached row, renders the new one
+  (`render_row`), re-inserts, and updates the cache slot.
+
+Fallback (always correct — it is the prior behavior): RANK/DENSE_RANK/
+ROW_NUMBER/NTILE, RANGE/GROUPS frames, and any structural (size-changing)
+delta fall through to the full-partition re-render. LAST_VALUE / fillforward
+still uses the full path pending its own increment.
+
+Gates (both in ctest): `test_window_incremental` (incremental == full
+differential per shape) and `bench_window` (single-row update flat vs
+partition size — ~4.4us at both 1k and 100k rows, ratio ~1). Motivation:
+NumPad compiles its time intelligence (CUMSUM/YTD/QTD/MTD/ROLLING/LAG) to
+SQL window functions partitioned per time-series, so this removes the
+O(all-periods)-per-edit cost. Spec:
+`docs/superpowers/specs/2026-07-18-incremental-window-maintenance-design.md`.
+
 ## DP4: columnar state (research-scale)
 
 Replace hash-map Z-sets/arrangements with sorted columnar runs and
