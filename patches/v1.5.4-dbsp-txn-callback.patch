@@ -1,0 +1,110 @@
+diff --git a/src/include/duckdb/main/config.hpp b/src/include/duckdb/main/config.hpp
+index 15c4d1d..17f8d1b 100644
+--- a/src/include/duckdb/main/config.hpp
++++ b/src/include/duckdb/main/config.hpp
+@@ -36,6 +36,7 @@
+ #include "duckdb/main/user_settings.hpp"
+ #include "duckdb/parser/parsed_data/create_info.hpp"
+ #include "duckdb/common/types/type_manager.hpp"
++#include <functional>
+ 
+ namespace duckdb {
+ 
+@@ -176,6 +177,19 @@ struct DBConfigOptions {
+ 	bool operator==(const DBConfigOptions &other) const;
+ };
+ 
++class ClientContext;
++class TableCatalogEntry;
++struct TransactionModifications;
++
++//! DBSP engine hook: fired inside DuckTransaction::Commit (after the undo
++//! commit, before WAL flush) with the exact per-table modifications of the
++//! committing transaction. Empty registry = feature off (zero overhead).
++struct TransactionModificationCallback {
++	std::function<void(ClientContext &, TableCatalogEntry &,
++	                   TransactionModifications &)>
++	    on_commit;
++};
++
+ struct DBConfig {
+ 	friend class DatabaseInstance;
+ 	friend class StorageManager;
+@@ -216,6 +230,11 @@ public:
+ 	shared_ptr<DatabaseFilePathManager> path_manager;
+ 	//! Database configuration variables as controlled by SET
+ 	GlobalUserSettings user_settings;
++	//! DBSP: consumers of exact per-commit table modifications (empty = off).
++	vector<TransactionModificationCallback> transaction_modification_callbacks;
++	void RegisterTxnModificationCallback(TransactionModificationCallback cb) {
++		transaction_modification_callbacks.push_back(std::move(cb));
++	}
+ 
+ public:
+ 	DUCKDB_API static DBConfig &GetConfig(ClientContext &context);
+diff --git a/src/include/duckdb/transaction/undo_buffer.hpp b/src/include/duckdb/transaction/undo_buffer.hpp
+index b4e4342..095f32f 100644
+--- a/src/include/duckdb/transaction/undo_buffer.hpp
++++ b/src/include/duckdb/transaction/undo_buffer.hpp
+@@ -20,6 +20,7 @@ class StorageCommitState;
+ class WriteAheadLog;
+ struct UndoBufferPointer;
+ struct CommitInfo;
++struct TransactionModificationCallback;
+ 
+ struct UndoBufferProperties {
+ 	idx_t estimated_size = 0;
+@@ -58,6 +59,9 @@ public:
+ 	void WriteToWAL(WriteAheadLog &wal, optional_ptr<StorageCommitState> commit_state);
+ 	//! Commit the changes made in the UndoBuffer: should be called on commit
+ 	void Commit(UndoBuffer::IteratorState &iterator_state, CommitInfo &info);
++	//! DBSP: stream this transaction's exact per-table modifications to the
++	//! registered callbacks. Called from DuckTransaction::Commit after Commit().
++	void StreamModifications(const vector<TransactionModificationCallback> &cbs);
+ 	//! Revert committed changes made in the UndoBuffer up until the currently committed state
+ 	void RevertCommit(UndoBuffer::IteratorState &iterator_state, transaction_t transaction_id);
+ 	//! Rollback the changes made in this UndoBuffer: should be called on
+diff --git a/src/transaction/duck_transaction.cpp b/src/transaction/duck_transaction.cpp
+index 70a8d09..7b4bf93 100644
+--- a/src/transaction/duck_transaction.cpp
++++ b/src/transaction/duck_transaction.cpp
+@@ -265,6 +265,12 @@ ErrorData DuckTransaction::Commit(AttachedDatabase &db, CommitInfo &commit_info,
+ 	try {
+ 		storage->Commit(commit_state.get());
+ 		undo_buffer.Commit(iterator_state, commit_info);
++		// DBSP: stream exact per-table modifications to registered consumers.
++		auto &txn_cbs =
++		    DBConfig::GetConfig(db.GetDatabase()).transaction_modification_callbacks;
++		if (!txn_cbs.empty()) {
++			undo_buffer.StreamModifications(txn_cbs);
++		}
+ 		// if (DebugForceAbortCommit()) {
+ 		// 	throw InvalidInputException("Force revert");
+ 		// }
+diff --git a/src/transaction/undo_buffer.cpp b/src/transaction/undo_buffer.cpp
+index c1776f5..10773c3 100644
+--- a/src/transaction/undo_buffer.cpp
++++ b/src/transaction/undo_buffer.cpp
+@@ -16,6 +16,7 @@
+ #include "duckdb/transaction/rollback_state.hpp"
+ #include "duckdb/transaction/wal_write_state.hpp"
+ #include "duckdb/transaction/duck_transaction.hpp"
++#include "duckdb/main/config.hpp"
+ 
+ namespace duckdb {
+ constexpr uint32_t UNDO_ENTRY_HEADER_SIZE = sizeof(UndoFlags) + sizeof(uint32_t);
+@@ -214,4 +215,14 @@ void UndoBuffer::Rollback() {
+ 	RollbackState state(transaction);
+ 	ReverseIterateEntries([&](UndoFlags type, data_ptr_t data) { state.RollbackEntry(type, data); });
+ }
++
++void UndoBuffer::StreamModifications(const vector<TransactionModificationCallback> &cbs) {
++	// TODO(dbsp): port WriteToWAL()'s per-entry extraction (same file) and route
++	// per-table modifications to `cbs` instead of the WAL:
++	//   INSERT_TUPLE -> new-image rows; DELETE_TUPLE -> old-image rows by rowid;
++	//   UPDATE_TUPLE -> old image (undo changed cols + Fetch untouched) + new.
++	// Empty no-op scaffold: the hook is present but emits nothing, so the
++	// extension consumer stays on its fallback until this is filled in.
++	(void)cbs;
++}
+ } // namespace duckdb
