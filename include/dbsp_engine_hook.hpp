@@ -146,6 +146,14 @@ inline void ingest_engine_modifications(duckdb::ClientContext &context, duckdb::
     engine_hook_stats().tables_ingested.fetch_add(1, std::memory_order_relaxed);
     engine_hook_stats().rows_ingested.fetch_add(delta.size(), std::memory_order_relaxed);
     state->engine_buffer_delta(key, std::move(delta));
+    // PROOF OF LIFE: the flag (which disarms the capture stack) flips only
+    // on the first DELIVERED ingest — never at registration. A hook that
+    // never fires (stock engine, cross-image registry loss, any future
+    // misconfiguration) leaves the capture stack armed instead of silently
+    // degrading every commit to scan-and-diff (found by benchmark).
+    if (!engine_hook_flag().load(std::memory_order_relaxed)) {
+      engine_hook_flag().store(true, std::memory_order_relaxed);
+    }
   } catch (...) {
     // Conversion failed: the buffered picture is incomplete. Poison the
     // transaction's capture so commit reconciles by scan instead of applying
@@ -160,10 +168,12 @@ inline bool register_engine_hook(duckdb::DatabaseInstance &db) {
                     duckdb::TransactionModifications &mods) {
     ingest_engine_modifications(context, info, mods);
   };
-  // Side registry keyed by instance (ABI-neutral engine surface); the engine
-  // erases the entry in ~DatabaseInstance.
+  // ObjectCache-backed registry on the shared DatabaseInstance (survives the
+  // two-image world: the loadable extension carries its own engine copy, so
+  // any static registry would be per-image and the hook would never fire).
   duckdb::RegisterTxnModificationCallback(db, std::move(cb));
-  engine_hook_flag().store(true, std::memory_order_relaxed);
+  // NOTE: engine_hook_flag stays FALSE here — it flips on first delivery
+  // (see ingest_engine_modifications). Registration is not proof of life.
   return true;
 }
 

@@ -9,8 +9,15 @@
 
 using namespace dbsp_test;
 
-TEST_CASE("engine hook consumer: hook is registered and active", "[engine_hook_consumer]") {
+TEST_CASE("engine hook consumer: flag flips on first delivery, not registration",
+          "[engine_hook_consumer]") {
+  // Proof-of-life contract: registration alone must NOT disarm the capture
+  // stack; only a delivered ingest proves the engine actually consults the
+  // registry (guards against the two-image static-registry failure mode).
   DuckDBTestHarness db;
+  db.createTable("poke", "id INTEGER, v DOUBLE", {});
+  db.exec("SELECT * FROM dbsp_track('poke')");
+  db.exec("INSERT INTO poke VALUES (1, 1.0)");
   REQUIRE(dbsp_native::engine_hook_active());
 }
 

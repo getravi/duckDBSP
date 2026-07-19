@@ -1,16 +1,18 @@
 diff --git a/src/include/duckdb/transaction/undo_buffer.hpp b/src/include/duckdb/transaction/undo_buffer.hpp
-index b4e4342..b972337 100644
+index b4e4342..7a2955e 100644
 --- a/src/include/duckdb/transaction/undo_buffer.hpp
 +++ b/src/include/duckdb/transaction/undo_buffer.hpp
-@@ -10,17 +10,54 @@
+@@ -10,17 +10,78 @@
  
  #include "duckdb/common/common.hpp"
  #include "duckdb/common/enums/undo_flags.hpp"
 +#include "duckdb/common/types/column/column_data_collection.hpp"
++#include "duckdb/storage/object_cache.hpp"
  #include "duckdb/transaction/undo_buffer_allocator.hpp"
  #include "duckdb/common/enums/active_transaction_state.hpp"
  
 +#include <functional>
++#include <mutex>
 +
  namespace duckdb {
  class BufferManager;
@@ -42,22 +44,44 @@ index b4e4342..b972337 100644
 +	std::function<void(ClientContext &, DataTableInfo &, TransactionModifications &)> on_commit;
 +};
 +
-+//! Registration lives in a SIDE REGISTRY keyed by DatabaseInstance*, NOT in
-+//! DBConfig: DBConfig is embedded in DatabaseInstance, so growing it shifts
-+//! every later member and breaks the ABI of prebuilt (stock-header)
-+//! extensions. With the side registry, stock extension binaries load into
-+//! the patched engine unchanged. Entries are erased in ~DatabaseInstance —
-+//! required, or a recycled instance address would inherit dead callbacks.
++//! The registry lives in the DatabaseInstance-owned ObjectCache — state on
++//! the SHARED INSTANCE OBJECT, never per-image statics. A loadable extension
++//! contains its own statically-linked engine copy, so a static/global
++//! registry exists twice (extension registers into its image's copy, the
++//! host engine reads its own — the hook silently never fires; found by
++//! benchmark + `nm`: RegisterTxnModificationCallback is a LOCAL symbol in
++//! dbsp.duckdb_extension). ObjectCache also dies with the instance, so no
++//! recycled-address cleanup is needed. DBConfig stays untouched (ABI).
++class TxnModificationCallbackRegistry : public ObjectCacheEntry {
++public:
++	static constexpr const char *KEY = "dbsp_txn_modification_callbacks_v1";
++
++	std::mutex lock;
++	vector<TransactionModificationCallback> callbacks;
++
++	string GetObjectType() override {
++		return KEY;
++	}
++	static string ObjectType() {
++		return KEY;
++	}
++	optional_idx GetEstimatedCacheMemory() const override {
++		// invalid index = never evict: the hook registry must live exactly
++		// as long as the DatabaseInstance
++		return optional_idx();
++	}
++};
++
++//! Register a callback on this instance (creates the registry entry on first
++//! use). Callable from either image: all state hangs off `db`.
 +void RegisterTxnModificationCallback(DatabaseInstance &db, TransactionModificationCallback callback);
-+//! Engine-internal: the registered callbacks for an instance (nullptr if none).
-+const vector<TransactionModificationCallback> *GetTxnModificationCallbacks(DatabaseInstance &db);
-+//! Engine-internal: drop an instance's callbacks (called from ~DatabaseInstance).
-+void UnregisterTxnModificationCallbacks(DatabaseInstance &db);
++//! The instance's registry entry, or nullptr when nothing ever registered.
++shared_ptr<TxnModificationCallbackRegistry> GetTxnModificationCallbacks(DatabaseInstance &db);
 +
  struct UndoBufferProperties {
  	idx_t estimated_size = 0;
  	bool has_updates = false;
-@@ -58,6 +95,9 @@ public:
+@@ -58,6 +119,9 @@ public:
  	void WriteToWAL(WriteAheadLog &wal, optional_ptr<StorageCommitState> commit_state);
  	//! Commit the changes made in the UndoBuffer: should be called on commit
  	void Commit(UndoBuffer::IteratorState &iterator_state, CommitInfo &info);
@@ -67,47 +91,36 @@ index b4e4342..b972337 100644
  	//! Revert committed changes made in the UndoBuffer up until the currently committed state
  	void RevertCommit(UndoBuffer::IteratorState &iterator_state, transaction_t transaction_id);
  	//! Rollback the changes made in this UndoBuffer: should be called on
-diff --git a/src/main/database.cpp b/src/main/database.cpp
-index 54c84ff..43e0427 100644
---- a/src/main/database.cpp
-+++ b/src/main/database.cpp
-@@ -28,6 +28,7 @@
- #include "duckdb/storage/block_allocator.hpp"
- #include "duckdb/storage/storage_manager.hpp"
- #include "duckdb/transaction/transaction_manager.hpp"
-+#include "duckdb/transaction/undo_buffer.hpp"
- #include "duckdb/main/capi/extension_api.hpp"
- #include "duckdb/storage/external_file_cache.hpp"
- #include "duckdb/storage/compression/empty_validity.hpp"
-@@ -78,6 +79,9 @@ DatabaseInstance::DatabaseInstance() : db_validity(*this) {
- }
- 
- DatabaseInstance::~DatabaseInstance() {
-+	// DBSP: drop this instance's txn-modification callbacks BEFORE teardown —
-+	// a later instance recycling this address must not inherit them.
-+	UnregisterTxnModificationCallbacks(*this);
- 	// destroy all attached databases
- 	if (db_manager) {
- 		db_manager->ResetDatabases();
 diff --git a/src/transaction/duck_transaction.cpp b/src/transaction/duck_transaction.cpp
-index 70a8d09..194324f 100644
+index 70a8d09..f99a1ed 100644
 --- a/src/transaction/duck_transaction.cpp
 +++ b/src/transaction/duck_transaction.cpp
-@@ -265,6 +265,12 @@ ErrorData DuckTransaction::Commit(AttachedDatabase &db, CommitInfo &commit_info,
+@@ -1,4 +1,6 @@
+ #include "duckdb/transaction/duck_transaction.hpp"
++
++#include <mutex>
+ #include "duckdb/transaction/duck_transaction_manager.hpp"
+ #include "duckdb/main/client_context.hpp"
+ #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+@@ -265,6 +267,16 @@ ErrorData DuckTransaction::Commit(AttachedDatabase &db, CommitInfo &commit_info,
  	try {
  		storage->Commit(commit_state.get());
  		undo_buffer.Commit(iterator_state, commit_info);
 +		// DBSP: stream exact per-table modifications to registered consumers.
-+		// Side registry, not DBConfig — see undo_buffer.hpp (ABI neutrality).
-+		auto txn_cbs = GetTxnModificationCallbacks(db.GetDatabase());
-+		if (txn_cbs) {
-+			undo_buffer.StreamModifications(*txn_cbs);
++		// ObjectCache-backed registry on the shared instance — see
++		// undo_buffer.hpp (ABI + cross-image correctness).
++		auto txn_registry = GetTxnModificationCallbacks(db.GetDatabase());
++		if (txn_registry) {
++			std::lock_guard<std::mutex> txn_cb_guard(txn_registry->lock);
++			if (!txn_registry->callbacks.empty()) {
++				undo_buffer.StreamModifications(txn_registry->callbacks);
++			}
 +		}
  		// if (DebugForceAbortCommit()) {
  		// 	throw InvalidInputException("Force revert");
  		// }
 diff --git a/src/transaction/undo_buffer.cpp b/src/transaction/undo_buffer.cpp
-index c1776f5..70378ad 100644
+index c1776f5..cb82ce4 100644
 --- a/src/transaction/undo_buffer.cpp
 +++ b/src/transaction/undo_buffer.cpp
 @@ -16,6 +16,14 @@
@@ -125,52 +138,38 @@ index c1776f5..70378ad 100644
  
  namespace duckdb {
  constexpr uint32_t UNDO_ENTRY_HEADER_SIZE = sizeof(UndoFlags) + sizeof(uint32_t);
-@@ -214,4 +222,221 @@ void UndoBuffer::Rollback() {
+@@ -214,4 +222,207 @@ void UndoBuffer::Rollback() {
  	RollbackState state(transaction);
  	ReverseIterateEntries([&](UndoFlags type, data_ptr_t data) { state.RollbackEntry(type, data); });
  }
 +
 +//===--------------------------------------------------------------------===//
-+// DBSP engine hook: txn-modification callback registry
++// DBSP engine hook: txn-modification callback registry (ObjectCache-backed)
 +//===--------------------------------------------------------------------===//
-+// Side registry keyed by DatabaseInstance* — deliberately NOT a DBConfig
-+// member (DBConfig is embedded in DatabaseInstance; growing it breaks the
-+// ABI of prebuilt stock-header extensions). See undo_buffer.hpp.
-+namespace {
-+struct TxnModificationRegistry {
-+	mutex lock;
-+	unordered_map<DatabaseInstance *, vector<TransactionModificationCallback>> callbacks;
-+
-+	static TxnModificationRegistry &Get() {
-+		static TxnModificationRegistry registry;
-+		return registry;
-+	}
-+};
-+} // namespace
++// State hangs off the DatabaseInstance's ObjectCache so BOTH images of the
++// engine (host + a loadable extension's statically-linked copy) see one
++// registry. See the class comment in undo_buffer.hpp.
 +
 +void RegisterTxnModificationCallback(DatabaseInstance &db, TransactionModificationCallback callback) {
-+	auto &registry = TxnModificationRegistry::Get();
-+	lock_guard<mutex> guard(registry.lock);
-+	registry.callbacks[&db].push_back(std::move(callback));
++	auto &cache = db.GetObjectCache();
++	auto existing = cache.GetObject(TxnModificationCallbackRegistry::KEY);
++	shared_ptr<TxnModificationCallbackRegistry> registry;
++	if (existing && existing->GetObjectType() == TxnModificationCallbackRegistry::ObjectType()) {
++		registry = shared_ptr_cast<ObjectCacheEntry, TxnModificationCallbackRegistry>(existing);
++	} else {
++		registry = make_shared_ptr<TxnModificationCallbackRegistry>();
++		cache.Put(TxnModificationCallbackRegistry::KEY, registry);
++	}
++	std::lock_guard<std::mutex> guard(registry->lock);
++	registry->callbacks.push_back(std::move(callback));
 +}
 +
-+const vector<TransactionModificationCallback> *GetTxnModificationCallbacks(DatabaseInstance &db) {
-+	auto &registry = TxnModificationRegistry::Get();
-+	lock_guard<mutex> guard(registry.lock);
-+	auto entry = registry.callbacks.find(&db);
-+	if (entry == registry.callbacks.end() || entry->second.empty()) {
++shared_ptr<TxnModificationCallbackRegistry> GetTxnModificationCallbacks(DatabaseInstance &db) {
++	auto existing = db.GetObjectCache().GetObject(TxnModificationCallbackRegistry::KEY);
++	if (!existing || existing->GetObjectType() != TxnModificationCallbackRegistry::ObjectType()) {
 +		return nullptr;
 +	}
-+	// Stable for the instance's lifetime: registration happens at extension
-+	// load, the vector is only appended to, and erasure only runs in
-+	// ~DatabaseInstance when no transaction can still be committing.
-+	return &entry->second;
-+}
-+
-+void UnregisterTxnModificationCallbacks(DatabaseInstance &db) {
-+	auto &registry = TxnModificationRegistry::Get();
-+	lock_guard<mutex> guard(registry.lock);
-+	registry.callbacks.erase(&db);
++	return shared_ptr_cast<ObjectCacheEntry, TxnModificationCallbackRegistry>(existing);
 +}
 +
 +namespace {
