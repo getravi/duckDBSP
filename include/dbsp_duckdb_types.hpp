@@ -617,6 +617,40 @@ public:
   virtual void apply_changes(const std::string &table_name,
                              const DuckDBZSet &changes) = 0;
 
+  // Apply ONE commit's deltas from multiple sources as one logical step.
+  // A view whose two join sides are both fed in the same propagation pass
+  // (sibling MVs over one base table) must see both deltas in a single
+  // circuit step — the bilinear join correction (−Δl⋈Δr under both-shared
+  // arrangements) only fires within a step. Applied one source at a time,
+  // a join of two MVs accumulates duplicate rows and never retracts stale
+  // ones. PlannedCircuitView overrides this to push every input and step
+  // once; the default preserves sequential per-source application and
+  // accumulates the per-apply deltas so dependents see the union.
+  virtual void apply_changes_batch(
+      const std::vector<std::pair<std::string, const DuckDBZSet *>>
+          &changes) {
+    batched_ = changes.size() > 1;
+    if (!batched_) {
+      if (!changes.empty()) {
+        apply_changes(changes[0].first, *changes[0].second);
+      }
+      return;
+    }
+    batch_delta_.clear();
+    for (const auto &[src, delta] : changes) {
+      apply_changes(src, *delta);
+      for (const auto &[row, w] : get_delta()) {
+        batch_delta_.insert(row, w);
+      }
+    }
+  }
+
+  // Delta of the last apply_changes_batch: the union across sources when
+  // the default multi-source path ran, else whatever get_delta() reports.
+  virtual const DuckDBZSet &get_batch_delta() const {
+    return batched_ ? batch_delta_ : get_delta();
+  }
+
   // Get current result
   virtual const DuckDBZSet &get_result() const = 0;
 
@@ -661,6 +695,9 @@ protected:
   std::string name_;
   std::string sql_;
   uint64_t version_;
+  // apply_changes_batch state (default multi-source path only)
+  DuckDBZSet batch_delta_;
+  bool batched_ = false;
 };
 
 // Filter view: SELECT * FROM table WHERE condition

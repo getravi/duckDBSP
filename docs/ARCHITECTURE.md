@@ -383,12 +383,18 @@ static void LoadInternal(DatabaseInstance &instance) {
    ┌─────┴─────┐
    │           │
    ▼           ▼
-   filter_view.apply_changes('orders', Δorders)
-   totals_view.apply_changes('orders', Δorders)
+   filter_view.apply_changes_batch({'orders': Δorders})
+   totals_view.apply_changes_batch({'orders': Δorders})
          │
          ▼
-   vip_totals.apply_changes('totals', Δtotals)
+   vip_totals.apply_changes_batch({'totals': Δtotals})
 ```
+
+A view fed by SEVERAL sources updated in the same pass (e.g. a join of
+two sibling views over one base table) receives all of their deltas in
+ONE `apply_changes_batch` call = one circuit step — required for the
+join's both-shared bilinear correction (−Δl⋈Δr) to fire. Per-source
+sequential applies would overcount Δl⋈Δr and strand stale rows.
 
 ### Incremental Aggregation Example
 

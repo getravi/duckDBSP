@@ -202,3 +202,34 @@ TEST_CASE("Cycle detection prevents infinite loops", "[integration][cascade][cyc
         REQUIRE(msg.find("Error") != std::string::npos);
     }
 }
+
+TEST_CASE("Join of two sibling MVs stays exact across repeated updates",
+          "[integration][cascade][mvjoin]") {
+    // Both join inputs are MVs over the SAME base table, so one commit
+    // delivers a delta to both sides in a single propagation pass. The join
+    // must apply them as one circuit step (bilinear both-shared correction);
+    // applied one source at a time, the view accumulates duplicate rows and
+    // never retracts stale values.
+    DuckDBTestHarness db;
+    db.createTable("base", "k INT, v DOUBLE", {"(1, 1.0)", "(2, 2.0)", "(3, 3.0)"});
+    db.exec("SELECT * FROM dbsp_track('base')");
+    db.exec("SELECT * FROM dbsp_sync('base')");
+    db.exec("CREATE MATERIALIZED VIEW mv_a AS SELECT k, v * 2 AS a FROM base");
+    db.exec("CREATE MATERIALIZED VIEW mv_b AS SELECT k, v + 1 AS b FROM base");
+    db.exec("CREATE MATERIALIZED VIEW mv_c AS SELECT x.k, x.a * y.b AS c "
+            "FROM mv_a x JOIN mv_b y ON x.k = y.k");
+    db.assertViewRowCount("mv_c", 3);
+
+    for (int i = 0; i < 3; i++) {
+        db.exec("UPDATE base SET v = " + std::to_string(100.0 + i) + " WHERE k = 3");
+        db.exec("SELECT * FROM dbsp_sync('base')");
+        db.assertViewRowCount("mv_c", 3); // one row per key, every time
+    }
+
+    // Final value at k=3: v=102 -> a=204, b=103 -> c=21012
+    auto result = db.query(
+        "SELECT c FROM dbsp_query('mv_c') WHERE k = 3");
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 1);
+    REQUIRE(result->GetValue(0, 0).GetValue<double>() == 21012.0);
+}

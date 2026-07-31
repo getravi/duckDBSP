@@ -3431,6 +3431,25 @@ public:
     ++version_;
   }
 
+  // One commit, one step: push EVERY updated source's delta before
+  // stepping, so a join fed by two same-pass sources (sibling MVs over one
+  // base table) sees both sides in a single bilinear step — that is where
+  // PlanJoinNode's both-shared −Δl⋈Δr correction fires. Sequential
+  // per-source applies would overcount Δl⋈Δr and strand stale rows.
+  void apply_changes_batch(
+      const std::vector<std::pair<std::string, const DuckDBZSet *>> &changes)
+      override {
+    batched_ = false; // sink delta covers the whole step
+    for (const auto &[src, delta] : changes) {
+      auto it = sources_.find(src);
+      if (it != sources_.end()) {
+        it->second->push_borrowed(*delta);
+      }
+    }
+    circuit_.step();
+    ++version_;
+  }
+
   const DuckDBZSet &get_result() const override {
     return sink_->materialized();
   }

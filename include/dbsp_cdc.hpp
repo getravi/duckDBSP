@@ -27,7 +27,6 @@
 #include "duckdb/transaction/meta_transaction.hpp"
 
 #include <algorithm>
-#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <atomic>
@@ -3161,13 +3160,11 @@ private:
     // Lock ordering: struct_mutex_ (held by caller) → view_mutex_ (acquired here).
     std::unique_lock<std::shared_mutex> view_lock(view_mutex_);
 
-    // Pending deltas by source name. Values either borrow a view's
-    // get_delta() (valid until that view's next apply — topological order
-    // guarantees the read happens first) or point into the arena below
-    // when a view consumed deltas from multiple sources (each apply clears
-    // the previous delta, so dependents need the accumulated union).
+    // Pending deltas by source name. Values borrow a view's
+    // get_batch_delta() — valid until that view's next apply, and each
+    // view applies at most once per pass (topological order guarantees
+    // every dependent reads first).
     std::unordered_map<std::string, const DuckDBZSet *> pending;
-    std::deque<DuckDBZSet> arena;
     pending[source_name] = &delta;
 
     // Shared arrangements are updated BEFORE any consuming view steps —
@@ -3205,32 +3202,29 @@ private:
 
     struct StepResult {
       std::string view_name;
-      const DuckDBZSet *single_delta = nullptr; // borrows view state
-      DuckDBZSet accumulated;                   // owned multi-source union
+      const DuckDBZSet *delta = nullptr; // borrows view state
       size_t applied = 0;
     };
     auto step_view = [&](const std::string &view_name) -> StepResult {
       StepResult r;
       r.view_name = view_name;
       NativeMaterializedView &view = *views_.at(view_name);
+      // All of this pass's source deltas go to the view in ONE batched
+      // apply (one circuit step). Per-source sequential applies are wrong
+      // for a join whose both sides updated this pass: its −Δl⋈Δr
+      // both-shared correction only fires when the deltas share a step.
+      std::vector<std::pair<std::string, const DuckDBZSet *>> inputs;
       for (const auto &src : view.source_tables()) {
         auto p = pending.find(src);
         if (p == pending.end() || p->second->empty())
           continue;
-        view.apply_changes(src, *p->second);
-        r.applied++;
-        if (r.applied == 1) {
-          r.single_delta = &view.get_delta();
-        } else {
-          if (r.applied == 2 && r.single_delta) {
-            r.accumulated = *r.single_delta; // upgrade borrow to owned
-            r.single_delta = nullptr;
-          }
-          for (const auto &[row, w] : view.get_delta()) {
-            r.accumulated.insert(row, w);
-          }
-        }
+        inputs.emplace_back(src, p->second);
       }
+      if (inputs.empty())
+        return r;
+      view.apply_changes_batch(inputs);
+      r.applied = inputs.size();
+      r.delta = &view.get_batch_delta();
       return r;
     };
 
@@ -3284,18 +3278,10 @@ private:
       // Publish results sequentially (stable order): pending map for the
       // next level, arrangement updates for MV-sourced joins
       for (auto &r : results) {
-        if (r.applied == 0)
+        if (r.applied == 0 || !r.delta || r.delta->empty())
           continue;
-        if (r.single_delta) {
-          if (!r.single_delta->empty()) {
-            pending[r.view_name] = r.single_delta;
-            apply_to_arrangements(r.view_name, *r.single_delta);
-          }
-        } else if (!r.accumulated.empty()) {
-          arena.push_back(std::move(r.accumulated));
-          pending[r.view_name] = &arena.back();
-          apply_to_arrangements(r.view_name, arena.back());
-        }
+        pending[r.view_name] = r.delta;
+        apply_to_arrangements(r.view_name, *r.delta);
       }
     }
   }

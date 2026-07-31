@@ -1,5 +1,27 @@
 # Changelog
 
+## Fix: same-pass multi-source deltas apply as one circuit step - Jul 2026
+
+- A view fed by two sources updated in the SAME propagation pass (join of
+  two sibling MVs over one base table) received its deltas as two separate
+  circuit steps. Each step ran against post-delta shared arrangements, so
+  PlanJoinNode's both-shared bilinear correction (emit −Δl⋈Δr) never
+  fired: the join overcounted Δl⋈Δr on every commit — duplicate,
+  conflicting rows per key accumulated unboundedly (quadratic growth) and
+  stale rows were never retracted. Base-table multi-writes were unaffected
+  (separate propagation passes are sequentially correct); the bug was
+  MV-cascade-only.
+- Fix: `NativeMaterializedView::apply_changes_batch` — the CDC cascade
+  now hands a view ALL of its pending source deltas at once;
+  `PlannedCircuitView` pushes every input and steps the circuit once, so
+  the in-step correction fires. Default implementation preserves
+  sequential per-source behavior (with delta-union) for legacy views.
+  `propagate_changes`'s per-view apply loop and multi-source union arena
+  are replaced by the batched call.
+- Found by NumPad's full-SQL/DBSP spike (view-vs-oracle parity + row-count
+  sentinels); regression-tested in test_cascading_views.cpp ("Join of two
+  sibling MVs stays exact across repeated updates").
+
 ## Perf/coverage: spill codec 12x + bounded percentage limits - Jul 2026
 
 - Spill row codec: duckdb's BinarySerializer cost ~650ns/row with a
