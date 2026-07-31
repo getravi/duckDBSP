@@ -1,5 +1,28 @@
 # Changelog
 
+## Feature: LEFT/RIGHT outer-join checkpoint state - Jul 2026
+
+- Circuit-state checkpointing (D3b) now covers `LEFT` and `RIGHT` outer
+  joins, not just `INNER`: `PlanJoinNode::state_kind()` reports
+  `SERIALIZABLE` for non-spilled, non-mark LEFT/RIGHT joins, so pad-carrying
+  join views restore from a checkpoint instead of rebuild-by-replay on
+  load. `FULL` (`OUTER`) and `MARK` joins, and any spilled join side, stay
+  `UNSUPPORTED` this pass.
+- `serialize_state`/`restore_state` gained `left_pad_`/`right_pad_` (the
+  currently-emitted NULL-pad weight per row) alongside the existing
+  equi-key indexes and per-row weight totals — exactly what
+  `reconcile_pads` reads to compute the correct pad diff on the first
+  post-restore delta. `right_total_`/`right_null_` are MARK-only
+  bookkeeping and stay unserialized (MARK joins are still UNSUPPORTED).
+- **Checkpoint format version bump**: the blob layout changed, so a new
+  `_dbsp_ckpt_version` table now travels with every checkpoint.
+  `checkpoint_valid` treats a missing or mismatched version as no
+  checkpoint at all (rebuild-by-replay) rather than risk misparsing an
+  older blob. Practical effect: **the first `dbsp_load()` against a
+  database checkpointed by a pre-upgrade build pays one rebuild-by-replay,
+  then re-checkpoints in the new format on the next save** — no data loss,
+  no crash, just a one-time cost.
+
 ## Feature: dbsp_replace_view + CREATE OR REPLACE MATERIALIZED VIEW - subtree-only repopulation - Jul 2026
 
 - New `dbsp_replace_view(name, sql)` table function and

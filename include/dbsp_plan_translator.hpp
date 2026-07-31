@@ -2554,18 +2554,36 @@ private:
   std::vector<KeyPair> keys_;
   std::vector<Residual> residuals_;
 public:
-  // Checkpointing (D3b): INNER joins keep only equi-key indexes (private
-  // ones for non-shared sides; shared arrangements are checkpointed by the
-  // CDC layer). Outer/mark joins carry pad/mark bookkeeping and spilled
-  // indexes live on disk — both UNSUPPORTED in v1 (rebuild-by-replay).
+  // Checkpointing (D3b, extended Task 3): INNER/LEFT/RIGHT joins serialize
+  // their equi-key indexes (private ones for non-shared sides; shared
+  // arrangements are checkpointed by the CDC layer) plus, for LEFT/RIGHT,
+  // the pad bookkeeping reconcile_pads needs to resume correctly (see
+  // serialize_state). FULL (OUTER) and MARK joins carry bookkeeping this
+  // pass does not cover, and spilled indexes live on disk — both stay
+  // UNSUPPORTED (rebuild-by-replay).
   StateKind state_kind() const override {
-    if (join_type_ != duckdb::JoinType::INNER || marks_ || pads_left_ ||
-        pads_right_ || local_spill_left_ || local_spill_right_) {
+    if (marks_ || local_spill_left_ || local_spill_right_) {
       return StateKind::UNSUPPORTED;
     }
-    return StateKind::SERIALIZABLE;
+    if (join_type_ == duckdb::JoinType::INNER ||
+        join_type_ == duckdb::JoinType::LEFT ||
+        join_type_ == duckdb::JoinType::RIGHT) {
+      return StateKind::SERIALIZABLE;
+    }
+    return StateKind::UNSUPPORTED; // FULL (OUTER) — both sides pad, unbuilt
   }
 
+  // reconcile_pads (see above) reads exactly four pieces of per-node state
+  // to decide each row's desired pad weight and diff it against what was
+  // last emitted: the padded side's own-row weight totals (left_weights_ /
+  // right_weights_, already serialized for INNER), the other side's
+  // equi-key index to recompute match_count (left_index_ / right_index_,
+  // already serialized), and — new in Task 3 — the currently-emitted pad
+  // weight per row (left_pad_ / right_pad_) so a post-restore delta emits
+  // the correct diff instead of re-emitting a pad that was already output
+  // pre-checkpoint. right_total_/right_null_ are MARK-only bookkeeping
+  // (only ever written when marks_, which stays UNSUPPORTED) and are
+  // therefore NOT read by reconcile_pads — correctly omitted here.
   void serialize_state(std::vector<uint8_t> &out) const override {
     BlobWriter w;
     auto write_weights = [&w](const RowWeights &rw) {
@@ -2586,6 +2604,8 @@ public:
     write_index(right_index_);
     write_weights(left_weights_);
     write_weights(right_weights_);
+    write_weights(left_pad_);
+    write_weights(right_pad_);
     out = w.take();
   }
 
@@ -2617,6 +2637,8 @@ public:
       read_index(right_index_);
       read_weights(left_weights_);
       read_weights(right_weights_);
+      read_weights(left_pad_);
+      read_weights(right_pad_);
       return r.done();
     } catch (...) {
       return false;

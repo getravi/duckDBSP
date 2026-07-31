@@ -571,6 +571,7 @@ public:
 
     const std::string ckpt_tbl = qualify(catalog, "_dbsp_ckpt");
     const std::string ckpt_meta_tbl = qualify(catalog, "_dbsp_ckpt_meta");
+    const std::string ckpt_ver_tbl = qualify(catalog, "_dbsp_ckpt_version");
 
     try {
       InternalQueryGuard guard;
@@ -580,12 +581,28 @@ public:
                 "VARCHAR, node_id BIGINT, data BLOB)");
       con.Query("CREATE OR REPLACE TABLE " + ckpt_meta_tbl + " (table_name "
                 "VARCHAR, row_count BIGINT, row_hash VARCHAR)");
+      // Format version (see dbsp_checkpoint.hpp kDbspCkptFormatVersion): a
+      // pre-bump checkpoint lacks this table entirely, so checkpoint_valid
+      // treats a missing/mismatched version as no checkpoint at all rather
+      // than misparsing node blobs written under an older layout.
+      con.Query("CREATE OR REPLACE TABLE " + ckpt_ver_tbl + " (version BIGINT)");
       auto ins = con.Prepare("INSERT INTO " + ckpt_tbl + " VALUES ($1, $2, $3, $4)");
       auto insm = con.Prepare("INSERT INTO " + ckpt_meta_tbl + " VALUES ($1, $2, $3)");
-      if (!ins || ins->HasError() || !insm || insm->HasError()) {
+      auto insv = con.Prepare("INSERT INTO " + ckpt_ver_tbl + " VALUES ($1)");
+      if (!ins || ins->HasError() || !insm || insm->HasError() || !insv ||
+          insv->HasError()) {
         con.Query("ROLLBACK");
         last_error_ = "checkpoint prepare failed";
         return false;
+      }
+      {
+        auto rv = insv->Execute(
+            static_cast<int64_t>(dbsp_native::kDbspCkptFormatVersion));
+        if (rv->HasError()) {
+          con.Query("ROLLBACK");
+          last_error_ = rv->GetError();
+          return false;
+        }
       }
       for (const auto &ck : view_blobs) {
         for (const auto &[node_id, blob] : ck.nodes) {
@@ -650,6 +667,7 @@ public:
                         const std::string &catalog = "") {
     const std::string ckpt_tbl = qualify(catalog, "_dbsp_ckpt");
     const std::string ckpt_meta_tbl = qualify(catalog, "_dbsp_ckpt_meta");
+    const std::string ckpt_ver_tbl = qualify(catalog, "_dbsp_ckpt_version");
     try {
       InternalQueryGuard guard;
       duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
@@ -664,6 +682,29 @@ public:
       auto exists = con.Query(exists_sql);
       if (exists->HasError() || exists->RowCount() == 0) {
         return false;
+      }
+      // Format-version gate: a checkpoint saved before the version table
+      // existed (or under a different blob layout) must be treated as
+      // absent, never fed to node restore_state — see
+      // dbsp_checkpoint.hpp kDbspCkptFormatVersion.
+      std::string ver_exists_sql;
+      if (catalog.empty()) {
+        ver_exists_sql = "SELECT 1 FROM information_schema.tables WHERE "
+                         "table_name = '_dbsp_ckpt_version'";
+      } else {
+        ver_exists_sql = "SELECT 1 FROM information_schema.tables WHERE "
+                         "table_catalog = '" +
+                         catalog + "' AND table_name = '_dbsp_ckpt_version'";
+      }
+      auto ver_exists = con.Query(ver_exists_sql);
+      if (ver_exists->HasError() || ver_exists->RowCount() == 0) {
+        return false; // pre-bump checkpoint: no version table at all
+      }
+      auto ver = con.Query("SELECT version FROM " + ckpt_ver_tbl);
+      if (ver->HasError() || ver->RowCount() != 1 ||
+          ver->GetValue(0, 0).GetValue<int64_t>() !=
+              dbsp_native::kDbspCkptFormatVersion) {
+        return false; // version mismatch: discard, rebuild by replay
       }
       auto meta = con.Query(
           "SELECT table_name, row_count, row_hash FROM " + ckpt_meta_tbl);

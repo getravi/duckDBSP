@@ -24,6 +24,18 @@
 
 namespace dbsp_native {
 
+// Checkpoint blob format version. Bump whenever a node's serialize_state
+// layout changes shape (e.g. new fields appended) so a blob written under
+// an older layout is detected and discarded rather than fed to the new
+// restore_state, which would misparse it. CDCManager::save_checkpoint
+// writes this into a dedicated _dbsp_ckpt_version table; checkpoint_valid
+// rejects the whole checkpoint (treats it as absent -> rebuild-by-replay)
+// when that table is missing (pre-bump blob) or its value differs.
+//
+// v2 (Task 3, durability-ergonomics): PlanJoinNode::serialize_state gained
+// left_pad_/right_pad_ for LEFT/RIGHT outer-join pad bookkeeping.
+constexpr int64_t kDbspCkptFormatVersion = 2;
+
 // How a circuit node participates in checkpointing.
 enum class CkptSupport {
   STATELESS,    // nothing to save; restore is a no-op

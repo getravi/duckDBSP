@@ -440,11 +440,19 @@ State after:
 - All data stored in-memory
 - No automatic eviction or bounds
 - Persistence saves definitions plus (D3b) a circuit-state checkpoint for
-  supported views: aggregate group scalars, private INNER-join indexes,
-  and sink results, watermarked by source COUNT + bit_xor(hash(row))
+  supported views: aggregate group scalars, private INNER/LEFT/RIGHT-join
+  indexes plus (LEFT/RIGHT) their pad bookkeeping, and sink results,
+  watermarked by source COUNT + bit_xor(hash(row)). FULL (OUTER) and MARK
+  joins, spilled join/aggregate state, recursion state, and window/sort
+  embedded views stay UNSUPPORTED (rebuild-by-replay).
 - On load, checkpointed views restore without circuit replay when the
   watermarks still match; everything else is rebuilt from current table
   data
+- A checkpoint blob format version travels alongside the data (a
+  dedicated `_dbsp_ckpt_version` table); a checkpoint saved under an
+  older layout — or missing the table entirely — is treated as absent
+  rather than misparsed, so a version bump costs at most one
+  rebuild-by-replay on the next load
 
 ### Lifetime
 
