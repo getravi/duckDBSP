@@ -1,5 +1,36 @@
 # Changelog
 
+## Feature: dbsp_replace_view + CREATE OR REPLACE MATERIALIZED VIEW - subtree-only repopulation - Jul 2026
+
+- New `dbsp_replace_view(name, sql)` table function and
+  `CREATE OR REPLACE MATERIALIZED VIEW name AS <query>` DDL (routes to
+  plain create when `name` doesn't exist yet, to replace when it does):
+  change one view's definition and rebuild only it and its transitive
+  dependents — upstream sources and every other view are left untouched,
+  and each dependent's own DDL is preserved verbatim (only the named view
+  gets the new SQL).
+- Algorithm: verify the view exists (else `DBSP-E206`); snapshot
+  `(name, sql)` for every transitive dependent via the dependency graph's
+  `topological_order()` (already filters to the dependent set and orders
+  it so a dependent's in-set dependencies precede it); drop the whole
+  subtree through the existing `drop_view_cascade` path; recreate the
+  named view with the new SQL, then recreate each dependent with its
+  saved SQL in that order. Recreation replays each view from its sources'
+  current materialized state, so cost is proportional to the subtree, not
+  the whole model.
+- Failure semantics (v1, no transactional rollback): if a create fails
+  mid-sequence, the remaining dependents are still attempted with their
+  saved old DDL, and the error (`DBSP-E304`) lists every failure plus
+  which views are still queryable afterward — the registry itself is
+  never left in a half-registered/inconsistent state.
+- `drop_view_cascade` is called without a `ClientContext` here (matching
+  every other cascade-drop call site in the file): passing one would call
+  `context->Query()` to delete `_dbsp_views` rows while already running
+  inside a table function on that same context — a reentrant, deadlocking
+  call. Skipping it is harmless: `create_view`'s own `INSERT OR REPLACE`
+  (gated on `dbsp_autopersist`, same as a plain `CREATE`) restores the
+  `_dbsp_views` row for every view recreated below.
+
 ## Feature: dbsp_autopersist - views survive a clean reopen - Jul 2026
 
 - New `dbsp_autopersist(enable)` setting, **ON by default**: a database

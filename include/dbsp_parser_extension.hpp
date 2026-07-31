@@ -27,17 +27,23 @@ struct CreateMaterializedViewParseData : public ParserExtensionParseData {
     string view_name;
     string select_query;
     bool if_not_exists = false;
+    bool or_replace = false;
 
     unique_ptr<ParserExtensionParseData> Copy() const override {
         auto result = make_uniq<CreateMaterializedViewParseData>();
         result->view_name = view_name;
         result->select_query = select_query;
         result->if_not_exists = if_not_exists;
+        result->or_replace = or_replace;
         return std::move(result);
     }
 
     string ToString() const override {
-        string result = "CREATE MATERIALIZED VIEW";
+        string result = "CREATE";
+        if (or_replace) {
+            result += " OR REPLACE";
+        }
+        result += " MATERIALIZED VIEW";
         if (if_not_exists) {
             result += " IF NOT EXISTS";
         }
@@ -92,22 +98,33 @@ struct RefreshMaterializedViewParseData : public ParserExtensionParseData {
 // Parser Functions
 //===--------------------------------------------------------------------===//
 
-// Parse CREATE MATERIALIZED VIEW statement
+// Parse CREATE [OR REPLACE] MATERIALIZED VIEW statement
 inline ParserExtensionParseResult ParseCreateMaterializedView(const string &query) {
     // Simple regex-based parsing for now
-    // Format: CREATE MATERIALIZED VIEW [IF NOT EXISTS] name AS select_query
+    // Format: CREATE [OR REPLACE] MATERIALIZED VIEW [IF NOT EXISTS] name AS select_query
 
     auto query_upper = StringUtil::Upper(query);
 
-    // Check for CREATE MATERIALIZED VIEW
-    if (query_upper.find("CREATE MATERIALIZED VIEW") != 0) {
+    // Check for CREATE OR REPLACE MATERIALIZED VIEW first (longer prefix) —
+    // plain CREATE MATERIALIZED VIEW does not match it, so order matters.
+    static const string kOrReplacePrefix = "CREATE OR REPLACE MATERIALIZED VIEW";
+    static const string kCreatePrefix = "CREATE MATERIALIZED VIEW";
+
+    bool or_replace = false;
+    size_t pos;
+    if (query_upper.find(kOrReplacePrefix) == 0) {
+        or_replace = true;
+        pos = kOrReplacePrefix.length();
+    } else if (query_upper.find(kCreatePrefix) == 0) {
+        pos = kCreatePrefix.length();
+    } else {
         return ParserExtensionParseResult(); // Not our statement
     }
 
     auto result = make_uniq<CreateMaterializedViewParseData>();
+    result->or_replace = or_replace;
 
     // Extract IF NOT EXISTS
-    size_t pos = strlen("CREATE MATERIALIZED VIEW");
     while (pos < query.length() && std::isspace(query[pos])) pos++;
 
     if (query_upper.find("IF NOT EXISTS", pos) == pos) {
@@ -213,8 +230,9 @@ inline ParserExtensionParseResult ParseRefreshMaterializedView(const string &que
 inline ParserExtensionParseResult MaterializedViewParse(ParserExtensionInfo *info, const string &query) {
     auto query_upper = StringUtil::Upper(query);
 
-    // Try CREATE MATERIALIZED VIEW
-    if (query_upper.find("CREATE MATERIALIZED VIEW") == 0) {
+    // Try CREATE [OR REPLACE] MATERIALIZED VIEW
+    if (query_upper.find("CREATE OR REPLACE MATERIALIZED VIEW") == 0 ||
+        query_upper.find("CREATE MATERIALIZED VIEW") == 0) {
         return ParseCreateMaterializedView(query);
     }
 

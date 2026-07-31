@@ -30,6 +30,17 @@ Creates an incrementally maintained view. Equivalent to
 `dbsp_create_materialized_view` table function (registered for the
 parser extension; not intended for direct use).
 
+### CREATE OR REPLACE MATERIALIZED VIEW
+
+```sql
+CREATE OR REPLACE MATERIALIZED VIEW name AS SELECT ...;
+```
+
+Plain `CREATE` when `name` doesn't exist yet; when it does, changes its
+definition and rebuilds **only** `name` and its transitive dependents —
+equivalent to `dbsp_replace_view('name', 'SELECT ...')`. See
+`dbsp_replace_view` below for the rebuild semantics.
+
 ### REFRESH MATERIALIZED VIEW
 
 ```sql
@@ -187,6 +198,48 @@ SELECT * FROM dbsp_create_view('vip_totals',
 - Source tables are automatically tracked if not already
 - Views can reference other views (cascading)
 - Circular dependencies are detected and rejected
+
+---
+
+### dbsp_replace_view(name, sql)
+
+Change an existing materialized view's definition in place, rebuilding
+**only** that view and its transitive dependents — everything upstream
+(its sources, and any unrelated view) is left untouched, and every
+dependent keeps its own original DDL.
+
+```sql
+SELECT * FROM dbsp_replace_view('view_name', 'SELECT ... FROM ...');
+```
+
+Equivalent to `CREATE OR REPLACE MATERIALIZED VIEW view_name AS SELECT ...`
+(the DDL form routes here automatically when `view_name` already exists).
+
+**Parameters:**
+- `name` (VARCHAR): Name of an existing view
+- `sql` (VARCHAR): New SQL SELECT statement for the view
+
+**Returns:**
+- `result` (VARCHAR): Confirmation with source tables
+
+**Example:**
+```sql
+SELECT * FROM dbsp_create_view('lvl1', 'SELECT k, v * 2 AS d FROM base');
+SELECT * FROM dbsp_create_view('lvl2', 'SELECT k, d + 1 AS e FROM lvl1');
+
+-- Redefine lvl1; lvl2's own DDL is untouched, only its values change
+SELECT * FROM dbsp_replace_view('lvl1', 'SELECT k, v * 3 AS d FROM base');
+```
+
+**Notes:**
+- Fails with `DBSP-E206` if `name` doesn't exist — use `dbsp_create_view`
+  for a new view instead.
+- No transactional rollback (v1): if a dependent fails to recreate mid
+  rebuild, the remaining dependents are still attempted with their saved
+  DDL, and the `DBSP-E304` error reports every failure plus which views
+  are still queryable afterward.
+- Cost is proportional to the changed view's subtree — sources and
+  sibling views outside it never repopulate.
 
 ---
 

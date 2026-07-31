@@ -1575,6 +1575,104 @@ public:
     return views_.erase(view_name) > 0;
   }
 
+  // Feature 2 (dbsp_replace_view / CREATE OR REPLACE MATERIALIZED VIEW):
+  // change one view's definition; only it and its transitive dependents
+  // repopulate. Upstream state (its own sources, and anything outside the
+  // subtree) is untouched, and every dependent keeps its original DDL —
+  // only `view_name` gets `new_sql`.
+  //
+  // Lock discipline mirrors load_from_duck_table (see its comment above):
+  // snapshot the dependent DDL under a shared lock, then drop/create
+  // unlocked — create_view and drop_view_cascade each take struct_mutex_
+  // themselves, and it is not reentrant.
+  //
+  // Failure semantics (spec §2): no transactional rollback in v1. If a
+  // create fails mid-sequence, the remaining dependents are still attempted
+  // (with their saved old DDL) and last_error_ accumulates a full report of
+  // what failed and which views are still queryable afterward. Returns
+  // false on any failure; the registry itself is left internally
+  // consistent either way (create_view/drop_view_cascade never leave a
+  // partially-registered view).
+  bool replace_view(duckdb::ClientContext &context, const std::string &view_name,
+                    const std::string &new_sql) {
+    std::vector<ViewDefinition> dependent_defs;
+    {
+      std::shared_lock<std::shared_mutex> lock(struct_mutex_);
+      if (!views_.count(view_name)) {
+        ErrorInfo info;
+        info.code = ErrorCode::VIEW_NOT_FOUND;
+        info.message = get_message(ErrorCode::VIEW_NOT_FOUND) + ": " + view_name;
+        info.context = "View: " + view_name;
+        info.workaround = get_workaround(ErrorCode::VIEW_NOT_FOUND);
+        last_error_ = format_error(info);
+        return false;
+      }
+      // topological_order() filters to the dependent set and orders it so
+      // that a dependent's in-set dependencies precede it — exactly the
+      // recreation order needed once `view_name` itself exists again.
+      for (const auto &dep : dep_graph_.topological_order(view_name)) {
+        auto it = view_definitions_.find(dep);
+        if (it != view_definitions_.end()) {
+          dependent_defs.push_back(it->second);
+        }
+      }
+    }
+
+    // Drop the subtree (view_name + all transitive dependents) via the
+    // existing cascade path. No `context` here — like every other
+    // drop_view_cascade caller in this file, we're running inside a table
+    // function on this ClientContext already (mid-query); drop_view_cascade
+    // would call context->Query() to delete the _dbsp_views row, which
+    // deadlocks against the context's own query lock. Skipping that delete
+    // is harmless: create_view() below re-inserts (INSERT OR REPLACE) the
+    // row for every recreated view when autopersist is on, so the table
+    // ends up consistent regardless.
+    if (!drop_view_cascade(view_name)) {
+      return false; // last_error_ already set by drop_view_cascade
+    }
+
+    std::vector<std::string> failures;
+    if (!create_view(context, view_name, new_sql)) {
+      failures.push_back(view_name + ": " + last_error_);
+    }
+    for (const auto &def : dependent_defs) {
+      if (!create_view(context, def.name, def.sql)) {
+        failures.push_back(def.name + ": " + last_error_);
+      }
+    }
+
+    if (!failures.empty()) {
+      std::string still_live;
+      for (const auto &def : dependent_defs) {
+        if (is_view_registered(def.name)) {
+          if (!still_live.empty()) still_live += ", ";
+          still_live += def.name;
+        }
+      }
+      if (is_view_registered(view_name)) {
+        still_live = still_live.empty() ? view_name : view_name + ", " + still_live;
+      }
+
+      ErrorInfo info;
+      info.code = ErrorCode::CASCADE_UPDATE_FAILED;
+      std::string details =
+          "replace_view('" + view_name + "') partial failure: " +
+          std::to_string(failures.size()) + " of " +
+          std::to_string(dependent_defs.size() + 1) + " recreate(s) failed:\n";
+      for (const auto &f : failures) {
+        details += "  - " + f + "\n";
+      }
+      info.message = details;
+      info.context = "View: " + view_name + " — still queryable: " +
+                     (still_live.empty() ? "(none)" : still_live);
+      info.workaround = get_workaround(ErrorCode::CASCADE_UPDATE_FAILED);
+      last_error_ = format_error(info);
+      return false;
+    }
+
+    return true;
+  }
+
   // Record an INSERT. `context` enables lazy-baseline materialization
   // (D3c): the first notified delta after a checkpoint restore triggers
   // the deferred table scans. Context-less callers on a deferred manager

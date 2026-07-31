@@ -24,6 +24,7 @@ enum class ErrorCode {
   CIRCULAR_DEPENDENCY = 203,
   IDENTIFIER_TOO_LONG = 204,
   RESERVED_KEYWORD = 205,
+  VIEW_NOT_FOUND = 206,
 
   // Runtime errors (E3xx) - Execution failures
   VIEW_UPDATE_FAILED = 301,
@@ -82,6 +83,7 @@ inline std::string get_message(ErrorCode code) {
       {ErrorCode::CIRCULAR_DEPENDENCY, "Circular view dependency"},
       {ErrorCode::IDENTIFIER_TOO_LONG, "Identifier too long"},
       {ErrorCode::RESERVED_KEYWORD, "Reserved keyword used"},
+      {ErrorCode::VIEW_NOT_FOUND, "View not found"},
       // Runtime errors (E3xx)
       {ErrorCode::VIEW_UPDATE_FAILED, "View update failed"},
       {ErrorCode::TYPE_MISMATCH, "Type mismatch in view"},
@@ -125,6 +127,11 @@ inline std::string get_workaround(ErrorCode code) {
        "Maximum identifier length is 255 characters."},
       {ErrorCode::RESERVED_KEYWORD,
        "Use a different name or quote the identifier."},
+      {ErrorCode::VIEW_NOT_FOUND,
+       "Check the name against dbsp_views(). dbsp_replace_view / "
+       "CREATE OR REPLACE MATERIALIZED VIEW can only replace a view "
+       "that already exists — use dbsp_create_view (or plain "
+       "CREATE MATERIALIZED VIEW) to create a new one."},
 
       // Runtime errors (E3xx)
       {ErrorCode::VIEW_UPDATE_FAILED,

@@ -176,6 +176,7 @@ See [docs/TESTING.md](docs/TESTING.md) for details.
 | Function | Description |
 |----------|-------------|
 | `dbsp_create_view(name, sql)` | Create view with SQL syntax |
+| `dbsp_replace_view(name, sql)` | Redefine a view, rebuilding only it and its dependents |
 | `dbsp_query(view)` | Query a materialized view |
 | `dbsp_views()` | List all views with stats |
 | `dbsp_drop(view)` | Drop a view |
@@ -236,6 +237,8 @@ See [Error Handling Guide](docs/ERROR_HANDLING.md) for details.
 
 **DDL Syntax:**
 - `CREATE MATERIALIZED VIEW name AS SELECT ...`
+- `CREATE OR REPLACE MATERIALIZED VIEW name AS SELECT ...` - redefine a
+  view, rebuilding only it and its transitive dependents
 - `DROP MATERIALIZED VIEW name [CASCADE]`
 - `REFRESH MATERIALIZED VIEW name` (no-op with auto-refresh)
 

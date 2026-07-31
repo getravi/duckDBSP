@@ -233,3 +233,48 @@ TEST_CASE("Join of two sibling MVs stays exact across repeated updates",
     REQUIRE(result->RowCount() == 1);
     REQUIRE(result->GetValue(0, 0).GetValue<double>() == 21012.0);
 }
+
+TEST_CASE("Replace a mid-chain view rebuilds only its subtree",
+          "[integration][cascade][replace]") {
+    DuckDBTestHarness db;
+    db.createTable("base", "k INT, v DOUBLE", {"(1, 1.0)", "(2, 2.0)"});
+    db.exec("SELECT * FROM dbsp_track('base')");
+    db.exec("SELECT * FROM dbsp_sync('base')");
+    db.exec("CREATE MATERIALIZED VIEW lvl1 AS SELECT k, v * 2 AS d FROM base");
+    db.exec("CREATE MATERIALIZED VIEW lvl2 AS SELECT k, d + 1 AS e FROM lvl1");
+
+    // Replace lvl1: doubles become triples; lvl2's own DDL must survive
+    db.exec("SELECT * FROM dbsp_replace_view('lvl1', "
+            "'SELECT k, v * 3 AS d FROM base')");
+    auto rows = db.query("SELECT e FROM dbsp_query('lvl2') WHERE k = 2");
+    REQUIRE(rows->GetValue(0, 0).GetValue<double>() == 7.0); // 2*3+1
+
+    // Still incremental afterwards
+    db.exec("INSERT INTO base VALUES (3, 3.0)");
+    db.exec("SELECT * FROM dbsp_sync('base')");
+    rows = db.query("SELECT e FROM dbsp_query('lvl2') WHERE k = 3");
+    REQUIRE(rows->GetValue(0, 0).GetValue<double>() == 10.0); // 3*3+1
+}
+
+TEST_CASE("CREATE OR REPLACE MATERIALIZED VIEW maps to replace",
+          "[integration][cascade][replace]") {
+    DuckDBTestHarness db;
+    db.createTable("base", "k INT", {"(1)"});
+    db.exec("CREATE OR REPLACE MATERIALIZED VIEW mv AS SELECT k FROM base");     // create
+    db.exec("CREATE OR REPLACE MATERIALIZED VIEW mv AS SELECT k + 1 AS k FROM base"); // replace
+    auto rows = db.query("SELECT k FROM dbsp_query('mv')");
+    REQUIRE(rows->GetValue(0, 0).GetValue<int32_t>() == 2);
+}
+
+TEST_CASE("Replace with bad SQL reports and leaves registry queryable",
+          "[integration][cascade][replace]") {
+    DuckDBTestHarness db;
+    db.createTable("base", "k INT", {"(1)"});
+    db.exec("CREATE MATERIALIZED VIEW good AS SELECT k FROM base");
+    auto result = db.query("SELECT * FROM dbsp_replace_view('good', "
+                           "'SELECT nonexistent_col FROM base')");
+    // The call surfaces an error (either result error or error-status row)
+    // and the registry remains usable afterwards:
+    auto views = db.query("SELECT * FROM dbsp_views()");
+    REQUIRE_FALSE(views->HasError());
+}

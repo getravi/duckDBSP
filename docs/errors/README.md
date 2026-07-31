@@ -7,8 +7,8 @@ Reference for `DBSP-Exxx` error codes.
 | Range | Category | Codes |
 |-------|----------|-------|
 | E1xx | Unsupported SQL | [E110](E1xx/DBSP-E110.md) — plan operator not supported |
-| E2xx | Validation errors | E201 invalid identifier, E202 path traversal, E203 circular dependency, E204 identifier too long, E205 reserved keyword |
-| E3xx | Runtime errors | E301 view update failed, E302 type mismatch, E303 NULL constraint, E304 cascade update failed |
+| E2xx | Validation errors | E201 invalid identifier, E202 path traversal, E203 circular dependency, E204 identifier too long, E205 reserved keyword, E206 view not found (replace) |
+| E3xx | Runtime errors | E301 view update failed, E302 type mismatch, E303 NULL constraint, E304 cascade update failed (incl. `dbsp_replace_view` partial failure) |
 | E4xx | Resource errors | E401 memory limit, E402 too many views, E403 view too large, E404 nesting depth |
 | E5xx | Persistence errors | E501 file read, E502 file write, E503 serialization, E504 deserialization |
 

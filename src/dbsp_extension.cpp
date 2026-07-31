@@ -1348,6 +1348,7 @@ void UsePlannerFunc(ClientContext &context, TableFunctionInput &input,
 struct CreateMaterializedViewData : public TableFunctionData {
   string view_name;
   string select_query;
+  bool or_replace = false;
   bool done = false;
 };
 
@@ -1357,6 +1358,11 @@ unique_ptr<FunctionData> CreateMaterializedViewBind(
   auto data = make_uniq<CreateMaterializedViewData>();
   data->view_name = input.inputs[0].GetValue<string>();
   data->select_query = input.inputs[1].GetValue<string>();
+  // Optional 3rd arg (OR REPLACE flag): the directly-registered
+  // dbsp_create_materialized_view table function only declares two
+  // parameters, so this stays absent for that call path.
+  data->or_replace =
+      input.inputs.size() > 2 ? input.inputs[2].GetValue<bool>() : false;
   return_types.push_back(LogicalType::VARCHAR);
   names.push_back("result");
   return std::move(data);
@@ -1375,14 +1381,22 @@ void CreateMaterializedViewExecute(ClientContext &context,
 
   auto &manager = dbsp_native::get_cdc_manager(context);
   manager.maybe_autoload(context);
+
+  // CREATE OR REPLACE MATERIALIZED VIEW: only takes the replace path when
+  // the view already exists (matches SQL's usual OR REPLACE semantics —
+  // plain create otherwise).
+  bool replacing = state.or_replace && manager.view_exists(state.view_name);
   bool success =
-      manager.create_view(context, state.view_name, state.select_query);
+      replacing
+          ? manager.replace_view(context, state.view_name, state.select_query)
+          : manager.create_view(context, state.view_name, state.select_query);
 
   if (!success) {
     string error = manager.last_error();
     if (error.find("DBSP-E") == string::npos) {
-      error = "Failed to create materialized view '" + state.view_name +
-              "': " + error;
+      error = (replacing ? "Failed to replace materialized view '"
+                         : "Failed to create materialized view '") +
+              state.view_name + "': " + error;
     }
     throw InvalidInputException(error);
   }
@@ -1397,7 +1411,69 @@ void CreateMaterializedViewExecute(ClientContext &context,
     sources += info.source_tables[i];
   }
 
-  string message = "Created materialized view: " + state.view_name +
+  string message = (replacing ? "Replaced materialized view: "
+                              : "Created materialized view: ") +
+                   state.view_name + " (sources: " + sources + ")";
+  output.SetValue(0, 0, Value(message));
+
+  state.done = true;
+}
+
+// ============================================================================
+// dbsp_replace_view - CREATE OR REPLACE a materialized view: rebuild only
+// the named view and its transitive dependents (Feature 2)
+// ============================================================================
+
+struct ReplaceViewData : public TableFunctionData {
+  string view_name;
+  string sql;
+  bool done = false;
+};
+
+unique_ptr<FunctionData>
+ReplaceViewBind(ClientContext &context, TableFunctionBindInput &input,
+                vector<LogicalType> &return_types, vector<string> &names) {
+  auto data = make_uniq<ReplaceViewData>();
+  data->view_name = input.inputs[0].GetValue<string>();
+  data->sql = input.inputs[1].GetValue<string>();
+  return_types.push_back(LogicalType::VARCHAR);
+  names.push_back("result");
+  return std::move(data);
+}
+
+void ReplaceViewExecute(ClientContext &context, TableFunctionInput &input,
+                        DataChunk &output) {
+  EnsureContextState(context);
+  auto &state = input.bind_data->CastNoConst<ReplaceViewData>();
+
+  if (state.done) {
+    output.SetCardinality(0);
+    return;
+  }
+
+  auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
+  bool success = manager.replace_view(context, state.view_name, state.sql);
+
+  if (!success) {
+    string error = manager.last_error();
+    if (error.find("DBSP-E") == string::npos) {
+      error = "Failed to replace materialized view '" + state.view_name +
+              "': " + error;
+    }
+    throw InvalidInputException(error);
+  }
+
+  output.SetCardinality(1);
+  auto info = manager.get_view_info(state.view_name);
+  string sources = "";
+  for (size_t i = 0; i < info.source_tables.size(); i++) {
+    if (i > 0)
+      sources += ", ";
+    sources += info.source_tables[i];
+  }
+
+  string message = "Replaced materialized view: " + state.view_name +
                    " (sources: " + sources + ")";
   output.SetValue(0, 0, Value(message));
 
@@ -1549,13 +1625,15 @@ MaterializedViewPlan(ParserExtensionInfo *info, ClientContext &context,
           dynamic_cast<::dbsp_native::CreateMaterializedViewParseData *>(
               parse_data_p.get())) {
     TableFunction func("create_materialized_view",
-                       {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                       {LogicalType::VARCHAR, LogicalType::VARCHAR,
+                        LogicalType::BOOLEAN},
                        CreateMaterializedViewExecute,
                        CreateMaterializedViewBind);
 
     result.function = func;
     result.parameters.push_back(Value(create_data->view_name));
     result.parameters.push_back(Value(create_data->select_query));
+    result.parameters.push_back(Value(create_data->or_replace));
     result.return_type = StatementReturnType::QUERY_RESULT;
 
     return result;
@@ -1753,6 +1831,11 @@ static void LoadInternal(ExtensionLoader &loader) {
   // Optional args for simple mode
   create_view_func.varargs = LogicalType::ANY;
   loader.RegisterFunction(create_view_func);
+
+  TableFunction replace_view_func("dbsp_replace_view",
+                                  {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                                  ReplaceViewExecute, ReplaceViewBind);
+  loader.RegisterFunction(replace_view_func);
 
   // Create Materialized View DDL support
   // Note: We cannot register actual SQL syntax here (ParserExtension needed for

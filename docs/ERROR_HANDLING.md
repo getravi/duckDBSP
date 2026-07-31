@@ -84,6 +84,36 @@ SELECT * FROM dbsp_create_view('big_orders',
 Note: ORDER BY / LIMIT are fully supported since Phase C1 — `dbsp_query`
 returns rows in ORDER BY order for sorted views.
 
+### E206: View Not Found (replace)
+
+`dbsp_replace_view(name, sql)` / `CREATE OR REPLACE MATERIALIZED VIEW`
+requires `name` to already exist — it changes a view's definition, it
+doesn't create one.
+
+**Solution**: create the view first, or check the spelling against
+`dbsp_views()`:
+
+```sql
+-- Instead of:
+SELECT * FROM dbsp_replace_view('typo_name', 'SELECT ...');
+
+-- Do this:
+SELECT * FROM dbsp_create_view('correct_name', 'SELECT ...');
+```
+
+### E304: Cascade Update Failed (replace partial failure)
+
+`dbsp_replace_view` rebuilds the named view and its whole dependent
+subtree; there's no transactional rollback in v1. If a dependent's SQL
+fails to recreate (e.g. it referenced a column the new definition
+dropped), the remaining dependents are still attempted with their saved
+DDL, and the error message lists every failure plus which views are
+still queryable afterward.
+
+**Solution**: fix the dependent's SQL (or the replacement SQL) and
+retry — recreate any view named in the failure list explicitly with
+`dbsp_create_view`.
+
 ## Getting Help
 
 - Browse [Error Catalog](errors/README.md) for all error codes
