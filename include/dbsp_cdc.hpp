@@ -1596,6 +1596,13 @@ public:
   bool replace_view(duckdb::ClientContext &context, const std::string &view_name,
                     const std::string &new_sql) {
     std::vector<ViewDefinition> dependent_defs;
+    // Full registry name snapshot, taken in the same critical section as
+    // dependent_defs (so this doesn't widen the race window with a second
+    // lock acquisition) — used below to detect views that got swept into
+    // the cascade drop without ever being in our saved-DDL list (TOCTOU: a
+    // view created onto the subtree after this snapshot but before
+    // drop_view_cascade's own later, exclusive recomputation).
+    std::vector<std::string> pre_drop_names;
     {
       std::shared_lock<std::shared_mutex> lock(struct_mutex_);
       if (!views_.count(view_name)) {
@@ -1616,6 +1623,10 @@ public:
           dependent_defs.push_back(it->second);
         }
       }
+      pre_drop_names.reserve(views_.size());
+      for (const auto &[name, _] : views_) {
+        pre_drop_names.push_back(name);
+      }
     }
 
     // Drop the subtree (view_name + all transitive dependents) via the
@@ -1624,24 +1635,65 @@ public:
     // function on this ClientContext already (mid-query); drop_view_cascade
     // would call context->Query() to delete the _dbsp_views row, which
     // deadlocks against the context's own query lock. Skipping that delete
-    // is harmless: create_view() below re-inserts (INSERT OR REPLACE) the
-    // row for every recreated view when autopersist is on, so the table
-    // ends up consistent regardless.
+    // is harmless for the common case: create_view() below re-inserts
+    // (INSERT OR REPLACE) the row for every successfully recreated view
+    // when autopersist is on. Views that never get recreated (failure path
+    // below) get their stale row cleaned up explicitly instead.
     if (!drop_view_cascade(view_name)) {
       return false; // last_error_ already set by drop_view_cascade
     }
 
-    std::vector<std::string> failures;
+    std::vector<std::string> failed_names;  // for _dbsp_views cleanup
+    std::vector<std::string> failure_lines; // for the human-readable report
+
     if (!create_view(context, view_name, new_sql)) {
-      failures.push_back(view_name + ": " + last_error_);
+      failed_names.push_back(view_name);
+      failure_lines.push_back(view_name + ": " + last_error_);
     }
     for (const auto &def : dependent_defs) {
       if (!create_view(context, def.name, def.sql)) {
-        failures.push_back(def.name + ": " + last_error_);
+        failed_names.push_back(def.name);
+        failure_lines.push_back(def.name + ": " + last_error_);
       }
     }
 
-    if (!failures.empty()) {
+    // TOCTOU detection: diff the pre-drop registry snapshot against the
+    // current one. Anything that's gone, isn't `view_name`, and wasn't one
+    // of our intentionally-dropped dependents was swept up by
+    // drop_view_cascade's own (fresh, exclusive-lock) recomputation of the
+    // dependent set — i.e. a view created concurrently onto the subtree in
+    // the snapshot/drop window. We never saved its DDL, so it can't be
+    // recreated here; report it rather than silently losing it.
+    {
+      std::unordered_set<std::string> known_names;
+      known_names.insert(view_name);
+      for (const auto &def : dependent_defs) {
+        known_names.insert(def.name);
+      }
+      std::shared_lock<std::shared_mutex> lock(struct_mutex_);
+      for (const auto &name : pre_drop_names) {
+        if (known_names.count(name)) {
+          continue;
+        }
+        if (!views_.count(name)) {
+          failed_names.push_back(name);
+          failure_lines.push_back(
+              name + ": concurrently created, definition unknown, recreate "
+                     "manually");
+        }
+      }
+    }
+
+    if (!failure_lines.empty()) {
+      // Keep the registry, the DuckDB catalog, and _dbsp_views persistence
+      // in agreement about which views are gone: an old row surviving here
+      // would let a crash before the next clean-shutdown save auto-load a
+      // stale definition later, in the wrong order relative to its
+      // already-recreated (freshly re-timestamped) ancestor.
+      for (const auto &name : failed_names) {
+        erase_persisted_view_row(context, name);
+      }
+
       std::string still_live;
       for (const auto &def : dependent_defs) {
         if (is_view_registered(def.name)) {
@@ -1655,12 +1707,11 @@ public:
 
       ErrorInfo info;
       info.code = ErrorCode::CASCADE_UPDATE_FAILED;
-      std::string details =
-          "replace_view('" + view_name + "') partial failure: " +
-          std::to_string(failures.size()) + " of " +
-          std::to_string(dependent_defs.size() + 1) + " recreate(s) failed:\n";
-      for (const auto &f : failures) {
-        details += "  - " + f + "\n";
+      std::string details = "replace_view('" + view_name + "') lost " +
+                            std::to_string(failure_lines.size()) +
+                            " view(s):\n";
+      for (const auto &line : failure_lines) {
+        details += "  - " + line + "\n";
       }
       info.message = details;
       info.context = "View: " + view_name + " — still queryable: " +
@@ -1671,6 +1722,30 @@ public:
     }
 
     return true;
+  }
+
+  // Best-effort delete of one view's persisted _dbsp_views row. Used by
+  // replace_view's failure path so a permanently-lost view (dropped but
+  // never successfully recreated) doesn't leave a stale row behind for a
+  // later dbsp_load()/auto-load to resurrect. Same fresh-Connection
+  // pattern as create_view's own INSERT (see its comment): must NOT run
+  // the query on `context` directly — replace_view executes inside a
+  // table function already mid-query on it, and context->Query() would
+  // deadlock (the same reason drop_view_cascade is called without a
+  // context above).
+  void erase_persisted_view_row(duckdb::ClientContext &context,
+                                const std::string &name) {
+    if (!autopersist_) {
+      return; // matches create_view's own persistence gate
+    }
+    try {
+      InternalQueryGuard guard;
+      duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+      con.Query("DELETE FROM _dbsp_views WHERE name = '" + name + "'");
+      // Ignore errors (including "table does not exist") — persistence is
+      // best-effort throughout this file.
+    } catch (...) {
+    }
   }
 
   // Record an INSERT. `context` enables lazy-baseline materialization

@@ -273,8 +273,47 @@ TEST_CASE("Replace with bad SQL reports and leaves registry queryable",
     db.exec("CREATE MATERIALIZED VIEW good AS SELECT k FROM base");
     auto result = db.query("SELECT * FROM dbsp_replace_view('good', "
                            "'SELECT nonexistent_col FROM base')");
-    // The call surfaces an error (either result error or error-status row)
-    // and the registry remains usable afterwards:
+    // The call itself must surface the error, not just leave it for a
+    // later query to notice.
+    REQUIRE(result->HasError());
+    // ... and the registry remains usable afterwards:
     auto views = db.query("SELECT * FROM dbsp_views()");
     REQUIRE_FALSE(views->HasError());
+}
+
+TEST_CASE("Multi-level cascade failure reports every lost dependent",
+          "[integration][cascade][replace]") {
+    DuckDBTestHarness db;
+    db.createTable("base", "k INT, v DOUBLE", {"(1, 1.0)"});
+    db.exec("SELECT * FROM dbsp_track('base')");
+    db.exec("SELECT * FROM dbsp_sync('base')");
+    // Chain: base -> midA -> midB -> endC
+    db.exec("CREATE MATERIALIZED VIEW midA AS SELECT k, v AS d FROM base");
+    db.exec("CREATE MATERIALIZED VIEW midB AS SELECT k, d FROM midA");
+    db.exec("CREATE MATERIALIZED VIEW endC AS SELECT k, d FROM midB");
+
+    // Replacing midA drops column `d` (renamed to `e`); midB's saved SQL
+    // ("SELECT k, d FROM midA") can no longer bind, so its recreate fails
+    // -- and endC's recreate fails right after it since midB is gone.
+    auto result = db.query("SELECT * FROM dbsp_replace_view('midA', "
+                           "'SELECT k, v AS e FROM base')");
+    REQUIRE(result->HasError());
+    auto err = result->GetError();
+    REQUIRE(err.find("midB") != std::string::npos);
+    REQUIRE(err.find("endC") != std::string::npos);
+
+    // midA itself is queryable under its new definition.
+    auto rows = db.query("SELECT e FROM dbsp_query('midA') WHERE k = 1");
+    REQUIRE_FALSE(rows->HasError());
+    REQUIRE(rows->GetValue(0, 0).GetValue<double>() == 1.0);
+
+    // midB/endC are really gone (not just failed once and left dangling).
+    REQUIRE(db.query("SELECT * FROM dbsp_query('midB')")->HasError());
+    REQUIRE(db.query("SELECT * FROM dbsp_query('endC')")->HasError());
+
+    // _dbsp_views must agree: no persisted row survives for either.
+    auto persisted = db.query(
+        "SELECT COUNT(*) FROM _dbsp_views WHERE name IN ('midB', 'endC')");
+    REQUIRE_FALSE(persisted->HasError());
+    REQUIRE(persisted->GetValue(0, 0).GetValue<int64_t>() == 0);
 }

@@ -104,14 +104,28 @@ SELECT * FROM dbsp_create_view('correct_name', 'SELECT ...');
 ### E304: Cascade Update Failed (replace partial failure)
 
 `dbsp_replace_view` rebuilds the named view and its whole dependent
-subtree; there's no transactional rollback in v1. If a dependent's SQL
-fails to recreate (e.g. it referenced a column the new definition
-dropped), the remaining dependents are still attempted with their saved
-DDL, and the error message lists every failure plus which views are
-still queryable afterward.
+subtree; there's no transactional rollback in v1. Two things can put a
+view in the "lost" list the error message reports:
+
+- A dependent's saved SQL fails to recreate (e.g. it referenced a column
+  the new definition dropped) — the remaining dependents are still
+  attempted with their saved DDL, so one failure can cascade into further
+  ones further down the chain (each reported by name).
+- A view created concurrently onto the subtree, in the narrow window
+  between `dbsp_replace_view` snapshotting dependent definitions and the
+  cascade actually dropping them, gets swept up by the drop but was never
+  in that snapshot — its definition is unknown, so it's reported instead
+  of silently recreated wrong (or not at all).
+
+Every view named in the "lost" list is fully gone: its live registry
+entry, its DuckDB-visible query surface, and its `_dbsp_views` persisted
+row are all removed together — a later `dbsp_load()` or auto-load won't
+try to resurrect it from a stale row. The error message also lists which
+views (the replaced one, and any dependents that did recreate cleanly)
+are still queryable.
 
 **Solution**: fix the dependent's SQL (or the replacement SQL) and
-retry — recreate any view named in the failure list explicitly with
+retry — recreate any view named in the "lost" list explicitly with
 `dbsp_create_view`.
 
 ## Getting Help
