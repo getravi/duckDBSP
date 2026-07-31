@@ -1,5 +1,43 @@
 # Changelog
 
+## Fix: silent-correctness bug — WHERE+aggregate join subquery side returned empty - Jul 2026
+
+- **Bug**: a materialized view whose `JOIN` had a subquery side containing
+  both a `WHERE` filter and a `GROUP BY` aggregate (e.g. `... JOIN (SELECT
+  k, MAX(v) m FROM t WHERE v IS NOT NULL GROUP BY k) x ON ...`) silently
+  returned an **empty** result from initial materialization — no error, no
+  fallback — while stock DuckDB returned the correct rows.
+- **Root cause**: `plan_ir::fuse_map_cols` (`include/dbsp_plan_translator.hpp`)
+  elides a `MAP_COLS` (column-selection) node beneath its parent and remaps
+  the parent's own bound-ref expressions through the eliminated node's
+  column mapping. This is sound for `MAP_EXPR`/`FILTER_MAP`, whose `exprs`
+  fully and independently define their output columns. It was *also*
+  applied to a bare `FILTER_EXPR`, which is a pure passthrough — its output
+  row layout **is** its input's layout, not something its own predicate
+  list redefines. Eliding the `MAP_COLS` beneath a bare `FILTER_EXPR`
+  correctly remapped the filter's own predicate, but silently changed the
+  column order/width the filter now hands to its *parent*. When that
+  parent was an `AGGREGATE` sitting directly above a `WHERE ... GROUP BY`
+  filter (only reachable when the filter's own parent isn't a `MAP_EXPR` —
+  otherwise `fuse_filter_map` already fuses it into a self-defining
+  `FILTER_MAP` first), the aggregate's group-by key and aggregate-argument
+  indices were left pointing at the pre-elision column positions —
+  silently grouping/aggregating the wrong columns. In the repro this
+  produced a `MAX` keyed and valued on swapped columns, so the outer join's
+  equi-keys never matched and the view came back empty.
+- **Fix**: `fuse_map_cols` no longer fires on bare `FILTER_EXPR` — only on
+  `MAP_EXPR`/`FILTER_MAP`, whose output is self-defined and therefore safe
+  against a reordering child being elided. A `WHERE ... GROUP BY` filter
+  keeps its `MAP_COLS` node (one extra node, matching the
+  `g_plan_ir_optimize=false` behavior, which was already correct); the
+  fusion still fires for the common `SELECT ... WHERE ...` case where the
+  filter is directly under a projection.
+- **Test**: `planner C4: WHERE+aggregate join subquery side stays exact`
+  (`test/integration/test_planner_frontend.cpp`) — initial materialization
+  against hand-computed truth, plus an incremental follow-up (insert a new
+  per-group max, then update it away) verified against DuckDB's own answer.
+  Confirmed failing (0 rows vs. 2) on the pre-fix code, passing after.
+
 ## Feature: signed incremental deltas for linear UNION ALL recursion - Jul 2026
 
 - **Motivation**: profiling the NumPad wfp roll-forward edit path

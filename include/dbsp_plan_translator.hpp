@@ -636,16 +636,29 @@ remap_bound_refs(const duckdb::Expression &expr,
   return ok ? std::move(clone) : nullptr;
 }
 
-// FILTER_MAP/FILTER_EXPR/MAP_EXPR over MAP_COLS(x): remap the consumer's
-// bound refs through the column selection and drop the MAP_COLS node.
-// MAP_COLS re-materializes every input row (per-Value copies + a lazily
-// hashed output Z-set insert) — measured as the DOMINANT cost of simple
+// FILTER_MAP/MAP_EXPR over MAP_COLS(x): remap the consumer's bound refs
+// through the column selection and drop the MAP_COLS node. MAP_COLS
+// re-materializes every input row (per-Value copies + a lazily hashed
+// output Z-set insert) — measured as the DOMINANT cost of simple
 // filter/projection views (~72ms of a 90ms 100k-row sync), so eliding it
 // matters more than batching it.
+//
+// Deliberately EXCLUDES bare FILTER_EXPR: unlike MAP_EXPR/FILTER_MAP,
+// whose `exprs` fully define their own output columns, FILTER_EXPR is a
+// pure passthrough — its output row layout IS its input's layout, not
+// something remap_bound_refs fixes up. Eliding MAP_COLS beneath a bare
+// FILTER_EXPR would correctly remap the filter's own predicate but
+// silently change the column order/width it hands to its PARENT (whoever
+// that is — e.g. an AGGREGATE reading group keys / agg args by position
+// right above a `WHERE ... GROUP BY` filter), corrupting any ancestor
+// still indexed against the old MAP_COLS-selected layout. A bare
+// FILTER_EXPR only remains after fuse_filter_map when its own parent is
+// NOT a MAP_EXPR (that pairing already fused into a self-defining
+// FILTER_MAP above), so there is no self-defining consumer to safely
+// absorb the reorder into.
 inline void fuse_map_cols(std::unique_ptr<PlanOpSpec> &spec,
                           PlanKeepAlive &keep_alive) {
   if (spec->kind != PlanOpSpec::Kind::FILTER_MAP &&
-      spec->kind != PlanOpSpec::Kind::FILTER_EXPR &&
       spec->kind != PlanOpSpec::Kind::MAP_EXPR) {
     return;
   }

@@ -89,12 +89,17 @@ every input row before the filter even ran.
 
 Two fixes shipped:
 
-1. **fuse_map_cols IR pass**: FILTER_MAP/FILTER_EXPR/MAP_EXPR over
-   MAP_COLS(x) clones the consumer's bound expressions, remaps their
-   BOUND_REF leaves through the column selection, and drops the MAP_COLS
-   node (declines wholesale on out-of-range/virtual-rowid entries).
-   MAP_COLS creation now records the CDC full-row types so the fused
-   node's chunk layout and arity checks are exact.
+1. **fuse_map_cols IR pass**: FILTER_MAP/MAP_EXPR over MAP_COLS(x) clones
+   the consumer's bound expressions, remaps their BOUND_REF leaves through
+   the column selection, and drops the MAP_COLS node (declines wholesale
+   on out-of-range/virtual-rowid entries). MAP_COLS creation now records
+   the CDC full-row types so the fused node's chunk layout and arity
+   checks are exact. Bare FILTER_EXPR is deliberately excluded (fixed
+   2026-07): it's a pure passthrough, not a self-defining consumer like
+   MAP_EXPR/FILTER_MAP — eliding MAP_COLS under it silently changed the
+   row layout handed to its parent (e.g. an AGGREGATE reading group
+   keys/args by position above a `WHERE ... GROUP BY` filter), corrupting
+   the parent's indices with no error. See CHANGELOG.md.
 2. **DP3a output-hash preseed**: PlanBatchNode folds its (already flat)
    projection result vectors into per-row hashes via fold_vector_hashes
    and pre-seeds output rows; PlanAggregateNode does the same for group

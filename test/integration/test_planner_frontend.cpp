@@ -1955,6 +1955,48 @@ TEST_CASE("zero-ceremony UX: create view, insert, read — no track/sync",
   requireViewMatchesQuery(db, "totals", sql);
 }
 
+TEST_CASE("planner C4: WHERE+aggregate join subquery side stays exact",
+          "[integration][planner][ir_opt]") {
+  // Regression for a silent-correctness bug: fuse_map_cols used to also
+  // fire on a bare FILTER_EXPR (not just MAP_EXPR/FILTER_MAP). FILTER_EXPR
+  // is a pure passthrough — its output layout IS its input's layout, not
+  // something its own `exprs` redefine — so eliding the MAP_COLS beneath a
+  // `WHERE ... GROUP BY` filter silently left the AGGREGATE directly above
+  // it (group keys + agg args) indexed against the now-stale pre-elision
+  // column order, corrupting the aggregate into grouping/aggregating the
+  // wrong columns. The join above then had no matching keys and returned
+  // an empty result with no error.
+  DuckDBTestHarness db;
+  db.createTable("t", "k INT, v DOUBLE",
+                 {"(1, 10)", "(1, 20)", "(2, 5)", "(2, NULL)"});
+  db.exec("SELECT * FROM dbsp_track('t')");
+  db.exec("SELECT * FROM dbsp_sync('t')");
+  db.exec("SELECT * FROM dbsp_use_planner(true)");
+
+  const std::string sql =
+      "SELECT a.k, a.v FROM t a JOIN (SELECT k, MAX(v) m FROM t WHERE v IS "
+      "NOT NULL GROUP BY k) x ON a.k = x.k AND a.v = x.m";
+  db.exec("SELECT * FROM dbsp_create_view('v_agg_where', '" + sql + "')");
+  REQUIRE(plannerBuilt(db, "v_agg_where"));
+
+  // Hand-computed truth: per-k max non-null v is (1,20) and (2,5); the
+  // join keeps only the row(s) whose v equals that max.
+  requireViewMatchesQuery(db, "v_agg_where", sql);
+  db.assertViewRowCount("v_agg_where", 2);
+
+  // Incremental follow-up: a new row becomes the max for k=1, then gets
+  // updated away again — both transitions must stay incrementally exact.
+  db.exec("INSERT INTO t VALUES (1, 30)");
+  db.exec("SELECT * FROM dbsp_sync('t')");
+  requireViewMatchesQuery(db, "v_agg_where", sql);
+  db.assertViewRowCount("v_agg_where", 2); // (1,30) and (2,5)
+
+  db.exec("UPDATE t SET v = 1 WHERE k = 1 AND v = 30");
+  db.exec("SELECT * FROM dbsp_sync('t')");
+  requireViewMatchesQuery(db, "v_agg_where", sql);
+  db.assertViewRowCount("v_agg_where", 2); // back to (1,20) and (2,5)
+}
+
 TEST_CASE("spill: enabling sweeps dead processes' spill directories",
           "[integration][spill][cleanup]") {
   namespace fs = std::filesystem;
