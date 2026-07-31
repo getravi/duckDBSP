@@ -3733,10 +3733,14 @@ private:
   // its input — AGGREGATE/DISTINCT/DISTINCT_ON/WINDOW/SORT_LIMIT all
   // collapse or reorder rows in ways that do NOT distribute over
   // step(R+δ) = step(R) + step(δ), even when the sentinel is referenced
-  // exactly once. The planner currently accepts these shapes inside a
-  // recursive step and they are already wrong on every existing path
-  // (pre-existing, out of scope here) — this scan only prevents the new
-  // signed-delta path from ALSO claiming linearity for them.
+  // exactly once. SET_OP is the same class UNLESS it is itself UNION_ALL
+  // (a plain per-branch sum, see PlanSetOpNode::multiplicity's UNION_ALL
+  // case): UNION/INTERSECT[_ALL]/EXCEPT[_ALL] compute min/clamped-
+  // indicator/max(a-b,0) of the per-branch counts, which is nonlinear.
+  // The planner currently accepts these shapes inside a recursive step and
+  // they are already wrong on every existing path (pre-existing, out of
+  // scope here) — this scan only prevents the new signed-delta path from
+  // ALSO claiming linearity for them.
   static void scan_step_linearity(const PlanOpSpec &spec,
                                   const std::string &sentinel,
                                   StepLinearity &info) {
@@ -3750,6 +3754,11 @@ private:
     case PlanOpSpec::Kind::WINDOW:
     case PlanOpSpec::Kind::SORT_LIMIT:
       info.has_weight_nonlinear_op = true;
+      break;
+    case PlanOpSpec::Kind::SET_OP:
+      if (spec.set_op != PlanOpSpec::SetOp::UNION_ALL) {
+        info.has_weight_nonlinear_op = true;
+      }
       break;
     default:
       break;
