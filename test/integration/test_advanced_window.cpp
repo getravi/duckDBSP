@@ -154,6 +154,46 @@ TEST_CASE("Window constant bounded ROWS frame (AVG) accepted and correct",
   requireViewMatchesQuery(harness, "w_frame", sql);
 }
 
+// Fast-path EXCLUSION boundary: a pure value UPDATE (no row count change)
+// stays on NativeWindowView's fast re-emit path (emit_affected/
+// affected_indices), not the structural full-render fallback. The AVG-frame
+// test above only ever updates a row close enough to the partition's end
+// that every later row is within reach of the 12-row trailing frame -- it
+// can never prove affected_indices correctly EXCLUDES rows whose frame
+// doesn't reach the edited row. Use a partition at least 2x the frame width
+// (24 rows, frame width 12) and edit the FIRST row: rows 0..11 must pick up
+// the new value (it's within their trailing frame), rows 12..23 must not
+// (row 0 is outside frame [r-11, r] once r >= 12) -- their AVG must stay
+// exactly what it was, verified by an exact-value diff against stock
+// DuckDB's own recompute over the whole partition, not just the changed
+// rows.
+TEST_CASE("Window bounded frame fast-path excludes rows outside its reach",
+          "[integration][window][constant-frame]") {
+  DuckDBTestHarness harness;
+  harness.exec("CREATE TABLE t (grp INTEGER, tidx INTEGER, v DOUBLE)");
+  for (int i = 0; i < 24; i++) {
+    harness.exec("INSERT INTO t VALUES (1, " + std::to_string(i) + ", " +
+                 std::to_string(i) + ".0)");
+  }
+  harness.exec("SELECT * FROM dbsp_track('t')");
+  harness.exec("SELECT * FROM dbsp_sync('t')");
+
+  const std::string sql =
+      "SELECT grp, tidx, AVG(v) OVER (PARTITION BY grp ORDER BY tidx ROWS "
+      "BETWEEN 11 PRECEDING AND CURRENT ROW) AS avgv FROM t";
+  auto create = harness.query(
+      "SELECT * FROM dbsp_create_view('w_excl', '" + sql + "')");
+  REQUIRE_FALSE(create->HasError());
+  requireViewMatchesQuery(harness, "w_excl", sql);
+
+  // Pure value update at tidx=0 (start of partition): row count unchanged
+  // -> fast path. Rows 0..11 include tidx=0 in their frame and must change;
+  // rows 12..23 must not.
+  harness.exec("UPDATE t SET v = 999.0 WHERE tidx = 0");
+  harness.exec("SELECT * FROM dbsp_sync('t')");
+  requireViewMatchesQuery(harness, "w_excl", sql);
+}
+
 // LAG(v, 12): a constant, non-default offset. Same constant_int gate as the
 // frame-bound test above.
 TEST_CASE("Window LAG with constant non-default offset accepted and correct",

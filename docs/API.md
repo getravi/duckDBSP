@@ -264,8 +264,9 @@ constant non-default offset like `LAG(v, 12)`), non-recursive CTEs, WITH
 RECURSIVE (deletions included), and ORDER BY/LIMIT/OFFSET (constant or
 percentage). The few remaining gaps (USING KEY recursion, expression
 LIMIT, approximate statistics like approx_quantile, unordered
-string_agg, non-constant NTILE bucket counts or NTH_VALUE offsets) fail
-with a DBSP-E110 error naming the construct.
+string_agg, NTILE bucket counts and NTH_VALUE offsets — even literal
+constants like `NTILE(4)`, unlike window frame bounds and LAG/LEAD
+offsets — see TODO.md) fail with a DBSP-E110 error naming the construct.
 
 ```sql
 SELECT * FROM dbsp_use_planner();       -- Always: ENABLED

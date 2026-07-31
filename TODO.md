@@ -20,6 +20,14 @@ subsystem, bespoke parser, standalone Z-set spilling).
 - string_agg/array_agg WITHOUT ORDER BY inside the aggregate (result
   order unreproducible incrementally; the ordered forms are supported —
   ties on order keys break by value, not input order)
+- NTILE bucket count / NTH_VALUE N — rejected even as a literal constant
+  (e.g. `NTILE(4)`), unlike window frame bounds and LAG/LEAD offsets which
+  now accept constants. Deliberately kept gated: NTILE's bucket-boundary
+  math (`NativeWindowView::render_row`) already diverges from stock
+  DuckDB for uneven partition sizes — found during the 2026-07-31
+  constant-folding fix, see CHANGELOG. Fix the algorithm first, then widen
+  the gate (`bare_constant_int` -> `constant_int` at those two call sites
+  in `dbsp_plan_translator.hpp`).
 
 ## Performance
 
