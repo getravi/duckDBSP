@@ -1,5 +1,50 @@
 # Changelog
 
+## Feature: signed incremental deltas for linear UNION ALL recursion - Jul 2026
+
+- **Motivation**: profiling the NumPad wfp roll-forward edit path
+  (`DBSP_TIMING`) attributed ~590ms of the ~597ms per-commit sync to ONE
+  recursive view (`v_closingheadcount`, 58,500 rows × 36 iterations): every
+  retraction-bearing delta (every `UPDATE`) routed `PlanRecursiveNode::
+  step()` to a full `recompute()`. The UNION/DRed alternative measures
+  *worse* here (884ms) — rederive image-passes the full relation per
+  fixpoint depth.
+- **Insight**: a **linear** recursive step (the recursive relation
+  referenced exactly once in the step) is linear in that relation —
+  `step(R + δ) = step(R) + step(δ)` — so its fixpoint's output delta for an
+  input delta δ is `Σᵢ stepⁱ(δ)`: the existing insert-only incremental path,
+  run with **signed** weights. No deletion special-case is needed;
+  retractions propagate through the same iteration as insertions.
+- **Change**: `PlanRecursiveNode` gains `linear_step_`, detected at build
+  time (the `REC_CTE` build site counts sentinel-table `SOURCE` refs in the
+  step's `PlanOpSpec` — exactly one → linear). `step()` now skips the
+  deletion special-case entirely when `union_all_ && linear_step_`: the
+  incremental seed/`admit`/`iterate` path is generalized to signed weights
+  (no more `w > 0` filter), `admit`'s UNION ALL branch does plain multiset
+  arithmetic on `accumulated_` (`ZSet::insert` already erases a row whose
+  running weight nets to zero — verified, not assumed), and a
+  `max_iterations_` trip on the signed path discards the attempt (restoring
+  `accumulated_`/`output_` from a pre-admission snapshot) and falls back to
+  `recompute()` — logged under `DBSP_DEBUG_SYNC` — rather than emit a
+  partial delta.
+- **Unchanged by design**: nonlinear UNION ALL (recursive relation
+  referenced ≥2 times — weighted deletion through a self-join doesn't
+  distribute) and UNION (set-semantics, still DRed) keep their existing
+  full/DRed paths bit-for-bit; insert-only behavior on every shape is
+  unchanged. `recompute()` is retained as the differential-test oracle for
+  all three paths.
+- **Test hook**: `dbsp_native::g_recompute_invocations`, an inline atomic
+  counter incremented in `recompute()` (same directly-test-accessible
+  convention as `g_plan_ir_optimize`/`g_intraop_shards`, no new SQL
+  surface), lets integration tests assert an `UPDATE`/`DELETE` on a linear
+  UNION ALL recursive view does not fall back to full recompute.
+- Regression coverage: `test/integration/test_recursive_deletion.cpp`
+  gained a wfp-shaped (per-partition running-total chain) value test,
+  a routing-assertion test (`g_recompute_invocations` before/after delta),
+  and a 100-round randomized UPDATE/DELETE/re-seed differential against the
+  same oracle-comparison harness the existing DRed tests use.
+- Design: `docs/superpowers/specs/2026-07-31-linear-recursion-deltas-design.md`.
+
 ## Fix: checkpoint declines a stale view-definition restore - Jul 2026
 
 - **Gap**: checkpoint restore only guarded against source-table drift (the

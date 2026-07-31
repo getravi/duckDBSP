@@ -88,6 +88,8 @@
 #include "duckdb/planner/operator/logical_window.hpp"
 
 #include <atomic>
+#include <cstdlib>
+#include <iostream>
 #include <memory>
 #include <set>
 #include <cmath>
@@ -3120,16 +3122,39 @@ private:
 // the step on the frontier until it stops producing new rows (UNION dedup
 // state persists across calls, so later deltas cannot double-count).
 //
-// Deltas containing a deletion take the DRed (Delete-Rederive) path for
-// UNION (set-semantics) recursion: an incremental overdelete fixpoint
-// over-approximates the retraction, then a rederive fixpoint re-admits rows
-// that still have alternative support (cycles included). Overdelete is
-// O(affected subgraph); rederive costs one image pass over the surviving
-// relation plus a bounded rederive fixpoint (deeper multi-hop re-admission)
-// — still cheaper than the full recompute it replaces. UNION ALL
-// (multiplicity) recursion keeps recompute(): weighted deletion in a cycle
-// is ill-defined. recompute() is retained for that path and as the
-// differential-test oracle.
+// A LINEAR UNION ALL step (the recursive relation referenced exactly once
+// in the step subtree, `linear_step_`) is linear in that relation:
+// step(R + δ) = step(R) + step(δ). Retraction-bearing deltas therefore ride
+// the SAME incremental fixpoint as insertions, just with signed weights —
+// no deletion special-case needed (design: docs/superpowers/specs/
+// 2026-07-31-linear-recursion-deltas-design.md). `admit`'s union_all_
+// branch already does plain multiset arithmetic on `accumulated_` (insert
+// signed weight; a row whose weight nets to zero is erased by ZSet::insert
+// itself); `iterate` pushes signed frontiers through step_view_ unchanged
+// (join/filter/project are all weight-linear). A max_iterations_ trip
+// aborts the signed attempt and falls back to recompute() from the
+// snapshot taken before admission — never a partial delta (logged under
+// DBSP_DEBUG_SYNC).
+//
+// All other deletion-bearing shapes are unchanged: NONLINEAR UNION ALL
+// (recursive relation referenced ≥2 times) keeps recompute() — weighted
+// deletion through a self-join doesn't distribute. UNION (set-semantics)
+// recursion takes the DRed (Delete-Rederive) path: an incremental
+// overdelete fixpoint over-approximates the retraction, then a rederive
+// fixpoint re-admits rows that still have alternative support (cycles
+// included). Overdelete is O(affected subgraph); rederive costs one image
+// pass over the surviving relation plus a bounded rederive fixpoint
+// (deeper multi-hop re-admission) — still cheaper than the full recompute
+// it replaces. recompute() is retained for the nonlinear path and as the
+// differential-test oracle for all shapes.
+//
+// Test-only observability hook (Task 1, linear-recursion-deltas): counts
+// PlanRecursiveNode::recompute() invocations process-wide, following the
+// existing g_plan_ir_optimize/g_intraop_shards convention of a directly
+// test-accessible inline atomic rather than adding new SQL surface. Tests
+// read a before/after delta around the mutation under test.
+inline std::atomic<size_t> g_recompute_invocations{0};
+
 class PlanRecursiveNode : public dbsp::Node {
 public:
   using InputFn = std::function<const DuckDBZSet &()>;
@@ -3138,11 +3163,11 @@ public:
                     std::unique_ptr<NativeMaterializedView> step_view,
                     std::string sentinel, bool union_all,
                     std::vector<std::pair<std::string, InputFn>> base_inputs,
-                    size_t max_iterations = 1000)
+                    size_t max_iterations = 1000, bool linear_step = false)
       : dbsp::Node(id, "plan_recursive"), anchor_(std::move(anchor)),
         step_view_(std::move(step_view)), sentinel_(std::move(sentinel)),
         union_all_(union_all), base_inputs_(std::move(base_inputs)),
-        max_iterations_(max_iterations) {}
+        max_iterations_(max_iterations), linear_step_(linear_step) {}
 
   void step() override {
     output_.clear();
@@ -3168,9 +3193,13 @@ public:
       base_deltas.emplace_back(table, &d);
     }
 
-    if (has_deletion) {
+    // Linear UNION ALL steps skip the deletion special-case entirely: the
+    // incremental path below is generalized to signed weights and handles
+    // insertions and retractions uniformly (see class-header design note).
+    const bool signed_path = union_all_ && linear_step_;
+    if (has_deletion && !signed_path) {
       if (union_all_) {
-        recompute(); // multiplicity semantics: full recompute (see design)
+        recompute(); // nonlinear multiplicity semantics: full recompute
       } else {
         dred(anchor_delta, base_deltas);
       }
@@ -3178,7 +3207,9 @@ public:
       return;
     }
 
-    // Incremental insert-only path
+    // Incremental path: insert-only (any shape) or signed retractions for
+    // a linear UNION ALL step. Weights carry sign as-is; `admit`'s
+    // union_all_ branch does plain multiset arithmetic on `accumulated_`.
     DuckDBZSet seed = anchor_delta;
     for (const auto &[table, d] : base_deltas) {
       step_view_->apply_changes(table, *d);
@@ -3186,13 +3217,33 @@ public:
         seed.insert(row, w);
       }
     }
+
+    // Snapshot only on the new deletion-bearing branch (never on the
+    // pre-existing insert-only path, so ordinary edits pay no extra copy):
+    // a max_iterations_ trip must recover to the pre-delta state and fall
+    // back to recompute(), never emit a partial delta (Rule 12), the same
+    // shape as dred()'s recovery guard.
+    DuckDBZSet accumulated_snapshot, output_snapshot;
+    if (has_deletion) {
+      accumulated_snapshot = accumulated_;
+      output_snapshot = output_;
+    }
     DuckDBZSet frontier;
     for (const auto &[row, w] : seed) {
-      if (w > 0) {
+      if (has_deletion ? w != 0 : w > 0) {
         admit(row, w, frontier, output_);
       }
     }
-    iterate(frontier, output_);
+    bool converged = iterate(frontier, output_);
+    if (has_deletion && !converged) {
+      accumulated_ = std::move(accumulated_snapshot);
+      output_ = std::move(output_snapshot);
+      recompute();
+      if (std::getenv("DBSP_DEBUG_SYNC")) {
+        std::cerr << "[dbsp] recursive: linear signed path hit "
+                     "max_iterations_, falling back to recompute()\n";
+      }
+    }
     has_output_ = !output_.empty();
   }
 
@@ -3213,6 +3264,7 @@ private:
   // Re-run the whole fixed point from integrated inputs; output_ becomes
   // the diff against the previous accumulated state
   void recompute() {
+    g_recompute_invocations.fetch_add(1, std::memory_order_relaxed);
     DuckDBZSet old_accumulated = std::move(accumulated_);
     accumulated_ = DuckDBZSet();
     step_view_->reset();
@@ -3379,20 +3431,38 @@ private:
     }
   }
 
-  void iterate(DuckDBZSet &frontier, DuckDBZSet &out) {
+  // Push `frontier` through step_view_ to a fixed point, admitting each
+  // round's output into `out`. Weights carry sign as-is: the only caller
+  // that ever passes a negative-weight frontier is step()'s linear signed
+  // path (recompute()'s seed is always non-negative — see recompute() —
+  // and dred() runs its own inline loops, never this one), so loosening
+  // the old `w > 0` filter to `w != 0` is a no-op for every pre-existing
+  // caller and is what makes retractions propagate here. Returns whether
+  // the frontier converged (emptied) before max_iterations_; false means
+  // the caller must discard this attempt's admissions and recover.
+  bool iterate(DuckDBZSet &frontier, DuckDBZSet &out) {
     size_t iter = 0;
     while (!frontier.empty() && iter++ < max_iterations_) {
       step_view_->apply_changes(sentinel_, frontier);
       DuckDBZSet next;
       for (const auto &[row, w] : step_view_->get_delta()) {
-        if (w > 0) {
+        if (w != 0) {
           admit(row, w, next, out);
         }
       }
       frontier = std::move(next);
     }
+    return frontier.empty();
   }
 
+  // Plain multiset weight arithmetic for union_all_: accumulated_/out/
+  // frontier all take the signed weight as-is. ZSet::insert erases an
+  // entry whose running weight nets to zero, so a row retracted to zero
+  // and later re-derived within the same iterate() call correctly nets
+  // out to "no change" in `out` — the same net-weight definition
+  // recompute()'s diff uses (see recompute()). Set semantics (else
+  // branch) never sees a negative w: has_deletion routes non-union_all
+  // recursion to dred() instead, which does not call admit().
   void admit(const DuckDBRow &row, int64_t w, DuckDBZSet &frontier,
              DuckDBZSet &out) {
     if (union_all_) {
@@ -3412,6 +3482,7 @@ private:
   bool union_all_;
   std::vector<std::pair<std::string, InputFn>> base_inputs_;
   size_t max_iterations_;
+  bool linear_step_;
   DuckDBZSet accumulated_;
   DuckDBZSet anchor_total_;                            // ∫ anchor deltas
   std::unordered_map<std::string, DuckDBZSet> base_totals_; // ∫ per table
@@ -3606,6 +3677,24 @@ private:
     for (const auto &child : spec.children) {
       count_sources(*child);
     }
+  }
+
+  // Count SOURCE nodes in `spec`'s subtree whose table name equals
+  // `sentinel` — i.e. how many times a recursive step references its own
+  // working relation (linearity detection for PlanRecursiveNode). Deliberately
+  // separate from count_sources()/source_refs_: that walk covers the WHOLE
+  // plan (used for arrangement sharing) and step_view->source_tables() is
+  // deduped (one entry per distinct table regardless of ref count) — neither
+  // gives a ref count scoped to one step subtree.
+  static size_t count_sentinel_refs(const PlanOpSpec &spec,
+                                    const std::string &sentinel) {
+    size_t n = (spec.kind == PlanOpSpec::Kind::SOURCE && spec.table == sentinel)
+                   ? 1
+                   : 0;
+    for (const auto &child : spec.children) {
+      n += count_sentinel_refs(*child, sentinel);
+    }
+    return n;
   }
 
   // v1 eligibility: side is a bare SOURCE referenced exactly once in the
@@ -3971,6 +4060,9 @@ private:
       OutputFn anchor = build(*spec.children[0], keep_alive);
       std::string sentinel =
           "__rec_cte_" + std::to_string(spec.cte_index) + "__";
+      // Linearity: the recursive relation referenced exactly once in the
+      // STEP subtree only (children[1]; the anchor doesn't recurse).
+      bool linear_step = count_sentinel_refs(*spec.children[1], sentinel) == 1;
       TableSchema step_schema;
       step_schema.table_name = name_ + "_rec_step";
       auto step_view = std::make_unique<PlannedCircuitView>(
@@ -3993,7 +4085,8 @@ private:
       bool union_all = spec.set_op == PlanOpSpec::SetOp::UNION_ALL;
       auto *node = circuit_.add_node(std::make_unique<PlanRecursiveNode>(
           circuit_.next_node_id(), std::move(anchor), std::move(step_view),
-          sentinel, union_all, std::move(base_inputs)));
+          sentinel, union_all, std::move(base_inputs),
+          /*max_iterations=*/1000, linear_step));
       return [node]() -> const DuckDBZSet & { return node->output(); };
     }
     case PlanOpSpec::Kind::SORT_LIMIT: {

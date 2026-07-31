@@ -195,6 +195,127 @@ TEST_CASE("Recursive deletion: randomized differential (DRed == oracle)",
   }
 }
 
+// --- Linear UNION ALL signed-delta path (2026-07-31 design) ---------------
+// A LINEAR UNION ALL recursive step (the recursive relation referenced
+// exactly once in the step) is linear in that relation, so retraction
+// deltas can ride the same incremental fixpoint as insertions with signed
+// weights, instead of the full recompute() every UNION ALL deletion took
+// before. `chain` below is the wfp roll-forward shape: a per-partition
+// running total over an ordered time spine.
+
+namespace {
+
+const char *kChainOracle =
+    "WITH RECURSIVE rf AS ("
+    "  SELECT p, t, v AS acc FROM net WHERE t = 0 "
+    "  UNION ALL "
+    "  SELECT n.p, n.t, rf.acc + n.v FROM rf JOIN net n "
+    "    ON n.p = rf.p AND n.t = rf.t + 1"
+    ") SELECT * FROM rf";
+
+void makeChainView(DuckDBTestHarness &h) {
+  auto r = h.query(std::string("SELECT * FROM dbsp_create_view('chain', '") +
+                   "WITH RECURSIVE rf AS ("
+                   "  SELECT p, t, v AS acc FROM net WHERE t = 0 "
+                   "  UNION ALL "
+                   "  SELECT n.p, n.t, rf.acc + n.v FROM rf JOIN net n "
+                   "    ON n.p = rf.p AND n.t = rf.t + 1"
+                   ") SELECT * FROM rf')");
+  REQUIRE_FALSE(r->HasError());
+}
+
+void seedNet(DuckDBTestHarness &h) {
+  h.exec("CREATE TABLE net (p INTEGER, t INTEGER, v DOUBLE)");
+  h.exec("INSERT INTO net VALUES "
+         "(1,0,10.0),(1,1,20.0),(1,2,30.0),"
+         "(2,0,5.0),(2,1,5.0),(2,2,5.0)");
+}
+
+} // namespace
+
+TEST_CASE("Linear UNION ALL recursion handles retractions incrementally",
+          "[integration][recursive][linear-delta]") {
+  DuckDBTestHarness h;
+  seedNet(h);
+  makeChainView(h);
+  assertViewMatchesOracle(h, "chain", kChainOracle);
+
+  // UPDATE = retraction + insertion; downstream of the changed link must
+  // re-carry the new running total.
+  h.exec("UPDATE net SET v = 100.0 WHERE p = 1 AND t = 1");
+  h.exec("SELECT * FROM dbsp_sync('net')");
+  assertViewMatchesOracle(h, "chain", kChainOracle);
+
+  // Delete a mid-chain link: everything downstream of (1,1) disappears.
+  h.exec("DELETE FROM net WHERE p = 1 AND t = 1");
+  h.exec("SELECT * FROM dbsp_sync('net')");
+  assertViewMatchesOracle(h, "chain", kChainOracle);
+
+  // Re-insert: the chain re-derives from (1,1) forward.
+  h.exec("INSERT INTO net VALUES (1, 1, 20.0)");
+  h.exec("SELECT * FROM dbsp_sync('net')");
+  assertViewMatchesOracle(h, "chain", kChainOracle);
+}
+
+TEST_CASE("Linear UNION ALL retractions do NOT full-recompute",
+          "[integration][recursive][linear-delta]") {
+  DuckDBTestHarness h;
+  seedNet(h);
+  makeChainView(h);
+  assertViewMatchesOracle(h, "chain", kChainOracle);
+
+  // dbsp_native::g_recompute_invocations is a process-wide test hook
+  // (Task 1, linear-recursion-deltas) counting PlanRecursiveNode::
+  // recompute() calls; before this change every UPDATE/DELETE on `net`
+  // routed here. Only this one view/harness exists at this point in the
+  // process, so a before/after delta attributes cleanly to it.
+  size_t before = dbsp_native::g_recompute_invocations.load();
+  h.exec("UPDATE net SET v = 100.0 WHERE p = 1 AND t = 1");
+  h.exec("SELECT * FROM dbsp_sync('net')");
+  REQUIRE(dbsp_native::g_recompute_invocations.load() == before);
+  assertViewMatchesOracle(h, "chain", kChainOracle);
+
+  before = dbsp_native::g_recompute_invocations.load();
+  h.exec("DELETE FROM net WHERE p = 1 AND t = 1");
+  h.exec("SELECT * FROM dbsp_sync('net')");
+  REQUIRE(dbsp_native::g_recompute_invocations.load() == before);
+  assertViewMatchesOracle(h, "chain", kChainOracle);
+}
+
+TEST_CASE("Linear UNION ALL randomized differential (signed path == oracle)",
+          "[integration][recursive][linear-delta]") {
+  DuckDBTestHarness h;
+  seedNet(h);
+  makeChainView(h);
+  assertViewMatchesOracle(h, "chain", kChainOracle);
+
+  std::mt19937 rng(4242);
+  std::uniform_int_distribution<int> partition(1, 2);
+  std::uniform_int_distribution<int> period(0, 2);
+  std::uniform_real_distribution<double> value(1.0, 50.0);
+
+  for (int round = 0; round < 100; round++) {
+    int p = partition(rng), t = period(rng);
+    int op = round % 3;
+    if (op == 0) {
+      h.exec("UPDATE net SET v = " + std::to_string(value(rng)) + " WHERE p = " +
+             std::to_string(p) + " AND t = " + std::to_string(t));
+    } else if (op == 1) {
+      h.exec("DELETE FROM net WHERE p = " + std::to_string(p) +
+             " AND t = " + std::to_string(t));
+    } else {
+      // Delete-then-insert: duplicates on (p,t) are legal for this schema,
+      // this just exercises a full retract+re-derive round-trip.
+      h.exec("DELETE FROM net WHERE p = " + std::to_string(p) +
+             " AND t = " + std::to_string(t));
+      h.exec("INSERT INTO net VALUES (" + std::to_string(p) + ", " +
+             std::to_string(t) + ", " + std::to_string(value(rng)) + ")");
+    }
+    h.exec("SELECT * FROM dbsp_sync('net')");
+    assertViewMatchesOracle(h, "chain", kChainOracle);
+  }
+}
+
 TEST_CASE("Recursive deletion: randomized MIXED-delta differential (DRed == oracle)",
           "[integration][recursive][deletion]") {
   DuckDBTestHarness h;

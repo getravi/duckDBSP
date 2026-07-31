@@ -180,9 +180,12 @@ SourceNode per base table) covering:
   recursive steps supported. Insert-only deltas maintain incrementally;
   deltas with deletions on UNION (set-semantics) recursion take the
   incremental DRed (Delete-Rederive) path (overdelete + rederive
-  fixpoints); UNION ALL recursion still falls back to a full fixed-point
-  recompute (weighted deletion in a cycle is ill-defined) (C2, hardening;
-  DRed, 2026-07-07)
+  fixpoints); a **linear** UNION ALL step (the recursive relation
+  referenced exactly once) rides the same incremental fixpoint with
+  signed weights instead — only a **nonlinear** UNION ALL step (referenced
+  ≥2 times) still falls back to a full fixed-point recompute (weighted
+  deletion through a self-join doesn't distribute) (C2, hardening; DRed,
+  2026-07-07; linear signed deltas, 2026-07-31)
 - DISTINCT ON — `NativeDistinctOnView` behind an `EmbeddedViewNode`;
   winner-pick order comes from the DISTINCT node's own order modifier (C3)
 
@@ -237,26 +240,42 @@ delta plus the step's reaction to base-table deltas, then iterates:
 
 UNION dedup state persists across deltas, so a row that becomes reachable
 again later is not double-counted. Deltas containing deletions take one of
-two paths depending on recursion semantics:
+three paths depending on recursion semantics:
 
+- **Linear UNION ALL recursion** (the recursive relation referenced exactly
+  once in the step subtree — `linear_step_`, detected at build time by
+  counting sentinel-table `SOURCE` refs in the step's `PlanOpSpec`) — the
+  step is linear in the recursive relation: `step(R + δ) = step(R) +
+  step(δ)`. Retraction-bearing deltas therefore skip the deletion
+  special-case entirely and ride the *same* incremental fixpoint as
+  insertions, just with signed weights: `admit`'s UNION ALL branch does
+  plain multiset arithmetic on `accumulated_` (add the signed weight; a row
+  whose running weight nets to zero is erased, exactly like ordinary
+  `ZSet::insert`), and `iterate` pushes signed frontiers through
+  `step_view_` unchanged (join/filter/project are all weight-linear). A
+  `max_iterations_` trip discards the attempt (restoring `accumulated_`/
+  `output_` from a pre-admission snapshot) and falls back to `recompute()`
+  — logged under `DBSP_DEBUG_SYNC` — rather than emit a partial delta.
 - **UNION (set-semantics) recursion** — the incremental DRed
   (Delete-Rederive) path: an overdelete fixpoint over-approximates the
   retraction from the affected subgraph, then a rederive fixpoint re-admits
   rows that still have alternative support (cycles included) by re-running
   the step over the surviving relation. `dred()` mirrors every
   `accumulated_` mutation to the sentinel source so the two stay in sync.
-- **UNION ALL (multiplicity) recursion** — `recompute()`: a full
+- **Nonlinear UNION ALL recursion** (recursive relation referenced ≥2 times,
+  e.g. a self-join of the working relation) — `recompute()`: a full
   fixed-point recompute from integrated anchor/base state. Weighted
-  deletion in a cycle is ill-defined incrementally, so this path stays
-  non-incremental by design. `recompute()` also serves as the
-  differential-test oracle for DRed.
+  deletion through a self-join doesn't distribute over `+`, so this path
+  stays non-incremental by design. `recompute()` also serves as the
+  differential-test oracle for both the DRed and linear-signed paths.
 
-Both paths emit the diff against the node's previous result.
+All paths emit the diff against the node's previous result.
 
 **Safety**: Maximum iteration limit (default 1000) prevents infinite loops.
 If a DRed overdelete or rederive fixpoint hits that cap before converging,
 `dred()` restores the pre-delta state and falls back to the self-healing
-`recompute()` rather than emit a silently corrupted diff.
+`recompute()` rather than emit a silently corrupted diff — the linear
+signed path's `iterate()` cap trip recovers the same way.
 
 ### 6. CDC Manager (`src/dbsp_cdc.hpp`)
 
