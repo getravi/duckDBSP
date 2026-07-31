@@ -2713,6 +2713,9 @@ public:
     if (delta.empty()) {
       return true;
     }
+    DbspScopeTimer t_total("apply_captured_delta",
+                           table_name + " rows=" +
+                               std::to_string(delta.size()));
     std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
     auto it = tracked_tables_.find(table_name);
     if (it == tracked_tables_.end()) {
@@ -3556,7 +3559,10 @@ private:
     // Shared arrangements are updated BEFORE any consuming view steps —
     // join nodes rely on the arrangement being post-delta and drop their
     // Δl⋈Δr term to compensate (Δl⋈R_new = Δl⋈R_old + Δl⋈Δr)
-    apply_to_arrangements(source_name, delta);
+    {
+      DbspScopeTimer t_arr("arrangements", source_name);
+      apply_to_arrangements(source_name, delta);
+    }
 
     // Group the topological order into levels: views in the same level
     // share no dependency path, so their circuits may step concurrently.
@@ -3608,6 +3614,7 @@ private:
       }
       if (inputs.empty())
         return r;
+      DbspScopeTimer t_step("view_step", view_name);
       view.apply_changes_batch(inputs);
       r.applied = inputs.size();
       r.delta = &view.get_batch_delta();
