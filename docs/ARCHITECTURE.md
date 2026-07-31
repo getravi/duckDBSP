@@ -258,12 +258,12 @@ three paths depending on recursion semantics:
   pre-admission snapshot) and falls back to `recompute()` — logged under
   `DBSP_DEBUG_SYNC` — rather than emit a partial delta. The same scan also
   vetoes `linear_step_` when the step subtree contains `AGGREGATE`,
-  `DISTINCT`, `DISTINCT_ON`, `WINDOW`, or `SORT_LIMIT` — even with exactly
-  one sentinel ref, these operators collapse or reorder rows and are not
-  weight-linear, so they cannot ride the signed path (the planner still
-  accepts these shapes inside a recursive step and they remain
-  pre-existing-wrong on every path — this veto only stops the signed path
-  from also claiming linearity for them).
+  `DISTINCT`, `DISTINCT_ON`, `WINDOW`, `SORT_LIMIT`, or non-`UNION ALL`
+  `SET_OP` — even with exactly one sentinel ref, these operators collapse or
+  reorder rows and are not weight-linear, so they cannot ride the signed path
+  (the planner still accepts these shapes inside a recursive step and they
+  remain pre-existing-wrong on every path — this veto only stops the signed
+  path from also claiming linearity for them).
 - **UNION (set-semantics) recursion** — the incremental DRed
   (Delete-Rederive) path: an overdelete fixpoint over-approximates the
   retraction from the affected subgraph, then a rederive fixpoint re-admits

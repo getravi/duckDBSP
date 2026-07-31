@@ -37,6 +37,8 @@ insertions, with negative weights.
    the step plan. Exactly one → `linear_step_ = true` on the node. Zero or
    ≥2 → false. The count must be over the *step* subtree only (anchor
    doesn't matter).
+   - **Review fix (2026-07-31):** detection additionally vetoes weight-nonlinear
+     operators in the step subtree (AGGREGATE/DISTINCT/DISTINCT_ON/WINDOW/SORT_LIMIT/non-UNION-ALL SET_OP).
 2. **Signed incremental path.** In `step()`: when `union_all_ &&
    linear_step_`, skip the `has_deletion` branch entirely — run the
    incremental path for every delta. Generalize it for signed weights:

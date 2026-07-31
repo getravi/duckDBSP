@@ -53,7 +53,8 @@ namespace dbsp_native {
 
 // DBSP_TIMING=1: emit per-phase wall-clock lines to stderr
 // ("[dbsp-timing] <phase> <detail> ms=..."), for profiling restore cost
-// (source sync / arrangement backfill / blob decode). Off by default.
+// (source sync / arrangement backfill / blob decode) and commit propagation
+// path (apply_captured_delta / arrangements / view_step). Off by default.
 inline bool dbsp_timing_enabled() {
   static const bool on = std::getenv("DBSP_TIMING") != nullptr;
   return on;

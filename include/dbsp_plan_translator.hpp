@@ -4134,7 +4134,7 @@ private:
       // Linearity: the recursive relation referenced exactly once in the
       // STEP subtree only (children[1]; the anchor doesn't recurse), AND no
       // weight-nonlinear operator (AGGREGATE/DISTINCT/DISTINCT_ON/WINDOW/
-      // SORT_LIMIT) anywhere in that subtree.
+      // SORT_LIMIT/non-UNION-ALL SET_OP) anywhere in that subtree.
       StepLinearity step_linearity;
       scan_step_linearity(*spec.children[1], sentinel, step_linearity);
       bool linear_step = step_linearity.sentinel_refs == 1 &&

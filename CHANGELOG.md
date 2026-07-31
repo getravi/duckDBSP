@@ -32,16 +32,17 @@
   `DISTINCT`/`GROUP BY`/`ORDER BY … LIMIT`/`WINDOW` inside a recursive
   step, and those shapes are pre-existing-wrong on every path (out of
   scope here — not newly broken by this change). But `AGGREGATE`,
-  `DISTINCT`, `DISTINCT_ON`, `WINDOW`, and `SORT_LIMIT` anywhere in the
-  step subtree now veto `linear_step_` even when the sentinel is
-  referenced exactly once: these operators are not weight-linear
-  (`step(R + δ) ≠ step(R) + step(δ)` — they collapse or reorder rows), so
-  without the veto the new signed path would have wrongly claimed
-  linearity for them. `admit`'s set-semantics (non-`UNION ALL`) branch is
-  also now explicitly guarded on `w > 0` (previously implicit, relying on
-  `has_deletion` never routing negatives there — now `iterate()` passes
-  signed weights through unconditionally for the `union_all_` linear path,
-  so the guard is explicit rather than incidental).
+  `DISTINCT`, `DISTINCT_ON`, `WINDOW`, `SORT_LIMIT`, and non-`UNION ALL`
+  `SET_OP` anywhere in the step subtree now veto `linear_step_` even when
+  the sentinel is referenced exactly once: these operators are not
+  weight-linear (`step(R + δ) ≠ step(R) + step(δ)` — they collapse or
+  reorder rows), so without the veto the new signed path would have
+  wrongly claimed linearity for them. `admit`'s set-semantics (non-`UNION
+  ALL`) branch is also now explicitly guarded on `w > 0` (previously
+  implicit, relying on `has_deletion` never routing negatives there — now
+  `iterate()` passes signed weights through unconditionally for the
+  `union_all_` linear path, so the guard is explicit rather than
+  incidental).
 - **Unchanged by design**: nonlinear UNION ALL (recursive relation
   referenced ≥2 times — weighted deletion through a self-join doesn't
   distribute) and UNION (set-semantics, still DRed) keep their existing
