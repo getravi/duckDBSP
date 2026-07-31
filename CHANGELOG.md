@@ -1,5 +1,72 @@
 # Changelog
 
+## Perf: checkpoint restore hash pre-seed (cold/restore attack, Task 3) - Jul 2026
+
+- **Corrected premise**: the plan for this task assumed checkpoint blobs
+  (`_dbsp_ckpt` sink/node rows) still used a slow, separate row codec and
+  needed to be switched over to the spill path's typed fast-path codec
+  (`serialize_row`/`deserialize_row`, "spill codec 12x", `ba26922`). Audit
+  found this already true and had been since before that codec existed:
+  `BlobWriter::row`/`BlobReader::row` (`dbsp_checkpoint.hpp`) have called
+  those exact functions since D3b's first commit (`8c77abd`, predating the
+  spill codec's typed-fast-path rewrite by 11 days), so checkpoint decode
+  inherited the speedup automatically, for free, with no code change ever
+  needed there. There is (and was) exactly one row codec, shared, no
+  per-site duplication.
+- **Real bottleneck, found by profiling instead of assuming**: a timing
+  probe reproducing the design doc's "851ms/58k rows" figure (a 58k-group
+  checkpointable `SUM` aggregate over `INTEGER`/`BIGINT`/`VARCHAR`/
+  `BOOLEAN` columns — the value shapes NumPad's wfp workload actually
+  uses) measured `blob_decode` at 1309.5ms (~22.6us/row) on this build,
+  confirming the cost is real but NOT in the byte-level codec (which,
+  at ~260ns/row for a 5-column fast-path row per the 12x/3.8x numbers
+  already published, would only account for ~15ms of that). The actual
+  cost: every row decoded from a checkpoint blob becomes a hash-map key
+  (aggregate `states_`, join `Index`/`RowWeights`) or a `DuckDBZSet` entry
+  on its first use, and `ColumnVec::hash()`'s lazy path calls
+  `duckdb::Value::Hash()` per column — which builds a throwaway 1-element
+  `Vector` and runs the full `VectorOperations::Hash` dispatch machinery
+  for a single value. `dbsp_engine_hook.hpp` already documents this exact
+  cost elsewhere as "~2/3 of ingestion time" for the same reason.
+- **Fix**: `BlobReader::hashed_row()` (`dbsp_checkpoint.hpp`) decodes a row
+  via the existing (unchanged) codec and pre-seeds its hash cache with
+  `hash_row_fast`, which calls `duckdb::Hash<T>` directly for the fast-path
+  types (`INTEGER`/`BIGINT`/`DOUBLE`/`VARCHAR`/`BOOLEAN`) — the exact
+  primitive `VectorOperations::Hash` itself dispatches to per element for a
+  flat vector of that physical type (confirmed against
+  `vector_operations/vector_hash.cpp`; `duckdb::Hash(string_t)` is
+  documented+asserted in duckdb's own source to equal
+  `duckdb::Hash(ptr, size)` for every string, inlined or not), without
+  building the temporary `Vector`. NULLs use `ColumnVec::kNullHash`
+  directly (matching `ColumnVec::hash()`'s own null convention, not
+  duckdb's); fallback-typed values still pay `Value::Hash()`, same
+  tradeoff the byte codec already makes for its own fallback tag. Wired at
+  every checkpoint row-decode call site that becomes a hash-map/Z-set key:
+  the CDC sink loop (`dbsp_cdc.hpp`), `PlanAggregateNode::restore_state`'s
+  group keys, and `PlanJoinNode::restore_state`'s index keys and
+  row-weight keys (`dbsp_plan_translator.hpp`) — one shared helper, no
+  per-site duplication.
+- **No format version bump**: the checkpoint blob's on-disk bytes are
+  unchanged (same codec, same layout) — this is a read-side in-memory
+  cache optimization only, so `kDbspCkptFormatVersion` stays at 4 and no
+  existing checkpoint is invalidated.
+- **Measured**: the same 58k-row probe drops from 1309.5ms to ~25.4ms
+  (mean of 6 runs: 23.6/24.0/25.4/24.2/26.9/28.4ms) — **~51.5x**, well
+  past the ≥3x target.
+- **Tests**: `test/integration/test_join_checkpoint.cpp` — a unit-level
+  case proving `hashed_row()`'s pre-seeded hash matches what the lazy
+  per-Value path computes for the same content, across every codec value
+  shape (`INTEGER`/`BIGINT`/`DOUBLE`/`VARCHAR`/`BOOLEAN`, typed `NULL`s of
+  each, and `DECIMAL` as the fallback type, both non-`NULL` and `NULL`);
+  and an integration case checkpointing a view whose `GROUP BY` spans all
+  of those types, restoring it, then inserting a row whose key exactly
+  matches an already-restored group — the scenario that would silently
+  duplicate a group instead of bumping its count if the pre-seeded hash
+  ever diverged from what a freshly-built equal row would hash to. Both
+  cases were verified to fail under a deliberately wrong hash before being
+  restored to the real implementation (sabotage-and-revert check, not just
+  written-and-passed).
+
 ## Feature: MIN/MAX aggregate checkpoint state (cold/restore attack, Task 2) - Jul 2026
 
 - Circuit-state checkpointing (D3b) now covers plain (non-`DISTINCT`) `MIN`/

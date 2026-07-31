@@ -1402,8 +1402,7 @@ public:
       states_.clear();
       const uint64_t n_groups = r.u64();
       for (uint64_t g = 0; g < n_groups; g++) {
-        DuckDBRow key;
-        key.columns.assign(r.row());
+        DuckDBRow key = r.hashed_row();
         GroupState group;
         group.row_weight = r.i64();
         const uint64_t n_aggs = r.u64();
@@ -2656,8 +2655,7 @@ public:
         rw.clear();
         const uint64_t n = r.u64();
         for (uint64_t i = 0; i < n; i++) {
-          DuckDBRow row;
-          row.columns.assign(r.row());
+          DuckDBRow row = r.hashed_row();
           const int64_t weight = r.i64();
           rw.emplace(std::move(row), weight);
         }
@@ -2666,8 +2664,7 @@ public:
         idx.clear();
         const uint64_t n = r.u64();
         for (uint64_t i = 0; i < n; i++) {
-          DuckDBRow key;
-          key.columns.assign(r.row());
+          DuckDBRow key = r.hashed_row();
           RowWeights bucket;
           read_weights(bucket);
           idx.emplace(std::move(key), std::move(bucket));

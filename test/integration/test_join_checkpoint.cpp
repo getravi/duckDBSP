@@ -449,3 +449,137 @@ TEST_CASE("aggregate checkpoint: MIN round-trips through save/restore, "
     db.exec("SELECT * FROM dbsp_sync('nums')");
     REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
 }
+
+// Task 3 (cold/restore attack): fast typed codec for checkpoint blobs.
+//
+// The byte-level row codec (serialize_row/deserialize_row) was already
+// shared with the spill path from D3b's first commit onward -- checkpoint
+// blob decode was never a separate, slower implementation. The real cost
+// (observed ~15us/row on a 58k-row sink, matching the design doc's
+// "851ms/58k rows") was every restored row paying Value::Hash()'s lazy
+// per-Value cost (a fresh 1-element Vector + VectorOperations::Hash per
+// column) the first time it entered a hash-keyed structure (aggregate
+// states_, join Index/RowWeights, DuckDBZSet) -- exactly the "~2/3 of
+// ingestion time" dbsp_engine_hook.hpp already documents for the same lazy
+// path elsewhere. BlobReader::hashed_row() pre-seeds the hash cache using
+// hash_row_fast, which calls the same duckdb::Hash<T> primitives
+// VectorOperations::Hash dispatches to per element, without the temporary
+// Vector. These tests are the correctness guard for that invariant: a
+// wrong hash silently corrupts hash-map lookups (a post-restore delta
+// fails to find its matching group/bucket) rather than crashing.
+
+TEST_CASE("checkpoint blob codec: hashed_row hash matches the lazy "
+          "per-Value path across every codec value shape",
+          "[unit][checkpoint][codec]") {
+    using duckdb::Value;
+    // Fast-path types (+ typed NULLs) and one fallback type (+ typed NULL)
+    // -- the same shape list test_spill_store.cpp's codec test uses, since
+    // hashed_row must stay correct for both branches of hash_row_fast.
+    std::vector<Value> row = {
+        Value::INTEGER(42),
+        Value::BIGINT(-7),
+        Value::DOUBLE(3.25),
+        Value("plain string"),
+        Value(""),
+        Value::BOOLEAN(true),
+        Value(duckdb::LogicalType::INTEGER), // typed NULL, fast path
+        Value(duckdb::LogicalType::VARCHAR), // typed NULL, fast path
+        Value::DECIMAL(int64_t(12345), 12, 3),      // fallback, non-NULL
+        Value(duckdb::LogicalType::DECIMAL(10, 2)), // fallback, NULL
+    };
+
+    dbsp_native::BlobWriter w;
+    w.row(row);
+    auto bytes = w.take();
+
+    dbsp_native::BlobReader r(bytes.data(), bytes.size());
+    // const: ColumnVec's non-const operator[] calls mutate(), which
+    // invalidates the hash cache -- exactly the pre-seeded value this test
+    // exists to check, so any read access here must go through the const
+    // (read-only) accessor instead.
+    const dbsp_native::DuckDBRow hashed = r.hashed_row();
+    REQUIRE(r.done());
+
+    // Round-trip correctness (same bar as the spill codec's own test).
+    REQUIRE(hashed.columns.size() == row.size());
+    for (size_t i = 0; i < row.size(); i++) {
+        INFO("column " << i << ": " << row[i].ToString());
+        REQUIRE(row[i].IsNull() == hashed.columns[i].IsNull());
+        if (!row[i].IsNull()) {
+            REQUIRE(row[i] == hashed.columns[i]);
+        }
+    }
+
+    // A fresh row built from the identical values, hash left uncomputed
+    // (forces the lazy per-Value path on first .hash() call) -- must land
+    // on the exact same hash as the pre-seeded one.
+    dbsp_native::DuckDBRow lazy;
+    std::vector<Value> same = row;
+    lazy.columns.assign(std::move(same));
+    REQUIRE_FALSE(lazy.columns.hash_valid());
+    REQUIRE(hashed.columns.hash() == lazy.columns.hash());
+}
+
+namespace {
+
+void setupTypedRowsTable(DuckDBTestHarness &db) {
+    db.exec("CREATE TABLE typed_rows (g INTEGER, big BIGINT, amt DOUBLE, "
+            "label VARCHAR, flag BOOLEAN, price DECIMAL(10,2))");
+    db.exec("SELECT * FROM dbsp_track('typed_rows')");
+    db.exec("INSERT INTO typed_rows VALUES "
+            "(1, 100, 1.5, 'alpha', true, 12.34), "
+            "(2, NULL, NULL, NULL, NULL, NULL), "
+            "(3, 300, 3.5, 'gamma', false, 99.99)");
+    db.exec("SELECT * FROM dbsp_sync('typed_rows')");
+    db.exec("SELECT * FROM dbsp_use_planner(true)");
+}
+
+} // namespace
+
+TEST_CASE("checkpoint blob codec: view spanning every codec value shape "
+          "round-trips, and a post-restore delta matching an existing "
+          "restored group's key bucket-matches instead of duplicating it",
+          "[integration][checkpoint][codec]") {
+    DuckDBTestHarness db;
+    setupTypedRowsTable(db);
+
+    const std::string sql =
+        "SELECT g, big, amt, label, flag, price, COUNT(*) AS n "
+        "FROM typed_rows GROUP BY g, big, amt, label, flag, price";
+
+    db.exec("SELECT * FROM dbsp_create_view('v_live', '" + sql + "')");
+    db.exec("SELECT * FROM dbsp_create_view('v_restore', '" + sql + "')");
+    REQUIRE(db.manager().get_view("v_restore")->checkpointable());
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+
+    auto save_result = db.query("SELECT * FROM dbsp_save()");
+    REQUIRE_FALSE(save_result->HasError());
+    REQUIRE(save_result->GetValue(0, 0).ToString().find(
+                "circuit checkpoint: 2 views") != std::string::npos);
+
+    REQUIRE_FALSE(db.query("SELECT dbsp_drop('v_restore')")->HasError());
+
+    auto load_result = db.query("SELECT * FROM dbsp_load()");
+    REQUIRE_FALSE(load_result->HasError());
+    REQUIRE(load_result->GetValue(0, 0).ToString().find(
+                "1 from checkpoint") != std::string::npos);
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+
+    // Post-restore delta: a NEW row with the EXACT SAME key tuple as the
+    // already-restored group 1 (g=1, big=100, amt=1.5, label='alpha',
+    // flag=true, price=12.34). If the restored group's pre-seeded hash
+    // diverged from what a freshly-built row with equal content hashes to,
+    // this INSERT would silently land in the wrong bucket (or fail the
+    // hash-map's equality fast-reject) and create a second, spurious group
+    // instead of bumping n: 1 -> 2 on the existing one.
+    db.exec("INSERT INTO typed_rows VALUES "
+            "(1, 100, 1.5, 'alpha', true, 12.34)");
+    db.exec("SELECT * FROM dbsp_sync('typed_rows')");
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+
+    // Also exercise the all-NULL group (g=2) retreating/advancing so the
+    // typed-NULL codec path round-trips through a real hash-map lookup too.
+    db.exec("INSERT INTO typed_rows VALUES (2, NULL, NULL, NULL, NULL, NULL)");
+    db.exec("SELECT * FROM dbsp_sync('typed_rows')");
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+}

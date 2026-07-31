@@ -791,8 +791,7 @@ public:
       DuckDBZSet result;
       const uint64_t n = r.u64();
       for (uint64_t i = 0; i < n; i++) {
-        DuckDBRow row;
-        row.columns.assign(r.row());
+        DuckDBRow row = r.hashed_row();
         const int64_t w = r.i64();
         result.insert(row, w);
       }

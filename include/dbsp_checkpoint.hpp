@@ -18,6 +18,7 @@
 // detected per-view by a SQL fingerprint (v3, see kDbspCkptFormatVersion)
 // and discarded for that view only.
 
+#include "dbsp_duckdb_types.hpp" // DuckDBRow / ColumnVec::kNullHash
 #include "dbsp_spill_store.hpp" // serialize_row / deserialize_row
 
 #include <cstdint>
@@ -99,6 +100,68 @@ private:
   std::vector<uint8_t> bytes_;
 };
 
+// Row hash matching ColumnVec::hash()/fold_vector_hashes bit-for-bit, computed
+// from already-decoded Values without paying Value::Hash()'s cost (a fresh
+// 1-element Vector + VectorOperations::Hash dispatch per column — the "lazy
+// per-Value hashing" dbsp_engine_hook.hpp's own comment calls out as ~2/3 of
+// chunk-ingestion time). Every checkpoint-restored row becomes a hash-map key
+// (aggregate states_, join Index/RowWeights) or a DuckDBZSet entry, so a
+// restore built entirely from `row()` pays that lazy cost once per row on
+// first use — and a checkpointed view with many groups/sink rows spends most
+// of "blob_decode" there, not in the byte-level codec (already shared with
+// the spill path, see serialize_row/deserialize_row above).
+//
+// For the codec's typed fast-path columns (INTEGER/BIGINT/DOUBLE/VARCHAR/
+// BOOLEAN), duckdb::Hash<T> is the exact primitive VectorOperations::Hash
+// calls per element for a flat vector of that physical type (verified
+// against duckdb/src/common/vector_operations/vector_hash.cpp — HashOp
+// dispatches straight to duckdb::Hash<T>, and duckdb::Hash(string_t) is
+// documented+asserted equal to duckdb::Hash(ptr, size) for every string,
+// inlined or not), so calling it directly here reproduces Value::Hash()
+// exactly without the temporary-Vector detour. Fallback-typed and NULL
+// values keep behaving exactly as the lazy path already does (NULL ->
+// ColumnVec::kNullHash, ColumnVec::hash()'s own convention rather than
+// duckdb's; fallback -> v.Hash(), the one case that still pays full price —
+// same tradeoff serialize_row's byte-level fallback already makes). The
+// combiner is copy-identical to ColumnVec::hash()/fold_vector_hashes so a
+// row restored this way hashes the same as an equal-content row a live
+// chunk-based path would build; test_join_checkpoint.cpp's "hashed_row
+// matches the lazy path" case is the correctness guard for that invariant.
+inline size_t hash_row_fast(const std::vector<duckdb::Value> &vals) {
+  size_t h = 0;
+  for (const auto &v : vals) {
+    size_t col_hash;
+    if (v.IsNull()) {
+      col_hash = ColumnVec::kNullHash;
+    } else {
+      switch (v.type().id()) {
+      case duckdb::LogicalTypeId::INTEGER:
+        col_hash = duckdb::Hash<int32_t>(duckdb::IntegerValue::Get(v));
+        break;
+      case duckdb::LogicalTypeId::BIGINT:
+        col_hash = duckdb::Hash<int64_t>(duckdb::BigIntValue::Get(v));
+        break;
+      case duckdb::LogicalTypeId::DOUBLE:
+        col_hash = duckdb::Hash<double>(duckdb::DoubleValue::Get(v));
+        break;
+      case duckdb::LogicalTypeId::VARCHAR: {
+        const auto &s = duckdb::StringValue::Get(v);
+        col_hash = duckdb::Hash(s.data(), s.size());
+        break;
+      }
+      case duckdb::LogicalTypeId::BOOLEAN:
+        col_hash = duckdb::Hash<bool>(duckdb::BooleanValue::Get(v));
+        break;
+      default:
+        col_hash = v.Hash(); // fallback types: pay the slow-but-correct path
+        break;
+      }
+    }
+    h ^= col_hash + 0x9e3779b9 + (h << 6) + (h >> 2);
+  }
+  return h;
+}
+
 class BlobReader {
 public:
   BlobReader(const uint8_t *data, size_t len) : data_(data), len_(len) {}
@@ -115,6 +178,19 @@ public:
     auto vals = deserialize_row(data_ + pos_, n);
     pos_ += n;
     return vals;
+  }
+
+  // Same bytes as row(), but returns a DuckDBRow with its hash cache
+  // pre-seeded (hash_row_fast) instead of left for the first map/Z-set
+  // operation to compute lazily. Use this at every checkpoint restore call
+  // site that turns a decoded row into a hash-map key or Z-set entry.
+  DuckDBRow hashed_row() {
+    auto vals = row();
+    DuckDBRow out;
+    const size_t h = hash_row_fast(vals);
+    out.columns.assign(std::move(vals));
+    out.columns.set_hash(h);
+    return out;
   }
 
   bool done() const { return pos_ == len_; }

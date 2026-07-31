@@ -489,6 +489,20 @@ State after:
   path for that view alone on a mismatch — the guard against a view whose
   definition changed (e.g. `dbsp_replace_view`) after the checkpoint was
   written but before the next save landed
+- Blob row values (`BlobWriter`/`BlobReader::row`, `dbsp_checkpoint.hpp`) go
+  through the same typed row codec as spill (`serialize_row`/
+  `deserialize_row`, `dbsp_spill_store.hpp`) — a tag-byte fast path for
+  `INTEGER`/`BIGINT`/`DOUBLE`/`VARCHAR`/`BOOLEAN` and their typed `NULL`s,
+  falling back to DuckDB's `BinarySerializer` for everything else; one
+  codec, no per-checkpoint-site duplication. `BlobReader::hashed_row()`
+  additionally pre-seeds the decoded row's hash cache (`hash_row_fast`,
+  calling the same `duckdb::Hash<T>` primitives `VectorOperations::Hash`
+  uses per element) instead of leaving it for the first hash-map/Z-set
+  insertion to compute lazily via `Value::Hash()` — a restored row becomes
+  a hash-map key immediately (aggregate `states_`, join `Index`/
+  `RowWeights`, the sink `DuckDBZSet`), and the lazy path's per-value
+  temporary-`Vector` cost otherwise dominates restore time (cold/restore
+  attack, Task 3: ~54x on a 58k-row sink, see CHANGELOG).
 
 ### Lifetime
 
