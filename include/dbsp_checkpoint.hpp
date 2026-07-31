@@ -53,7 +53,13 @@ namespace dbsp_native {
 // view's restore unaffected. The version bump means any v2 checkpoint
 // (which has no fingerprint rows at all) is treated as wholesale absent,
 // same one-time-rebuild cost as prior bumps.
-constexpr int64_t kDbspCkptFormatVersion = 3;
+// v4 (cold/restore attack, Task 2): PlanAggregateNode::serialize_state
+// gained the per-group `values` multiset for plain (non-DISTINCT) MIN/MAX,
+// so those views now report SERIALIZABLE instead of UNSUPPORTED. A v3
+// checkpoint has no such field for any group and would misparse under the
+// new restore_state layout, so it is treated as absent (one-time
+// rebuild-by-replay, same cost as prior bumps).
+constexpr int64_t kDbspCkptFormatVersion = 4;
 
 // How a circuit node participates in checkpointing.
 enum class CkptSupport {

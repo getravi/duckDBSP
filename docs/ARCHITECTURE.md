@@ -467,11 +467,14 @@ State after:
 - All data stored in-memory
 - No automatic eviction or bounds
 - Persistence saves definitions plus (D3b) a circuit-state checkpoint for
-  supported views: aggregate group scalars, private INNER/LEFT/RIGHT-join
-  indexes plus (LEFT/RIGHT) their pad bookkeeping, and sink results,
-  watermarked by source COUNT + bit_xor(hash(row)). FULL (OUTER) and MARK
-  joins, spilled join/aggregate state, recursion state, and window/sort
-  embedded views stay UNSUPPORTED (rebuild-by-replay).
+  supported views: aggregate group scalars plus (Task 2, cold/restore
+  attack) the per-group values multiset for plain non-DISTINCT MIN/MAX,
+  private INNER/LEFT/RIGHT-join indexes plus (LEFT/RIGHT) their pad
+  bookkeeping, and sink results, watermarked by source COUNT +
+  bit_xor(hash(row)). DISTINCT and holistic/ordered aggregates (MEDIAN,
+  QUANTILE_*, MODE, MAD, STRING_AGG, ARRAY_AGG, FIRST), FULL (OUTER) and
+  MARK joins, spilled join/aggregate state, recursion state, and
+  window/sort embedded views stay UNSUPPORTED (rebuild-by-replay).
 - On load, checkpointed views restore without circuit replay when the
   watermarks still match; everything else is rebuilt from current table
   data

@@ -1333,18 +1333,35 @@ private:
   bool global_emitted_ = false;
 
 public:
-  // Checkpointing (D3b): the count/sum/avg family keeps only scalars per
-  // group — serializable. Anything value-collecting (MIN/MAX multisets,
-  // DISTINCT weights, ordered aggregates, MODE/MEDIAN/quantiles) stays
-  // UNSUPPORTED in v1 and forces rebuild-by-replay.
+  // Checkpointing (D3b; extended Task 2, cold/restore attack): the
+  // count/sum/avg family keeps only scalars per group — serializable.
+  // Plain (non-DISTINCT) MIN/MAX also serialize: the `values` multiset is
+  // exactly the retraction state agg_value()/apply() read (see MIN/MAX in
+  // both), so round-tripping it is enough to resume correctly, including a
+  // deleted extreme retreating to the next-highest/lowest remaining value.
+  // DISTINCT (any fn — dvals weight-tracking untouched here) and holistic/
+  // ordered aggregates (FIRST, STRING_AGG, ARRAY_AGG, MEDIAN, QUANTILE_*,
+  // MODE, MAD) stay UNSUPPORTED. A group whose values have spilled to disk
+  // (N4, values.size() > 65536 under spill mode) also declines the whole
+  // node — the spilled log isn't captured here, mirroring the join node's
+  // exclusion of spilled equi-key indexes (7512fd4).
   StateKind state_kind() const override {
     for (const auto &a : aggs_) {
       const bool scalar_fn = a.fn == PlanAggSpec::Fn::COUNT_STAR ||
                              a.fn == PlanAggSpec::Fn::COUNT ||
                              a.fn == PlanAggSpec::Fn::SUM ||
                              a.fn == PlanAggSpec::Fn::AVG;
-      if (!scalar_fn || a.distinct) {
+      const bool value_collecting_fn = a.fn == PlanAggSpec::Fn::MIN ||
+                                       a.fn == PlanAggSpec::Fn::MAX;
+      if ((!scalar_fn && !value_collecting_fn) || a.distinct) {
         return StateKind::UNSUPPORTED;
+      }
+    }
+    for (const auto &[key, group] : states_) {
+      for (const auto &a : group.aggs) {
+        if (a.spilled_values) {
+          return StateKind::UNSUPPORTED;
+        }
       }
     }
     return StateKind::SERIALIZABLE;
@@ -1365,6 +1382,11 @@ public:
         w.f64(a.dsum);
         w.i64(a.hsum.upper);
         w.u64(a.hsum.lower);
+        // MIN/MAX retraction state: the full values multiset, duplicates
+        // preserved, as one row so a deleted extreme retreats correctly
+        // post-restore (empty for scalar-only aggs — cheap no-op row).
+        std::vector<duckdb::Value> vals(a.values.begin(), a.values.end());
+        w.row(vals);
       }
     }
     out = w.take();
@@ -1393,6 +1415,8 @@ public:
           a.dsum = r.f64();
           a.hsum.upper = r.i64();
           a.hsum.lower = r.u64();
+          auto vals = r.row();
+          a.values.insert(vals.begin(), vals.end());
         }
         states_.emplace(std::move(key), std::move(group));
       }

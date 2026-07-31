@@ -277,3 +277,175 @@ TEST_CASE("join checkpoint: stale checkpoint declined when view SQL changed "
     std::sort(expected.begin(), expected.end());
     REQUIRE(after == expected);
 }
+
+// Task 2 (cold/restore attack): MIN/MAX (value-collecting) aggregate
+// checkpoint state.
+//
+// PlanAggregateNode previously reported UNSUPPORTED for anything beyond the
+// scalar count/sum/avg family, forcing every MIN/MAX view to rebuild by
+// replay on load. This extends SERIALIZABLE to plain (non-DISTINCT) MIN/MAX
+// by round-tripping the per-group `values` multiset the maintenance path
+// already keeps for retractions. DISTINCT and holistic aggregates
+// (MEDIAN/QUANTILE/MODE/etc.) and any group whose values have spilled to
+// disk (N4) stay UNSUPPORTED.
+namespace {
+
+// Three groups shaped for the round-trip tests below: g=1 and g=3 each
+// carry three distinct values (multiset depth >1, so deleting the current
+// extreme must retreat to the next one, not just go blank); g=2 carries a
+// single value (so a fresh insert cleanly demonstrates the extreme
+// advancing past it).
+void setupAggTables(DuckDBTestHarness &db) {
+    db.exec("CREATE TABLE nums (g INTEGER, v INTEGER)");
+    db.exec("SELECT * FROM dbsp_track('nums')");
+    db.exec("INSERT INTO nums VALUES (1, 5), (1, 15), (1, 25), "
+            "(2, 100), (3, 10), (3, 20), (3, 30)");
+    db.exec("SELECT * FROM dbsp_sync('nums')");
+    db.exec("SELECT * FROM dbsp_use_planner(true)");
+}
+
+} // namespace
+
+TEST_CASE("aggregate checkpoint: state_kind gate for MIN/MAX vs "
+          "DISTINCT/MEDIAN/spilled",
+          "[integration][checkpoint][aggregate]") {
+    DuckDBTestHarness db;
+    setupAggTables(db);
+
+    db.exec("SELECT * FROM dbsp_create_view('v_max', "
+            "'SELECT g, MAX(v) AS m FROM nums GROUP BY g')");
+    REQUIRE(db.manager().get_view("v_max")->checkpointable());
+
+    db.exec("SELECT * FROM dbsp_create_view('v_min', "
+            "'SELECT g, MIN(v) AS m FROM nums GROUP BY g')");
+    REQUIRE(db.manager().get_view("v_min")->checkpointable());
+
+    db.exec("SELECT * FROM dbsp_create_view('v_max_distinct', "
+            "'SELECT g, MAX(DISTINCT v) AS m FROM nums GROUP BY g')");
+    REQUIRE_FALSE(db.manager().get_view("v_max_distinct")->checkpointable());
+
+    db.exec("SELECT * FROM dbsp_create_view('v_median', "
+            "'SELECT g, MEDIAN(v) AS m FROM nums GROUP BY g')");
+    REQUIRE_FALSE(db.manager().get_view("v_median")->checkpointable());
+
+    // A group whose values multiset has spilled to a disk bucket log (N4:
+    // >65536 values under dbsp_spill(true)) cannot be reconstructed from a
+    // checkpoint blob — mirrors the join node's exclusion of spilled
+    // equi-key indexes (state_kind gate test above).
+    db.exec("CREATE TABLE many (g INTEGER, v INTEGER)");
+    db.exec("SELECT * FROM dbsp_track('many')");
+    db.exec("SELECT * FROM dbsp_spill(true)");
+    db.exec("SELECT * FROM dbsp_create_view('v_max_spilled', "
+            "'SELECT g, MAX(v) AS m FROM many GROUP BY g')");
+    db.exec("INSERT INTO many SELECT 1, i FROM range(70000) AS t(i)");
+    db.exec("SELECT * FROM dbsp_sync('many')");
+    REQUIRE_FALSE(db.manager().get_view("v_max_spilled")->checkpointable());
+    db.exec("SELECT * FROM dbsp_spill(false)"); // process-global: reset
+}
+
+TEST_CASE("aggregate checkpoint: MAX round-trips through save/restore, "
+          "advancing and retreating (twice, same group) on post-restore "
+          "deltas",
+          "[integration][checkpoint][aggregate]") {
+    DuckDBTestHarness db;
+    setupAggTables(db);
+
+    const std::string sql = "SELECT g, MAX(v) AS m FROM nums GROUP BY g";
+
+    // Twin A (v_live) stays live for the whole test. Twin B (v_restore) is
+    // checkpointed, dropped (in-memory only), and reloaded cold from the
+    // checkpoint.
+    db.exec("SELECT * FROM dbsp_create_view('v_live', '" + sql + "')");
+    db.exec("SELECT * FROM dbsp_create_view('v_restore', '" + sql + "')");
+    REQUIRE(db.manager().get_view("v_restore")->checkpointable());
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+
+    auto save_result = db.query("SELECT * FROM dbsp_save()");
+    REQUIRE_FALSE(save_result->HasError());
+    const std::string save_msg = save_result->GetValue(0, 0).ToString();
+    REQUIRE(save_msg.find("circuit checkpoint: 2 views") != std::string::npos);
+
+    REQUIRE_FALSE(db.query("SELECT dbsp_drop('v_restore')")->HasError());
+
+    auto load_result = db.query("SELECT * FROM dbsp_load()");
+    REQUIRE_FALSE(load_result->HasError());
+    const std::string load_msg = load_result->GetValue(0, 0).ToString();
+    // Only v_restore needed reloading (v_live was still live, skipped).
+    REQUIRE(load_msg.find("1 from checkpoint") != std::string::npos);
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+
+    // Post-restore delta 1: group 2 (single value 100) gets a higher value
+    // -> max advances 100 -> 500.
+    db.exec("INSERT INTO nums VALUES (2, 500)");
+    db.exec("SELECT * FROM dbsp_sync('nums')");
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+
+    // Post-restore delta 2/3: group 3 ({10, 20, 30}) has its current max
+    // deleted TWICE in a row -> max retreats 30 -> 20 -> 10. This only
+    // works if the restored state kept the whole multiset, not just the
+    // cached top value.
+    db.exec("DELETE FROM nums WHERE g = 3 AND v = 30");
+    db.exec("SELECT * FROM dbsp_sync('nums')");
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+
+    db.exec("DELETE FROM nums WHERE g = 3 AND v = 20");
+    db.exec("SELECT * FROM dbsp_sync('nums')");
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+
+    // Post-restore delta 4: group 1 ({5, 15, 25}) has its max deleted once
+    // -> max retreats 25 -> 15.
+    db.exec("DELETE FROM nums WHERE g = 1 AND v = 25");
+    db.exec("SELECT * FROM dbsp_sync('nums')");
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+}
+
+TEST_CASE("aggregate checkpoint: MIN round-trips through save/restore, "
+          "falling and rising (twice, same group) on post-restore deltas",
+          "[integration][checkpoint][aggregate]") {
+    DuckDBTestHarness db;
+    setupAggTables(db);
+
+    const std::string sql = "SELECT g, MIN(v) AS m FROM nums GROUP BY g";
+
+    db.exec("SELECT * FROM dbsp_create_view('v_live', '" + sql + "')");
+    db.exec("SELECT * FROM dbsp_create_view('v_restore', '" + sql + "')");
+    REQUIRE(db.manager().get_view("v_restore")->checkpointable());
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+
+    auto save_result = db.query("SELECT * FROM dbsp_save()");
+    REQUIRE_FALSE(save_result->HasError());
+    const std::string save_msg = save_result->GetValue(0, 0).ToString();
+    REQUIRE(save_msg.find("circuit checkpoint: 2 views") != std::string::npos);
+
+    REQUIRE_FALSE(db.query("SELECT dbsp_drop('v_restore')")->HasError());
+
+    auto load_result = db.query("SELECT * FROM dbsp_load()");
+    REQUIRE_FALSE(load_result->HasError());
+    const std::string load_msg = load_result->GetValue(0, 0).ToString();
+    REQUIRE(load_msg.find("1 from checkpoint") != std::string::npos);
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+
+    // Post-restore delta 1: group 2 (single value 100) gets a lower value
+    // -> min falls 100 -> 1.
+    db.exec("INSERT INTO nums VALUES (2, 1)");
+    db.exec("SELECT * FROM dbsp_sync('nums')");
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+
+    // Post-restore delta 2/3: group 3 ({10, 20, 30}) has its current min
+    // deleted TWICE in a row -> min rises 10 -> 20 -> 30. Proves the
+    // restored multiset kept the full depth, not just the cached bottom
+    // value.
+    db.exec("DELETE FROM nums WHERE g = 3 AND v = 10");
+    db.exec("SELECT * FROM dbsp_sync('nums')");
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+
+    db.exec("DELETE FROM nums WHERE g = 3 AND v = 20");
+    db.exec("SELECT * FROM dbsp_sync('nums')");
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+
+    // Post-restore delta 4: group 1 ({5, 15, 25}) has its min deleted once
+    // -> min rises 5 -> 15.
+    db.exec("DELETE FROM nums WHERE g = 1 AND v = 5");
+    db.exec("SELECT * FROM dbsp_sync('nums')");
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+}

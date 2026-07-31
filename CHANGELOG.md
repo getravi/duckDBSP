@@ -1,5 +1,37 @@
 # Changelog
 
+## Feature: MIN/MAX aggregate checkpoint state (cold/restore attack, Task 2) - Jul 2026
+
+- Circuit-state checkpointing (D3b) now covers plain (non-`DISTINCT`) `MIN`/
+  `MAX` aggregates, not just the count/sum/avg family:
+  `PlanAggregateNode::state_kind()` reports `SERIALIZABLE` for them, so
+  MIN/MAX-bearing views restore from a checkpoint instead of rebuild-by-
+  replay on load. `DISTINCT` (any function) and holistic/ordered aggregates
+  (`FIRST`, `STRING_AGG`, `ARRAY_AGG`, `MEDIAN`, `QUANTILE_CONT`/`DISC`,
+  `MODE`, `MAD`) stay `UNSUPPORTED`. A group whose values have spilled to
+  disk (N4, >65536 values under `dbsp_spill(true)`) also declines the whole
+  node — the spilled log isn't captured this pass, mirroring the join
+  node's exclusion of spilled equi-key indexes.
+- `serialize_state`/`restore_state` gained the per-group `values` multiset
+  (duplicates preserved, written as a single row per group/agg) — exactly
+  the retraction state `apply()`/`agg_value()` already read for MIN/MAX, so
+  a post-restore delete of the current extreme retreats to the next
+  remaining value the same way live maintenance would, including a group
+  whose extreme retreats more than once in a row.
+- **Checkpoint format version bump (3 → 4)**: the aggregate blob layout
+  changed (new field per group/agg), so `kDbspCkptFormatVersion` advanced.
+  `checkpoint_valid` treats a v3 (or earlier) checkpoint as absent rather
+  than misparse it against the new `restore_state` — one-time
+  rebuild-by-replay on the first post-upgrade `dbsp_load()`, then
+  re-checkpoints in the new format on the next save.
+- **Tests**: `test/integration/test_join_checkpoint.cpp` — a `state_kind`
+  gate case (`MIN`/`MAX` checkpointable; `DISTINCT`/`MEDIAN`/spilled still
+  not) plus twin round-trip cases for `MAX` and `MIN`: a checkpointed view
+  is dropped and reloaded, then post-restore deltas force a group's extreme
+  to advance (new value beats it) and to retreat twice in a row (the
+  current extreme deleted twice), asserted against a continuously-live
+  twin via exact `(row, weight)` snapshot equality.
+
 ## Fix: truthful `dbsp_load()` report on an already-populated registry - Jul 2026
 
 - **Bug**: calling `dbsp_load()` when the registry was already populated
