@@ -36,6 +36,14 @@
   (`auto_sync_all`/`dbsp_sync`) for the identical reason — `propagate_
   changes` runs under callers' shared lock on `struct_mutex_`, and
   `save_checkpoint` takes its own shared lock on it.
+- `autoload_attempted_` is an atomic (compare-exchanged in
+  `maybe_autoload`), not a plain bool: two connections to the same
+  `DatabaseInstance` can race their first DBSP call. A failed auto-load
+  logs `last_error()` under `DBSP_DEBUG_SYNC` (the existing debug var this
+  file already used for other best-effort CDC diagnostics); a failed or
+  thrown auto-save on close logs under `DBSP_DEBUG_TEARDOWN` (the existing
+  crash-marker/teardown debug var, now also captured into the detached
+  save thread).
 - Regression test: test/python/test_autopersist.py.
 
 ## Fix: same-pass multi-source deltas apply as one circuit step - Jul 2026

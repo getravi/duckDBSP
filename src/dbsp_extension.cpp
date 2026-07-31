@@ -1695,14 +1695,29 @@ public:
     //     Connection and the manager's own — is released. That busy-spin is
     //     what makes "close() then immediately reopen" observe the save
     //     synchronously despite it running on a background thread.
-    std::thread([m = std::move(manager), db]() mutable {
+    //   - `dbg` (DBSP_DEBUG_TEARDOWN) is captured by value so a failed save
+    //     (return-false or thrown) logs on this thread too, not just the
+    //     view-teardown path below.
+    std::thread([m = std::move(manager), db, dbg]() mutable {
       if (m->autopersist_enabled() && m->has_views()) {
         try {
           duckdb::Connection save_con(*db);
-          m->save_to_duck_table(*save_con.context);
-          m->save_checkpoint(*save_con.context);
-        } catch (...) {
+          bool saved_defs = m->save_to_duck_table(*save_con.context);
+          bool saved_ckpt = m->save_checkpoint(*save_con.context);
+          if (dbg && (!saved_defs || !saved_ckpt)) {
+            std::cerr << "[dbsp] auto-save on close failed: defs=" << saved_defs
+                      << " ckpt=" << saved_ckpt << " last_error=" << m->last_error()
+                      << "\n";
+          }
+        } catch (const std::exception &e) {
           // Best-effort: a failed auto-save must not crash shutdown.
+          if (dbg) {
+            std::cerr << "[dbsp] auto-save on close threw: " << e.what() << "\n";
+          }
+        } catch (...) {
+          if (dbg) {
+            std::cerr << "[dbsp] auto-save on close threw an unknown exception\n";
+          }
         }
       }
       m.reset();

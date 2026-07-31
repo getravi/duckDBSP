@@ -463,21 +463,38 @@ public:
   // process yet — a registry the user has already started populating
   // (directly, or via a prior auto-load) is never loaded over. A missing
   // _dbsp_views table is not an error (load_from_duck_table already treats
-  // it as "nothing to load"); any other load failure is swallowed here too
-  // — auto-load is best-effort, never fatal to the triggering call. Must
-  // NOT hold struct_mutex_ while calling load_from_duck_table (see its own
-  // comment): the has-views check below takes and releases its own lock
-  // first.
+  // it as "nothing to load"); any other load failure is best-effort, never
+  // fatal to the triggering call, but not silent either: it's logged under
+  // DBSP_DEBUG_SYNC (same debug var this file already uses for other
+  // best-effort CDC diagnostics) and last_error_ is left as
+  // load_from_duck_table set it, so a later last_error()-reading caller
+  // still sees it. Must NOT hold struct_mutex_ while calling
+  // load_from_duck_table (see its own comment): the has-views check below
+  // takes and releases its own lock first.
+  //
+  // autoload_attempted_ is a compare-and-swap, not a plain read-then-write:
+  // two connections to the same DatabaseInstance can race their first DBSP
+  // call, and a plain bool read/written from multiple threads without
+  // synchronization is a data race (UB) regardless of how "benign" the
+  // outcome looks. The CAS makes exactly one caller the winner that may
+  // proceed to check has_views()/load; every other racer (including a
+  // concurrent create_view()) just returns.
   void maybe_autoload(duckdb::ClientContext &context) {
-    if (!autopersist_ || autoload_attempted_) {
+    if (!autopersist_) {
       return;
     }
-    bool populated = has_views();
-    autoload_attempted_ = true;
-    if (populated) {
-      return;
+    bool expected = false;
+    if (!autoload_attempted_.compare_exchange_strong(expected, true)) {
+      return; // another call already claimed the auto-load attempt
     }
-    load_from_duck_table(context);
+    if (has_views()) {
+      return; // user already populated the registry themselves
+    }
+    if (!load_from_duck_table(context)) {
+      if (std::getenv("DBSP_DEBUG_SYNC")) {
+        std::cerr << "[dbsp] auto-load failed: " << last_error_ << "\n";
+      }
+    }
   }
 
   // Auto-save: fires a piggybacked circuit-state checkpoint once
@@ -3530,14 +3547,12 @@ private:
   // ON by default: a materialized view keeps itself current. Turn off
   // for bulk loads (each autocommit write pays a scoped scan-and-diff).
   std::atomic<bool> auto_sync_enabled_{true};
-  // Auto-persist (Feature 1). autoload_attempted_ is a plain bool, not
-  // atomic: maybe_autoload's own callers are the six read/write entry
-  // points, which already serialize per-statement per the existing
-  // dbsp_* table-function "done" pattern; a load race across truly
-  // concurrent first statements is a benign double-attempt (the second
-  // load sees a non-empty registry and no-ops), not corruption.
+  // Auto-persist (Feature 1). autoload_attempted_ is atomic (not a plain
+  // bool): multiple connections to the same DatabaseInstance can race
+  // their first DBSP call, and maybe_autoload's compare_exchange on this
+  // flag is what makes exactly one of them the auto-load attempt.
   std::atomic<bool> autopersist_{true};
-  bool autoload_attempted_ = false;
+  std::atomic<bool> autoload_attempted_{false};
   std::atomic<size_t> autopersist_interval_{0}; // commits; 0 = off
   std::atomic<size_t> commits_since_checkpoint_{0};
   std::atomic<bool> checkpoint_due_{false};
