@@ -1,5 +1,43 @@
 # Changelog
 
+## Feature: dbsp_autopersist - views survive a clean reopen - Jul 2026
+
+- New `dbsp_autopersist(enable)` setting, **ON by default**: a database
+  that used DBSP views now reopens with them alive, with no explicit
+  `dbsp_save()`/`dbsp_load()` calls. Auto-save runs on a clean connection
+  close (the existing crash-marker release hook — the last user connection
+  to an instance closing) when autopersist is on and any view exists;
+  auto-load runs at the first DBSP entry point with a `ClientContext` in a
+  fresh session (`dbsp_query`, `dbsp_views`, `dbsp_track`,
+  `CREATE MATERIALIZED VIEW`, `dbsp_sync`, `dbsp_changes`) if the view
+  registry is still empty — the existing checkpoint-fast-path `dbsp_load()`
+  machinery underneath is unchanged. Fires at most once per session and
+  never after a view has already been created here (`CDCManager::
+  maybe_autoload`/`autoload_attempted_`). `dbsp_autopersist_interval(n)`
+  (default 0 = off) additionally piggybacks a circuit-state checkpoint
+  every `n` commits, so a crash between clean shutdowns loses at most `n`
+  commits of operator state — the data itself is never at risk (base
+  tables are DuckDB-durable; a stale checkpoint fails its watermark check
+  and rebuilds).
+- Auto-save could not run inline in the `OnConnectionClosed` hook: it's
+  called from inside `ConnectionManager::RemoveConnection`, which holds
+  `connections_lock`, and `save_to_duck_table`/`save_checkpoint` each build
+  a fresh `duckdb::Connection` to do their work — whose constructor calls
+  `AddConnection`, re-locking the same non-recursive mutex on the same
+  thread. It now runs on the same detached thread that already tears down
+  the manager (destroying views does the same thing for the same reason),
+  ordered before that teardown; the manager's own views keep the
+  `DatabaseInstance` alive for the save without an extra reference, and a
+  same-process reopen already busy-spins until that instance is fully
+  destroyed (`DBInstanceCache`), which serializes the reopen after the
+  save completes. The checkpoint-interval counter is incremented inside
+  `propagate_changes` (lock-free), but the actual `save_checkpoint()` call
+  is deferred to a point after the caller's `struct_mutex_` is released
+  (`auto_sync_all`/`dbsp_sync`) for the identical reason — `propagate_
+  changes` runs under callers' shared lock on `struct_mutex_`, and
+  `save_checkpoint` takes its own shared lock on it.
+- Regression test: test/python/test_autopersist.py.
+
 ## Fix: same-pass multi-source deltas apply as one circuit step - Jul 2026
 
 - A view fed by two sources updated in the SAME propagation pass (join of

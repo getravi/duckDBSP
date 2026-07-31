@@ -409,6 +409,11 @@ public:
     arrangements_by_table_.clear();
     last_error_.clear();
     auto_sync_enabled_ = true; // matches a fresh manager
+    autopersist_ = true;
+    autoload_attempted_ = false;
+    autopersist_interval_ = 0;
+    commits_since_checkpoint_ = 0;
+    checkpoint_due_ = false;
     deferred_tables_ = 0;
     rebuild_pending_ = false;
     {
@@ -434,12 +439,67 @@ public:
   // callable; toggling is a no-op.
   bool is_planner_enabled() const { return true; }
 
+  // Auto-persist control (Feature 1: views survive a clean connection
+  // reopen with no explicit dbsp_save()/dbsp_load()). Default ON, same
+  // atomic-flag shape as auto-sync above.
+  void enable_autopersist() { autopersist_ = true; }
+
+  void disable_autopersist() { autopersist_ = false; }
+
+  bool autopersist_enabled() const { return autopersist_; }
+
+  void set_autopersist_interval(size_t n) { autopersist_interval_ = n; }
+
+  size_t autopersist_interval() const { return autopersist_interval_; }
+
+  bool has_views() const {
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
+    return !views_.empty();
+  }
+
+  // Auto-load trigger: called at the top of every user-facing entry point
+  // that has a ClientContext and touches DBSP state. Fires at most once per
+  // manager lifetime, and only when nothing has been created in this
+  // process yet — a registry the user has already started populating
+  // (directly, or via a prior auto-load) is never loaded over. A missing
+  // _dbsp_views table is not an error (load_from_duck_table already treats
+  // it as "nothing to load"); any other load failure is swallowed here too
+  // — auto-load is best-effort, never fatal to the triggering call. Must
+  // NOT hold struct_mutex_ while calling load_from_duck_table (see its own
+  // comment): the has-views check below takes and releases its own lock
+  // first.
+  void maybe_autoload(duckdb::ClientContext &context) {
+    if (!autopersist_ || autoload_attempted_) {
+      return;
+    }
+    bool populated = has_views();
+    autoload_attempted_ = true;
+    if (populated) {
+      return;
+    }
+    load_from_duck_table(context);
+  }
+
+  // Auto-save: fires a piggybacked circuit-state checkpoint once
+  // autopersist_interval_ commits have accumulated since the last one
+  // (counted by propagate_changes). Callers must invoke this from a point
+  // where struct_mutex_ is NOT held by the current thread — save_checkpoint
+  // takes its own shared lock on it, and struct_mutex_ (a std::shared_mutex)
+  // is not safe to re-enter even for a second shared lock on the same
+  // thread if a writer is queued.
+  void maybe_save_checkpoint(duckdb::ClientContext &context) {
+    if (checkpoint_due_.exchange(false)) {
+      save_checkpoint(context);
+    }
+  }
+
   // Auto-sync all tracked tables (called from TransactionCommit hook)
   void auto_sync_all(duckdb::ClientContext &context,
                      duckdb::MetaTransaction *meta_transaction = nullptr) {
     if (!is_auto_sync_enabled())
       return;
     sync_all(context, meta_transaction);
+    maybe_save_checkpoint(context);
   }
 
   // --- Circuit-state checkpointing (D3b) --------------------------------
@@ -1111,6 +1171,11 @@ public:
   // Supports referencing other views (cascading views)
   bool create_view(duckdb::ClientContext &context, const std::string &view_name,
                    const std::string &sql, bool skip_init_replay = false) {
+    // Never auto-load over a registry the user (or a prior auto-load) has
+    // started populating — belt-and-suspenders alongside maybe_autoload's
+    // own check, so any create_view caller trips this regardless of
+    // whether it went through one of the wrapped entry points first.
+    autoload_attempted_ = true;
     std::unique_lock<std::shared_mutex> struct_lock(struct_mutex_);
 
     // Validate view name to prevent SQL injection
@@ -1204,41 +1269,49 @@ public:
                          .count();
     view_definitions_[view_name] = def;
 
-    // Save to _dbsp_views table (ignore errors for now)
-    try {
-      std::string sources_str;
-      for (size_t i = 0; i < resolved_sources.size(); i++) {
-        if (i > 0) sources_str += ",";
-        sources_str += resolved_sources[i];
+    // Save to _dbsp_views table (ignore errors for now). Gated on
+    // autopersist_ (Feature 1): this incremental best-effort write is what
+    // makes a later auto-load see the view at all, so autopersist_ is the
+    // single master switch for every implicit persistence side effect —
+    // this one, and the on-close save/checkpoint. Turning it off (bulk
+    // loads) means exactly that: nothing about this session is persisted
+    // automatically, matching dbsp_auto_sync's own bulk-load contract.
+    if (autopersist_) {
+      try {
+        std::string sources_str;
+        for (size_t i = 0; i < resolved_sources.size(); i++) {
+          if (i > 0) sources_str += ",";
+          sources_str += resolved_sources[i];
+        }
+
+        // Escape single quotes in SQL
+        std::string escaped_sql = sql;
+        size_t pos = 0;
+        while ((pos = escaped_sql.find("'", pos)) != std::string::npos) {
+          escaped_sql.replace(pos, 1, "''");
+          pos += 2;
+        }
+
+        std::string insert_sql =
+          "INSERT OR REPLACE INTO _dbsp_views (name, sql, sources, created_at) "
+          "VALUES ('" + view_name + "', '" + escaped_sql + "', '" + sources_str + "', " +
+          std::to_string(def.created_at) + ")";
+
+        // Use a fresh connection: `context` is mid-query (we run inside a table
+        // function on it), so context.Query() would block on the context lock.
+        InternalQueryGuard guard;
+        duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+        con.Query("CREATE TABLE IF NOT EXISTS _dbsp_views (name VARCHAR "
+                  "PRIMARY KEY, sql VARCHAR, sources VARCHAR, created_at "
+                  "BIGINT)");
+        auto res = con.Query(insert_sql);
+        // Ignore errors - persistence is best-effort
+      } catch (const std::exception &e) {
+        // Ignore persistence errors - log for debugging
+        last_error_ = std::string("Persistence error: ") + e.what();
+      } catch (...) {
+        last_error_ = "Unknown persistence error";
       }
-
-      // Escape single quotes in SQL
-      std::string escaped_sql = sql;
-      size_t pos = 0;
-      while ((pos = escaped_sql.find("'", pos)) != std::string::npos) {
-        escaped_sql.replace(pos, 1, "''");
-        pos += 2;
-      }
-
-      std::string insert_sql =
-        "INSERT OR REPLACE INTO _dbsp_views (name, sql, sources, created_at) "
-        "VALUES ('" + view_name + "', '" + escaped_sql + "', '" + sources_str + "', " +
-        std::to_string(def.created_at) + ")";
-
-      // Use a fresh connection: `context` is mid-query (we run inside a table
-      // function on it), so context.Query() would block on the context lock.
-      InternalQueryGuard guard;
-      duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
-      con.Query("CREATE TABLE IF NOT EXISTS _dbsp_views (name VARCHAR "
-                "PRIMARY KEY, sql VARCHAR, sources VARCHAR, created_at "
-                "BIGINT)");
-      auto res = con.Query(insert_sql);
-      // Ignore errors - persistence is best-effort
-    } catch (const std::exception &e) {
-      // Ignore persistence errors - log for debugging
-      last_error_ = std::string("Persistence error: ") + e.what();
-    } catch (...) {
-      last_error_ = "Unknown persistence error";
     }
 
     // Register the view's result schema for dependent views
@@ -3156,6 +3229,19 @@ private:
     // docs/DESIGN_WRITE_CAPTURE.md).
     commit_seq_++;
 
+    // Auto-persist checkpoint interval (Feature 1): count commits here
+    // (cheap, lock-free) but defer the actual save_checkpoint() call to
+    // maybe_save_checkpoint() at a point where struct_mutex_ is not held —
+    // this function runs under callers' struct_mutex_ (on_insert/on_delete/
+    // sync_tables hold it for their whole body), and save_checkpoint takes
+    // its own shared lock on the same mutex.
+    size_t interval = autopersist_interval_.load();
+    if (interval > 0 &&
+        commits_since_checkpoint_.fetch_add(1) + 1 >= interval) {
+      commits_since_checkpoint_ = 0;
+      checkpoint_due_ = true;
+    }
+
     // Acquire view_mutex_ exclusively for writing view content.
     // Lock ordering: struct_mutex_ (held by caller) → view_mutex_ (acquired here).
     std::unique_lock<std::shared_mutex> view_lock(view_mutex_);
@@ -3444,6 +3530,17 @@ private:
   // ON by default: a materialized view keeps itself current. Turn off
   // for bulk loads (each autocommit write pays a scoped scan-and-diff).
   std::atomic<bool> auto_sync_enabled_{true};
+  // Auto-persist (Feature 1). autoload_attempted_ is a plain bool, not
+  // atomic: maybe_autoload's own callers are the six read/write entry
+  // points, which already serialize per-statement per the existing
+  // dbsp_* table-function "done" pattern; a load race across truly
+  // concurrent first statements is a benign double-attempt (the second
+  // load sees a non-empty registry and no-ops), not corruption.
+  std::atomic<bool> autopersist_{true};
+  bool autoload_attempted_ = false;
+  std::atomic<size_t> autopersist_interval_{0}; // commits; 0 = off
+  std::atomic<size_t> commits_since_checkpoint_{0};
+  std::atomic<bool> checkpoint_due_{false};
   size_t last_loaded_count_ = 0;
   size_t last_ckpt_restored_count_ = 0;
   size_t last_ckpt_saved_count_ = 0;

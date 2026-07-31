@@ -26,6 +26,8 @@ DBSP:         INSERT 1 row → Update affected aggregates → O(delta)
   (`... FROM m.orders`); tables are keyed by canonical
   `catalog.schema.table`
 - **Persistence**: Save/restore views across sessions
+- **Auto-persist**: views survive a clean connection reopen with no
+  explicit save/load calls (`dbsp_autopersist`, on by default)
 - **Zero Dependencies**: Pure C++ header-only core library
 - **Bounded Memory**: optional disk-backed state (`dbsp_spill`)
 - **Parallel Updates**: optional multi-core sync, propagation, and join
@@ -194,6 +196,11 @@ views from current table data. Table-form persistence lives in the database
 file, so file copies/backups carry the views. JSON file paths must be
 relative to the working directory — absolute paths are rejected.
 
+`dbsp_save()`/`dbsp_load()` are no longer something a caller has to
+remember: with auto-persist on (the default), a clean connection close
+saves automatically and the next session's first DBSP call loads
+automatically. See `dbsp_autopersist` below.
+
 ### Manual CDC
 
 | Function | Description |
@@ -206,6 +213,8 @@ relative to the working directory — absolute paths are rejected.
 | Function | Description |
 |----------|-------------|
 | `dbsp_auto_sync(bool)` | Toggle automatic sync on commit (default ON; turn off for bulk loads) |
+| `dbsp_autopersist(bool)` | Toggle auto-save-on-close + auto-load-on-reopen (default ON; turn off for bulk loads) |
+| `dbsp_autopersist_interval(n)` | Piggyback a circuit-state checkpoint every `n` commits (default 0 = off) |
 | `dbsp_parallel(bool)` | Toggle parallel multi-table sync + same-level view propagation |
 | `dbsp_spill(bool)` | Toggle disk-backed state: baselines, join indexes, top-K windows, big aggregate groups |
 | `dbsp_use_planner([bool])` | No-op since Phase C (planner is the only frontend); kept for script compatibility |

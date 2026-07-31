@@ -590,6 +590,53 @@ SELECT * FROM dbsp_auto_sync(false);  -- Disable
 SELECT * FROM dbsp_auto_sync();       -- Query status
 ```
 
+### dbsp_autopersist(enable)
+
+Toggle auto-persist — **ON by default**: a database that used DBSP views
+reopens with them alive, no explicit `dbsp_save()`/`dbsp_load()` calls.
+
+- **Auto-save**: on a clean connection close (the last user connection to
+  an instance), if autopersist is on and any view exists, the extension
+  saves view definitions (`dbsp_save()`) and a circuit-state checkpoint
+  (`save_checkpoint()`) automatically.
+- **Auto-load**: the first DBSP entry point that has a `ClientContext`
+  (`dbsp_query`, `dbsp_views`, `dbsp_track`, `CREATE MATERIALIZED VIEW`,
+  `dbsp_sync`, `dbsp_changes`) loads persisted state — checkpoint fast path
+  included — if the view registry in this session is still empty. Fires at
+  most once per session and never after a view has already been created
+  here; a missing `_dbsp_views` table is not an error (there is simply
+  nothing to load).
+
+The two-call `dbsp_save()`/`dbsp_load()` contract still works exactly as
+before and stays useful for named/JSON-file forms and manual snapshots;
+auto-persist just means the default zero-arg round trip is no longer
+something a caller has to remember.
+
+Turn auto-persist off for bulk-load workflows the same way as auto-sync —
+`dbsp_autopersist(false)` before, `(true)` after — to skip the save/load
+overhead entirely.
+
+```sql
+SELECT * FROM dbsp_autopersist(true);   -- Enable (default)
+SELECT * FROM dbsp_autopersist(false);  -- Disable
+SELECT * FROM dbsp_autopersist();       -- Query status
+```
+
+### dbsp_autopersist_interval(n)
+
+Piggyback a circuit-state checkpoint every `n` commits (counted across
+`dbsp_sync`-driven propagation), so a crash between clean shutdowns loses
+at most `n` commits of operator state. **Default 0 (off)** — the
+underlying data is never at risk either way (base tables are
+DuckDB-durable, and a stale checkpoint fails its watermark check and
+falls back to a full rebuild on load).
+
+```sql
+SELECT * FROM dbsp_autopersist_interval(100);  -- checkpoint every 100 commits
+SELECT * FROM dbsp_autopersist_interval(0);    -- off
+SELECT * FROM dbsp_autopersist_interval();     -- query the current interval
+```
+
 ### dbsp_stats()
 
 Sync-path observability counters, for monitoring which ingestion path

@@ -323,6 +323,18 @@ public:
       return;
     }
 
+    // Auto-persist checkpoint interval (dbsp_autopersist_interval): fires a
+    // piggybacked save_checkpoint() once enough commits have accumulated
+    // (counted by propagate_changes), regardless of which of this
+    // function's several sync paths/early returns below applied. struct_
+    // mutex_ is never held by this thread once TransactionCommit returns,
+    // so it's safe to run save_checkpoint's own locking at that point.
+    struct CheckpointGuard {
+      CDCManager &m;
+      duckdb::ClientContext &ctx;
+      ~CheckpointGuard() { m.maybe_save_checkpoint(ctx); }
+    } checkpoint_guard{manager, context};
+
     try {
       // Engine-hook fast path (SaaS fork): the engine reported this
       // transaction's exact per-table images — facts need no guards.

@@ -115,6 +115,7 @@ void TrackFunc(ClientContext &context, TableFunctionInput &input,
     return;
 
   auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
   bool ok = manager.track_table(context, data.table_name);
 
   if (!ok) {
@@ -195,6 +196,7 @@ void CreateViewFunc(ClientContext &context, TableFunctionInput &input,
     return;
 
   auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
   string result;
 
   if (data.is_sql_mode) {
@@ -363,6 +365,7 @@ void SyncFunc(ClientContext &context, TableFunctionInput &input,
     return;
 
   auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
 
   if (data.sync_all) {
     manager.sync_all(context);
@@ -374,6 +377,7 @@ void SyncFunc(ClientContext &context, TableFunctionInput &input,
     output.SetValue(
         0, 0, Value(ok ? "Synced: " + data.table_name : "Failed to sync"));
   }
+  manager.maybe_save_checkpoint(context);
   data.done = true;
 }
 
@@ -402,6 +406,7 @@ unique_ptr<FunctionData> QueryBind(ClientContext &context,
   data->view_name = input.inputs[0].GetValue<string>();
 
   auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
   const auto *schema = manager.get_view_schema(data->view_name);
 
   // Collect rows via scan_view: holds the read locks for the whole
@@ -491,6 +496,7 @@ unique_ptr<FunctionData> ChangesBind(ClientContext &context,
   data->view_name = input.inputs[0].GetValue<string>();
 
   auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
   const auto *schema = manager.get_view_schema(data->view_name);
 
   bool found = manager.scan_view_delta(
@@ -556,6 +562,7 @@ unique_ptr<FunctionData> ListViewsBind(ClientContext &context,
   auto data = make_uniq<ListViewsBindData>();
 
   auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
   for (const auto &name : manager.list_views()) {
     data->views.push_back(manager.get_view_info(name));
   }
@@ -1052,6 +1059,131 @@ void AutoSyncFunc(ClientContext &context, TableFunctionInput &input,
 }
 
 // ============================================================================
+// dbsp_autopersist - Enable/disable auto-load-on-reopen + auto-save-on-close
+// Usage: SELECT * FROM dbsp_autopersist(true);   -- Enable (default)
+//        SELECT * FROM dbsp_autopersist(false);  -- Disable
+//        SELECT * FROM dbsp_autopersist();       -- Query status
+// ============================================================================
+
+struct AutoPersistBindData : public TableFunctionData {
+  bool enable = false;
+  bool query_only = false;
+  bool done = false;
+};
+
+unique_ptr<FunctionData> AutoPersistBind(ClientContext &context,
+                                         TableFunctionBindInput &input,
+                                         vector<LogicalType> &return_types,
+                                         vector<string> &names) {
+  auto data = make_uniq<AutoPersistBindData>();
+
+  if (input.inputs.empty()) {
+    data->query_only = true;
+  } else {
+    data->enable = input.inputs[0].GetValue<bool>();
+  }
+
+  return_types.push_back(LogicalType::VARCHAR);
+  names.push_back("result");
+  return std::move(data);
+}
+
+void AutoPersistFunc(ClientContext &context, TableFunctionInput &input,
+                     DataChunk &output) {
+  EnsureContextState(context);
+  auto &data = input.bind_data->CastNoConst<AutoPersistBindData>();
+  if (data.done)
+    return;
+
+  // Deliberately does NOT call maybe_autoload: dbsp_autopersist(false) is
+  // the bulk-load-style escape hatch a caller uses BEFORE anything else
+  // runs (same shape as dbsp_auto_sync), so it must not itself trigger the
+  // auto-load it may be trying to suppress.
+  auto &manager = dbsp_native::get_cdc_manager(context);
+
+  if (data.query_only) {
+    bool enabled = manager.autopersist_enabled();
+    output.SetCardinality(1);
+    output.SetValue(
+        0, 0,
+        Value(string("Auto-persist is ") + (enabled ? "ENABLED" : "DISABLED")));
+  } else {
+    if (data.enable) {
+      manager.enable_autopersist();
+      output.SetCardinality(1);
+      output.SetValue(
+          0, 0,
+          Value("Auto-persist ENABLED: views survive a clean connection "
+                "reopen"));
+    } else {
+      manager.disable_autopersist();
+      output.SetCardinality(1);
+      output.SetValue(
+          0, 0,
+          Value("Auto-persist DISABLED: use dbsp_save()/dbsp_load() "
+                "manually"));
+    }
+  }
+  data.done = true;
+}
+
+// ============================================================================
+// dbsp_autopersist_interval - Piggyback a circuit-state checkpoint every N
+// commits (0 = off, default). A crash then loses at most N commits of
+// operator state; the underlying data is never at risk (DuckDB-durable).
+// Usage: SELECT * FROM dbsp_autopersist_interval(100);  -- set
+//        SELECT * FROM dbsp_autopersist_interval();     -- query
+// ============================================================================
+
+struct AutoPersistIntervalBindData : public TableFunctionData {
+  int64_t n = -1; // -1 = query only
+  bool done = false;
+};
+
+unique_ptr<FunctionData> AutoPersistIntervalBind(
+    ClientContext &context, TableFunctionBindInput &input,
+    vector<LogicalType> &return_types, vector<string> &names) {
+  auto data = make_uniq<AutoPersistIntervalBindData>();
+
+  if (!input.inputs.empty()) {
+    data->n = input.inputs[0].GetValue<int64_t>();
+    if (data->n < 0) {
+      throw InvalidInputException(
+          "dbsp_autopersist_interval(N): N must be >= 0");
+    }
+  }
+
+  return_types.push_back(LogicalType::VARCHAR);
+  names.push_back("result");
+  return std::move(data);
+}
+
+void AutoPersistIntervalFunc(ClientContext &context, TableFunctionInput &input,
+                             DataChunk &output) {
+  EnsureContextState(context);
+  auto &data = input.bind_data->CastNoConst<AutoPersistIntervalBindData>();
+  if (data.done)
+    return;
+
+  auto &manager = dbsp_native::get_cdc_manager(context);
+  if (data.n < 0) {
+    output.SetCardinality(1);
+    output.SetValue(
+        0, 0,
+        Value("Auto-persist checkpoint interval: " +
+              std::to_string(manager.autopersist_interval()) +
+              " commits (0 = off)"));
+  } else {
+    manager.set_autopersist_interval(static_cast<size_t>(data.n));
+    output.SetCardinality(1);
+    output.SetValue(0, 0,
+                    Value("Auto-persist checkpoint interval set to " +
+                          std::to_string(data.n) + " commits"));
+  }
+  data.done = true;
+}
+
+// ============================================================================
 // dbsp_parallel - Enable/disable parallel sync + parallel view propagation
 // Usage: SELECT * FROM dbsp_parallel(true);   -- Enable
 //        SELECT * FROM dbsp_parallel(false);  -- Disable
@@ -1242,6 +1374,7 @@ void CreateMaterializedViewExecute(ClientContext &context,
   }
 
   auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
   bool success =
       manager.create_view(context, state.view_name, state.select_query);
 
@@ -1534,8 +1667,46 @@ public:
     dbsp_native::get_recovery_manager().mark_session_end();
     // Destroy on a detached thread: destroying views destroys their
     // Connections, whose destructors re-enter RemoveConnection and would
-    // deadlock on connections_lock if run inline here.
-    std::thread([m = std::move(manager)]() mutable { m.reset(); }).detach();
+    // deadlock on connections_lock if run inline here. Auto-persist
+    // (Feature 1) piggybacks its save on this SAME thread, before the
+    // manager is destroyed:
+    //   - No ClientContext is safely usable here: `context` belongs to the
+    //     closing session and may be destroyed the moment RemoveConnection
+    //     returns to its caller, racing this detached thread. save_to_
+    //     duck_table()/save_checkpoint() only need a ClientContext to reach
+    //     its DatabaseInstance, so a fresh duckdb::Connection built straight
+    //     from `db` (kept alive below) stands in for it instead.
+    //   - That fresh Connection's constructor calls AddConnection, which
+    //     takes connections_lock — exactly like the view-destroying
+    //     Connections above, this MUST happen off-thread: doing it inline
+    //     in OnConnectionClosed would recurse into the lock RemoveConnection
+    //     is still holding on the calling thread. A detached thread doesn't
+    //     hold that lock, so it only has to wait (briefly) rather than
+    //     deadlock.
+    //   - `db` stays alive across the save without an extra shared_ptr
+    //     capture: as long as the manager isn't reset() yet, its own views'
+    //     internal Connections keep the DatabaseInstance pinned (same
+    //     invariant the comment above already relies on) — and the save
+    //     runs before that reset() below.
+    //   - Ordering vs. a same-process reopen: DBInstanceCache busy-spins a
+    //     new duckdb.connect() to this path until the old DatabaseInstance
+    //     is fully destroyed (see test_reopen_hang.py), which can't happen
+    //     until every reference this thread holds — including our save
+    //     Connection and the manager's own — is released. That busy-spin is
+    //     what makes "close() then immediately reopen" observe the save
+    //     synchronously despite it running on a background thread.
+    std::thread([m = std::move(manager), db]() mutable {
+      if (m->autopersist_enabled() && m->has_views()) {
+        try {
+          duckdb::Connection save_con(*db);
+          m->save_to_duck_table(*save_con.context);
+          m->save_checkpoint(*save_con.context);
+        } catch (...) {
+          // Best-effort: a failed auto-save must not crash shutdown.
+        }
+      }
+      m.reset();
+    }).detach();
   }
 };
 
@@ -1630,6 +1801,17 @@ static void LoadInternal(ExtensionLoader &loader) {
                                AutoSyncBind);
   auto_sync_func.varargs = LogicalType::BOOLEAN;
   loader.RegisterFunction(auto_sync_func);
+
+  TableFunction autopersist_func("dbsp_autopersist", {}, AutoPersistFunc,
+                                 AutoPersistBind);
+  autopersist_func.varargs = LogicalType::BOOLEAN;
+  loader.RegisterFunction(autopersist_func);
+
+  TableFunction autopersist_interval_func("dbsp_autopersist_interval", {},
+                                          AutoPersistIntervalFunc,
+                                          AutoPersistIntervalBind);
+  autopersist_interval_func.varargs = LogicalType::BIGINT;
+  loader.RegisterFunction(autopersist_interval_func);
 
   TableFunction use_planner_func("dbsp_use_planner", {}, UsePlannerFunc,
                                  UsePlannerBind);
