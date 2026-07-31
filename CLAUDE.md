@@ -40,3 +40,11 @@ Never accumulate throwaway files. Rules:
 5. Runtime spill directories are self-cleaning (dbsp_spill(true) sweeps
    directories left by dead processes) — don't add manual cleanup steps
    for them.
+
+## Build Parallelism
+
+Use `make -j 6` (and `cmake --build . -j 6`) for all builds in this repo.
+Never bare `make -j` / `cmake -j` — unbounded parallelism on this tree has
+frozen the machine before (8 cores, 16GB RAM; the big translation units are
+memory-hungry, so full-width parallel links can swap). 6 is the measured-safe
+ceiling; do not raise it without checking free memory first.
