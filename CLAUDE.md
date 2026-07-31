@@ -43,8 +43,14 @@ Never accumulate throwaway files. Rules:
 
 ## Build Parallelism
 
-Use `make -j 6` (and `cmake --build . -j 6`) for all builds in this repo.
+Use `make -j 8` (and `cmake --build . -j 8`) for all builds in this repo.
 Never bare `make -j` / `cmake -j` — unbounded parallelism on this tree has
-frozen the machine before (8 cores, 16GB RAM; the big translation units are
-memory-hungry, so full-width parallel links can swap). 6 is the measured-safe
-ceiling; do not raise it without checking free memory first.
+frozen the machine before. 8 cores / 16GB RAM: if a build starts swapping
+(system stalls, kernel_task churn), drop back to `-j 6` for that build.
+
+## Test Runs
+
+Full `ctest` (from `test/build_test`) is required before every commit that
+touches code (headers, sources, tests, CMake). Doc-only commits (*.md,
+comments-only diffs) may skip it — verify the diff is genuinely doc/comment-
+only (`git diff --stat` + no code lines) before skipping.
