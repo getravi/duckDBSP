@@ -68,6 +68,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "core_functions/aggregate/quantile_helpers.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
@@ -5213,8 +5214,11 @@ private:
           expr.Cast<duckdb::BoundReferenceExpression>().index);
     }
 
-    // Extract a constant int64; false if not a non-NULL constant
-    static bool constant_int(const duckdb::Expression &expr, int64_t &out) {
+    // Extract a constant int64 from a bare BOUND_CONSTANT; false otherwise.
+    // No BOUND_CAST unwrapping -- see constant_int() below for why that
+    // matters.
+    static bool bare_constant_int(const duckdb::Expression &expr,
+                                  int64_t &out) {
       if (expr.GetExpressionClass() !=
           duckdb::ExpressionClass::BOUND_CONSTANT) {
         return false;
@@ -5225,6 +5229,29 @@ private:
       }
       out = val.GetValue<int64_t>();
       return true;
+    }
+
+    // Extract a constant int64; false if not a non-NULL constant. The
+    // binder wraps frame/offset literals in a BOUND_CAST shell (e.g.
+    // `11 PRECEDING` arrives as CAST(11 AS BIGINT)), so unwrap any chain of
+    // BOUND_CAST nodes before checking for BOUND_CONSTANT underneath.
+    //
+    // Used only for window frame bounds (start_expr/end_expr) and LAG/LEAD
+    // offsets -- the shapes this task verified against the render_row /
+    // affected_indices machinery. NTILE's bucket count and NTH_VALUE's N
+    // deliberately keep using bare_constant_int (unchanged, still gated):
+    // the same BOUND_CAST shell reaches them, but a differential check
+    // during this task found NTILE's bucket-boundary math already diverges
+    // from stock DuckDB (confirmed pre-existing, unrelated to this fix) --
+    // widening the gate there would silently ship a broken feature instead
+    // of a loud "unsupported" error. See docs/superpowers/plans/2026-07-31-
+    // cold-restore-attack.md Task 1 report.
+    static bool constant_int(const duckdb::Expression &expr, int64_t &out) {
+      const duckdb::Expression *cur = &expr;
+      while (cur->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CAST) {
+        cur = cur->Cast<duckdb::BoundCastExpression>().child.get();
+      }
+      return bare_constant_int(*cur, out);
     }
 
     SpecPtr visit_window(duckdb::LogicalWindow &op) {
@@ -5300,7 +5327,7 @@ private:
           break;
         case duckdb::ExpressionType::WINDOW_NTILE:
           def.function = "NTILE";
-          if (w.children.empty() || !constant_int(*w.children[0], n)) {
+          if (w.children.empty() || !bare_constant_int(*w.children[0], n)) {
             return unsupported("NTILE with non-constant bucket count");
           }
           def.offset = static_cast<int>(n);
@@ -5342,7 +5369,7 @@ private:
           }
           def.arg_column_idx = resolve_col(*w.children[0]);
           if (t == duckdb::ExpressionType::WINDOW_NTH_VALUE) {
-            if (w.children.size() < 2 || !constant_int(*w.children[1], n)) {
+            if (w.children.size() < 2 || !bare_constant_int(*w.children[1], n)) {
               return unsupported("NTH_VALUE with non-constant N");
             }
             def.offset = static_cast<int>(n);

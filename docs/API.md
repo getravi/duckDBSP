@@ -257,12 +257,15 @@ STRING_AGG/ARRAY_AGG, holistic MEDIAN/QUANTILE_CONT/QUANTILE_DISC/
 MODE/MAD), inner and outer joins (LEFT/RIGHT/FULL, equi + residual
 predicates), cross joins, IN/NOT IN/EXISTS/scalar subqueries
 (correlated included), DISTINCT, DISTINCT ON, UNION/INTERSECT/EXCEPT
-(ALL and DISTINCT), window functions (expressions auto-projected),
-non-recursive CTEs, WITH RECURSIVE (deletions included), and ORDER
-BY/LIMIT/OFFSET (constant or percentage). The few remaining gaps
-(USING KEY recursion, expression LIMIT, approximate statistics like
-approx_quantile, unordered string_agg) fail with a DBSP-E110 error
-naming the construct.
+(ALL and DISTINCT), window functions (expressions auto-projected;
+`ROWS`/`RANGE`/`GROUPS` frames including constant bounded frames like
+`ROWS BETWEEN 11 PRECEDING AND CURRENT ROW`, and `LAG`/`LEAD` with a
+constant non-default offset like `LAG(v, 12)`), non-recursive CTEs, WITH
+RECURSIVE (deletions included), and ORDER BY/LIMIT/OFFSET (constant or
+percentage). The few remaining gaps (USING KEY recursion, expression
+LIMIT, approximate statistics like approx_quantile, unordered
+string_agg, non-constant NTILE bucket counts or NTH_VALUE offsets) fail
+with a DBSP-E110 error naming the construct.
 
 ```sql
 SELECT * FROM dbsp_use_planner();       -- Always: ENABLED

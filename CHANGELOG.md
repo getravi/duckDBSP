@@ -1,5 +1,77 @@
 # Changelog
 
+## Fix: truthful `dbsp_load()` report on an already-populated registry - Jul 2026
+
+- **Bug**: calling `dbsp_load()` when the registry was already populated
+  (e.g. right after the auto-load that fires on the first DBSP entry point
+  of a session) reported `"(N views, 0 from checkpoint, ...)"` — read as
+  "the checkpoint was never used", when in fact an earlier load (auto-load
+  or a prior explicit `dbsp_load()`) had already consumed it. Cost real
+  debugging time chasing a checkpoint-fast-path regression that didn't
+  exist.
+- **Root cause**: `load_from_duck_table` (`include/dbsp_cdc.hpp`) already
+  skips per-row work for any view name already live in this session's
+  registry (`views_.count(name)` → `continue`), but unconditionally
+  overwrote `last_loaded_count_`/`last_ckpt_restored_count_` with this
+  call's (zero) counts at the end — discarding the true history from
+  whichever earlier call actually did the restoring. `dbsp_load()`'s
+  message (`src/dbsp_extension.cpp`) then read those zeroed counters at
+  face value.
+- **Fix**: `load_from_duck_table` now also tracks `last_skipped_count_`
+  (rows skipped because already live). When a call loads 0 new views but
+  skips ≥1 already-live ones, `dbsp_load()`'s message says so plainly
+  (`"0 loaded this call (N already loaded)"`) instead of the ambiguous
+  `"0 from checkpoint"` framing. A call that legitimately restores nothing
+  (nothing was ever persisted) is unaffected — same message as before.
+  Reload-over-an-already-populated-registry is intentionally still
+  supported (a second `dbsp_load()` can still pick up newly-saved views not
+  yet live in this session) — only the report was misleading, not the
+  behavior.
+- **Test**: `test/python/test_autopersist.py` — after auto-load populates
+  the registry on reopen, an explicit `dbsp_load()` must not contain
+  `"0 from checkpoint"` and must say `"already loaded"`. Confirmed failing
+  (old message: `"(1 views, 0 from checkpoint, 1 sources deferred)"`) before
+  the fix, passing after. Existing checkpoint-restore tests
+  (`test_checkpoint_restore.py`, `test_join_checkpoint.cpp`) that assert
+  `"0 from checkpoint"`/`"1 from checkpoint"` on fresh (never-yet-loaded)
+  registries are unaffected — they hit `skipped == 0`, the unchanged branch.
+
+## Feature: accept constant window frames and LAG/LEAD offsets in the planner frontend - Jul 2026
+
+- **Bug**: `CREATE MATERIALIZED VIEW ... AVG(v) OVER (... ROWS BETWEEN 11
+  PRECEDING AND CURRENT ROW)` and `LAG(v, 12) OVER (...)` were rejected as
+  `DBSP-E110: non-constant frame start` / `non-constant offset`, even
+  though `LAG(v)` (implicit offset 1) worked fine.
+- **Root cause**: `constant_int` (`include/dbsp_plan_translator.hpp`)
+  required a bare `BOUND_CONSTANT` expression class. The binder actually
+  wraps frame-bound and LAG/LEAD-offset literals in a `BOUND_CAST` shell
+  (confirmed via probe: `11 PRECEDING` arrives as `CAST(11 AS BIGINT)`,
+  `LAG(v, 12)`'s offset as `CAST(12 AS BIGINT)`) — `constant_int` saw
+  `BOUND_CAST`, not `BOUND_CONSTANT`, and rejected both. The downstream
+  window machinery (`NativeWindowView`'s `start_offset`/`end_offset`,
+  `render_row`, `affected_indices`) already fully supported bounded ROWS
+  frames; only the frontend gate misfired.
+- **Fix**: `constant_int` now unwraps a chain of `BOUND_CAST` nodes before
+  checking for `BOUND_CONSTANT` underneath. Used for window frame bounds
+  (`start_expr`/`end_expr`) and LAG/LEAD offsets — the shapes verified
+  against the render/incremental machinery for this fix. NTILE's bucket
+  count and NTH_VALUE's `N` deliberately keep the old strict bare-constant
+  check (`bare_constant_int`, unchanged behavior, still gated): the same
+  `BOUND_CAST` shell reaches them, but a differential check found NTILE's
+  bucket-boundary math already diverges from stock DuckDB for uneven
+  partition sizes (pre-existing, out of scope here) — widening the gate
+  there would have silently shipped a broken feature instead of a loud
+  "unsupported" error.
+- **Test**: `test/integration/test_advanced_window.cpp` — differential
+  checks (materialized view vs. stock DuckDB, exact values) for the
+  bounded-AVG-frame and `LAG(v,12)` cases, each run before and after (a) a
+  mid-window value UPDATE and (b) a partition-growing INSERT that pushes
+  earlier values outside later rows' bounded frames (the fast re-emit path
+  and the full structural-rebuild path, respectively) — plus a regression
+  guard that `LAG(v)`'s default offset still works, and a scope-boundary
+  test asserting NTILE/NTH_VALUE remain gated. Confirmed both new cases
+  failing with `DBSP-E110` on the pre-fix code, passing after.
+
 ## Fix: silent-correctness bug — WHERE+aggregate join subquery side returned empty - Jul 2026
 
 - **Bug**: a materialized view whose `JOIN` had a subquery side containing

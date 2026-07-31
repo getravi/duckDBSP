@@ -90,5 +90,30 @@ with tempfile.TemporaryDirectory() as tmp:
     conn2.close()
     print("PASS: dbsp_autopersist(false) is honored (nothing saved or loaded)")
 
+    # ── 3. dbsp_load() on an already-populated registry is truthful ──
+    # conn3 auto-loads mv from the checkpoint conn2's clean close saved (same
+    # "first DBSP entry point" trigger as step 1). A subsequent EXPLICIT
+    # dbsp_load() call has nothing left to do -- every row in _dbsp_views
+    # already names a live view -- and must say so, not claim "0 from
+    # checkpoint" (which reads as "the checkpoint was never used", when in
+    # fact the auto-load moments earlier DID consume it).
+    conn3 = open_db(path)
+    got = sorted(conn3.execute("SELECT * FROM dbsp_query('mv')").fetchall())
+    assert got == [(1, 20.0), (2, 40.0), (3, 60.0)], (
+        f"pre-explicit-load state wrong: {got}"
+    )
+
+    msg = conn3.execute("SELECT * FROM dbsp_load()").fetchone()[0]
+    assert "0 from checkpoint" not in msg, (
+        f"dbsp_load() on an already-loaded registry must not claim the "
+        f"checkpoint went unused: {msg!r}"
+    )
+    assert "already loaded" in msg, (
+        f"dbsp_load() on an already-loaded registry must say so plainly: "
+        f"{msg!r}"
+    )
+    conn3.close()
+    print("PASS: dbsp_load() on an already-loaded registry is truthful")
+
 signal.alarm(0)
 print("PASS: autopersist saves on clean close and auto-loads on reopen", flush=True)

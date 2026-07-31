@@ -975,10 +975,12 @@ public:
 
     size_t loaded = 0;
     size_t ckpt_restored = 0;
+    size_t skipped = 0;
     for (const auto &[name, view_sql] : rows) {
       {
         std::shared_lock<std::shared_mutex> lock(struct_mutex_);
         if (views_.count(name)) {
+          skipped++;
           continue; // already live in this session
         }
       }
@@ -1033,6 +1035,7 @@ public:
     }
     last_loaded_count_ = loaded;
     last_ckpt_restored_count_ = ckpt_restored;
+    last_skipped_count_ = skipped;
     return true;
   }
 
@@ -1046,6 +1049,9 @@ public:
   // load_from_duck_table call — a watermark-matched restore reads zero
   // source rows.
   size_t last_deferred_sources_count() const { return last_deferred_count_; }
+  // Rows the last load_from_duck_table call skipped because the view was
+  // already live in this session (see field comment).
+  size_t last_skipped_count() const { return last_skipped_count_; }
 
   // --- D3c lazy baselines: cross-cutting hooks ---------------------------
 
@@ -3850,6 +3856,12 @@ private:
   size_t last_loaded_count_ = 0;
   size_t last_ckpt_restored_count_ = 0;
   size_t last_ckpt_saved_count_ = 0;
+  // Rows in the last load_from_duck_table call whose view name was already
+  // live in this session's registry (skipped, not (re)created) -- lets a
+  // caller distinguish "this call restored 0 from checkpoint because the
+  // checkpoint had nothing" from "this call restored 0 because everything
+  // was already loaded by an earlier call".
+  size_t last_skipped_count_ = 0;
   std::atomic<uint64_t> captured_delta_syncs_{0};
   std::atomic<uint64_t> scan_syncs_{0};
   // Write-capture (UPDATE/DELETE) observability + conflict detection:

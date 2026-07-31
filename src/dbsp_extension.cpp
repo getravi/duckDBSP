@@ -920,10 +920,23 @@ void LoadFunc(ClientContext &context, TableFunctionInput &input,
   auto views = manager.list_views();
   msg += " (" + std::to_string(views.size()) + " views";
   if (data.format != "json") {
-    msg += ", " + std::to_string(manager.last_ckpt_restored_count()) +
-           " from checkpoint, " +
-           std::to_string(manager.last_deferred_sources_count()) +
-           " sources deferred";
+    // last_ckpt_restored_count()/last_loaded_count() reflect only THIS
+    // call's work. If every row in the source table named an already-live
+    // view (this call loaded 0, but skipped > 0), the earlier load that
+    // populated them -- auto-load or a prior dbsp_load() -- is what
+    // actually consumed the checkpoint; saying "0 from checkpoint" here
+    // would misreport that as the checkpoint having been unused this
+    // session. State the skip explicitly instead of implying that.
+    if (manager.last_loaded_count() == 0 && manager.last_skipped_count() > 0) {
+      msg += ", 0 loaded this call (" +
+             std::to_string(manager.last_skipped_count()) +
+             " already loaded)";
+    } else {
+      msg += ", " + std::to_string(manager.last_ckpt_restored_count()) +
+             " from checkpoint, " +
+             std::to_string(manager.last_deferred_sources_count()) +
+             " sources deferred";
+    }
   }
   msg += ")";
 
