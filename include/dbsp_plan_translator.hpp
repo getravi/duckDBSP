@@ -3494,8 +3494,9 @@ public:
 
   // --- Circuit-state checkpointing (D3b) -------------------------------
   // Same contract as SingleSourceCircuitView: a view is checkpointable iff
-  // no node is UNSUPPORTED (value-collecting aggregates, outer/mark joins,
-  // spilled state). D3b shipped the node-level serialize/restore hooks on
+  // no node is UNSUPPORTED (value-collecting aggregates, FULL/MARK joins,
+  // spilled state — INNER/LEFT/RIGHT joins serialize, see PlanJoinNode::
+  // state_kind()). D3b shipped the node-level serialize/restore hooks on
   // PlanAggNode/PlanJoinNode but never overrode these on PlannedCircuitView,
   // so planner-built views (every join/aggregate view since C5) silently
   // fell back to rebuild-by-replay and dbsp_save() wrote no circuit rows.

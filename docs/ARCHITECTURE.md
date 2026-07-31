@@ -453,6 +453,12 @@ State after:
   older layout — or missing the table entirely — is treated as absent
   rather than misparsed, so a version bump costs at most one
   rebuild-by-replay on the next load
+- Each checkpointed view also carries a SQL fingerprint (its exact
+  definition at save time). A load compares this against the SQL it is
+  about to use to cold-create the view and declines the checkpoint fast
+  path for that view alone on a mismatch — the guard against a view whose
+  definition changed (e.g. `dbsp_replace_view`) after the checkpoint was
+  written but before the next save landed
 
 ### Lifetime
 

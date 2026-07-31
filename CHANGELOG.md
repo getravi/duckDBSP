@@ -1,5 +1,47 @@
 # Changelog
 
+## Fix: checkpoint declines a stale view-definition restore - Jul 2026
+
+- **Gap**: checkpoint restore only guarded against source-table drift (the
+  row-count/hash watermark) and blob-layout drift (the format version),
+  not against the view's own *definition* changing. `dbsp_replace_view` /
+  `CREATE OR REPLACE MATERIALIZED VIEW` (or a same-name drop+recreate)
+  followed by an unclean close (crash, autopersist off, a failed
+  auto-save) could leave a `_dbsp_views` row with the *new* SQL sitting
+  next to `_dbsp_ckpt` node/sink blobs still holding the *old* view's
+  operator state and sink result. The next load would cold-create the
+  view from the new SQL and silently inject the old blobs on top —
+  serving stale data forever, since incoming deltas never retract a wrong
+  sink row they never produced.
+- **Fix**: `save_checkpoint` now writes an additional `kind='sql'` row per
+  checkpointed view, holding that view's exact SQL at save time. On load,
+  `checkpoint_valid` returns this per-view fingerprint; `load_from_duck_
+  table` compares it against the SQL it is about to use to cold-create the
+  view and only takes the checkpoint fast path when they match. A
+  mismatch declines the fast path for *that view alone* — it rebuilds by
+  replay from current table data — while every other view's checkpoint
+  restore is unaffected. Crash recovery (`src/dbsp_recovery.cpp`
+  `load_views`) shares `load_from_duck_table` and gets the same guard for
+  free.
+- **Belt-and-braces**: `replace_view` now also best-effort deletes the
+  `_dbsp_ckpt` rows for the entire subtree it just dropped (the replaced
+  view plus its transitive dependents), closing the staleness window
+  earlier rather than waiting on the next full `save_checkpoint()` (which
+  already rewrites `_dbsp_ckpt` from scratch) — the fingerprint check
+  above is the correctness backstop either way.
+- **Checkpoint format version bump (v2 → v3)**: the blob set changed
+  shape (new `sql` rows), so a v2 checkpoint — which has none — is treated
+  as wholesale absent and rebuilt by replay once, same one-time cost as
+  the v1 → v2 bump.
+- Dead code removed: `CDCManager::auto_sync_all` had zero callers (a
+  leftover from an earlier checkpoint-interval design); the actual
+  checkpoint-interval deferral runs through the `TransactionCommit` hook's
+  `CheckpointGuard` and `dbsp_sync`, corrected in the note below.
+- Regression coverage: `test/integration/test_join_checkpoint.cpp` gained
+  a stale-fingerprint test (view SQL changed underneath an unrefreshed
+  checkpoint must rebuild from the new SQL, not serve the old blob) and a
+  RIGHT-join save/restore round-trip test mirroring the existing LEFT one.
+
 ## Feature: LEFT/RIGHT outer-join checkpoint state - Jul 2026
 
 - Circuit-state checkpointing (D3b) now covers `LEFT` and `RIGHT` outer
@@ -87,9 +129,13 @@
   save completes. The checkpoint-interval counter is incremented inside
   `propagate_changes` (lock-free), but the actual `save_checkpoint()` call
   is deferred to a point after the caller's `struct_mutex_` is released
-  (`auto_sync_all`/`dbsp_sync`) for the identical reason — `propagate_
-  changes` runs under callers' shared lock on `struct_mutex_`, and
-  `save_checkpoint` takes its own shared lock on it.
+  (the `TransactionCommit` hook's `CheckpointGuard` destructor, and
+  `dbsp_sync`) for the identical reason — `propagate_changes` runs under
+  callers' shared lock on `struct_mutex_`, and `save_checkpoint` takes its
+  own shared lock on it. (`CDCManager::auto_sync_all`, an earlier
+  candidate for this deferral point, was dead code — no caller ever
+  reached it — and has been removed; the two call sites above are the only
+  live ones.)
 - `autoload_attempted_` is an atomic (compare-exchanged in
   `maybe_autoload`), not a plain bool: two connections to the same
   `DatabaseInstance` can race their first DBSP call. A failed auto-load

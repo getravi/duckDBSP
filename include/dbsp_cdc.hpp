@@ -510,15 +510,6 @@ public:
     }
   }
 
-  // Auto-sync all tracked tables (called from TransactionCommit hook)
-  void auto_sync_all(duckdb::ClientContext &context,
-                     duckdb::MetaTransaction *meta_transaction = nullptr) {
-    if (!is_auto_sync_enabled())
-      return;
-    sync_all(context, meta_transaction);
-    maybe_save_checkpoint(context);
-  }
-
   // --- Circuit-state checkpointing (D3b) --------------------------------
   // Persist per-view operator state (aggregate groups, private join
   // indexes) and sink results into _dbsp_ckpt, plus per-source watermarks
@@ -537,6 +528,7 @@ public:
     }
     struct ViewCkpt {
       std::string name;
+      std::string sql; // fingerprint (Finding 1): definition at save time
       std::vector<std::pair<uint64_t, std::vector<uint8_t>>> nodes;
       std::vector<uint8_t> sink;
     };
@@ -551,6 +543,10 @@ public:
         }
         ViewCkpt ck;
         ck.name = name;
+        auto def_it = view_definitions_.find(name);
+        if (def_it != view_definitions_.end()) {
+          ck.sql = def_it->second.sql;
+        }
         if (!view->serialize_circuit_state(ck.nodes)) {
           continue;
         }
@@ -623,6 +619,19 @@ public:
           last_error_ = r->GetError();
           return false;
         }
+        // SQL fingerprint (Finding 1): the view's exact definition at save
+        // time, so a load whose _dbsp_views SQL has since diverged (e.g. a
+        // replace_view whose fresh checkpoint never landed before an
+        // unclean close) can detect the mismatch and decline the fast
+        // path for this view rather than misapply old operator state to
+        // a new query.
+        auto rsql = ins->Execute("sql", ck.name, static_cast<int64_t>(0),
+                                 duckdb::Value::BLOB(ck.sql));
+        if (rsql->HasError()) {
+          con.Query("ROLLBACK");
+          last_error_ = rsql->GetError();
+          return false;
+        }
       }
       for (const auto &t : table_names) {
         auto wm = con.Query("SELECT COUNT(*), CAST(bit_xor(hash(t)) AS "
@@ -657,6 +666,11 @@ public:
                        std::unordered_map<uint64_t, std::vector<uint8_t>>>
         nodes;
     std::unordered_map<std::string, std::vector<uint8_t>> sinks;
+    // Per-view SQL fingerprint at save time (Finding 1) — compared against
+    // the SQL about to be used to cold-create the view; a mismatch means
+    // the view's definition changed since this checkpoint was written, so
+    // the fast path is declined for that view alone.
+    std::unordered_map<std::string, std::string> sql_fingerprints;
     // Verified per-source watermarks (COUNT, bit_xor(hash) as VARCHAR) —
     // seeds for lazy (deferred) baselines on the load fast path (D3c).
     std::unordered_map<std::string, std::pair<int64_t, std::string>>
@@ -741,6 +755,9 @@ public:
           out.nodes[name][node_id] = std::move(blob);
         } else if (kind == "sink") {
           out.sinks[name] = std::move(blob);
+        } else if (kind == "sql") {
+          out.sql_fingerprints[name] =
+              std::string(blob.begin(), blob.end());
         }
       }
       return !out.sinks.empty();
@@ -964,7 +981,23 @@ public:
           continue; // already live in this session
         }
       }
-      const bool cold = have_ckpt && ckpt.sinks.count(name) > 0;
+      // Finding 1: a per-view checkpoint is only trusted when its saved
+      // SQL fingerprint matches the definition about to be used to
+      // cold-create it. A mismatch (view replaced/redefined since the
+      // checkpoint was written, e.g. via dbsp_replace_view, without a
+      // fresh save landing before this load) declines the fast path for
+      // this view alone — every other view's checkpoint is unaffected.
+      const bool fingerprint_ok = have_ckpt &&
+                                  ckpt.sql_fingerprints.count(name) > 0 &&
+                                  ckpt.sql_fingerprints.at(name) == view_sql;
+      const bool cold =
+          have_ckpt && ckpt.sinks.count(name) > 0 && fingerprint_ok;
+      if (have_ckpt && ckpt.sinks.count(name) > 0 && !fingerprint_ok &&
+          std::getenv("DBSP_DEBUG_SYNC")) {
+        std::cerr << "[dbsp] checkpoint declined for '" << name
+                  << "': SQL fingerprint mismatch (view redefined since "
+                     "save) -- rebuilding by replay\n";
+      }
       if (create_view(context, name, view_sql, /*skip_init_replay=*/cold)) {
         if (cold && !restore_view_state(name, ckpt)) {
           // Corrupt/mismatched blob: rebuild this view the normal way
@@ -1684,6 +1717,19 @@ public:
       return false; // last_error_ already set by drop_view_cascade
     }
 
+    // Belt-and-braces alongside the SQL-fingerprint guard in
+    // checkpoint_valid (Finding 1): the whole dropped subtree's
+    // checkpoint blobs are stale the moment this cascade runs, regardless
+    // of whether the recreates below succeed — proactively erase them so
+    // an unclean close before the next save_checkpoint() can't leave a
+    // _dbsp_ckpt row for a definition this name no longer has. The
+    // fingerprint check is the correctness backstop either way; this just
+    // closes the window earlier.
+    erase_persisted_checkpoint_rows(context, view_name);
+    for (const auto &def : dependent_defs) {
+      erase_persisted_checkpoint_rows(context, def.name);
+    }
+
     std::vector<std::string> failed_names;  // for _dbsp_views cleanup
     std::vector<std::string> failure_lines; // for the human-readable report
 
@@ -1783,6 +1829,29 @@ public:
       InternalQueryGuard guard;
       duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
       con.Query("DELETE FROM _dbsp_views WHERE name = '" + name + "'");
+      // Ignore errors (including "table does not exist") — persistence is
+      // best-effort throughout this file.
+    } catch (...) {
+    }
+  }
+
+  // Best-effort delete of one view's persisted _dbsp_ckpt rows (all kinds:
+  // node/sink/sql). Called from replace_view (Finding 1 belt-and-braces):
+  // proactively drops now-stale checkpoint blobs for a view whose
+  // definition just changed, rather than relying solely on the SQL-
+  // fingerprint mismatch in checkpoint_valid to decline the fast path at
+  // the next load. Unlike erase_persisted_view_row, this is NOT gated on
+  // autopersist_: dbsp_save()/dbsp_close() can write a checkpoint
+  // regardless of the autopersist setting, so a checkpoint can exist even
+  // with autopersist off — exactly the scenario Finding 1 describes. Same
+  // fresh-Connection pattern as erase_persisted_view_row (see its
+  // comment): must NOT run on `context` directly.
+  void erase_persisted_checkpoint_rows(duckdb::ClientContext &context,
+                                       const std::string &name) {
+    try {
+      InternalQueryGuard guard;
+      duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+      con.Query("DELETE FROM _dbsp_ckpt WHERE name = '" + name + "'");
       // Ignore errors (including "table does not exist") — persistence is
       // best-effort throughout this file.
     } catch (...) {

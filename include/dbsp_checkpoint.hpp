@@ -13,7 +13,10 @@
 // non-checkpointable; such views fall back to the normal rebuild-by-replay
 // on load. Correctness never depends on a checkpoint being present or
 // fresh: a stale checkpoint (source tables changed since save) is detected
-// by row-count watermarks and discarded.
+// by row-count watermarks and discarded; a checkpoint whose view
+// *definition* has changed since save (e.g. via dbsp_replace_view) is
+// detected per-view by a SQL fingerprint (v3, see kDbspCkptFormatVersion)
+// and discarded for that view only.
 
 #include "dbsp_spill_store.hpp" // serialize_row / deserialize_row
 
@@ -34,7 +37,23 @@ namespace dbsp_native {
 //
 // v2 (Task 3, durability-ergonomics): PlanJoinNode::serialize_state gained
 // left_pad_/right_pad_ for LEFT/RIGHT outer-join pad bookkeeping.
-constexpr int64_t kDbspCkptFormatVersion = 2;
+//
+// v3 (durability-ergonomics fix-wave, Finding 1): the checkpoint now also
+// carries a per-view SQL fingerprint (a `kind='sql'` row in _dbsp_ckpt,
+// alongside each view's `node`/`sink` rows) recording the view's exact
+// definition at save time. Without it, a checkpoint saved under one
+// definition could be silently replayed onto a *different* one — e.g.
+// dbsp_replace_view()/CREATE OR REPLACE swaps a view's SQL, then an
+// unclean close (crash, autopersist off, a failed auto-save) skips the
+// next save_checkpoint(), leaving stale node/sink blobs on disk next to a
+// _dbsp_views row that already carries the new SQL. On load,
+// checkpoint_valid compares the stored fingerprint against the SQL about
+// to be used to cold-create the view; a mismatch declines the checkpoint
+// fast path for *that view only* (rebuild-by-replay), leaving every other
+// view's restore unaffected. The version bump means any v2 checkpoint
+// (which has no fingerprint rows at all) is treated as wholesale absent,
+// same one-time-rebuild cost as prior bumps.
+constexpr int64_t kDbspCkptFormatVersion = 3;
 
 // How a circuit node participates in checkpointing.
 enum class CkptSupport {
