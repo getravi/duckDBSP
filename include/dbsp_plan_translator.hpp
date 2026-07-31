@@ -3167,7 +3167,19 @@ public:
       : dbsp::Node(id, "plan_recursive"), anchor_(std::move(anchor)),
         step_view_(std::move(step_view)), sentinel_(std::move(sentinel)),
         union_all_(union_all), base_inputs_(std::move(base_inputs)),
-        max_iterations_(max_iterations), linear_step_(linear_step) {}
+        max_iterations_(max_iterations), linear_step_(linear_step) {
+    // Test-only override: DBSP_REC_MAX_ITER lets integration tests force a
+    // small iteration cap so the max_iterations_ fallback (signed path ->
+    // recompute()) can be exercised deterministically without needing a
+    // naturally-deep chain. Read once at construction, not per-step.
+    if (const char *env = std::getenv("DBSP_REC_MAX_ITER")) {
+      char *end = nullptr;
+      unsigned long v = std::strtoul(env, &end, 10);
+      if (end != env && v > 0) {
+        max_iterations_ = v;
+      }
+    }
+  }
 
   void step() override {
     output_.clear();
@@ -3218,32 +3230,52 @@ public:
       }
     }
 
-    // Snapshot only on the new deletion-bearing branch (never on the
-    // pre-existing insert-only path, so ordinary edits pay no extra copy):
-    // a max_iterations_ trip must recover to the pre-delta state and fall
-    // back to recompute(), never emit a partial delta (Rule 12), the same
-    // shape as dred()'s recovery guard.
-    DuckDBZSet accumulated_snapshot, output_snapshot;
     if (has_deletion) {
-      accumulated_snapshot = accumulated_;
-      output_snapshot = output_;
+      // Signed retraction path (union_all_ && linear_step_, guaranteed by
+      // the guard above). Snapshot first: a max_iterations_ trip OR any
+      // exception during admission/iteration must recover to the pre-delta
+      // state and fall back to recompute() — never emit a partial delta
+      // (Rule 12) — the same shape as dred()'s recovery guard. Never taken
+      // on the pre-existing insert-only path below, so ordinary edits pay
+      // no extra copy.
+      DuckDBZSet accumulated_snapshot = accumulated_;
+      DuckDBZSet output_snapshot = output_;
+      bool converged = false;
+      bool threw = false;
+      try {
+        DuckDBZSet frontier;
+        for (const auto &[row, w] : seed) {
+          if (w != 0) {
+            admit(row, w, frontier, output_);
+          }
+        }
+        converged = iterate(frontier, output_);
+      } catch (...) {
+        threw = true;
+      }
+      if (threw || !converged) {
+        accumulated_ = std::move(accumulated_snapshot);
+        output_ = std::move(output_snapshot);
+        recompute();
+        if (std::getenv("DBSP_DEBUG_SYNC")) {
+          std::cerr << "[dbsp] recursive: linear signed path "
+                    << (threw ? "threw" : "hit max_iterations_")
+                    << ", falling back to recompute()\n";
+        }
+      }
+      has_output_ = !output_.empty();
+      return;
     }
+
+    // Pre-existing insert-only path (any shape, including nonlinear/UNION
+    // recursion when this delta happens to carry no deletion): unchanged.
     DuckDBZSet frontier;
     for (const auto &[row, w] : seed) {
-      if (has_deletion ? w != 0 : w > 0) {
+      if (w > 0) {
         admit(row, w, frontier, output_);
       }
     }
-    bool converged = iterate(frontier, output_);
-    if (has_deletion && !converged) {
-      accumulated_ = std::move(accumulated_snapshot);
-      output_ = std::move(output_snapshot);
-      recompute();
-      if (std::getenv("DBSP_DEBUG_SYNC")) {
-        std::cerr << "[dbsp] recursive: linear signed path hit "
-                     "max_iterations_, falling back to recompute()\n";
-      }
-    }
+    iterate(frontier, output_);
     has_output_ = !output_.empty();
   }
 
@@ -3460,16 +3492,22 @@ private:
   // entry whose running weight nets to zero, so a row retracted to zero
   // and later re-derived within the same iterate() call correctly nets
   // out to "no change" in `out` — the same net-weight definition
-  // recompute()'s diff uses (see recompute()). Set semantics (else
-  // branch) never sees a negative w: has_deletion routes non-union_all
-  // recursion to dred() instead, which does not call admit().
+  // recompute()'s diff uses (see recompute()). Set semantics (else branch)
+  // is explicitly guarded on w > 0 below — see that branch's comment.
   void admit(const DuckDBRow &row, int64_t w, DuckDBZSet &frontier,
              DuckDBZSet &out) {
     if (union_all_) {
       accumulated_.insert(row, w);
       out.insert(row, w);
       frontier.insert(row, w);
-    } else if (accumulated_.get(row) == 0) {
+    } else if (w > 0 && accumulated_.get(row) == 0) {
+      // Set semantics never admit on a negative w (a retraction reaching
+      // here would otherwise be misread as "absent, so admit it"). This
+      // branch is never fed negatives today — has_deletion routes
+      // non-union_all recursion to dred(), which does not call admit() —
+      // but iterate() now passes signed weights through unconditionally
+      // for the union_all_ linear path, so guard explicitly rather than
+      // rely on that invariant holding forever.
       accumulated_.insert(row, 1);
       out.insert(row, 1);
       frontier.insert(row, 1);
@@ -3679,22 +3717,46 @@ private:
     }
   }
 
-  // Count SOURCE nodes in `spec`'s subtree whose table name equals
-  // `sentinel` — i.e. how many times a recursive step references its own
-  // working relation (linearity detection for PlanRecursiveNode). Deliberately
-  // separate from count_sources()/source_refs_: that walk covers the WHOLE
-  // plan (used for arrangement sharing) and step_view->source_tables() is
-  // deduped (one entry per distinct table regardless of ref count) — neither
-  // gives a ref count scoped to one step subtree.
-  static size_t count_sentinel_refs(const PlanOpSpec &spec,
-                                    const std::string &sentinel) {
-    size_t n = (spec.kind == PlanOpSpec::Kind::SOURCE && spec.table == sentinel)
-                   ? 1
-                   : 0;
-    for (const auto &child : spec.children) {
-      n += count_sentinel_refs(*child, sentinel);
+  // Linearity scan over a recursive step's PlanOpSpec subtree. Deliberately
+  // separate from count_sources()/source_refs_ (that walk covers the WHOLE
+  // plan, used for arrangement sharing) and from step_view->source_tables()
+  // (deduped — one entry per distinct table regardless of ref count):
+  // neither gives a ref count scoped to one step subtree.
+  struct StepLinearity {
+    size_t sentinel_refs = 0;
+    bool has_weight_nonlinear_op = false;
+  };
+
+  // Counts SOURCE nodes whose table equals `sentinel` (how many times the
+  // step references its own working relation) AND flags any operator whose
+  // per-row output isn't a linear (weight-preserving-per-row) function of
+  // its input — AGGREGATE/DISTINCT/DISTINCT_ON/WINDOW/SORT_LIMIT all
+  // collapse or reorder rows in ways that do NOT distribute over
+  // step(R+δ) = step(R) + step(δ), even when the sentinel is referenced
+  // exactly once. The planner currently accepts these shapes inside a
+  // recursive step and they are already wrong on every existing path
+  // (pre-existing, out of scope here) — this scan only prevents the new
+  // signed-delta path from ALSO claiming linearity for them.
+  static void scan_step_linearity(const PlanOpSpec &spec,
+                                  const std::string &sentinel,
+                                  StepLinearity &info) {
+    if (spec.kind == PlanOpSpec::Kind::SOURCE && spec.table == sentinel) {
+      info.sentinel_refs++;
     }
-    return n;
+    switch (spec.kind) {
+    case PlanOpSpec::Kind::AGGREGATE:
+    case PlanOpSpec::Kind::DISTINCT:
+    case PlanOpSpec::Kind::DISTINCT_ON:
+    case PlanOpSpec::Kind::WINDOW:
+    case PlanOpSpec::Kind::SORT_LIMIT:
+      info.has_weight_nonlinear_op = true;
+      break;
+    default:
+      break;
+    }
+    for (const auto &child : spec.children) {
+      scan_step_linearity(*child, sentinel, info);
+    }
   }
 
   // v1 eligibility: side is a bare SOURCE referenced exactly once in the
@@ -4061,8 +4123,13 @@ private:
       std::string sentinel =
           "__rec_cte_" + std::to_string(spec.cte_index) + "__";
       // Linearity: the recursive relation referenced exactly once in the
-      // STEP subtree only (children[1]; the anchor doesn't recurse).
-      bool linear_step = count_sentinel_refs(*spec.children[1], sentinel) == 1;
+      // STEP subtree only (children[1]; the anchor doesn't recurse), AND no
+      // weight-nonlinear operator (AGGREGATE/DISTINCT/DISTINCT_ON/WINDOW/
+      // SORT_LIMIT) anywhere in that subtree.
+      StepLinearity step_linearity;
+      scan_step_linearity(*spec.children[1], sentinel, step_linearity);
+      bool linear_step = step_linearity.sentinel_refs == 1 &&
+                         !step_linearity.has_weight_nonlinear_op;
       TableSchema step_schema;
       step_schema.table_name = name_ + "_rec_step";
       auto step_view = std::make_unique<PlannedCircuitView>(

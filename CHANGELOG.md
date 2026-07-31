@@ -16,33 +16,53 @@
   run with **signed** weights. No deletion special-case is needed;
   retractions propagate through the same iteration as insertions.
 - **Change**: `PlanRecursiveNode` gains `linear_step_`, detected at build
-  time (the `REC_CTE` build site counts sentinel-table `SOURCE` refs in the
-  step's `PlanOpSpec` — exactly one → linear). `step()` now skips the
-  deletion special-case entirely when `union_all_ && linear_step_`: the
-  incremental seed/`admit`/`iterate` path is generalized to signed weights
-  (no more `w > 0` filter), `admit`'s UNION ALL branch does plain multiset
-  arithmetic on `accumulated_` (`ZSet::insert` already erases a row whose
-  running weight nets to zero — verified, not assumed), and a
-  `max_iterations_` trip on the signed path discards the attempt (restoring
-  `accumulated_`/`output_` from a pre-admission snapshot) and falls back to
-  `recompute()` — logged under `DBSP_DEBUG_SYNC` — rather than emit a
-  partial delta.
+  time (the `REC_CTE` build site walks the step's `PlanOpSpec` subtree
+  counting sentinel-table `SOURCE` refs — exactly one → linear-eligible).
+  `step()` now skips the deletion special-case entirely when
+  `union_all_ && linear_step_`: the incremental seed/`admit`/`iterate` path
+  is generalized to signed weights (no more `w > 0` filter), `admit`'s
+  UNION ALL branch does plain multiset arithmetic on `accumulated_`
+  (`ZSet::insert` already erases a row whose running weight nets to zero —
+  verified, not assumed), and a `max_iterations_` trip **or an exception**
+  during admission/iteration on the signed path discards the attempt
+  (restoring `accumulated_`/`output_` from a pre-admission snapshot) and
+  falls back to `recompute()` — logged under `DBSP_DEBUG_SYNC` — rather
+  than emit a partial delta.
+- **Linearity veto (defense-in-depth)**: the planner already accepts
+  `DISTINCT`/`GROUP BY`/`ORDER BY … LIMIT`/`WINDOW` inside a recursive
+  step, and those shapes are pre-existing-wrong on every path (out of
+  scope here — not newly broken by this change). But `AGGREGATE`,
+  `DISTINCT`, `DISTINCT_ON`, `WINDOW`, and `SORT_LIMIT` anywhere in the
+  step subtree now veto `linear_step_` even when the sentinel is
+  referenced exactly once: these operators are not weight-linear
+  (`step(R + δ) ≠ step(R) + step(δ)` — they collapse or reorder rows), so
+  without the veto the new signed path would have wrongly claimed
+  linearity for them. `admit`'s set-semantics (non-`UNION ALL`) branch is
+  also now explicitly guarded on `w > 0` (previously implicit, relying on
+  `has_deletion` never routing negatives there — now `iterate()` passes
+  signed weights through unconditionally for the `union_all_` linear path,
+  so the guard is explicit rather than incidental).
 - **Unchanged by design**: nonlinear UNION ALL (recursive relation
   referenced ≥2 times — weighted deletion through a self-join doesn't
   distribute) and UNION (set-semantics, still DRed) keep their existing
   full/DRed paths bit-for-bit; insert-only behavior on every shape is
   unchanged. `recompute()` is retained as the differential-test oracle for
   all three paths.
-- **Test hook**: `dbsp_native::g_recompute_invocations`, an inline atomic
+- **Test hooks**: `dbsp_native::g_recompute_invocations`, an inline atomic
   counter incremented in `recompute()` (same directly-test-accessible
   convention as `g_plan_ir_optimize`/`g_intraop_shards`, no new SQL
   surface), lets integration tests assert an `UPDATE`/`DELETE` on a linear
   UNION ALL recursive view does not fall back to full recompute.
+  `DBSP_REC_MAX_ITER` (env var, read once at `PlanRecursiveNode`
+  construction) lets tests force a small iteration cap to exercise the
+  `max_iterations_` fallback deterministically.
 - Regression coverage: `test/integration/test_recursive_deletion.cpp`
-  gained a wfp-shaped (per-partition running-total chain) value test,
-  a routing-assertion test (`g_recompute_invocations` before/after delta),
-  and a 100-round randomized UPDATE/DELETE/re-seed differential against the
-  same oracle-comparison harness the existing DRed tests use.
+  gained a wfp-shaped (per-partition running-total chain) value test, a
+  routing-assertion test (`g_recompute_invocations` before/after delta), a
+  100-round randomized UPDATE/DELETE/re-seed differential against the same
+  oracle-comparison harness the existing DRed tests use, and a
+  `DBSP_REC_MAX_ITER`-forced fallback test asserting both that recompute()
+  fires AND that its recovered result is correct.
 - Design: `docs/superpowers/specs/2026-07-31-linear-recursion-deltas-design.md`.
 
 ## Fix: checkpoint declines a stale view-definition restore - Jul 2026

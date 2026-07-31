@@ -244,7 +244,7 @@ three paths depending on recursion semantics:
 
 - **Linear UNION ALL recursion** (the recursive relation referenced exactly
   once in the step subtree — `linear_step_`, detected at build time by
-  counting sentinel-table `SOURCE` refs in the step's `PlanOpSpec`) — the
+  scanning the step's `PlanOpSpec` for sentinel-table `SOURCE` refs) — the
   step is linear in the recursive relation: `step(R + δ) = step(R) +
   step(δ)`. Retraction-bearing deltas therefore skip the deletion
   special-case entirely and ride the *same* incremental fixpoint as
@@ -253,9 +253,17 @@ three paths depending on recursion semantics:
   whose running weight nets to zero is erased, exactly like ordinary
   `ZSet::insert`), and `iterate` pushes signed frontiers through
   `step_view_` unchanged (join/filter/project are all weight-linear). A
-  `max_iterations_` trip discards the attempt (restoring `accumulated_`/
-  `output_` from a pre-admission snapshot) and falls back to `recompute()`
-  — logged under `DBSP_DEBUG_SYNC` — rather than emit a partial delta.
+  `max_iterations_` trip, or any exception during admission/iteration,
+  discards the attempt (restoring `accumulated_`/`output_` from a
+  pre-admission snapshot) and falls back to `recompute()` — logged under
+  `DBSP_DEBUG_SYNC` — rather than emit a partial delta. The same scan also
+  vetoes `linear_step_` when the step subtree contains `AGGREGATE`,
+  `DISTINCT`, `DISTINCT_ON`, `WINDOW`, or `SORT_LIMIT` — even with exactly
+  one sentinel ref, these operators collapse or reorder rows and are not
+  weight-linear, so they cannot ride the signed path (the planner still
+  accepts these shapes inside a recursive step and they remain
+  pre-existing-wrong on every path — this veto only stops the signed path
+  from also claiming linearity for them).
 - **UNION (set-semantics) recursion** — the incremental DRed
   (Delete-Rederive) path: an overdelete fixpoint over-approximates the
   retraction from the affected subgraph, then a rederive fixpoint re-admits

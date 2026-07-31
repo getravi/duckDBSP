@@ -5,6 +5,7 @@
 
 #include "../test_helpers.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <random>
 
 using namespace dbsp_test;
@@ -231,6 +232,18 @@ void seedNet(DuckDBTestHarness &h) {
          "(2,0,5.0),(2,1,5.0),(2,2,5.0)");
 }
 
+// RAII env-var override for DBSP_REC_MAX_ITER (test-only PlanRecursiveNode
+// hook, read once at construction): guarantees the process-wide env var is
+// cleared even if a REQUIRE inside the guarded scope fails and unwinds the
+// stack, so a tiny cap never leaks into a later TEST_CASE's views.
+struct EnvGuard {
+  std::string name;
+  EnvGuard(std::string n, const char *value) : name(std::move(n)) {
+    setenv(name.c_str(), value, 1);
+  }
+  ~EnvGuard() { unsetenv(name.c_str()); }
+};
+
 } // namespace
 
 TEST_CASE("Linear UNION ALL recursion handles retractions incrementally",
@@ -314,6 +327,57 @@ TEST_CASE("Linear UNION ALL randomized differential (signed path == oracle)",
     h.exec("SELECT * FROM dbsp_sync('net')");
     assertViewMatchesOracle(h, "chain", kChainOracle);
   }
+}
+
+TEST_CASE("Linear UNION ALL max_iterations fallback recovers correctly",
+          "[integration][recursive][linear-delta]") {
+  // Force the signed path to trip max_iterations_ (DBSP_REC_MAX_ITER=2, a
+  // chain far deeper than that beyond the retraction point) and check BOTH
+  // halves of fallback correctness: the fallback actually fires
+  // (g_recompute_invocations increments) AND it produces the right answer,
+  // not merely that it fires without crashing or silently under-computing.
+  //
+  // The cap is read once at PlanRecursiveNode construction and applies to
+  // EVERY commit, including insert-only ones — and the insert-only path has
+  // no recovery of its own (pre-existing, unchanged by this task). So the
+  // chain below is built one row per commit (each single-row append only
+  // ever needs the seed admission, zero iterate() rounds, comfortably under
+  // cap=2) rather than in one deep bulk insert, which would itself trip the
+  // (unguarded) insert-only path before the test ever reaches the retraction
+  // it means to exercise.
+  EnvGuard cap("DBSP_REC_MAX_ITER", "2");
+  DuckDBTestHarness h;
+  h.exec("CREATE TABLE net (p INTEGER, t INTEGER, v DOUBLE)");
+  h.exec("INSERT INTO net VALUES (1, 0, 10.0)");
+  makeChainView(h);
+  assertViewMatchesOracle(h, "chain", kChainOracle);
+
+  // One partition, t = 1..7 appended incrementally: the chain ends up 8
+  // periods deep, far more than the 2-iteration cap could propagate in one
+  // commit if it all had to happen at once.
+  for (int t = 1; t <= 7; t++) {
+    h.exec("INSERT INTO net VALUES (1, " + std::to_string(t) + ", " +
+           std::to_string(10.0 * (t + 1)) + ")");
+    h.exec("SELECT * FROM dbsp_sync('net')");
+  }
+  assertViewMatchesOracle(h, "chain", kChainOracle);
+  REQUIRE(h.getViewRows("chain").size() == 8);
+
+  // The retraction itself must propagate through t=2,3,4,5,6,7 — 6 hops,
+  // far past cap=2 — so this commit trips max_iterations_ and falls back.
+  size_t before = dbsp_native::g_recompute_invocations.load();
+  h.exec("DELETE FROM net WHERE p = 1 AND t = 1");
+  h.exec("SELECT * FROM dbsp_sync('net')");
+  REQUIRE(dbsp_native::g_recompute_invocations.load() > before);
+
+  // Hand-computed truth: retracting t=1 severs the chain; only t=0
+  // (acc = 10.0, the anchor row) survives.
+  auto rows = h.getViewRows("chain");
+  REQUIRE(rows.size() == 1);
+  REQUIRE(rows[0][0].GetValue<int32_t>() == 1);
+  REQUIRE(rows[0][1].GetValue<int32_t>() == 0);
+  REQUIRE(rows[0][2].GetValue<double>() == 10.0);
+  assertViewMatchesOracle(h, "chain", kChainOracle);
 }
 
 TEST_CASE("Recursive deletion: randomized MIXED-delta differential (DRed == oracle)",
