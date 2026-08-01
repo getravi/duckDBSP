@@ -9,10 +9,21 @@ DUCKDB_VERSION="v1.5.4"
 echo "=== DBSP DuckDB Extension Build ==="
 echo ""
 
-# Check if DuckDB source exists
-if [ ! -d "$SCRIPT_DIR/duckdb" ]; then
+# Check if DuckDB source exists. Content check, not just the directory: a CI
+# checkout of this repo leaves duckdb/ as an EMPTY submodule dir, and git
+# commands run inside it silently resolve against THIS repo — the patch
+# reverse-check then false-positives and the build fails at configure.
+if [ ! -f "$SCRIPT_DIR/duckdb/CMakeLists.txt" ]; then
     echo "Fetching DuckDB ${DUCKDB_VERSION}..."
     git clone --depth 1 --branch ${DUCKDB_VERSION} https://github.com/duckdb/duckdb.git "$SCRIPT_DIR/duckdb"
+fi
+
+# Guard: duckdb/ must be its own git checkout (patch checks below would
+# otherwise run against the wrong repo).
+DUCKDB_TOPLEVEL=$(git -C "$SCRIPT_DIR/duckdb" rev-parse --show-toplevel 2>/dev/null || true)
+if [ "$DUCKDB_TOPLEVEL" != "$SCRIPT_DIR/duckdb" ]; then
+    echo "ERROR: $SCRIPT_DIR/duckdb is not a standalone DuckDB checkout (toplevel: ${DUCKDB_TOPLEVEL:-none})." >&2
+    exit 1
 fi
 
 # Apply the engine patches (the patch files ARE the fork — stock DuckDB lacks
