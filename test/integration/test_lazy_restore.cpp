@@ -101,6 +101,16 @@ TEST_CASE("lazy restore: first touch decodes only that view's chain",
     REQUIRE(db.manager().pending_restore_count() == 3);
     const size_t decodes_before = dbsp_native::g_lazy_view_decodes.load();
 
+    // get_view_info() (dbsp_views()) must report the real row count for a
+    // still-pending view -- read from the stashed sink blob's length
+    // prefix -- WITHOUT realizing it (no decode, still pending after).
+    REQUIRE(db.manager().get_view_info("v_sum").row_count == pre_sum.size());
+    REQUIRE(db.manager().get_view_info("v_filt").row_count == pre_filt.size());
+    REQUIRE(db.manager().get_view_info("v_count").row_count ==
+            pre_count.size());
+    REQUIRE(dbsp_native::g_lazy_view_decodes.load() == decodes_before);
+    REQUIRE(db.manager().pending_restore_count() == 3);
+
     // Touch exactly one view via the dbsp_query path (QueryFunc ->
     // scan_view -> realize_pending_view).
     auto q = db.query("SELECT * FROM dbsp_query('v_sum') ORDER BY cat");

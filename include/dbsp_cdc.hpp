@@ -3085,7 +3085,36 @@ public:
     if (it != views_.end()) {
       info.name = view_name;
       info.sql = it->second->sql();
-      info.row_count = it->second->get_result().size();
+      // D-lazy: get_result() on a still-pending view is the cold-create
+      // empty default, not its real row count -- dbsp_views() would
+      // otherwise report 0 rows for every untouched view right after
+      // reopen, an observable divergence from eager mode. The sink blob's
+      // own leading u64 length prefix (BlobWriter's sink format: u64
+      // count, then `count` (row, weight) pairs -- see save_checkpoint)
+      // already IS the exact row count, readable in 8 bytes with no row
+      // decode. Deliberately does NOT call realize_pending_view_locked:
+      // reporting metadata about a pending view must not itself defeat
+      // the laziness dbsp_lazy_restore exists to provide (dbsp_views()
+      // enumerates every view -- realizing here would eagerly decode
+      // everything on the first `dbsp_views()` call, same as if lazy
+      // restore were off).
+      auto pend_it = it->second->is_pending_restore()
+                         ? pending_restore_.find(view_name)
+                         : pending_restore_.end();
+      if (pend_it != pending_restore_.end()) {
+        try {
+          BlobReader r(pend_it->second.sink.data(),
+                       pend_it->second.sink.size());
+          info.row_count = static_cast<size_t>(r.u64());
+        } catch (...) {
+          // Corrupt/truncated stash: unknown row count, not a crash --
+          // the same corruption surfaces properly (rebuild scheduled) the
+          // first time something actually realizes this view.
+          info.row_count = 0;
+        }
+      } else {
+        info.row_count = it->second->get_result().size();
+      }
       info.version = it->second->version();
       info.source_tables = it->second->source_tables();
       info.dependent_views = dep_graph_.get_all_dependents(view_name);

@@ -332,6 +332,14 @@ SELECT * FROM dbsp_views();
 | `rows` | BIGINT | Current row count |
 | `version` | BIGINT | Update version number |
 
+For a view still pending lazy restore (see `dbsp_lazy_restore` below),
+`rows` is read straight from the checkpoint's stashed sink blob (its
+length-prefix, no decode) rather than the view's live state — exact,
+since "pending" means no delta has touched it, but this call never
+triggers the view's actual restore. `dbsp_views()` enumerates every view,
+so realizing here to compute a row count would eagerly decode everything
+on the first call, defeating the point of lazy restore.
+
 ---
 
 ### dbsp_drop(view_name)
@@ -706,6 +714,11 @@ delta still returns/applies the exact same result, just with the decode
 cost deferred to when it's actually needed. A checkpointed view never
 touched between reopen and the next `dbsp_save()` is re-saved verbatim
 (no decode at all).
+
+One deliberate exception to "decodes transparently on first read": `dbsp_views()`
+reports a pending view's row count from the checkpoint's stashed metadata
+without decoding it (see `dbsp_views()` above) — it enumerates every view,
+so realizing there would eagerly decode everything on the first call.
 
 `dbsp_load()`'s report string counts views left pending separately from
 "sources deferred" (D3c table baselines) and "from checkpoint":
