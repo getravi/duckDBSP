@@ -569,6 +569,22 @@ private:
       return out;
     }
     out.text = query;
+    // dbsp's own DDL: CREATE MATERIALIZED VIEW only READS tracked tables to
+    // populate the new view — it never writes one. The custom syntax fails
+    // core parsing, so without this carve-out it fell into "unparseable:
+    // assume the worst" → WRITE_UNKNOWN → sync_all, a full scan-diff of
+    // EVERY tracked table on every view creation — O(views × rows) DAG
+    // builds (the residual after the shadow-table fix).
+    {
+      const auto first = query.find_first_not_of(" \t\r\n");
+      if (first != std::string::npos) {
+        const auto head = duckdb::StringUtil::Lower(query.substr(first, 24));
+        if (head == "create materialized view") {
+          out.kind = StmtClass::READ;
+          return out;
+        }
+      }
+    }
     duckdb::Parser parser;
     try {
       parser.ParseQuery(query);

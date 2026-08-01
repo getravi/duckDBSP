@@ -1,5 +1,20 @@
 # Changelog
 
+## Perf: CREATE MATERIALIZED VIEW classified READ — per-create full scan-diff removed - Aug 2026
+
+- **Symptom** (residual after the shadow-table fix): per-view create cost still
+  grew with total view count (1.9→6.0ms/view from 500→2,000 views).
+- **Root cause**: `CREATE MATERIALIZED VIEW` is dbsp syntax the core parser
+  cannot parse, so `classify()` hit "unparseable: assume the worst" →
+  WRITE_UNKNOWN → the commit hook ran `sync_all` — a full scan-diff of EVERY
+  tracked table on every view creation: O(views × rows) DAG builds.
+- **Fix**: a leading-keyword carve-out classifies `CREATE MATERIALIZED VIEW`
+  as READ — view creation only reads tracked tables to populate the new view.
+- **Measured**: per-view create now FLAT (1.06/1.02/1.15 ms at 500/1,000/2,000
+  views); a 2,000-view DAG builds in 2.3s (~112s before the two fixes).
+- **Tests**: ctest 44/44; NumPad gated suites (incl. incremental edit sync and
+  MV-authority deltas) green.
+
 ## Perf: view creation shadows only referenced MVs — O(N^2) DAG registration fixed - Aug 2026
 
 - **Symptom**: creating or loading a large view DAG was quadratic in total
