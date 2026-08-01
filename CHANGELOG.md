@@ -100,11 +100,40 @@
     every view, not a per-view lock, so realizing everything up front
     keeps the existing "each view's own disjoint state" assumption behind
     the lock-free parallel `step_view` section true.
-  - `create_view`'s warm-replay loop and `register_arrangements`'s
-    view-sourced arrangement backfill — both read a source **view**'s
-    `get_result()` directly (no watermark/backfill-deferral mechanism
-    exists for view sources, unlike table baselines), so both realize the
-    source first, unconditionally.
+  - `create_view`'s warm-replay loop reads a source **view**'s
+    `get_result()` directly, so it realizes that source first,
+    unconditionally.
+  - `register_arrangements`'s view-sourced arrangement backfill only
+    realizes the source view for a **warm** (non-`cold`) registration —
+    mirroring exactly the table-side rule immediately above it
+    (`materialize_deferred_locked` for a still-deferred table when
+    `!cold`): a warm create's *other*, non-shared-skip sources replay
+    through this same join synchronously right after registration
+    (`create_view`'s warm-replay loop, same `view_mutex_` hold), and would
+    probe a still-empty arrangement mid-replay if the source weren't real
+    yet. A **cold** (checkpoint-loop) registration, by contrast, defers:
+    the arrangement is created empty and flagged `needs_backfill`, wired
+    into the join node, and left alone — no read of the source view
+    happens at registration time, and nothing probes it either, since the
+    checkpoint fast path runs no warm-replay at all
+    (`skip_init_replay` empties `resolved_sources`). The one guaranteed
+    fill point for a deferred one is `realize_pending_view_locked` itself:
+    once a pending view decodes (from any of the call sites above), it
+    now also backfills every `needs_backfill` arrangement registered over
+    it (`backfill_deferred_arrangements_locked`, generalized from its
+    previous table-only shape to also read a view's `get_result()`).
+    Every join-node probe of such an arrangement is downstream of that
+    point — `propagate_changes`'s pre-pass realizes a delta's entire
+    transitive dependent set (which necessarily includes the arrangement's
+    source view, by dependency-graph construction) before its per-level
+    `step_view` loop runs; a directly-queried view's own checkpoint-decoded
+    result never reads the arrangement at all. (Originally shipped
+    realizing the source view unconditionally here, cold or warm — on a
+    fully chained DAG, where every view feeds another, the cold case
+    transitively decoded the entire DAG during the checkpoint-load loop
+    itself, defeating laziness. Fixed same-day, still Task 1, by gating
+    the eager realize on `!cold` instead of dropping it outright — the
+    warm case still needs it for the reason above.)
   - `save_checkpoint` re-saves a still-pending view's stash **verbatim**:
     no decode, no re-encode, byte-identical to what `checkpoint_valid`
     read. Valid because "pending" is definitionally "zero deltas applied
@@ -151,7 +180,14 @@
   realization round-trips (one view re-encoded, the other re-saved
   verbatim, both correct after a second reload); `dbsp_lazy_restore(false)`
   reproduces the eager behavior exactly (0 pending, the lazy decode
-  counter never moves).
+  counter never moves). A fifth case added with the register_arrangements
+  fix above: a chained view-on-view DAG (`base -> v1 -> v2 -> v3`, with a
+  shared join arrangement sourced from a middle view in the chain)
+  asserts `pending_restore_count() == 3` immediately after reopen, before
+  any query — the assertion the original (defective) unconditional-realize
+  behavior would have failed at count 0 — then queries only `v3`'s chain
+  and asserts the decode count matches exactly the chain length, then
+  exercises delta-before-query correctness on the same chained shape.
 
 ## Feature: window-view checkpoint state (restore-tail, Task 2) - Jul 2026
 

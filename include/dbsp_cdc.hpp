@@ -966,6 +966,22 @@ public:
       record_error_best_effort(
           "DBSP: lazy-restore stash for view '" + view_name +
           "' failed to decode; scheduling full rebuild");
+    } else {
+      // D-lazy: any shared arrangement registered over this view while it
+      // was still pending (register_arrangements deferred the fill instead
+      // of realizing eagerly — see needs_backfill there) can now be filled
+      // from the just-decoded real result. This is the one guaranteed
+      // backfill point every join-node probe of such an arrangement sits
+      // downstream of, regardless of which caller triggered the realize:
+      // propagate_changes's pre-pass realizes every pending view in a
+      // delta's transitive dependent set before its per-level step_view
+      // loop runs; create_view's warm-replay loop realizes a view source
+      // before reading its result for replay; scan_view/query_view realize
+      // before returning a view's own (checkpoint-decoded) result, which
+      // never itself reads the arrangement. Mirrors D3c's
+      // materialize_deferred_locked -> backfill_deferred_arrangements_locked
+      // pairing for deferred table baselines.
+      backfill_deferred_arrangements_locked(view_name, /*view_lock_held=*/true);
     }
     return ok;
   }
@@ -1721,19 +1737,40 @@ public:
         materialize_deferred_locked(context, req.table, nullptr,
                                     /*view_lock_held=*/true);
       }
-      // D-lazy: an arrangement over a VIEW source is seeded below from
-      // that view's full get_result() (no table-side "defer_fill" analog
-      // exists for views — the backfill is either done now or never,
-      // there is no needs_backfill sweep for view-named arrangement
-      // sources), so a still-pending source view must be realized first,
-      // regardless of `cold` (this governs the CURRENT view being
-      // created, not req.table's own pending state). Caller
-      // (create_view) already holds view_mutex_ exclusively.
-      if (source_is_view) {
+      // D-lazy: mirror the table-side rule directly above — only a COLD
+      // (checkpoint-loop) registration may defer a still-pending VIEW
+      // source's fill; a WARM create must realize it right here, exactly
+      // like materialize_deferred_locked does for a deferred table. Why:
+      // register_arrangements runs, then create_view's warm-replay loop
+      // (right after, same view_mutex_ hold) replays this view's OTHER,
+      // non-shared-skip sources through THIS SAME join node — if that
+      // side is a table with real rows, its replay probes this
+      // arrangement synchronously, in THIS call, before anything else
+      // could realize the source and backfill it. Deferring here too
+      // would silently null-pad every probe against a still-empty
+      // arrangement (wrong join result), not just delay it.
+      //
+      // Gating on `cold` is exactly the defect fix: the checkpoint-load
+      // loop (skip_init_replay -> cold=true) runs no warm-replay at all
+      // (resolved_sources is emptied), so nothing probes the arrangement
+      // during THIS call — deferring is safe there, and is what stops
+      // register_arrangements from cascading a decode through every
+      // downstream view on a chained DAG (the wfp defect). The eventual
+      // fill runs at the deferred fill point once the source view is
+      // itself realized (by propagate_changes's pre-pass, a later warm
+      // create_view's replay loop, scan_view/query_view, or the crash-
+      // recovery sweep), which is always before any delta can reach a
+      // join node probing this arrangement — see the guarantee argument
+      // in the D-lazy report addendum.
+      bool source_view_pending =
+          source_is_view && views_.at(req.table)->is_pending_restore();
+      if (source_view_pending && !cold) {
         realize_pending_view_locked(req.table);
+        source_view_pending = false; // realized above; fill normally below
       }
       const bool defer_fill =
-          source_is_table && tracked_tables_.at(req.table)->is_deferred();
+          (source_is_table && tracked_tables_.at(req.table)->is_deferred()) ||
+          source_view_pending;
       std::shared_ptr<SharedArrangement> arr;
       auto it = arrangements_.find(req.fingerprint);
       if (it != arrangements_.end()) {
@@ -1761,9 +1798,12 @@ public:
                             std::to_string(arrangement_file_seq_++) +
                             ".dbspill");
         }
-        // Backfill full current state so init replay can skip this table.
+        // Backfill full current state so init replay can skip this source.
         // D3c: over a still-deferred table (cold create) the backfill is
         // deferred with the baseline — flagged so materialization fills it.
+        // D-lazy: over a still-pending view source, deferred the same way —
+        // flagged so realize_pending_view_locked's backfill (below) fills
+        // it once the source view itself decodes.
         if (defer_fill) {
           arr->needs_backfill = true;
         } else {
@@ -3493,12 +3533,17 @@ private:
     return true;
   }
 
-  // Backfill shared arrangements flagged needs_backfill from the (now
-  // materialized) baseline. Caller holds struct_mutex_; acquires
-  // view_mutex_ exclusively unless view_lock_held.
-  void backfill_deferred_arrangements_locked(const std::string &table_name,
+  // Backfill shared arrangements flagged needs_backfill from a source that
+  // just became fully real: either a deferred table baseline finished
+  // materializing (D3c, called from materialize_deferred_locked) or a
+  // pending view finished decoding (D-lazy, called from
+  // realize_pending_view_locked). `source_name` may name either — the two
+  // are mutually exclusive in tracked_tables_/views_, so the branch below
+  // picks whichever fill shape applies. Caller holds struct_mutex_;
+  // acquires view_mutex_ exclusively unless view_lock_held.
+  void backfill_deferred_arrangements_locked(const std::string &source_name,
                                              bool view_lock_held) {
-    auto arr_it = arrangements_by_table_.find(table_name);
+    auto arr_it = arrangements_by_table_.find(source_name);
     if (arr_it == arrangements_by_table_.end()) {
       return;
     }
@@ -3507,8 +3552,9 @@ private:
     if (!view_lock_held) {
       view_lock.lock();
     }
-    auto tt_it = tracked_tables_.find(table_name);
-    if (tt_it == tracked_tables_.end()) {
+    auto tt_it = tracked_tables_.find(source_name);
+    auto view_it = views_.find(source_name);
+    if (tt_it == tracked_tables_.end() && view_it == views_.end()) {
       return;
     }
     for (auto &weak : arr_it->second) {
@@ -3516,17 +3562,23 @@ private:
       if (!arr || !arr->needs_backfill) {
         continue;
       }
-      DbspScopeTimer timer("arr_backfill", table_name);
-      DuckDBZSet chunk;
-      tt_it->second->scan_state([&](const DuckDBRow &row, int64_t w) {
-        chunk.insert(row, w);
-        if (chunk.size() >= 65536) {
+      DbspScopeTimer timer("arr_backfill", source_name);
+      if (tt_it != tracked_tables_.end()) {
+        DuckDBZSet chunk;
+        tt_it->second->scan_state([&](const DuckDBRow &row, int64_t w) {
+          chunk.insert(row, w);
+          if (chunk.size() >= 65536) {
+            arr->apply(chunk);
+            chunk = DuckDBZSet();
+          }
+        });
+        if (!chunk.empty()) {
           arr->apply(chunk);
-          chunk = DuckDBZSet();
         }
-      });
-      if (!chunk.empty()) {
-        arr->apply(chunk);
+      } else {
+        // View source: realize_pending_view_locked already decoded and
+        // set_result()'d before calling us, so get_result() is real.
+        arr->apply(view_it->second->get_result());
       }
       arr->needs_backfill = false;
     }

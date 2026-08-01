@@ -64,6 +64,47 @@ void setupItemsTable(DuckDBTestHarness &db) {
     db.exec("SELECT * FROM dbsp_use_planner(true)");
 }
 
+// Chained-DAG shape (register_arrangements fix): items -> v1 -> v2 -> v3,
+// where v2's LEFT JOIN probes v1 as its shared (arrangement-eligible)
+// side, and v3's LEFT JOIN probes v2 the same way. side1/side2 are the
+// joins' LOCAL (non-shared, fully-replayed) sides -- edits to them are
+// what force a *probe* of the other side's shared arrangement, as opposed
+// to edits to `items`, which only exercise the arrangement's *write*
+// (apply_to_arrangements) path. `suffix` builds a second, independently-
+// named parallel chain over the same source tables, used as a
+// continuously-live correctness oracle (mirrors v_live/v_restore in the
+// other cases here).
+void setupChainTables(DuckDBTestHarness &db) {
+    setupItemsTable(db);
+    db.exec("CREATE TABLE side1 (cat VARCHAR, tag1 VARCHAR)");
+    db.exec("SELECT * FROM dbsp_track('side1')");
+    db.exec("INSERT INTO side1 VALUES ('a', 't1'), ('b', 't2')");
+    db.exec("SELECT * FROM dbsp_sync('side1')");
+
+    db.exec("CREATE TABLE side2 (tag1 VARCHAR, tag2 VARCHAR)");
+    db.exec("SELECT * FROM dbsp_track('side2')");
+    db.exec("INSERT INTO side2 VALUES ('t1', 'x'), ('t2', 'y')");
+    db.exec("SELECT * FROM dbsp_sync('side2')");
+}
+
+void createChain(DuckDBTestHarness &db, const std::string &suffix) {
+    const std::string v1 = "v1" + suffix;
+    const std::string v2 = "v2" + suffix;
+    const std::string v3 = "v3" + suffix;
+    db.exec("SELECT * FROM dbsp_create_view('" + v1 + "', "
+            "'SELECT cat, SUM(value) AS total FROM items GROUP BY cat')");
+    // v1 is the RIGHT (probe-target) side of a LEFT JOIN -- arrangement-
+    // eligible (not self-padding, referenced once) -- a shared arrangement
+    // gets registered over it.
+    db.exec("SELECT * FROM dbsp_create_view('" + v2 + "', "
+            "'SELECT s.cat AS cat, s.tag1 AS tag1, j.total AS total FROM "
+            "side1 s LEFT JOIN " + v1 + " j ON s.cat = j.cat')");
+    // Same shape one level down: v2 is the shared side of v3's LEFT JOIN.
+    db.exec("SELECT * FROM dbsp_create_view('" + v3 + "', "
+            "'SELECT w.tag1 AS tag1, w.tag2 AS tag2, j.total AS total FROM "
+            "side2 w LEFT JOIN " + v2 + " j ON w.tag1 = j.tag1')");
+}
+
 } // namespace
 
 TEST_CASE("lazy restore: first touch decodes only that view's chain",
@@ -255,4 +296,92 @@ TEST_CASE("lazy restore: dbsp_lazy_restore(false) is eager, like before",
     // process (each DuckDBTestHarness is its own DatabaseInstance /
     // CDCManager, but be explicit rather than relying on that).
     REQUIRE_FALSE(db.query("SELECT * FROM dbsp_lazy_restore(true)")->HasError());
+}
+
+// Regression test for the register_arrangements defect: on a fully
+// chained view-on-view DAG (every view feeds the next, exactly the wfp
+// shape), the ORIGINAL D-lazy code called realize_pending_view_locked
+// unconditionally for any view-sourced shared-arrangement request during
+// register_arrangements -- reached from every view's cold-create call
+// inside load_from_duck_table's checkpoint loop, regardless of `cold`.
+// Because v2 registers an arrangement over v1, creating v2 (cold)
+// transitively realized v1 right there, at load time, before dbsp_load()
+// even returned; likewise v3's registration realized v2. The fix defers
+// the fill (SharedArrangement::needs_backfill, mirroring D3c's table-
+// baseline deferral) instead of realizing eagerly, and generalizes
+// backfill_deferred_arrangements_locked (previously table-only) so
+// realize_pending_view_locked backfills any arrangement sourced from the
+// view it just decoded.
+TEST_CASE("lazy restore: chained view-on-view DAG defers the whole chain",
+          "[integration][checkpoint][lazy_restore]") {
+    DuckDBTestHarness db;
+    setupChainTables(db);
+
+    // "" is checkpointed and reloaded pending; "_live" is a second,
+    // independently-named parallel chain over the same source tables that
+    // never goes through the checkpoint fast path -- the correctness
+    // oracle for every comparison below.
+    createChain(db, "");
+    createChain(db, "_live");
+    REQUIRE(db.manager().get_view("v1")->checkpointable());
+    REQUIRE(db.manager().get_view("v2")->checkpointable());
+    REQUIRE(db.manager().get_view("v3")->checkpointable());
+
+    REQUIRE(snapshotView(db, "v1") == snapshotView(db, "v1_live"));
+    REQUIRE(snapshotView(db, "v2") == snapshotView(db, "v2_live"));
+    REQUIRE(snapshotView(db, "v3") == snapshotView(db, "v3_live"));
+
+    REQUIRE_FALSE(db.query("SELECT * FROM dbsp_save()")->HasError());
+    // Dependency order: v3 depends on v2 depends on v1 -- drop_view
+    // refuses to drop a view other views still depend on.
+    REQUIRE_FALSE(db.query("SELECT dbsp_drop('v3')")->HasError());
+    REQUIRE_FALSE(db.query("SELECT dbsp_drop('v2')")->HasError());
+    REQUIRE_FALSE(db.query("SELECT dbsp_drop('v1')")->HasError());
+
+    auto load_result = db.query("SELECT * FROM dbsp_load()");
+    REQUIRE_FALSE(load_result->HasError());
+    const std::string load_msg = load_result->GetValue(0, 0).ToString();
+    REQUIRE(load_msg.find("3 from checkpoint") != std::string::npos);
+    REQUIRE(load_msg.find("3 pending lazy restore") != std::string::npos);
+
+    // This is the assertion the original defect would have failed: it
+    // eagerly realized v1 (via v2's cold-create registration) and v2 (via
+    // v3's) purely from the load loop, before ANY query -- leaving this
+    // count well below 3.
+    REQUIRE(db.manager().pending_restore_count() == 3);
+    const size_t decodes_before = dbsp_native::g_lazy_view_decodes.load();
+
+    // Exercise only v3's ancestor chain: a delta on `items`, v1's sole
+    // source. Its transitive dependents (dep graph) are exactly
+    // {v1, v2, v3} (and the live twins) -- not side1/side2, which don't
+    // depend on items. propagate_changes's realize pre-pass must decode
+    // all three before applying the delta.
+    db.exec("INSERT INTO items VALUES (5, 'a', 5)");
+    db.exec("SELECT * FROM dbsp_sync('items')");
+
+    REQUIRE(dbsp_native::g_lazy_view_decodes.load() == decodes_before + 3);
+    REQUIRE(db.manager().pending_restore_count() == 0);
+
+    // Delta-before-query correctness: none of v1/v2/v3 was ever queried
+    // before this delta landed, only realized+stepped via the pre-pass.
+    REQUIRE(snapshotView(db, "v1") == snapshotView(db, "v1_live"));
+    REQUIRE(snapshotView(db, "v2") == snapshotView(db, "v2_live"));
+    REQUIRE(snapshotView(db, "v3") == snapshotView(db, "v3_live"));
+
+    // Probe the v1-sourced arrangement from the OTHER (non-shared) side:
+    // a new side1 row for an existing cat must find v1's real total via
+    // the arrangement register_arrangements deferred and
+    // realize_pending_view_locked backfilled above -- an empty/unfilled
+    // arrangement here would silently pad NULL instead (LEFT JOIN, no
+    // match found).
+    db.exec("INSERT INTO side1 VALUES ('a', 't3')");
+    db.exec("SELECT * FROM dbsp_sync('side1')");
+    REQUIRE(snapshotView(db, "v2") == snapshotView(db, "v2_live"));
+
+    // Same probe one level down: a new side2 row for the tag1 v2 just
+    // gained must find v2's real total via v3's (equally deferred and
+    // backfilled) shared arrangement over v2.
+    db.exec("INSERT INTO side2 VALUES ('t3', 'z')");
+    db.exec("SELECT * FROM dbsp_sync('side2')");
+    REQUIRE(snapshotView(db, "v3") == snapshotView(db, "v3_live"));
 }
