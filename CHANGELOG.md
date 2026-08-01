@@ -1,5 +1,18 @@
 # Changelog
 
+## Fix: window SUM/AVG over an all-NULL frame returns NULL - Jul 2026
+
+- `NativeWindowView`'s SUM and AVG emitted `0.0` when every value in the
+  frame was NULL; stock DuckDB (and SQL semantics) return NULL — an
+  all-NULL frame is not a frame that summed to zero. Both render paths
+  (fast-path renderer and full re-render) fixed; COUNT correctly stays 0
+  and MIN/MAX already returned NULL. Surfaced by the NumPad wfp
+  measurement the same day constant bounded frames became acceptable —
+  the bug predates that change but was unreachable through SQL until it.
+- Differential tests vs stock DuckDB across SUM/AVG/COUNT/MIN/MAX,
+  bounded and unbounded frames, including edits that make a frame
+  all-NULL and back.
+
 ## Perf: checkpoint restore hash pre-seed (cold/restore attack, Task 3) - Jul 2026
 
 - **Corrected premise**: the plan for this task assumed checkpoint blobs

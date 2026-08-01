@@ -263,6 +263,188 @@ TEST_CASE("Window LAG default offset still works",
 // for these two call sites (they keep bare_constant_int) so this stays a
 // loud "unsupported" instead of a silently wrong result. This test guards
 // that scope boundary.
+// All-NULL-frame aggregate semantics: stock DuckDB returns NULL for
+// SUM/AVG/MIN/MAX when every value in the frame is NULL (COUNT returns 0,
+// which is already a real number, not NULL). duckDBSP's window aggregate
+// accumulator folded "no non-null values seen" through as sum=0/count=0 and
+// then emitted 0.0 for SUM/AVG instead of NULL -- silently wrong wherever a
+// partition (or a prefix of one) is genuinely all-NULL, e.g. wfp's
+// zero-employee org/lvl combos feeding Rolling12MAvgHeadcount. grp=1 is
+// all-NULL throughout (every bounded frame in it is all-NULL); grp=2 is a
+// non-null control that must keep matching stock exactly (regression guard
+// for the normal case the existing AVG-frame tests already cover).
+TEST_CASE("Window bounded ROWS frame: all-NULL partition returns NULL not 0",
+          "[integration][window][null-frame]") {
+  DuckDBTestHarness harness;
+  harness.exec("CREATE TABLE t (grp INTEGER, tidx INTEGER, v DOUBLE)");
+  for (int i = 0; i < 10; i++) {
+    harness.exec("INSERT INTO t VALUES (1, " + std::to_string(i) + ", NULL)");
+    harness.exec("INSERT INTO t VALUES (2, " + std::to_string(i) + ", " +
+                 std::to_string(i) + ".0)");
+  }
+  harness.exec("SELECT * FROM dbsp_track('t')");
+  harness.exec("SELECT * FROM dbsp_sync('t')");
+
+  const std::string sql =
+      "SELECT grp, tidx, "
+      "SUM(v) OVER (PARTITION BY grp ORDER BY tidx ROWS BETWEEN 3 PRECEDING "
+      "AND CURRENT ROW) AS sum_b, "
+      "AVG(v) OVER (PARTITION BY grp ORDER BY tidx ROWS BETWEEN 3 PRECEDING "
+      "AND CURRENT ROW) AS avg_b, "
+      "MIN(v) OVER (PARTITION BY grp ORDER BY tidx ROWS BETWEEN 3 PRECEDING "
+      "AND CURRENT ROW) AS min_b, "
+      "MAX(v) OVER (PARTITION BY grp ORDER BY tidx ROWS BETWEEN 3 PRECEDING "
+      "AND CURRENT ROW) AS max_b, "
+      "COUNT(v) OVER (PARTITION BY grp ORDER BY tidx ROWS BETWEEN 3 PRECEDING "
+      "AND CURRENT ROW) AS cnt_b "
+      "FROM t";
+  auto create = harness.query(
+      "SELECT * FROM dbsp_create_view('w_nullframe', '" + sql + "')");
+  INFO("create error: " << (create->HasError() ? create->GetError() : "none"));
+  REQUIRE_FALSE(create->HasError());
+
+  requireViewMatchesQuery(harness, "w_nullframe", sql);
+}
+
+// Same defect class on the UNBOUNDED PRECEDING (cumulative) frame, which
+// reuses the identical aggregate-accumulation code path -- the report that
+// found this bug flagged the unbounded path as untested and possibly
+// affected too (it predates today's bounded-frame fix). grp=1 is all-NULL
+// throughout (cumulative SUM/AVG must stay NULL at every row). grp=2 has a
+// NULL prefix (tidx 0..2) followed by non-null values -- the cumulative
+// frame is all-NULL for tidx 0..2 and must flip to non-NULL exactly at
+// tidx=3, the transition stock DuckDB's own running accumulator defines.
+TEST_CASE("Window UNBOUNDED PRECEDING frame: all-NULL prefix returns NULL "
+          "not 0",
+          "[integration][window][null-frame]") {
+  DuckDBTestHarness harness;
+  harness.exec("CREATE TABLE t (grp INTEGER, tidx INTEGER, v DOUBLE)");
+  for (int i = 0; i < 8; i++) {
+    harness.exec("INSERT INTO t VALUES (1, " + std::to_string(i) + ", NULL)");
+    std::string v2 = (i < 3) ? "NULL" : (std::to_string(i) + ".0");
+    harness.exec("INSERT INTO t VALUES (2, " + std::to_string(i) + ", " + v2 +
+                 ")");
+  }
+  harness.exec("SELECT * FROM dbsp_track('t')");
+  harness.exec("SELECT * FROM dbsp_sync('t')");
+
+  const std::string sql =
+      "SELECT grp, tidx, "
+      "SUM(v) OVER (PARTITION BY grp ORDER BY tidx ROWS BETWEEN UNBOUNDED "
+      "PRECEDING AND CURRENT ROW) AS sum_c, "
+      "AVG(v) OVER (PARTITION BY grp ORDER BY tidx ROWS BETWEEN UNBOUNDED "
+      "PRECEDING AND CURRENT ROW) AS avg_c, "
+      "MIN(v) OVER (PARTITION BY grp ORDER BY tidx ROWS BETWEEN UNBOUNDED "
+      "PRECEDING AND CURRENT ROW) AS min_c, "
+      "MAX(v) OVER (PARTITION BY grp ORDER BY tidx ROWS BETWEEN UNBOUNDED "
+      "PRECEDING AND CURRENT ROW) AS max_c, "
+      "COUNT(v) OVER (PARTITION BY grp ORDER BY tidx ROWS BETWEEN UNBOUNDED "
+      "PRECEDING AND CURRENT ROW) AS cnt_c "
+      "FROM t";
+  auto create = harness.query(
+      "SELECT * FROM dbsp_create_view('w_nullcum', '" + sql + "')");
+  INFO("create error: " << (create->HasError() ? create->GetError() : "none"));
+  REQUIRE_FALSE(create->HasError());
+
+  requireViewMatchesQuery(harness, "w_nullcum", sql);
+}
+
+// Post-edit: a pure value UPDATE (row count unchanged) that turns a
+// previously-populated bounded frame all-NULL, and the reverse edit that
+// turns it back. Row count is unchanged both times, so this stays on
+// NativeWindowView's fast re-emit path (emit_affected/affected_indices) --
+// render_row is the function the fix touches, and this is the only test in
+// the file that exercises the fix through that path rather than the
+// structural full-render path used at initial load.
+TEST_CASE("Window bounded ROWS frame: edit into and out of an all-NULL "
+          "frame (fast path)",
+          "[integration][window][null-frame]") {
+  DuckDBTestHarness harness;
+  harness.exec("CREATE TABLE t (grp INTEGER, tidx INTEGER, v DOUBLE)");
+  for (int i = 0; i < 8; i++) {
+    harness.exec("INSERT INTO t VALUES (1, " + std::to_string(i) + ", " +
+                 std::to_string(i) + ".0)");
+  }
+  harness.exec("SELECT * FROM dbsp_track('t')");
+  harness.exec("SELECT * FROM dbsp_sync('t')");
+
+  const std::string sql =
+      "SELECT grp, tidx, "
+      "SUM(v) OVER (PARTITION BY grp ORDER BY tidx ROWS BETWEEN 2 PRECEDING "
+      "AND CURRENT ROW) AS sum_b, "
+      "AVG(v) OVER (PARTITION BY grp ORDER BY tidx ROWS BETWEEN 2 PRECEDING "
+      "AND CURRENT ROW) AS avg_b, "
+      "MIN(v) OVER (PARTITION BY grp ORDER BY tidx ROWS BETWEEN 2 PRECEDING "
+      "AND CURRENT ROW) AS min_b, "
+      "MAX(v) OVER (PARTITION BY grp ORDER BY tidx ROWS BETWEEN 2 PRECEDING "
+      "AND CURRENT ROW) AS max_b, "
+      "COUNT(v) OVER (PARTITION BY grp ORDER BY tidx ROWS BETWEEN 2 PRECEDING "
+      "AND CURRENT ROW) AS cnt_b "
+      "FROM t";
+  auto create = harness.query(
+      "SELECT * FROM dbsp_create_view('w_nulledit', '" + sql + "')");
+  REQUIRE_FALSE(create->HasError());
+  requireViewMatchesQuery(harness, "w_nulledit", sql);
+
+  // Blank tidx 0,1,2: tidx=2's trailing 3-row frame (0,1,2) becomes
+  // all-NULL. Row count unchanged -> fast path.
+  harness.exec("UPDATE t SET v = NULL WHERE tidx IN (0, 1, 2)");
+  harness.exec("SELECT * FROM dbsp_sync('t')");
+  requireViewMatchesQuery(harness, "w_nulledit", sql);
+
+  // Reverse: un-blank tidx=1 so tidx=2's frame has one non-null value again
+  // -- the all-NULL frame must go back to a real number, not stay stuck at
+  // whatever the fix emits for the NULL case.
+  harness.exec("UPDATE t SET v = 99.0 WHERE tidx = 1");
+  harness.exec("SELECT * FROM dbsp_sync('t')");
+  requireViewMatchesQuery(harness, "w_nulledit", sql);
+}
+
+// Same edit-path defect on the UNBOUNDED PRECEDING (cumulative) frame.
+TEST_CASE("Window UNBOUNDED PRECEDING frame: edit into and out of an "
+          "all-NULL frame (fast path)",
+          "[integration][window][null-frame]") {
+  DuckDBTestHarness harness;
+  harness.exec("CREATE TABLE t (grp INTEGER, tidx INTEGER, v DOUBLE)");
+  for (int i = 0; i < 8; i++) {
+    harness.exec("INSERT INTO t VALUES (1, " + std::to_string(i) + ", " +
+                 std::to_string(i) + ".0)");
+  }
+  harness.exec("SELECT * FROM dbsp_track('t')");
+  harness.exec("SELECT * FROM dbsp_sync('t')");
+
+  const std::string sql =
+      "SELECT grp, tidx, "
+      "SUM(v) OVER (PARTITION BY grp ORDER BY tidx ROWS BETWEEN UNBOUNDED "
+      "PRECEDING AND CURRENT ROW) AS sum_c, "
+      "AVG(v) OVER (PARTITION BY grp ORDER BY tidx ROWS BETWEEN UNBOUNDED "
+      "PRECEDING AND CURRENT ROW) AS avg_c, "
+      "MIN(v) OVER (PARTITION BY grp ORDER BY tidx ROWS BETWEEN UNBOUNDED "
+      "PRECEDING AND CURRENT ROW) AS min_c, "
+      "MAX(v) OVER (PARTITION BY grp ORDER BY tidx ROWS BETWEEN UNBOUNDED "
+      "PRECEDING AND CURRENT ROW) AS max_c, "
+      "COUNT(v) OVER (PARTITION BY grp ORDER BY tidx ROWS BETWEEN UNBOUNDED "
+      "PRECEDING AND CURRENT ROW) AS cnt_c "
+      "FROM t";
+  auto create = harness.query(
+      "SELECT * FROM dbsp_create_view('w_nullcumedit', '" + sql + "')");
+  REQUIRE_FALSE(create->HasError());
+  requireViewMatchesQuery(harness, "w_nullcumedit", sql);
+
+  // Blank tidx 0,1,2: the cumulative frame is all-NULL for those rows (and
+  // only those rows -- tidx=3 onward still has non-null values entering the
+  // running frame). Row count unchanged -> fast path.
+  harness.exec("UPDATE t SET v = NULL WHERE tidx IN (0, 1, 2)");
+  harness.exec("SELECT * FROM dbsp_sync('t')");
+  requireViewMatchesQuery(harness, "w_nullcumedit", sql);
+
+  // Reverse: un-blank tidx=0 so the cumulative frame has a real value from
+  // the start again.
+  harness.exec("UPDATE t SET v = 99.0 WHERE tidx = 0");
+  harness.exec("SELECT * FROM dbsp_sync('t')");
+  requireViewMatchesQuery(harness, "w_nullcumedit", sql);
+}
+
 TEST_CASE("NTILE and NTH_VALUE constant args stay gated (scope boundary)",
           "[integration][window][constant-frame]") {
   DuckDBTestHarness harness;

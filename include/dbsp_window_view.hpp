@@ -260,12 +260,17 @@ private:
         }
 
         if (win.function == "SUM") {
-          out_row.columns.push_back(duckdb::Value(sum));
+          // Stock DuckDB: SUM over a frame with zero non-null values is
+          // NULL, not 0.0 (an all-NULL frame is not the same as a frame
+          // that legitimately summed to zero).
+          out_row.columns.push_back(count > 0 ? duckdb::Value(sum)
+                                               : duckdb::Value());
         } else if (win.function == "COUNT") {
           out_row.columns.push_back(duckdb::Value(count));
         } else if (win.function == "AVG") {
-          double avg = count > 0 ? sum / count : 0;
-          out_row.columns.push_back(duckdb::Value(avg));
+          // Same NULL-vs-zero distinction as SUM above.
+          out_row.columns.push_back(count > 0 ? duckdb::Value(sum / count)
+                                               : duckdb::Value());
         } else if (win.function == "MIN") {
           out_row.columns.push_back(min_val);
         } else if (win.function == "MAX") {
@@ -842,12 +847,15 @@ public:
             }
 
             if (win.function == "SUM") {
-              out_row.columns.push_back(duckdb::Value(sum));
+              // Stock DuckDB: SUM over a frame with zero non-null values is
+              // NULL, not 0.0 (mirrors the fast-path renderer above).
+              out_row.columns.push_back(count > 0 ? duckdb::Value(sum)
+                                                   : duckdb::Value());
             } else if (win.function == "COUNT") {
               out_row.columns.push_back(duckdb::Value(count));
             } else if (win.function == "AVG") {
-              double avg = count > 0 ? sum / count : 0;
-              out_row.columns.push_back(duckdb::Value(avg));
+              out_row.columns.push_back(count > 0 ? duckdb::Value(sum / count)
+                                                   : duckdb::Value());
             } else if (win.function == "MIN") {
               out_row.columns.push_back(min_val);
             } else if (win.function == "MAX") {
