@@ -1,5 +1,71 @@
 # Changelog
 
+## Fix: NTILE bucket-boundary math + ungate constant bucket counts (Task 2) - Jul 2026
+
+- **Bug**: `NativeWindowView`'s NTILE (`include/dbsp_window_view.hpp`, two
+  render call sites — the fast-path `render_row()` and the full-partition
+  re-render loop inside `apply_changes()`) computed
+  `bucket = floor(row_idx * n / p) + 1` for `p` partition rows and `n`
+  requested buckets. This formula coincides with stock DuckDB's answer
+  when `n <= p`, but diverges whenever there are more buckets than rows
+  (`n > p`): it skips bucket numbers instead of assigning rows
+  sequentially to buckets `1..p` the way stock does (found during the
+  2026-07-31 constant-frame fix's differential check; confirmed
+  pre-existing and unrelated to that fix, so left gated rather than
+  shipped broken — see TODO.md's prior entry).
+- **Root cause**: the proportional-floor formula is a well-known
+  balanced-partition identity, but it silently assumes `n <= p`; for
+  `n > p` it needs the same "clamp bucket count to row count" step stock
+  DuckDB takes (`WindowNtileExecutor::EvaluateInternal`,
+  `duckdb/src/function/window/window_rownumber_function.cpp:171-175`) —
+  `if (n_param > n_total) n_param = n_total;` — before splitting rows into
+  `n_large = p - n*floor(p/n)` "large" buckets of `floor(p/n)+1` rows and
+  the rest at `floor(p/n)` rows.
+- **Fix**: both NTILE call sites now clamp `num_buckets` to the partition
+  size, then apply the same `n_size`/`n_large`/`i_small` split as stock's
+  `WindowNtileExecutor` (verified by reading that function, not by
+  running it — see the code comment for the derivation and Global
+  Constraint on no builds/tests for this task).
+- **Ungate**: `dbsp_plan_translator.hpp`'s `visit_window` now extracts
+  NTILE's bucket-count argument with `constant_int` (the `BOUND_CAST`-
+  unwrapping extractor already used for window frame bounds and LAG/LEAD
+  offsets) instead of the strict `bare_constant_int`, so
+  `NTILE(4) OVER (...)` with a literal bucket count is accepted instead of
+  failing `DBSP-E110: NTILE with non-constant bucket count`.
+- **NTH_VALUE verdict — stays gated**: differentially reading NTH_VALUE's
+  render logic (both call sites, same file) found it always evaluates
+  `rows[n-1]` / `partition_rows[n-1]` — the N-th row of the whole
+  *partition* — never consulting the window's frame bounds
+  (`win.start`/`win.end`) at all. Stock DuckDB's NTH_VALUE is
+  frame-relative ("value evaluated at the row that is the n'th row of the
+  window frame", `window_value_function.cpp`): with the default frame
+  (`RANGE UNBOUNDED PRECEDING AND CURRENT ROW`), stock returns NULL for
+  rows before the frame has grown to N rows, and generally answers
+  relative to `[frame_start, frame_end]`, not `[0, partition_end]`. This
+  is a distinct, pre-existing bug from the NTILE one — ungating NTH_VALUE
+  now would ship a silently wrong result for every frame narrower than
+  the full partition (i.e. most uses). Left gated (`bare_constant_int`
+  unchanged); TODO.md's gap entry updated to describe this specifically
+  rather than bundling it with NTILE.
+- **Test**: `test/integration/test_advanced_window.cpp` — two new
+  differential tests (materialized view vs. stock DuckDB, exact values):
+  one covering `p % n == 0`, `p % n != 0`, `n > p` (empty buckets), and a
+  single-row partition all in one partitioned query; one walking a single
+  partition's row count through `n > p` → `p == n` → `n > p` (different
+  remainder) via INSERT then DELETE, exercising the full-partition
+  re-render path (NTILE has no fast-path rule in `affected_indices()`, so
+  every edit — structural or not — re-renders the whole partition). The
+  old combined "NTILE and NTH_VALUE stay gated" scope-boundary test is
+  now NTH_VALUE-only; its NTILE half is superseded by the differential
+  tests above. Pre-fix (bucket math wrong, gate still narrow), the new
+  differential tests' `dbsp_create_view` calls fail at creation with
+  `DBSP-E110: NTILE with non-constant bucket count` (gate not yet
+  widened) — they only exercise the fixed math once both changes land
+  together, which is why this is one commit. **Untested-by-build**:
+  verification deferred to the batched cycle (Task 3); this is a static,
+  read-the-source fix with no compiler or test run in this task per the
+  binding build protocol.
+
 ## Feature: lazy per-view checkpoint restore (D-lazy, Task 1) - Jul 2026
 
 - **Motivation**: a warm reopen paid the blob-decode cost of every

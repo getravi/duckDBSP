@@ -259,14 +259,14 @@ predicates), cross joins, IN/NOT IN/EXISTS/scalar subqueries
 (correlated included), DISTINCT, DISTINCT ON, UNION/INTERSECT/EXCEPT
 (ALL and DISTINCT), window functions (expressions auto-projected;
 `ROWS`/`RANGE`/`GROUPS` frames including constant bounded frames like
-`ROWS BETWEEN 11 PRECEDING AND CURRENT ROW`, and `LAG`/`LEAD` with a
-constant non-default offset like `LAG(v, 12)`), non-recursive CTEs, WITH
-RECURSIVE (deletions included), and ORDER BY/LIMIT/OFFSET (constant or
-percentage). The few remaining gaps (USING KEY recursion, expression
-LIMIT, approximate statistics like approx_quantile, unordered
-string_agg, NTILE bucket counts and NTH_VALUE offsets — even literal
-constants like `NTILE(4)`, unlike window frame bounds and LAG/LEAD
-offsets — see TODO.md) fail with a DBSP-E110 error naming the construct.
+`ROWS BETWEEN 11 PRECEDING AND CURRENT ROW`, `LAG`/`LEAD` with a constant
+non-default offset like `LAG(v, 12)`, and `NTILE` with a constant bucket
+count like `NTILE(4)`), non-recursive CTEs, WITH RECURSIVE (deletions
+included), and ORDER BY/LIMIT/OFFSET (constant or percentage). The few
+remaining gaps (USING KEY recursion, expression LIMIT, approximate
+statistics like approx_quantile, unordered string_agg, NTH_VALUE's N —
+even as a literal constant, unlike NTILE's bucket count — see TODO.md)
+fail with a DBSP-E110 error naming the construct.
 
 ```sql
 SELECT * FROM dbsp_use_planner();       -- Always: ENABLED

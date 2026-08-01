@@ -254,15 +254,18 @@ TEST_CASE("Window LAG default offset still works",
   requireViewMatchesQuery(harness, "w_lag1", sql);
 }
 
-// NTILE's bucket count and NTH_VALUE's N reach the same BOUND_CAST-wrapped
-// literal shape as the frame bounds / LAG-LEAD offsets above, but must stay
-// gated: a differential check during this fix (not committed, see the
-// task-1 report) found NTILE's bucket-boundary math already diverges from
-// stock DuckDB for uneven partition sizes -- pre-existing and out of this
-// task's scope. constant_int()'s BOUND_CAST unwrap is deliberately NOT used
-// for these two call sites (they keep bare_constant_int) so this stays a
-// loud "unsupported" instead of a silently wrong result. This test guards
-// that scope boundary.
+// NTH_VALUE's N reaches the same BOUND_CAST-wrapped literal shape as the
+// frame bounds / LAG-LEAD offsets and NTILE's bucket count (all of which
+// now accept constants -- see the differential tests below for NTILE), but
+// must stay gated: reading NTH_VALUE's render logic
+// (NativeWindowView, both call sites in dbsp_window_view.hpp) found it
+// always indexes the N-th row of the whole partition, ignoring the
+// window's frame bounds -- diverges from stock DuckDB's frame-relative
+// NTH_VALUE whenever the frame is narrower than the full partition.
+// constant_int()'s BOUND_CAST unwrap is deliberately NOT used for this
+// call site (it keeps bare_constant_int) so this stays a loud
+// "unsupported" instead of a silently wrong result. This test guards that
+// scope boundary.
 // All-NULL-frame aggregate semantics: stock DuckDB returns NULL for
 // SUM/AVG/MIN/MAX when every value in the frame is NULL (COUNT returns 0,
 // which is already a real number, not NULL). duckDBSP's window aggregate
@@ -445,7 +448,7 @@ TEST_CASE("Window UNBOUNDED PRECEDING frame: edit into and out of an "
   requireViewMatchesQuery(harness, "w_nullcumedit", sql);
 }
 
-TEST_CASE("NTILE and NTH_VALUE constant args stay gated (scope boundary)",
+TEST_CASE("NTH_VALUE constant N stays gated (scope boundary)",
           "[integration][window][constant-frame]") {
   DuckDBTestHarness harness;
   harness.exec("CREATE TABLE t (grp INTEGER, tidx INTEGER, v DOUBLE)");
@@ -456,14 +459,6 @@ TEST_CASE("NTILE and NTH_VALUE constant args stay gated (scope boundary)",
   harness.exec("SELECT * FROM dbsp_track('t')");
   harness.exec("SELECT * FROM dbsp_sync('t')");
 
-  auto ntile = harness.query(
-      "SELECT * FROM dbsp_create_view('w_ntile', "
-      "'SELECT grp, tidx, NTILE(4) OVER (PARTITION BY grp ORDER BY tidx) "
-      "AS b FROM t')");
-  REQUIRE(ntile->HasError());
-  REQUIRE(ntile->GetError().find("non-constant bucket count") !=
-         std::string::npos);
-
   auto nth_value = harness.query(
       "SELECT * FROM dbsp_create_view('w_nth', "
       "'SELECT grp, tidx, NTH_VALUE(v, 3) OVER (PARTITION BY grp ORDER BY "
@@ -471,4 +466,83 @@ TEST_CASE("NTILE and NTH_VALUE constant args stay gated (scope boundary)",
       "FROM t')");
   REQUIRE(nth_value->HasError());
   REQUIRE(nth_value->GetError().find("non-constant N") != std::string::npos);
+}
+
+// NTILE(n) differential vs stock DuckDB, covering every bucket-boundary
+// regime the fixed algorithm (dbsp_window_view.hpp) has to get right, all
+// in one partitioned query so a single dbsp_query/stock comparison covers
+// them: grp=1 (9 rows, NTILE(3)) is the p % n == 0 case (3 rows/bucket
+// evenly); grp=2 (8 rows, NTILE(3)) is p % n != 0 (buckets of 3, 3, 2 --
+// the first p%n buckets get the extra row); grp=3 (2 rows, NTILE(3)) is
+// n > p (more buckets than rows -- stock assigns buckets 1..p one row each
+// and buckets p+1..n never appear); grp=4 (1 row, NTILE(3)) is a
+// single-row partition, also n > p. The pre-fix formula
+// (floor(row_idx*n/p)+1) only diverges from stock in the n > p cases
+// (grp=3, grp=4), which is why the old gated-scope test above only needed
+// two groups; this test's grp=3/grp=4 are the ones that actually exercise
+// the bug this fix addresses.
+TEST_CASE("NTILE bucket assignment differential vs stock DuckDB",
+          "[integration][window][ntile]") {
+  DuckDBTestHarness harness;
+  harness.exec("CREATE TABLE t (grp INTEGER, tidx INTEGER)");
+  for (int i = 0; i < 9; i++) {
+    harness.exec("INSERT INTO t VALUES (1, " + std::to_string(i) + ")");
+  }
+  for (int i = 0; i < 8; i++) {
+    harness.exec("INSERT INTO t VALUES (2, " + std::to_string(i) + ")");
+  }
+  for (int i = 0; i < 2; i++) {
+    harness.exec("INSERT INTO t VALUES (3, " + std::to_string(i) + ")");
+  }
+  harness.exec("INSERT INTO t VALUES (4, 0)");
+  harness.exec("SELECT * FROM dbsp_track('t')");
+  harness.exec("SELECT * FROM dbsp_sync('t')");
+
+  const std::string sql = "SELECT grp, tidx, NTILE(3) OVER (PARTITION BY "
+                          "grp ORDER BY tidx) AS b FROM t";
+  auto create =
+      harness.query("SELECT * FROM dbsp_create_view('w_ntile', '" + sql + "')");
+  INFO("create error: " << (create->HasError() ? create->GetError() : "none"));
+  REQUIRE_FALSE(create->HasError());
+
+  requireViewMatchesQuery(harness, "w_ntile", sql);
+}
+
+// Post-edit re-render: NTILE has no fast-path rule (affected_indices()
+// only knows LAG/LEAD/SUM/COUNT/AVG/MIN/MAX), so every edit to an
+// NTILE-bearing partition -- structural or not -- goes through the
+// full-partition re-render loop in apply_changes() (the second of the two
+// call sites fixed by this change), not render_row()'s fast-path copy.
+// This walks one partition's row count p through the n > p / p == n /
+// p % n != 0 regimes via INSERT and DELETE, re-checking against stock
+// after each edit.
+TEST_CASE("NTILE bucket assignment differential vs stock after "
+          "INSERT/DELETE change partition size",
+          "[integration][window][ntile]") {
+  DuckDBTestHarness harness;
+  harness.exec("CREATE TABLE t (grp INTEGER, tidx INTEGER)");
+  // Start at p=2, n=5 (n > p): buckets 1,2 get one row each, 3-5 empty.
+  harness.exec("INSERT INTO t VALUES (1, 0), (1, 1)");
+  harness.exec("SELECT * FROM dbsp_track('t')");
+  harness.exec("SELECT * FROM dbsp_sync('t')");
+
+  const std::string sql =
+      "SELECT grp, tidx, NTILE(5) OVER (PARTITION BY grp ORDER BY tidx) AS "
+      "b FROM t";
+  auto create =
+      harness.query("SELECT * FROM dbsp_create_view('w_ntile_edit', '" +
+                    sql + "')");
+  REQUIRE_FALSE(create->HasError());
+  requireViewMatchesQuery(harness, "w_ntile_edit", sql);
+
+  // INSERT to p=5, n=5 (p == n): every bucket gets exactly one row.
+  harness.exec("INSERT INTO t VALUES (1, 2), (1, 3), (1, 4)");
+  harness.exec("SELECT * FROM dbsp_sync('t')");
+  requireViewMatchesQuery(harness, "w_ntile_edit", sql);
+
+  // DELETE back to p=3, n=5 (n > p again, different remainder than the
+  // p=2 start): buckets 1-3 get one row each, 4-5 empty.
+  harness.exec("DELETE FROM t WHERE tidx IN (3, 4)");
+  harness.exec("SELECT * FROM dbsp_sync('t')");
+  requireViewMatchesQuery(harness, "w_ntile_edit", sql);
 }

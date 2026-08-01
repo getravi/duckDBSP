@@ -20,14 +20,20 @@ subsystem, bespoke parser, standalone Z-set spilling).
 - string_agg/array_agg WITHOUT ORDER BY inside the aggregate (result
   order unreproducible incrementally; the ordered forms are supported —
   ties on order keys break by value, not input order)
-- NTILE bucket count / NTH_VALUE N — rejected even as a literal constant
-  (e.g. `NTILE(4)`), unlike window frame bounds and LAG/LEAD offsets which
-  now accept constants. Deliberately kept gated: NTILE's bucket-boundary
-  math (`NativeWindowView::render_row`) already diverges from stock
-  DuckDB for uneven partition sizes — found during the 2026-07-31
-  constant-folding fix, see CHANGELOG. Fix the algorithm first, then widen
-  the gate (`bare_constant_int` -> `constant_int` at those two call sites
-  in `dbsp_plan_translator.hpp`).
+- NTH_VALUE's N — rejected even as a literal constant (e.g. `NTH_VALUE(v,
+  3)`), unlike window frame bounds, LAG/LEAD offsets, and (as of the
+  2026-07-31 lazy-restore-ntile fix) NTILE's bucket count, all of which
+  now accept constants. Deliberately kept gated: `NativeWindowView`'s
+  NTH_VALUE render logic (both call sites in
+  `include/dbsp_window_view.hpp`) always indexes the N-th row of the
+  whole partition, ignoring the window's frame bounds — diverges from
+  stock DuckDB's frame-relative NTH_VALUE whenever the frame is narrower
+  than the full partition (the common case, since the default frame is
+  `RANGE UNBOUNDED PRECEDING AND CURRENT ROW`), see CHANGELOG. Fix
+  NTH_VALUE to index within `[frame_start, frame_end]` like the aggregate
+  branch beside it does, then widen the gate (`bare_constant_int` ->
+  `constant_int` at its one remaining call site in
+  `dbsp_plan_translator.hpp`).
 
 ## Performance
 

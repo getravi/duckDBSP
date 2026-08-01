@@ -173,11 +173,27 @@ private:
           out_row.columns.push_back(duckdb::Value());
         }
       } else if (win.function == "NTILE") {
-        int num_buckets = win.offset;
+        // Stock semantics (DuckDB's WindowNtileExecutor,
+        // duckdb/src/function/window/window_rownumber_function.cpp): if
+        // there are more buckets than rows, clamp to one row per bucket
+        // (buckets beyond the row count are simply empty). Otherwise every
+        // bucket gets n_size = p/n rows, except the first n_large = p - n *
+        // n_size buckets which get one extra row each. This is NOT the
+        // same as `floor(row_idx * n / p) + 1` (the previous formula
+        // here), which only coincides with the correct answer when
+        // n <= p and skips bucket numbers when n > p.
+        int64_t total = (int64_t)rows.size();
+        int64_t num_buckets = win.offset;
         if (num_buckets <= 0)
           num_buckets = 1;
-        int64_t total = rows.size();
-        int64_t bucket = ((int64_t)row_idx * num_buckets) / total + 1;
+        if (num_buckets > total)
+          num_buckets = total;
+        int64_t n_size = total / num_buckets;
+        int64_t n_large = total - num_buckets * n_size;
+        int64_t i_small = n_large * (n_size + 1);
+        int64_t idx = (int64_t)row_idx;
+        int64_t bucket = idx < i_small ? 1 + idx / (n_size + 1)
+                                       : 1 + n_large + (idx - i_small) / n_size;
         out_row.columns.push_back(duckdb::Value(bucket));
       } else {
         // Aggregates over frame [frame_start, frame_end]
@@ -878,11 +894,23 @@ public:
               out_row.columns.push_back(duckdb::Value());
             }
           } else if (win.function == "NTILE") {
-            int num_buckets = win.offset; // NTILE(N)
+            // Same stock-matching algorithm as the render_row() copy of
+            // this branch above -- see the comment there for the
+            // derivation and why the old `floor(row_idx * n / p) + 1`
+            // formula was wrong for n > p (more buckets than rows).
+            int64_t total = (int64_t)partition_rows.size();
+            int64_t num_buckets = win.offset; // NTILE(N)
             if (num_buckets <= 0)
               num_buckets = 1;
-            int64_t total = partition_rows.size();
-            int64_t bucket = ((int64_t)row_idx * num_buckets) / total + 1;
+            if (num_buckets > total)
+              num_buckets = total;
+            int64_t n_size = total / num_buckets;
+            int64_t n_large = total - num_buckets * n_size;
+            int64_t i_small = n_large * (n_size + 1);
+            int64_t idx = (int64_t)row_idx;
+            int64_t bucket = idx < i_small
+                                 ? 1 + idx / (n_size + 1)
+                                 : 1 + n_large + (idx - i_small) / n_size;
             out_row.columns.push_back(duckdb::Value(bucket));
           } else {
             // Aggregates: Evaluated over frame

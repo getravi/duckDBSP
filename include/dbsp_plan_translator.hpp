@@ -5404,16 +5404,21 @@ private:
     // `11 PRECEDING` arrives as CAST(11 AS BIGINT)), so unwrap any chain of
     // BOUND_CAST nodes before checking for BOUND_CONSTANT underneath.
     //
-    // Used only for window frame bounds (start_expr/end_expr) and LAG/LEAD
-    // offsets -- the shapes this task verified against the render_row /
-    // affected_indices machinery. NTILE's bucket count and NTH_VALUE's N
-    // deliberately keep using bare_constant_int (unchanged, still gated):
-    // the same BOUND_CAST shell reaches them, but a differential check
-    // during this task found NTILE's bucket-boundary math already diverges
-    // from stock DuckDB (confirmed pre-existing, unrelated to this fix) --
-    // widening the gate there would silently ship a broken feature instead
-    // of a loud "unsupported" error. See docs/superpowers/plans/2026-07-31-
-    // cold-restore-attack.md Task 1 report.
+    // Used for window frame bounds (start_expr/end_expr), LAG/LEAD offsets,
+    // and -- as of the lazy-restore-ntile fix -- NTILE's bucket count:
+    // NativeWindowView's NTILE bucket-boundary math (both render call
+    // sites in include/dbsp_window_view.hpp) was rewritten to match stock
+    // DuckDB's WindowNtileExecutor first, so widening the gate here no
+    // longer ships a silently-wrong result. NTH_VALUE's N deliberately
+    // keeps using bare_constant_int (unchanged, still gated): reading its
+    // render logic found it always indexes the N-th row of the whole
+    // PARTITION, ignoring the window's frame bounds entirely -- diverges
+    // from stock DuckDB's frame-relative NTH_VALUE whenever the frame is
+    // narrower than the full partition (the common case, since the
+    // default frame is RANGE UNBOUNDED PRECEDING AND CURRENT ROW).
+    // Widening NTH_VALUE's gate needs that fixed first. See
+    // docs/superpowers/plans/2026-07-31-lazy-restore-ntile.md Task 2 and
+    // TODO.md.
     static bool constant_int(const duckdb::Expression &expr, int64_t &out) {
       const duckdb::Expression *cur = &expr;
       while (cur->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CAST) {
@@ -5495,7 +5500,7 @@ private:
           break;
         case duckdb::ExpressionType::WINDOW_NTILE:
           def.function = "NTILE";
-          if (w.children.empty() || !bare_constant_int(*w.children[0], n)) {
+          if (w.children.empty() || !constant_int(*w.children[0], n)) {
             return unsupported("NTILE with non-constant bucket count");
           }
           def.offset = static_cast<int>(n);
