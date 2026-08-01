@@ -1738,6 +1738,21 @@ public:
       // buffers), and on big views it pins the full result a second
       // time — drop it now.
       views_[view_name]->drop_delta();
+      // Bounded-RAM Phase 1b: mirror the new view's result to its
+      // __mv_ table (internal connection; guard keeps hooks out).
+      mv_db_ = &duckdb::DatabaseInstance::GetDatabase(context);
+      if (mv_tables_enabled_.load()) {
+        InternalQueryGuard mv_guard;
+        try {
+          duckdb::Connection mv_con(*mv_db_);
+          if (!mv_write_full(mv_con, view_name, *views_[view_name])) {
+            mv_tables_enabled_ = false;
+          }
+        } catch (const std::exception &e) {
+          last_error_ = std::string("mv mirror failed: ") + e.what();
+          mv_tables_enabled_ = false;
+        }
+      }
     }
 
     return true;
@@ -2988,6 +3003,220 @@ public:
   // stepped) view's delta is legitimately empty either way -- decoding
   // its stash here would pay the blob_decode cost for a value realization
   // cannot change, defeating the point of staying lazy.
+  // ---- Bounded-RAM Phase 1b: disk-backed MV results (__mv_* tables) ----
+  // All writers run on an internal connection under InternalQueryGuard —
+  // the commit hooks skip internal queries, so mirroring a view result
+  // never re-enters the manager. Any failure disables mirroring loudly
+  // (last_error_) rather than serving a silently-stale table.
+
+  static std::string mv_quote(const std::string &ident) {
+    std::string out = "\"";
+    for (char c : ident) {
+      if (c == '"') {
+        out += "\"\"";
+      } else {
+        out += c;
+      }
+    }
+    out += "\"";
+    return out;
+  }
+
+  static std::string mv_table_for(const std::string &view_name) {
+    return "__mv_" + view_name;
+  }
+
+  bool mv_tables_enabled() const { return mv_tables_enabled_.load(); }
+
+  // Enable/disable mirroring. Enabling backfills a table for every
+  // registered view from its current circuit result.
+  bool set_mv_tables(duckdb::ClientContext &context, bool enable) {
+    if (!enable) {
+      mv_tables_enabled_ = false;
+      return true;
+    }
+    std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    std::shared_lock<std::shared_mutex> view_lock(view_mutex_);
+    mv_db_ = &duckdb::DatabaseInstance::GetDatabase(context);
+    InternalQueryGuard guard;
+    try {
+      duckdb::Connection con(*mv_db_);
+      for (const auto &[name, view] : views_) {
+        if (!mv_write_full(con, name, *view)) {
+          return false;
+        }
+      }
+      mv_tables_enabled_ = true;
+      return true;
+    } catch (const std::exception &e) {
+      last_error_ = std::string("mv_tables enable failed: ") + e.what();
+      return false;
+    }
+  }
+
+private:
+  std::string mv_columns_ddl(const TableSchema &schema) const {
+    std::string ddl;
+    for (size_t i = 0; i < schema.columns.size(); i++) {
+      if (i > 0) {
+        ddl += ", ";
+      }
+      ddl += mv_quote(schema.columns[i].name) + " " +
+             schema.columns[i].type.ToString();
+    }
+    return ddl;
+  }
+
+  void mv_append_rows(duckdb::Connection &con, const std::string &table,
+                      const DuckDBZSet &rows, bool with_weight) {
+    duckdb::Appender appender(con, table);
+    for (const auto &[row, w] : rows) {
+      const int64_t copies = with_weight ? 1 : w;
+      for (int64_t k = 0; k < copies; k++) {
+        appender.BeginRow();
+        for (const auto &v : row.columns) {
+          appender.Append<duckdb::Value>(v);
+        }
+        if (with_weight) {
+          appender.Append<int64_t>(w);
+        }
+        appender.EndRow();
+      }
+    }
+    appender.Close();
+  }
+
+  bool mv_write_full(duckdb::Connection &con, const std::string &name,
+                     const NativeMaterializedView &view) {
+    const auto &schema = view.result_schema();
+    if (schema.columns.empty()) {
+      return true; // nothing to mirror (schema-less legacy view)
+    }
+    const std::string qt = mv_quote(mv_table_for(name));
+    auto res = con.Query("CREATE OR REPLACE TABLE " + qt + " (" +
+                         mv_columns_ddl(schema) + ")");
+    if (res->HasError()) {
+      last_error_ = "mv table create failed: " + res->GetError();
+      return false;
+    }
+    for (const auto &[row, w] : view.get_result()) {
+      (void)row;
+      if (w < 0) {
+        last_error_ = "mv mirror: negative weight in result of " + name;
+        return false;
+      }
+    }
+    mv_append_rows(con, mv_table_for(name), view.get_result(),
+                   /*with_weight=*/false);
+    return mv_meta_upsert(con, name);
+  }
+
+  bool mv_apply_delta(duckdb::Connection &con, const std::string &name,
+                      const NativeMaterializedView &view,
+                      const DuckDBZSet &delta) {
+    // Fast path needs every delta weight at ±1 (retract exactly one copy
+    // per row). Anything else — multiplicities — takes the full rewrite.
+    for (const auto &[row, w] : delta) {
+      (void)row;
+      if (w != 1 && w != -1) {
+        return mv_write_full(con, name, view);
+      }
+    }
+    const auto &schema = view.result_schema();
+    if (schema.columns.empty()) {
+      return true;
+    }
+    const std::string qt = mv_quote(mv_table_for(name));
+    auto res = con.Query("CREATE OR REPLACE TEMP TABLE __mv_stage (" +
+                         mv_columns_ddl(schema) + ", __w BIGINT)");
+    if (res->HasError()) {
+      last_error_ = "mv stage create failed: " + res->GetError();
+      return false;
+    }
+    mv_append_rows(con, "__mv_stage", delta, /*with_weight=*/true);
+    std::string match;
+    for (size_t i = 0; i < schema.columns.size(); i++) {
+      if (i > 0) {
+        match += " AND ";
+      }
+      const std::string c = mv_quote(schema.columns[i].name);
+      match += "t." + c + " IS NOT DISTINCT FROM s." + c;
+    }
+    res = con.Query("DELETE FROM " + qt + " t USING __mv_stage s WHERE " +
+                    "s.__w < 0 AND " + match);
+    if (res->HasError()) {
+      last_error_ = "mv delete failed: " + res->GetError();
+      return false;
+    }
+    std::string cols;
+    for (size_t i = 0; i < schema.columns.size(); i++) {
+      if (i > 0) {
+        cols += ", ";
+      }
+      cols += mv_quote(schema.columns[i].name);
+    }
+    res = con.Query("INSERT INTO " + qt + " SELECT " + cols +
+                    " FROM __mv_stage WHERE __w > 0");
+    if (res->HasError()) {
+      last_error_ = "mv insert failed: " + res->GetError();
+      return false;
+    }
+    con.Query("DROP TABLE __mv_stage");
+    return mv_meta_upsert(con, name);
+  }
+
+  bool mv_meta_upsert(duckdb::Connection &con, const std::string &name) {
+    auto res = con.Query("CREATE TABLE IF NOT EXISTS __dbsp_mv_meta ("
+                         "view_name VARCHAR PRIMARY KEY, commit_seq BIGINT)");
+    if (res->HasError()) {
+      last_error_ = "mv meta create failed: " + res->GetError();
+      return false;
+    }
+    res = con.Query("INSERT OR REPLACE INTO __dbsp_mv_meta VALUES ('" +
+                    escape_string(name) + "', " +
+                    std::to_string(commit_seq_.load()) + ")");
+    if (res->HasError()) {
+      last_error_ = "mv meta upsert failed: " + res->GetError();
+      return false;
+    }
+    return true;
+  }
+
+  // Mirror the deltas of this pass's touched views. Runs at the end of
+  // propagate_changes, locks held; InternalQueryGuard keeps the hooks out.
+  // ONE internal transaction per pass: either every touched view's table
+  // advances together with the meta rows, or none do.
+  void mv_after_propagate(const std::vector<std::string> &touched) {
+    if (!mv_tables_enabled_.load() || mv_db_ == nullptr || touched.empty()) {
+      return;
+    }
+    InternalQueryGuard guard;
+    try {
+      duckdb::Connection con(*mv_db_);
+      con.Query("BEGIN");
+      for (const auto &name : touched) {
+        auto it = views_.find(name);
+        if (it == views_.end()) {
+          continue;
+        }
+        const auto &delta = it->second->get_batch_delta();
+        if (delta.empty()) {
+          continue;
+        }
+        if (!mv_apply_delta(con, name, *it->second, delta)) {
+          con.Query("ROLLBACK");
+          mv_tables_enabled_ = false;
+          return;
+        }
+      }
+      con.Query("COMMIT");
+    } catch (const std::exception &e) {
+      last_error_ = std::string("mv mirror failed: ") + e.what();
+      mv_tables_enabled_ = false;
+    }
+  }
+
+public:
   // Per-view resident-state accounting (bounded-RAM Phase 0): one
   // StateAccounting spans the whole scan so H6 payload-shared rows are
   // counted once — per-view attribution of a shared payload goes to the
@@ -4121,6 +4350,7 @@ private:
       return r;
     };
 
+    std::vector<std::string> mv_touched;
     for (const auto &level : levels) {
       std::vector<StepResult> results;
       results.reserve(level.size());
@@ -4179,9 +4409,14 @@ private:
         if (r.applied == 0 || !r.delta || r.delta->empty())
           continue;
         pending[r.view_name] = r.delta;
+        mv_touched.push_back(r.view_name);
         apply_to_arrangements(r.view_name, *r.delta);
       }
     }
+
+    // Bounded-RAM Phase 1b: mirror this pass's deltas into the __mv_
+    // backing tables (one internal transaction for the whole pass).
+    mv_after_propagate(mv_touched);
   }
 
   // Update every live shared arrangement over `name` with `delta`; prune
@@ -4380,6 +4615,12 @@ private:
   // Strictly monotonic created_at stamp for view definitions (see
   // create_view) — written under struct_mutex_ exclusive.
   uint64_t last_created_at_ = 0;
+  // Bounded-RAM Phase 1b: disk-backed MV results. When enabled, every MV
+  // mirrors its result into a __mv_<name> table in the same database
+  // (full write at create/enable, per-commit delta apply after each
+  // propagation). Reads still come from circuit state until Phase 1c.
+  std::atomic<bool> mv_tables_enabled_{false};
+  duckdb::DatabaseInstance *mv_db_ = nullptr; // captured at create_view
   std::atomic<uint64_t> capture_guard_fallbacks_{0};
   std::atomic<bool> write_capture_enabled_{true};
   // D3c lazy baselines: count of deferred tables (lock-free hot-path

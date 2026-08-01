@@ -94,6 +94,7 @@ unique_ptr<FunctionData> TrackBind(ClientContext &context,
                                    TableFunctionBindInput &input,
                                    vector<LogicalType> &return_types,
                                    vector<string> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<TrackBindData>();
 
   if (input.inputs.empty()) {
@@ -158,6 +159,7 @@ unique_ptr<FunctionData> CreateViewBind(ClientContext &context,
                                         TableFunctionBindInput &input,
                                         vector<LogicalType> &return_types,
                                         vector<string> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<CreateViewBindData>();
 
   if (input.inputs.size() < 2) {
@@ -277,6 +279,7 @@ unique_ptr<FunctionData> NotifyBind(ClientContext &context,
                                     TableFunctionBindInput &input,
                                     vector<LogicalType> &return_types,
                                     vector<string> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<NotifyBindData>();
 
   if (input.inputs.size() < 2) {
@@ -344,6 +347,7 @@ unique_ptr<FunctionData> SyncBind(ClientContext &context,
                                   TableFunctionBindInput &input,
                                   vector<LogicalType> &return_types,
                                   vector<string> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<SyncBindData>();
 
   if (input.inputs.empty()) {
@@ -397,6 +401,7 @@ unique_ptr<FunctionData> QueryBind(ClientContext &context,
                                    TableFunctionBindInput &input,
                                    vector<LogicalType> &return_types,
                                    vector<string> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<QueryBindData>();
 
   if (input.inputs.empty()) {
@@ -487,6 +492,7 @@ unique_ptr<FunctionData> ChangesBind(ClientContext &context,
                                      TableFunctionBindInput &input,
                                      vector<LogicalType> &return_types,
                                      vector<string> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<ChangesBindData>();
 
   if (input.inputs.empty()) {
@@ -547,6 +553,55 @@ void ChangesFunc(ClientContext &context, TableFunctionInput &input,
 }
 
 // ============================================================================
+// dbsp_mv_tables - Toggle disk-backed MV result tables (__mv_<view>)
+// Usage: SELECT * FROM dbsp_mv_tables(true);
+// Enabling backfills a __mv_ table per registered view and keeps them in
+// sync per commit (one internal transaction per propagation pass, plus a
+// __dbsp_mv_meta watermark row per view). Disabling stops mirroring and
+// leaves the tables as-is (stale until re-enabled).
+// ============================================================================
+
+struct MvTablesBindData : public TableFunctionData {
+  string message;
+  bool done = false;
+};
+
+unique_ptr<FunctionData> MvTablesBind(ClientContext &context,
+                                      TableFunctionBindInput &input,
+                                      vector<LogicalType> &return_types,
+                                      vector<string> &names) {
+  EnsureContextState(context);
+  auto data = make_uniq<MvTablesBindData>();
+  if (input.inputs.empty()) {
+    throw InvalidInputException("dbsp_mv_tables(enable)");
+  }
+  const bool enable = input.inputs[0].GetValue<bool>();
+  auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
+  if (manager.set_mv_tables(context, enable)) {
+    data->message = enable ? "MV result tables ENABLED" : "MV result tables DISABLED";
+  } else {
+    throw InvalidInputException("dbsp_mv_tables failed: " +
+                                manager.last_error());
+  }
+  return_types.push_back(LogicalType::VARCHAR);
+  names.push_back("result");
+  return std::move(data);
+}
+
+void MvTablesFunc(ClientContext &context, TableFunctionInput &input,
+                  DataChunk &output) {
+  auto &data = input.bind_data->CastNoConst<MvTablesBindData>();
+  if (data.done) {
+    output.SetCardinality(0);
+    return;
+  }
+  output.SetValue(0, 0, Value(data.message));
+  output.SetCardinality(1);
+  data.done = true;
+}
+
+// ============================================================================
 // dbsp_view_state - Per-view resident circuit-state bytes by class
 // Usage: SELECT * FROM dbsp_view_state();
 // Columns: view_name, result_bytes, arrangement_bytes, window_bytes,
@@ -568,6 +623,7 @@ unique_ptr<FunctionData> ViewStateBind(ClientContext &context,
                                        TableFunctionBindInput &input,
                                        vector<LogicalType> &return_types,
                                        vector<string> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<ViewStateBindData>();
 
   auto &manager = dbsp_native::get_cdc_manager(context);
@@ -627,6 +683,7 @@ unique_ptr<FunctionData> DeltaGenerationsBind(ClientContext &context,
                                               TableFunctionBindInput &input,
                                               vector<LogicalType> &return_types,
                                               vector<string> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<DeltaGenerationsBindData>();
 
   auto &manager = dbsp_native::get_cdc_manager(context);
@@ -671,6 +728,7 @@ unique_ptr<FunctionData> ListViewsBind(ClientContext &context,
                                        TableFunctionBindInput &input,
                                        vector<LogicalType> &return_types,
                                        vector<string> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<ListViewsBindData>();
 
   auto &manager = dbsp_native::get_cdc_manager(context);
@@ -723,6 +781,7 @@ unique_ptr<FunctionData> ListTablesBind(ClientContext &context,
                                         TableFunctionBindInput &input,
                                         vector<LogicalType> &return_types,
                                         vector<string> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<ListTablesBindData>();
 
   auto &manager = dbsp_native::get_cdc_manager(context);
@@ -770,6 +829,7 @@ unique_ptr<FunctionData> StatsBind(ClientContext &context,
                                    TableFunctionBindInput &input,
                                    vector<LogicalType> &return_types,
                                    vector<string> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<StatsBindData>();
   auto &manager = dbsp_native::get_cdc_manager(context);
   data->metrics = {
@@ -860,6 +920,7 @@ unique_ptr<FunctionData> SaveBind(ClientContext &context,
                                   TableFunctionBindInput &input,
                                   vector<LogicalType> &return_types,
                                   vector<string> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<SaveBindData>();
 
   if (input.inputs.empty()) {
@@ -964,6 +1025,7 @@ unique_ptr<FunctionData> LoadBind(ClientContext &context,
                                   TableFunctionBindInput &input,
                                   vector<LogicalType> &return_types,
                                   vector<string> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<LoadBindData>();
 
   if (input.inputs.empty()) {
@@ -1082,6 +1144,7 @@ unique_ptr<FunctionData> DepsBind(ClientContext &context,
                                   TableFunctionBindInput &input,
                                   vector<LogicalType> &return_types,
                                   vector<string> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<DepsBindData>();
 
   if (input.inputs.empty()) {
@@ -1146,6 +1209,7 @@ unique_ptr<FunctionData> AutoSyncBind(ClientContext &context,
                                       TableFunctionBindInput &input,
                                       vector<LogicalType> &return_types,
                                       vector<string> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<AutoSyncBindData>();
 
   if (input.inputs.empty()) {
@@ -1209,6 +1273,7 @@ unique_ptr<FunctionData> AutoPersistBind(ClientContext &context,
                                          TableFunctionBindInput &input,
                                          vector<LogicalType> &return_types,
                                          vector<string> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<AutoPersistBindData>();
 
   if (input.inputs.empty()) {
@@ -1342,6 +1407,7 @@ unique_ptr<FunctionData> LazyRestoreBind(ClientContext &context,
                                          TableFunctionBindInput &input,
                                          vector<LogicalType> &return_types,
                                          vector<string> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<LazyRestoreBindData>();
 
   if (input.inputs.empty()) {
@@ -1407,6 +1473,7 @@ unique_ptr<FunctionData> ParallelBind(ClientContext &context,
                                       TableFunctionBindInput &input,
                                       vector<LogicalType> &return_types,
                                       vector<string> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<ParallelBindData>();
   if (input.inputs.empty()) {
     data->query_only = true;
@@ -1461,6 +1528,7 @@ unique_ptr<FunctionData> SpillBind(ClientContext &context,
                                    TableFunctionBindInput &input,
                                    vector<LogicalType> &return_types,
                                    vector<string> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<SpillBindData>();
   if (input.inputs.empty()) {
     data->query_only = true;
@@ -1517,6 +1585,7 @@ unique_ptr<FunctionData> UsePlannerBind(ClientContext &context,
                                         TableFunctionBindInput &input,
                                         vector<LogicalType> &return_types,
                                         vector<string> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<UsePlannerBindData>();
 
   if (input.inputs.empty()) {
@@ -2085,6 +2154,10 @@ static void LoadInternal(ExtensionLoader &loader) {
   TableFunction view_state_func("dbsp_view_state", {}, ViewStateFunc,
                                 ViewStateBind);
   loader.RegisterFunction(view_state_func);
+
+  TableFunction mv_tables_func("dbsp_mv_tables", {LogicalType::BOOLEAN},
+                               MvTablesFunc, MvTablesBind);
+  loader.RegisterFunction(mv_tables_func);
 
   TableFunction list_views_func("dbsp_views", {}, ListViewsFunc, ListViewsBind);
   loader.RegisterFunction(list_views_func);

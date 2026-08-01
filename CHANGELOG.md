@@ -1,5 +1,27 @@
 # Changelog
 
+## Bounded-RAM Phase 1b: disk-backed MV result tables + lost-update fix - Aug 2026
+
+- **dbsp_mv_tables(enable)**: every view mirrors its result into a
+  `__mv_<view>` table in the same database file, backfilled at enable/create
+  and delta-maintained per propagation pass (one internal transaction; ±1
+  weights via staged DELETE+INSERT, anything else full-rewrite);
+  `__dbsp_mv_meta` watermarks each write. Measured on the 141-view DAG:
+  backfill 4.2s, 168MB on disk, edits 0.04-0.44s, 80/80 views identical to
+  their tables after an edit run. Internal writes run under
+  InternalQueryGuard — commit hooks never re-enter the manager.
+- **Fixed (pre-existing, exposed by the new test): first write after a
+  TF-triggered autoload silently LOST.** Table-function binds called
+  maybe_autoload without EnsureContextState, so a connection whose first
+  DBSP call was a TF (python clients) had no QueryBegin hook: the next
+  UPDATE skipped pre-write deferred-baseline materialization, the commit
+  path saw a watermark mismatch, declared a false out-of-band change, and
+  dropped the update (views stale until manual rebuild). Every TF bind now
+  ensures context state. Repro: reopen -> dbsp_views() -> UPDATE.
+- **Tests**: test/python/test_mv_tables.py (parity across agg/join/window/
+  recursive/chained/duplicate-row shapes, reopen durability, disable);
+  ctest 44/44.
+
 ## Bounded-RAM Phase 1a: transient node outputs dropped post-step - Aug 2026
 
 - **Why**: every circuit node's `output_` z-set kept its LAST step's rows for

@@ -822,6 +822,24 @@ across cores.
 SELECT * FROM dbsp_parallel(true);
 ```
 
+### dbsp_mv_tables(enable)
+
+Disk-backed MV results (bounded-RAM Phase 1b, default off): every registered
+view mirrors its result into a `__mv_<view>` table in the same database —
+backfilled on enable and at view creation, then kept in sync with one
+internal transaction per propagation pass. `__dbsp_mv_meta(view_name,
+commit_seq)` records the watermark of each table's last write. Backing
+tables are ordinary tables: durable across reopen and readable without any
+DBSP state. Disabling stops mirroring and leaves the tables stale.
+
+```sql
+SELECT * FROM dbsp_mv_tables(true);
+```
+
+Per-commit apply is DELETE (retractions) + INSERT (additions) via a staged
+temp table; any delta weight beyond ±1 falls back to a full table rewrite.
+Reads still come from circuit state (`dbsp_query`) until Phase 1c.
+
 ### dbsp_spill(enable)
 
 Toggle disk-backed state (default off): tracked-table baselines, join
