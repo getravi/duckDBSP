@@ -2898,6 +2898,25 @@ public:
 
   const DuckDBZSet &output() const { return view_->get_delta(); }
 
+  // Checkpointing (Task 2, restore-tail): delegate straight to the wrapped
+  // view's own per-node hooks (NativeMaterializedView::circuit_state_kind/
+  // serialize_circuit_node_state/restore_circuit_node_state -- see their
+  // doc comment in dbsp_duckdb_types.hpp for why these are separate from
+  // checkpointable()/serialize_circuit_state()/restore_circuit_state()).
+  // This node is a single leaf to the OUTER circuit's checkpoint walk
+  // (SingleSourceCircuitView::checkpointable() etc. iterate circuit_'s
+  // dbsp::Node objects and call exactly these three methods on each), so
+  // whatever the wrapped view reports IS this node's own state_kind.
+  StateKind state_kind() const override { return view_->circuit_state_kind(); }
+
+  void serialize_state(std::vector<uint8_t> &out) const override {
+    view_->serialize_circuit_node_state(out);
+  }
+
+  bool restore_state(const uint8_t *data, size_t len) override {
+    return view_->restore_circuit_node_state(data, len);
+  }
+
 private:
   InputFn input_fn_;
   std::unique_ptr<NativeMaterializedView> view_;

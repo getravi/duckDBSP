@@ -794,3 +794,135 @@ TEST_CASE("recursive-view checkpoint: post-restore max_iterations_ trip "
     REQUIRE(rows[0][1].GetValue<int32_t>() == 0);
     REQUIRE(rows[0][2].GetValue<double>() == 10.0);
 }
+
+// Task 2 (restore-tail): NativeWindowView checkpoint state via
+// EmbeddedViewNode.
+//
+// EmbeddedViewNode previously had no state_kind() override at all, so
+// EVERY embedded view (window, sort/limit, distinct on) fell back to a
+// full rebuild-by-replay on load regardless of shape. This extends
+// SERIALIZABLE to NativeWindowView specifically, via a new
+// NativeMaterializedView::circuit_state_kind()/serialize_circuit_node_
+// state()/restore_circuit_node_state() triple EmbeddedViewNode delegates
+// to (see dbsp_duckdb_types.hpp), by round-tripping partitions_' ordered
+// per-partition source rows and partition_outputs_' rendered-output
+// cache. NativeSortView/NativeLimitView/NativeDistinctOnView stay
+// UNSUPPORTED this pass (still no override on the base default).
+namespace {
+
+const char *kWindowSql =
+    "SELECT p, t, v, SUM(v) OVER (PARTITION BY p ORDER BY t "
+    "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM wsrc";
+
+void seedWindowTable(DuckDBTestHarness &db) {
+    db.exec("CREATE TABLE wsrc (p INTEGER, t INTEGER, v DOUBLE)");
+    db.exec("SELECT * FROM dbsp_track('wsrc')");
+    // p=1's t=1 row is NULL on purpose: its bounded 1-PRECEDING..CURRENT
+    // frame at t=1 is [t=0, t=1] = [5.0, NULL] -> sum=5.0 (NULL ignored,
+    // not an all-NULL frame yet). The round-trip test below blanks t=0
+    // post-restore, which turns BOTH t=0's own frame ([NULL]) and t=1's
+    // frame ([NULL, NULL]) fully NULL -- the recent all-NULL SUM fix
+    // (66b3806) must still hold after a checkpoint round-trip.
+    db.exec("INSERT INTO wsrc VALUES "
+            "(1,0,5.0),(1,1,NULL),(1,2,7.0),"
+            "(2,0,1.0),(2,1,2.0),(2,2,3.0)");
+    db.exec("SELECT * FROM dbsp_sync('wsrc')");
+    db.exec("SELECT * FROM dbsp_use_planner(true)");
+}
+
+} // namespace
+
+TEST_CASE("window-view checkpoint: state_kind gate for a window embedded "
+          "view vs a sort/limit embedded view",
+          "[integration][checkpoint][window]") {
+    DuckDBTestHarness db;
+    seedWindowTable(db);
+
+    db.exec("SELECT * FROM dbsp_create_view('v_win', '" +
+            std::string(kWindowSql) + "')");
+    REQUIRE(db.manager().get_view("v_win")->checkpointable());
+
+    // Bare ORDER BY (no window function) builds a NativeSortView behind
+    // the SAME EmbeddedViewNode wrapper -- proves state_kind() actually
+    // dispatches per wrapped-view kind rather than treating every
+    // EmbeddedViewNode as checkpointable once ANY shape graduates.
+    const std::string sort_sql = "SELECT p, t, v FROM wsrc ORDER BY v DESC";
+    db.exec("SELECT * FROM dbsp_create_view('v_sort', '" + sort_sql + "')");
+    REQUIRE_FALSE(db.manager().get_view("v_sort")->checkpointable());
+
+    // ORDER BY + LIMIT builds a NativeLimitView, same wrapper, same
+    // decline.
+    const std::string limit_sql =
+        "SELECT p, t, v FROM wsrc ORDER BY v DESC LIMIT 3";
+    db.exec("SELECT * FROM dbsp_create_view('v_limit', '" + limit_sql + "')");
+    REQUIRE_FALSE(db.manager().get_view("v_limit")->checkpointable());
+}
+
+TEST_CASE("window-view checkpoint: round-trips through save/restore, a "
+          "post-restore fast-path value edit (incl. an all-NULL frame), "
+          "then a post-restore structural insert",
+          "[integration][checkpoint][window]") {
+    DuckDBTestHarness db;
+    seedWindowTable(db);
+
+    // Twin A (v_live) stays live for the whole test. Twin B (v_restore) is
+    // checkpointed, dropped (in-memory only), and reloaded cold from the
+    // checkpoint.
+    db.exec("SELECT * FROM dbsp_create_view('v_live', '" +
+            std::string(kWindowSql) + "')");
+    db.exec("SELECT * FROM dbsp_create_view('v_restore', '" +
+            std::string(kWindowSql) + "')");
+    REQUIRE(db.manager().get_view("v_restore")->checkpointable());
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+
+    auto save_result = db.query("SELECT * FROM dbsp_save()");
+    REQUIRE_FALSE(save_result->HasError());
+    REQUIRE(save_result->GetValue(0, 0).ToString().find(
+                "circuit checkpoint: 2 views") != std::string::npos);
+
+    REQUIRE_FALSE(db.query("SELECT dbsp_drop('v_restore')")->HasError());
+
+    auto load_result = db.query("SELECT * FROM dbsp_load()");
+    REQUIRE_FALSE(load_result->HasError());
+    // Only v_restore needed reloading (v_live was still live, skipped).
+    REQUIRE(load_result->GetValue(0, 0).ToString().find(
+                "1 from checkpoint") != std::string::npos);
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+
+    // Post-restore delta 1: a PURE VALUE UPDATE at (p=1, t=0) -- same sort
+    // key (t unchanged), so apply_changes' overwrite-in-place branch fires
+    // (the incremental FAST path), which requires partitions_/
+    // partition_outputs_ to have been correctly restored (an empty
+    // restored cache would retract nothing here, leaving a stale
+    // duplicate row behind). This also blanks p=1's t=0 frame ([NULL]) AND
+    // t=1's frame ([NULL, NULL], t=0 in range) to all-NULL -- the SUM
+    // all-NULL fix must survive the round-trip.
+    db.exec("UPDATE wsrc SET v = NULL WHERE p = 1 AND t = 0");
+    db.exec("SELECT * FROM dbsp_sync('wsrc')");
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+
+    // Hand-verified: p=1/t=0's frame is now entirely NULL -> s IS NULL
+    // (never 0.0), directly on the restored twin. Positional access
+    // (column order p, t, v, s from kWindowSql's SELECT list) rather than
+    // a WHERE-by-alias filter through dbsp_query, so this doesn't lean on
+    // an assumption about how a window alias binds through that table
+    // function.
+    auto restore_rows = db.getViewRows("v_restore");
+    bool found_p1_t0 = false;
+    for (const auto &row : restore_rows) {
+      if (row[0].GetValue<int32_t>() == 1 && row[1].GetValue<int32_t>() == 0) {
+        found_p1_t0 = true;
+        REQUIRE(row[3].IsNull());
+      }
+    }
+    REQUIRE(found_p1_t0);
+
+    // Post-restore delta 2: a size-changing INSERT into p=1 (1 insert, 0
+    // deletes -> pd.inserts.size() != pd.deletes.size()) forces the
+    // STRUCTURAL full-render path, which retracts every partition_outputs_
+    // entry before re-rendering -- another read of the just-restored cache,
+    // this time on the full-render branch rather than the fast one.
+    db.exec("INSERT INTO wsrc VALUES (1, 3, 9.0)");
+    db.exec("SELECT * FROM dbsp_sync('wsrc')");
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+}

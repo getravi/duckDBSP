@@ -1,5 +1,74 @@
 # Changelog
 
+## Feature: window-view checkpoint state (restore-tail, Task 2) - Jul 2026
+
+- Circuit-state checkpointing (D3b) now covers `NativeWindowView` embedded
+  behind `EmbeddedViewNode` (the WINDOW plan shape). `EmbeddedViewNode`
+  previously had no `state_kind()` override at all, so every embedded view
+  — window, sort/limit, distinct-on — fell back to a full rebuild-by-replay
+  on load regardless of shape. `EmbeddedViewNode::state_kind()` (and
+  `serialize_state`/`restore_state`) now delegate to three new
+  `NativeMaterializedView` virtuals (`circuit_state_kind()`/
+  `serialize_circuit_node_state()`/`restore_circuit_node_state()` —
+  intentionally distinct names/signatures from the existing
+  `checkpointable()`/`serialize_circuit_state()`/`restore_circuit_state()`,
+  which compose *multiple* inner `dbsp::Node`s for a circuit-backed view
+  like `PlannedCircuitView`; an embedded view is a single opaque leaf to
+  that composition, not a nested circuit). Default `UNSUPPORTED`; only
+  `NativeWindowView` overrides this pass — `NativeSortView`/
+  `NativeLimitView`/`NativeDistinctOnView` still decline via the base
+  default, so a sort/limit/distinct-on embedded view still forces its
+  whole outer view to rebuild-by-replay, unchanged from before this pass.
+- `NativeWindowView` has no spill/overflow storage (checked: no `spill_`
+  member, no `SpilledBucketIndex`/spill-store usage anywhere in the file)
+  — unlike joins/aggregates it never needs a runtime decline, so
+  `circuit_state_kind()` unconditionally reports `SERIALIZABLE`.
+- `serialize_circuit_node_state`/`restore_circuit_node_state` carry
+  exactly what `apply_changes`' incremental fast path (the
+  size-unchanged overwrite-in-place branch) and its structural
+  full-render path each read to resume: `partitions_` (each partition's
+  ORDER-BY-sorted source rows — both paths key membership, order, and
+  overwrite-vs-structural classification off this) and
+  `partition_outputs_` (the rendered-output cache, index-aligned with
+  each partition's sorted rows — the fast path's
+  size-unchanged gate and its retract-before-overwrite both read this
+  directly; the full path's opening retraction loop reads it too).
+  `result_` (`get_result()`) is *not* independently serialized: nothing
+  reads it back inside this class (`apply_changes` only ever writes to
+  it, always in lockstep with `partition_outputs_`), and nothing external
+  calls `get_result()`/`set_result()` on an embedded view directly (unlike
+  a top-level view's own sink, whose integrated total *is* restored at
+  the outer `NativeMaterializedView::get_result()`/`set_result()` level —
+  see `dbsp::SinkNode::state_kind()`'s doc comment for that precedent).
+  Restore reconstructs it for free from the just-restored
+  `partition_outputs_` instead (provably always the multiset union of
+  every partition's current cache, by induction over `apply_changes`)
+  rather than leaving it silently empty or paying bytes for fully
+  redundant data.
+- **No checkpoint format version bump**: unlike Task 1's addition, this
+  does not change the byte layout of any blob a checkpoint could
+  *already* contain — `EmbeddedViewNode` never wrote a node blob before
+  (it was `UNSUPPORTED`), so an existing v5 checkpoint simply has no entry
+  keyed by a window-embedded node's id. `restore_circuit_state`'s
+  per-node loop already treats a missing key as a decline for that node
+  (`blobs.find(n.id()) == blobs.end()` → that view's checkpoint fast path
+  declines), gracefully falling back to rebuild-by-replay for *that view
+  only* — no need to invalidate the whole checkpoint via a version bump.
+  `kDbspCkptFormatVersion` stays 5.
+- **Tests**: `test/integration/test_join_checkpoint.cpp` — a `state_kind`
+  gate case (a window embedded view checkpointable; a sort embedded view
+  and a limit embedded view, same `EmbeddedViewNode` wrapper, still not),
+  and a twin round-trip case (save, drop, reload, then a post-restore
+  PURE VALUE UPDATE mid-partition — the incremental fast path, which also
+  drives one cell's bounded frame fully NULL, hand-verified directly
+  against the restored twin as the recent all-NULL SUM fix (66b3806) must
+  survive the round-trip — followed by a post-restore size-changing
+  INSERT, the structural full-render path, both asserted against a
+  continuously-live twin).
+- **Untested-by-build**: this task ran under a no-build constraint (plan:
+  `docs/superpowers/plans/2026-07-31-restore-tail.md`) — verification is
+  deferred to that plan's Task 3 batched build/ctest cycle.
+
 ## Feature: recursive-view checkpoint state (restore-tail, Task 1) - Jul 2026
 
 - Circuit-state checkpointing (D3b) now covers `WITH RECURSIVE` fixed-point

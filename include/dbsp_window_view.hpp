@@ -1,5 +1,6 @@
 #pragma once
 
+#include "dbsp_checkpoint.hpp" // BlobWriter/BlobReader (circuit_state_kind overrides below)
 #include "dbsp_duckdb_types.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
 #include <algorithm>
@@ -451,6 +452,134 @@ public:
     result_.clear();
     delta_.clear();
     version_ = 0;
+  }
+
+  // --- Checkpointing (Task 2, restore-tail) -----------------------------
+  // No spill/overflow storage exists in this class (unlike joins/
+  // aggregates -- checked: no spill_ member, no SpilledBucketIndex/
+  // spill_store usage anywhere in this file), so there is no runtime
+  // decline condition to gate on; every NativeWindowView instance reports
+  // SERIALIZABLE.
+  dbsp::Node::StateKind circuit_state_kind() const override {
+    return dbsp::Node::StateKind::SERIALIZABLE;
+  }
+
+  // serialize_circuit_node_state/restore_circuit_node_state carry exactly
+  // what apply_changes' incremental fast path (the size-unchanged
+  // overwrite-in-place branch, ~line 589 below) and the structural
+  // full-render path (~line 617) each read to resume:
+  //   - partitions_: per-partition ORDERED source rows (PartitionState::
+  //     sorted_rows). Both paths key off `partitions_.find(key)` /
+  //     `it->second.sorted_rows` to know current partition membership and
+  //     order -- the fast path's overwrite-vs-structural classification
+  //     (pd.inserts.size() != pd.deletes.size(), then per-delete
+  //     lower_bound/upper_bound matching against `vec`) and the full
+  //     path's `partition_rows` renderer both operate directly on this.
+  //     PartitionState::cmp is NOT serialized: it is rebuilt from
+  //     primary_sort_columns_ (itself rebuilt from the view-definition
+  //     windows_[0].sort_columns at cold construction, which always runs
+  //     BEFORE restore_circuit_node_state per EmbeddedViewNode's
+  //     construction-then-restore contract), a config value, not data.
+  //   - partition_outputs_: the rendered-output cache, index-aligned with
+  //     each partition's sorted_rows. The fast path's gate
+  //     (`cache.size() == partition_rows.size()`) and emit_affected's
+  //     `cache[idx]` retraction-before-overwrite read this directly; the
+  //     full path's opening loop retracts every `cache` entry before
+  //     re-rendering. Without this restored, the very first post-restore
+  //     edit would retract nothing that was never there, producing
+  //     duplicate (stale + new) rows in both delta_ and result_ -- exactly
+  //     what the twin round-trip tests below would catch.
+  // Excluded, and why:
+  //   - result_ (get_result()): NOT independently serialized. Nothing
+  //     reads it back on this class -- apply_changes only ever WRITES to
+  //     it (in lockstep with partition_outputs_: every render/retraction
+  //     applies the identical row+sign to both simultaneously), and
+  //     nothing external calls get_result()/set_result() on this instance
+  //     (it is privately owned by EmbeddedViewNode; unlike a top-level
+  //     view's own sink, whose integrated total IS restored at the outer
+  //     NativeMaterializedView::get_result()/set_result() level -- see
+  //     dbsp::SinkNode::state_kind()'s doc comment for that precedent --
+  //     nothing plays that role for an EMBEDDED view's own result_).
+  //     Rather than leave it silently empty forever (an unread-but-still-
+  //     wrong internal invariant) or pay bytes for fully redundant data,
+  //     restore reconstructs it for free from the just-restored
+  //     partition_outputs_: result_ is, by construction, always exactly
+  //     the multiset union of every partition's current cache (proven by
+  //     induction over apply_changes -- every mutation site touches both
+  //     together with the same row/sign, from the empty initial state).
+  //   - delta_/has_output_-equivalent: checkpoints are taken quiescent (no
+  //     pending push), same convention every other checkpointed node
+  //     already follows (SourceNode's pending_delta_, PlanRecursiveNode's
+  //     output_/has_output_).
+  //   - windows_/source_schema_/source_table_/primary_sort_columns_/
+  //     result_schema_: view-definition-derived construction-time
+  //     configuration, not data -- rebuilt fresh by cold construction,
+  //     which always runs before restore, and separately guarded by the
+  //     checkpoint's per-view SQL fingerprint against a changed
+  //     definition.
+  //   - version_: read by nothing on an embedded (non-top-level) view --
+  //     grepped every `.version()` call site; the only one reads a
+  //     top-level view's own counter for introspection, never an inner
+  //     wrapped view's.
+  void serialize_circuit_node_state(std::vector<uint8_t> &out) const override {
+    BlobWriter w;
+    w.u64(partitions_.size());
+    for (const auto &[key, pstate] : partitions_) {
+      w.row(key);
+      w.u64(pstate.sorted_rows.size());
+      for (const auto &row : pstate.sorted_rows) {
+        w.row(row.columns);
+      }
+    }
+    w.u64(partition_outputs_.size());
+    for (const auto &[key, cache] : partition_outputs_) {
+      w.row(key);
+      w.u64(cache.size());
+      for (const auto &row : cache) {
+        w.row(row.columns);
+      }
+    }
+    out = w.take();
+  }
+
+  bool restore_circuit_node_state(const uint8_t *data, size_t len) override {
+    try {
+      BlobReader r(data, len);
+      partitions_.clear();
+      partition_outputs_.clear();
+      result_.clear();
+
+      const uint64_t n_parts = r.u64();
+      for (uint64_t i = 0; i < n_parts; i++) {
+        PartitionKey key = r.row();
+        auto ins =
+            partitions_.emplace(key, PartitionState(primary_sort_columns_));
+        auto &vec = ins.first->second.sorted_rows;
+        const uint64_t n_rows = r.u64();
+        vec.reserve(n_rows);
+        for (uint64_t j = 0; j < n_rows; j++) {
+          vec.push_back(r.hashed_row());
+        }
+      }
+
+      const uint64_t n_out = r.u64();
+      for (uint64_t i = 0; i < n_out; i++) {
+        PartitionKey key = r.row();
+        auto &cache = partition_outputs_[key];
+        const uint64_t n_rows = r.u64();
+        cache.reserve(n_rows);
+        for (uint64_t j = 0; j < n_rows; j++) {
+          DuckDBRow row = r.hashed_row();
+          result_.insert(row, 1); // reconstruct result_ -- see exclusion note above
+          cache.push_back(std::move(row));
+        }
+      }
+
+      delta_.clear();
+      return r.done();
+    } catch (...) {
+      return false;
+    }
   }
 
   void apply_changes(const std::string &table_name,

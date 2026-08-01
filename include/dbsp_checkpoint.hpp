@@ -69,6 +69,19 @@ namespace dbsp_native {
 // node (the node was UNSUPPORTED then, so save_checkpoint never wrote one)
 // and would misparse under the new restore_state layout, so it is treated
 // as absent (one-time rebuild-by-replay, same cost as prior bumps).
+//
+// Task 2 (restore-tail) did NOT bump this: EmbeddedViewNode gained
+// circuit_state_kind()/serialize_circuit_node_state()/
+// restore_circuit_node_state() (dbsp_duckdb_types.hpp), letting a
+// NativeWindowView embedded view report SERIALIZABLE instead of
+// UNSUPPORTED — but EmbeddedViewNode never wrote a node blob under any
+// prior version (it was unconditionally UNSUPPORTED), so an existing v5
+// checkpoint simply has no blob keyed by that node's id, not a
+// differently-shaped one. restore_circuit_state's per-node loop already
+// treats a missing key as a decline for that node (blobs.find(n.id()) ==
+// end()), gracefully falling back to rebuild-by-replay for that view
+// alone — no whole-checkpoint invalidation needed for a node kind with no
+// prior blob to misparse.
 constexpr int64_t kDbspCkptFormatVersion = 5;
 
 // How a circuit node participates in checkpointing.

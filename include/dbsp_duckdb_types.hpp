@@ -5,6 +5,7 @@
 
 #include <cmath>
 
+#include "dbsp_circuit.hpp" // dbsp::Node::StateKind, reused by circuit_state_kind()
 #include "dbsp_spill_store.hpp"
 
 #include "dbsp_zset.hpp"
@@ -688,6 +689,37 @@ public:
   virtual bool restore_circuit_state(
       const std::unordered_map<uint64_t, std::vector<uint8_t>> &blobs) {
     (void)blobs;
+    return false;
+  }
+
+  // --- Per-node checkpointing when wrapped by EmbeddedViewNode (Task 2,
+  // restore-tail) --------------------------------------------------------
+  // EmbeddedViewNode (dbsp_plan_translator.hpp) embeds exactly ONE
+  // NativeMaterializedView as a single leaf dbsp::Node inside a bigger
+  // circuit (the WINDOW/SORT_LIMIT/DISTINCT_ON plan shapes) -- it is
+  // opaque, legacy hand-wired state to the circuit walk, not itself a
+  // multi-node circuit. These three mirror dbsp::Node's own
+  // state_kind()/serialize_state()/restore_state() shape exactly
+  // (StateKind, not CkptSupport -- reused directly so EmbeddedViewNode's
+  // override is a one-line delegation, no enum mapping) and are DISTINCT
+  // from checkpointable()/serialize_circuit_state()/restore_circuit_state()
+  // above, which compose MULTIPLE inner dbsp::Node objects for a
+  // circuit-backed view like PlannedCircuitView -- unrelated purpose,
+  // unrelated signature, kept separate rather than overloaded to avoid
+  // confusing the two call sites. Default UNSUPPORTED; only
+  // NativeWindowView overrides this pass -- NativeSortView/NativeLimitView/
+  // NativeDistinctOnView stay UNSUPPORTED via this base default, so an
+  // embedded view containing one of those still forces its whole outer
+  // view to rebuild-by-replay, unchanged from before this pass.
+  virtual dbsp::Node::StateKind circuit_state_kind() const {
+    return dbsp::Node::StateKind::UNSUPPORTED;
+  }
+  virtual void serialize_circuit_node_state(std::vector<uint8_t> &out) const {
+    (void)out;
+  }
+  virtual bool restore_circuit_node_state(const uint8_t *data, size_t len) {
+    (void)data;
+    (void)len;
     return false;
   }
 
