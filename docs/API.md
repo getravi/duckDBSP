@@ -470,6 +470,36 @@ SELECT * FROM dbsp_changes('customer_totals');
   between the two notifies if both halves are needed.
 - Empty result when the view exists but no sync has touched it; error when
   the view does not exist.
+- Reading does NOT drain the buffer: an untouched view keeps serving the
+  same delta (its create-time initial replay, at worst) until the next sync
+  that touches it. Use `dbsp_delta_generations()` to tell fresh buffers
+  from stale ones.
+
+---
+
+### dbsp_delta_generations()
+
+Per-view provenance for the `dbsp_changes` buffer: the commit generation at
+which each view's delta buffer was last rewritten.
+
+```sql
+SELECT * FROM dbsp_delta_generations();
+```
+
+**Returns:**
+- `view_name` (VARCHAR)
+- `generation` (BIGINT): commit sequence at the buffer's last rewrite
+  (create-time initial replay or a propagation step); 0 when the buffer was
+  never written (e.g. a restored, still-pending view).
+
+**Semantics:**
+- Generations only advance when a sync rewrites the view's buffer — reads
+  (`dbsp_changes`, `dbsp_query`) never move them.
+- Change-feed pattern: snapshot `MAX(generation)` as a baseline after
+  setup; after each commit batch, harvest `dbsp_changes` only from views
+  whose generation moved past the baseline, then advance the baseline.
+  Without the filter, a consumer re-reads stale buffers of untouched views
+  on every batch.
 
 ---
 

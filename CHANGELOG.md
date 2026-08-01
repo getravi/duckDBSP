@@ -1,5 +1,21 @@
 # Changelog
 
+## dbsp_delta_generations(): per-view delta-buffer provenance - Aug 2026
+
+- **Why**: `dbsp_changes` is a single-generation buffer that reading does not
+  drain — an untouched view serves its last delta (create-time initial
+  replay, at worst) forever. A change-feed consumer polling every view after
+  each commit re-harvested those stale full-view buffers on every edit
+  (measured downstream: a 1-cell edit yielded ~229k spurious "changed" cells
+  across 55 line items, and stale `old=NULL` pairs would corrupt undo).
+- **Fix**: `CDCManager` stamps `commit_seq_` into `view_delta_generation_`
+  whenever a view's delta buffer is rewritten (create-time initial replay,
+  `propagate_changes` step); new `dbsp_delta_generations()` table function
+  exposes `(view_name, generation)`. Consumers baseline on
+  `MAX(generation)` and harvest only views whose generation advanced.
+- **Tests**: `test/python/test_delta_generations.py` pins the contract
+  (touched-only advance, reads never advance, drop cleanup); ctest 44/44.
+
 ## Perf: CREATE MATERIALIZED VIEW classified READ — per-create full scan-diff removed - Aug 2026
 
 - **Symptom** (residual after the shadow-table fix): per-view create cost still

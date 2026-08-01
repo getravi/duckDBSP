@@ -547,6 +547,56 @@ void ChangesFunc(ClientContext &context, TableFunctionInput &input,
 }
 
 // ============================================================================
+// dbsp_delta_generations - Per-view delta-buffer generation
+// Usage: SELECT * FROM dbsp_delta_generations();
+// Columns: view_name VARCHAR, generation BIGINT. `generation` is the commit
+// sequence at which the view's dbsp_changes buffer was last rewritten. The
+// buffer is single-generation and reading does NOT drain it, so a change-feed
+// consumer must compare generations against a baseline to skip views whose
+// buffer predates the commits it cares about.
+// ============================================================================
+
+struct DeltaGenerationsBindData : public TableFunctionData {
+  vector<std::pair<string, uint64_t>> rows;
+  idx_t current = 0;
+};
+
+unique_ptr<FunctionData> DeltaGenerationsBind(ClientContext &context,
+                                              TableFunctionBindInput &input,
+                                              vector<LogicalType> &return_types,
+                                              vector<string> &names) {
+  auto data = make_uniq<DeltaGenerationsBindData>();
+
+  auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
+  manager.scan_delta_generations([&](const string &name, uint64_t gen) {
+    data->rows.emplace_back(name, gen);
+  });
+
+  return_types.push_back(LogicalType::VARCHAR);
+  names.push_back("view_name");
+  return_types.push_back(LogicalType::BIGINT);
+  names.push_back("generation");
+
+  return std::move(data);
+}
+
+void DeltaGenerationsFunc(ClientContext &context, TableFunctionInput &input,
+                          DataChunk &output) {
+  auto &data = input.bind_data->CastNoConst<DeltaGenerationsBindData>();
+
+  idx_t count = 0;
+  while (data.current < data.rows.size() && count < STANDARD_VECTOR_SIZE) {
+    const auto &row = data.rows[data.current];
+    output.SetValue(0, count, Value(row.first));
+    output.SetValue(1, count, Value::BIGINT(static_cast<int64_t>(row.second)));
+    data.current++;
+    count++;
+  }
+  output.SetCardinality(count);
+}
+
+// ============================================================================
 // dbsp_views - List all views
 // ============================================================================
 
@@ -1965,6 +2015,10 @@ static void LoadInternal(ExtensionLoader &loader) {
   TableFunction changes_func("dbsp_changes", {LogicalType::VARCHAR},
                              ChangesFunc, ChangesBind);
   loader.RegisterFunction(changes_func);
+
+  TableFunction delta_gen_func("dbsp_delta_generations", {},
+                               DeltaGenerationsFunc, DeltaGenerationsBind);
+  loader.RegisterFunction(delta_gen_func);
 
   TableFunction list_views_func("dbsp_views", {}, ListViewsFunc, ListViewsBind);
   loader.RegisterFunction(list_views_func);

@@ -1718,6 +1718,11 @@ public:
       }
 
       views_[view_name] = std::move(view);
+      // The initial-replay delta buffer written above belongs to the
+      // commit generation the view was created at — stamp it so
+      // dbsp_delta_generations() consumers can tell it apart from deltas
+      // of later commits.
+      view_delta_generation_[view_name] = commit_seq_.load();
     }
 
     return true;
@@ -1886,6 +1891,7 @@ public:
     // checkpoint blobs moot, so just discard them (cheaper than decoding
     // first only to throw the result away).
     pending_restore_.erase(view_name);
+    view_delta_generation_.erase(view_name);
     return views_.erase(view_name) > 0;
   }
 
@@ -1922,6 +1928,7 @@ public:
       view_definitions_.erase(dep);
       table_schemas_.erase(dep);
       pending_restore_.erase(dep); // D-lazy: discard, see drop_view
+      view_delta_generation_.erase(dep);
       views_.erase(dep);
     }
 
@@ -1942,6 +1949,7 @@ public:
     view_definitions_.erase(view_name);
     table_schemas_.erase(view_name);
     pending_restore_.erase(view_name); // D-lazy: discard, see drop_view
+    view_delta_generation_.erase(view_name);
     return views_.erase(view_name) > 0;
   }
 
@@ -2965,6 +2973,20 @@ public:
   // stepped) view's delta is legitimately empty either way -- decoding
   // its stash here would pay the blob_decode cost for a value realization
   // cannot change, defeating the point of staying lazy.
+  // (view, generation) snapshot for every registered view — the commit_seq_
+  // at which each view's delta buffer was last rewritten (see
+  // view_delta_generation_'s member comment). A view whose buffer was never
+  // written (e.g. restored pending) reports 0.
+  void scan_delta_generations(
+      const std::function<void(const std::string &, uint64_t)> &cb) {
+    std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    std::shared_lock<std::shared_mutex> view_lock(view_mutex_);
+    for (const auto &[name, _] : views_) {
+      auto it = view_delta_generation_.find(name);
+      cb(name, it == view_delta_generation_.end() ? 0 : it->second);
+    }
+  }
+
   bool scan_view_delta(const std::string &view_name,
                        const std::function<void(const DuckDBRow &, Weight)> &cb) {
     std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
@@ -4093,6 +4115,11 @@ private:
       // Publish results sequentially (stable order): pending map for the
       // next level, arrangement updates for MV-sourced joins
       for (auto &r : results) {
+        if (r.applied > 0) {
+          // The step rewrote this view's delta buffer (possibly to empty)
+          // — stamp it with this pass's commit generation.
+          view_delta_generation_[r.view_name] = commit_seq_.load();
+        }
         if (r.applied == 0 || !r.delta || r.delta->empty())
           continue;
         pending[r.view_name] = r.delta;
@@ -4253,6 +4280,13 @@ private:
   std::unordered_map<std::string, TableSchema> table_schemas_;
   std::unordered_map<std::string, std::unique_ptr<NativeMaterializedView>>
       views_;
+  // Delta-buffer provenance: commit_seq_ value at the last rewrite of each
+  // view's single-generation delta buffer (create-time initial replay, or a
+  // propagate_changes step). get_delta()/dbsp_changes is NOT a draining
+  // stream — an untouched view keeps serving its last delta forever — so
+  // consumers building change feeds need this to skip stale buffers.
+  // Guarded by view_mutex_ alongside views_.
+  std::unordered_map<std::string, uint64_t> view_delta_generation_;
   // D-lazy: checkpoint blobs for views the load fast path cold-created but
   // has not yet decoded (NativeMaterializedView::is_pending_restore()).
   // Tier 3 (view_mutex_) -- see stash_pending_view/realize_pending_view.
