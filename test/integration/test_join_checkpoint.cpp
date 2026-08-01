@@ -25,6 +25,7 @@
 #include "../test_helpers.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -582,4 +583,214 @@ TEST_CASE("checkpoint blob codec: view spanning every codec value shape "
     db.exec("INSERT INTO typed_rows VALUES (2, NULL, NULL, NULL, NULL, NULL)");
     db.exec("SELECT * FROM dbsp_sync('typed_rows')");
     REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+}
+
+// Task 1 (restore-tail): PlanRecursiveNode checkpoint state.
+//
+// PlanRecursiveNode previously had no state_kind() override, so every
+// WITH RECURSIVE view fell back to a full rebuild-by-replay on load. This
+// extends SERIALIZABLE to UNION ALL recursion whose nested step circuit is
+// itself wholly checkpointable, by round-tripping the integrated
+// accumulated_/anchor_total_/base_totals_ totals plus the step circuit's
+// own per-node state (embedded sub-blob). UNION (set-semantics) recursion
+// and a step containing any other unsupported node stay UNSUPPORTED.
+//
+// `chain` below is the wfp roll-forward shape (linear UNION ALL: a
+// per-partition running total over an ordered time spine, `net(p,t,v)` ->
+// rf.acc = running sum) — mirrors test_recursive_deletion.cpp's `chain`
+// view, replicated locally since no shared header covers it.
+namespace {
+
+const char *kChainSql =
+    "WITH RECURSIVE rf AS ("
+    "  SELECT p, t, v AS acc FROM net WHERE t = 0 "
+    "  UNION ALL "
+    "  SELECT n.p, n.t, rf.acc + n.v FROM rf JOIN net n "
+    "    ON n.p = rf.p AND n.t = rf.t + 1"
+    ") SELECT * FROM rf";
+
+void seedNetTable(DuckDBTestHarness &db) {
+    db.exec("CREATE TABLE net (p INTEGER, t INTEGER, v DOUBLE)");
+    db.exec("SELECT * FROM dbsp_track('net')");
+    db.exec("INSERT INTO net VALUES "
+            "(1,0,10.0),(1,1,20.0),(1,2,30.0),"
+            "(2,0,5.0),(2,1,5.0),(2,2,5.0)");
+    db.exec("SELECT * FROM dbsp_sync('net')");
+    db.exec("SELECT * FROM dbsp_use_planner(true)");
+}
+
+// RAII env-var override for DBSP_REC_MAX_ITER (test-only PlanRecursiveNode
+// hook, read once at construction): guarantees the process-wide env var is
+// cleared even if a REQUIRE inside the guarded scope fails and unwinds the
+// stack. Replicated from test_recursive_deletion.cpp — no shared header
+// covers it, and this file's convention (like that one's) is to keep test
+// fixtures local.
+struct EnvGuard {
+    std::string name;
+    EnvGuard(std::string n, const char *value) : name(std::move(n)) {
+        setenv(name.c_str(), value, 1);
+    }
+    ~EnvGuard() { unsetenv(name.c_str()); }
+};
+
+} // namespace
+
+TEST_CASE("recursive-view checkpoint: state_kind gate for linear UNION ALL, "
+          "UNION recursion, and a step containing an unsupported node",
+          "[integration][checkpoint][recursive]") {
+    DuckDBTestHarness db;
+    seedNetTable(db);
+
+    db.exec("SELECT * FROM dbsp_create_view('v_chain', '" +
+            std::string(kChainSql) + "')");
+    REQUIRE(db.manager().get_view("v_chain")->checkpointable());
+
+    const std::string union_sql =
+        "WITH RECURSIVE rf AS ("
+        "  SELECT p, t, v AS acc FROM net WHERE t = 0 "
+        "  UNION "
+        "  SELECT n.p, n.t, rf.acc + n.v FROM rf JOIN net n "
+        "    ON n.p = rf.p AND n.t = rf.t + 1"
+        ") SELECT * FROM rf";
+    db.exec("SELECT * FROM dbsp_create_view('v_union', '" + union_sql + "')");
+    REQUIRE_FALSE(db.manager().get_view("v_union")->checkpointable());
+
+    // union_all_ is true here, but the step's JOIN is forced into
+    // spill-mode storage (dbsp_spill(true), the same process-global test
+    // knob the LEFT-join gate test above uses to force local_spill_right_)
+    // -> that inner JOIN node reports UNSUPPORTED -> step_view_->
+    // checkpointable() is false -> the recursive node declines regardless
+    // of union_all_, proving state_kind() actually composes through the
+    // nested circuit rather than only checking union_all_.
+    db.exec("SELECT * FROM dbsp_spill(true)");
+    db.exec("SELECT * FROM dbsp_create_view('v_chain_spilled', '" +
+            std::string(kChainSql) + "')");
+    REQUIRE_FALSE(db.manager().get_view("v_chain_spilled")->checkpointable());
+    db.exec("SELECT * FROM dbsp_spill(false)"); // process-global: reset
+}
+
+TEST_CASE("recursive-view checkpoint: linear UNION ALL round-trips through "
+          "save/restore, mid-chain retractions resume the signed path",
+          "[integration][checkpoint][recursive]") {
+    DuckDBTestHarness db;
+    seedNetTable(db);
+
+    // Twin A (v_live) stays live for the whole test. Twin B (v_restore) is
+    // checkpointed, dropped (in-memory only), and reloaded cold from the
+    // checkpoint.
+    db.exec("SELECT * FROM dbsp_create_view('v_live', '" +
+            std::string(kChainSql) + "')");
+    db.exec("SELECT * FROM dbsp_create_view('v_restore', '" +
+            std::string(kChainSql) + "')");
+    REQUIRE(db.manager().get_view("v_restore")->checkpointable());
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+
+    auto save_result = db.query("SELECT * FROM dbsp_save()");
+    REQUIRE_FALSE(save_result->HasError());
+    REQUIRE(save_result->GetValue(0, 0).ToString().find(
+                "circuit checkpoint: 2 views") != std::string::npos);
+
+    REQUIRE_FALSE(db.query("SELECT dbsp_drop('v_restore')")->HasError());
+
+    auto load_result = db.query("SELECT * FROM dbsp_load()");
+    REQUIRE_FALSE(load_result->HasError());
+    // Only v_restore needed reloading (v_live was still live, skipped).
+    REQUIRE(load_result->GetValue(0, 0).ToString().find(
+                "1 from checkpoint") != std::string::npos);
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+
+    // Post-restore delta 1: an ordinary insert-only extension (p=1, t=3) —
+    // exercises the generic insert-only admit()/iterate() path against
+    // restored accumulated_/step_view_ state.
+    db.exec("INSERT INTO net VALUES (1, 3, 40.0)");
+    db.exec("SELECT * FROM dbsp_sync('net')");
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+
+    // Post-restore delta 2: UPDATE = retraction + insertion on a mid-chain
+    // link (p=1, t=1) — must resume the SIGNED retraction path from the
+    // restored accumulated_/anchor_total_/base_totals_/step_view_ state,
+    // propagating the new running total through t=2,3 exactly as the
+    // continuously-live twin does.
+    db.exec("UPDATE net SET v = 100.0 WHERE p = 1 AND t = 1");
+    db.exec("SELECT * FROM dbsp_sync('net')");
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+
+    // Post-restore delta 3: a mid-chain DELETE severs everything downstream
+    // -- same signed path, a pure retraction with no insertion in the same
+    // delta.
+    db.exec("DELETE FROM net WHERE p = 1 AND t = 1");
+    db.exec("SELECT * FROM dbsp_sync('net')");
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+}
+
+TEST_CASE("recursive-view checkpoint: post-restore max_iterations_ trip "
+          "falls back to a correct recompute()",
+          "[integration][checkpoint][recursive]") {
+    // Force the signed path to trip max_iterations_ AFTER restore
+    // (DBSP_REC_MAX_ITER=2, a chain far deeper than that beyond the
+    // retraction point) and check both halves of fallback correctness: the
+    // fallback actually fires (g_recompute_invocations increments) AND it
+    // produces the right answer — proving recompute() rebuilds correctly
+    // from the just-restored anchor_total_/base_totals_ + step_view_ reset
+    // state, not merely that it runs without crashing.
+    //
+    // The cap is read once at PlanRecursiveNode construction (both at cold
+    // create AND at the construction restore_view_state() runs right after
+    // — see state_kind()'s doc comment), and applies to EVERY commit,
+    // including insert-only ones. So the chain is built one row per commit
+    // (each single-row append only ever needs the seed admission, zero
+    // iterate() rounds, comfortably under cap=2), same shape
+    // test_recursive_deletion.cpp's own max_iterations test uses.
+    EnvGuard cap("DBSP_REC_MAX_ITER", "2");
+    DuckDBTestHarness db;
+    db.exec("CREATE TABLE net (p INTEGER, t INTEGER, v DOUBLE)");
+    db.exec("SELECT * FROM dbsp_track('net')");
+    db.exec("INSERT INTO net VALUES (1, 0, 10.0)");
+    db.exec("SELECT * FROM dbsp_sync('net')");
+    db.exec("SELECT * FROM dbsp_use_planner(true)");
+
+    db.exec("SELECT * FROM dbsp_create_view('v_live', '" +
+            std::string(kChainSql) + "')");
+    db.exec("SELECT * FROM dbsp_create_view('v_restore', '" +
+            std::string(kChainSql) + "')");
+
+    for (int t = 1; t <= 7; t++) {
+        db.exec("INSERT INTO net VALUES (1, " + std::to_string(t) + ", " +
+                std::to_string(10.0 * (t + 1)) + ")");
+        db.exec("SELECT * FROM dbsp_sync('net')");
+    }
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+    REQUIRE(db.getViewRows("v_restore").size() == 8);
+
+    auto save_result = db.query("SELECT * FROM dbsp_save()");
+    REQUIRE_FALSE(save_result->HasError());
+    REQUIRE(save_result->GetValue(0, 0).ToString().find(
+                "circuit checkpoint: 2 views") != std::string::npos);
+
+    REQUIRE_FALSE(db.query("SELECT dbsp_drop('v_restore')")->HasError());
+    auto load_result = db.query("SELECT * FROM dbsp_load()");
+    REQUIRE_FALSE(load_result->HasError());
+    REQUIRE(load_result->GetValue(0, 0).ToString().find(
+                "1 from checkpoint") != std::string::npos);
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+
+    // Retracting t=1 must propagate through t=2..7 -- 6 hops, far past
+    // cap=2 -- so this commit trips max_iterations_ on BOTH twins and
+    // falls back to recompute(). v_restore's recompute() rebuilds entirely
+    // from its just-restored state; if restore had left accumulated_/
+    // anchor_total_/base_totals_/step_view_ stale or partial, v_restore
+    // would diverge from the continuously-live v_live right here.
+    size_t before = dbsp_native::g_recompute_invocations.load();
+    db.exec("DELETE FROM net WHERE p = 1 AND t = 1");
+    db.exec("SELECT * FROM dbsp_sync('net')");
+    REQUIRE(dbsp_native::g_recompute_invocations.load() > before);
+    REQUIRE(snapshotView(db, "v_live") == snapshotView(db, "v_restore"));
+
+    // Hand-computed truth: retracting t=1 severs the chain; only t=0 (the
+    // anchor row, acc = 10.0) survives.
+    auto rows = db.getViewRows("v_restore");
+    REQUIRE(rows.size() == 1);
+    REQUIRE(rows[0][0].GetValue<int32_t>() == 1);
+    REQUIRE(rows[0][1].GetValue<int32_t>() == 0);
+    REQUIRE(rows[0][2].GetValue<double>() == 10.0);
 }

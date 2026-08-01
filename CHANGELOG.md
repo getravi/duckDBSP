@@ -1,5 +1,46 @@
 # Changelog
 
+## Feature: recursive-view checkpoint state (restore-tail, Task 1) - Jul 2026
+
+- Circuit-state checkpointing (D3b) now covers `WITH RECURSIVE` fixed-point
+  state: `PlanRecursiveNode::state_kind()` reports `SERIALIZABLE` for a
+  UNION ALL recursive view whose nested step circuit is itself wholly
+  checkpointable (`PlannedCircuitView::checkpointable()` — the same gate
+  every other view is already held to), so it restores from a checkpoint
+  instead of a full rebuild-by-replay on load. UNION (set-semantics)
+  recursion's DRed support bookkeeping is not captured this pass and stays
+  `UNSUPPORTED`, as does a UNION ALL step containing any other unsupported
+  node (a spilled join, etc.) — `state_kind()` is independent of
+  `linear_step_`: the fallback `recompute()` path (a `max_iterations_` trip,
+  an exception during signed admission, or any deletion on a nonlinear
+  union_all step) rebuilds entirely from the restored totals and
+  `step_view_->reset()`, so a restored node resumes correctly whether or
+  not the step is linear.
+- `serialize_state`/`restore_state` gained `accumulated_` (the integrated
+  fixed-point result `recompute()` diffs against), `anchor_total_` and
+  `base_totals_` (the running per-source totals `recompute()` reseeds its
+  whole rebuild from), and the nested `step_view_` circuit's own per-node
+  state (equi-key indexes / group state) via its existing
+  `serialize_circuit_state`/`restore_circuit_state`, embedded as a
+  length-prefixed sub-blob keyed by inner node id.
+- **Checkpoint format version bump (4 → 5)**: the recursive-node blob is
+  new (the node was `UNSUPPORTED` before, so `save_checkpoint` never wrote
+  one), so `kDbspCkptFormatVersion` advanced. `checkpoint_valid` treats a
+  v4 (or earlier) checkpoint as absent rather than misparse it against the
+  new `restore_state`, same one-time rebuild-by-replay cost as prior bumps.
+- **Tests**: `test/integration/test_join_checkpoint.cpp` — a `state_kind`
+  gate case (linear UNION ALL checkpointable; UNION recursion and a step
+  forced into spill-mode storage still not), a twin round-trip case (save,
+  drop, reload, then an insert-only extension and mid-chain UPDATE/DELETE
+  retractions resuming the signed path from restored state, asserted
+  against a continuously-live twin), and a post-restore
+  `DBSP_REC_MAX_ITER`-capped fallback case proving `recompute()` rebuilds
+  correctly from the just-restored totals when a deep retraction trips the
+  iteration cap after restore.
+- **Untested-by-build**: this task ran under a no-build constraint (plan:
+  `docs/superpowers/plans/2026-07-31-restore-tail.md`) — verification is
+  deferred to that plan's Task 3 batched build/ctest cycle.
+
 ## Fix: window SUM/AVG over an all-NULL frame returns NULL - Jul 2026
 
 - `NativeWindowView`'s SUM and AVG emitted `0.0` when every value in the

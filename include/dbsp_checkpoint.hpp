@@ -60,7 +60,16 @@ namespace dbsp_native {
 // checkpoint has no such field for any group and would misparse under the
 // new restore_state layout, so it is treated as absent (one-time
 // rebuild-by-replay, same cost as prior bumps).
-constexpr int64_t kDbspCkptFormatVersion = 4;
+// v5 (Task 1, restore-tail): PlanRecursiveNode::serialize_state gained
+// accumulated_/anchor_total_/base_totals_ plus the nested step_view_
+// circuit's own per-node blobs (embedded as a length-prefixed sub-blob
+// keyed by inner node id), so a UNION ALL recursive view whose step circuit
+// is itself wholly checkpointable now reports SERIALIZABLE instead of
+// UNSUPPORTED. A v4 checkpoint carries no node blob at all for a recursive
+// node (the node was UNSUPPORTED then, so save_checkpoint never wrote one)
+// and would misparse under the new restore_state layout, so it is treated
+// as absent (one-time rebuild-by-replay, same cost as prior bumps).
+constexpr int64_t kDbspCkptFormatVersion = 5;
 
 // How a circuit node participates in checkpointing.
 enum class CkptSupport {

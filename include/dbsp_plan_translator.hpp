@@ -3327,6 +3327,134 @@ public:
 
   const DuckDBZSet &output() const { return output_; }
 
+  // Checkpointing (Task 1, restore-tail): SERIALIZABLE iff union_all_ —
+  // UNION (set-semantics) recursion's DRed support_/dred bookkeeping is not
+  // captured this pass, so it stays UNSUPPORTED, the same decline
+  // discipline as every other unbuilt shape — AND the nested step circuit
+  // is itself wholly checkpointable (PlannedCircuitView::checkpointable(),
+  // the same gate save_checkpoint() already applies to every top-level
+  // view; a step containing e.g. a spilled join or any other UNSUPPORTED
+  // node declines here too). This is independent of linear_step_: the
+  // fallback recompute() path (taken for a max_iterations_ trip, any
+  // exception during signed admission, or any deletion on a NONLINEAR
+  // union_all step) rebuilds entirely from anchor_total_/base_totals_ +
+  // step_view_->reset(), so a restored node resumes correctly there
+  // whether or not the step is linear — only the SIGNED retraction path
+  // additionally needs linear_step_, and that gate is unchanged, evaluated
+  // at runtime per commit inside step().
+  StateKind state_kind() const override {
+    if (!union_all_) {
+      return StateKind::UNSUPPORTED;
+    }
+    return step_view_->checkpointable() ? StateKind::SERIALIZABLE
+                                        : StateKind::UNSUPPORTED;
+  }
+
+  // serialize_state/restore_state carry exactly what step()/recompute()
+  // read to resume:
+  //   - accumulated_: the integrated fixed-point result. Its content is
+  //     identical to this node's own materialized output (== the outer
+  //     view's get_result() at save time, restored separately at the view
+  //     level), so recompute()'s diff-against-old-accumulated is correct on
+  //     the first post-restore call, and admit()'s union_all_ branch keeps
+  //     accumulating into the SAME running total future commits expect.
+  //   - anchor_total_ / base_totals_: the running integrated totals
+  //     recompute() reseeds its whole-fixpoint rebuild from, and that every
+  //     future step() (either path) keeps accumulating into regardless of
+  //     shape — needed so a recompute() several commits after restore still
+  //     integrates the FULL history, not just what changed post-restore.
+  //   - step_view_'s own per-node state (equi-key indexes / group state —
+  //     whatever its apply_changes' incremental maintenance needs to
+  //     resume), via its EXISTING serialize_circuit_state/
+  //     restore_circuit_state, embedded here as a length-prefixed sub-blob
+  //     keyed by inner node id. state_kind() only reports SERIALIZABLE when
+  //     step_view_->checkpointable(), so serialize_circuit_state cannot
+  //     decline when this runs.
+  // Excluded, and why: output_/has_output_ (checkpoints are taken
+  // quiescent — no pending delta to resume, same convention SourceNode and
+  // every other checkpointed node already follow); anchor_/step_view_'s
+  // object identity/sentinel_/union_all_/base_inputs_/max_iterations_/
+  // linear_step_ (view-definition-derived construction-time configuration,
+  // not data — rebuilt fresh by the normal cold-construction path that
+  // always runs BEFORE restore_state() is ever called, per
+  // restore_view_state's contract, and separately guarded by the
+  // checkpoint's SQL fingerprint against a changed definition);
+  // g_recompute_invocations (a process-wide test-only counter, not node
+  // state at all).
+  void serialize_state(std::vector<uint8_t> &out) const override {
+    BlobWriter w;
+    auto write_zset = [&w](const DuckDBZSet &z) {
+      w.u64(z.size());
+      for (const auto &[row, weight] : z) {
+        w.row(row.columns);
+        w.i64(weight);
+      }
+    };
+    write_zset(accumulated_);
+    write_zset(anchor_total_);
+    w.u64(base_totals_.size());
+    for (const auto &[table, total] : base_totals_) {
+      w.row(std::vector<duckdb::Value>{duckdb::Value(table)});
+      write_zset(total);
+    }
+    std::vector<std::pair<uint64_t, std::vector<uint8_t>>> inner;
+    step_view_->serialize_circuit_state(inner);
+    w.u64(inner.size());
+    for (const auto &[node_id, blob] : inner) {
+      w.u64(node_id);
+      w.row(std::vector<duckdb::Value>{
+          duckdb::Value::BLOB(blob.data(), blob.size())});
+    }
+    out = w.take();
+  }
+
+  bool restore_state(const uint8_t *data, size_t len) override {
+    try {
+      BlobReader r(data, len);
+      auto read_zset = [&r](DuckDBZSet &z) {
+        z.clear();
+        const uint64_t n = r.u64();
+        for (uint64_t i = 0; i < n; i++) {
+          DuckDBRow row = r.hashed_row();
+          const int64_t weight = r.i64();
+          z.insert(row, weight);
+        }
+      };
+      read_zset(accumulated_);
+      read_zset(anchor_total_);
+      base_totals_.clear();
+      const uint64_t n_tables = r.u64();
+      for (uint64_t i = 0; i < n_tables; i++) {
+        auto key = r.row();
+        if (key.size() != 1) {
+          return false;
+        }
+        const std::string table = duckdb::StringValue::Get(key[0]);
+        DuckDBZSet total;
+        read_zset(total);
+        base_totals_.emplace(table, std::move(total));
+      }
+      std::unordered_map<uint64_t, std::vector<uint8_t>> inner_blobs;
+      const uint64_t n_inner = r.u64();
+      for (uint64_t i = 0; i < n_inner; i++) {
+        const uint64_t node_id = r.u64();
+        auto blob_val = r.row();
+        if (blob_val.size() != 1) {
+          return false;
+        }
+        const auto &bytes = duckdb::StringValue::Get(blob_val[0]);
+        inner_blobs.emplace(node_id,
+                            std::vector<uint8_t>(bytes.begin(), bytes.end()));
+      }
+      if (!step_view_->restore_circuit_state(inner_blobs)) {
+        return false;
+      }
+      return r.done();
+    } catch (...) {
+      return false;
+    }
+  }
+
 private:
   // Re-run the whole fixed point from integrated inputs; output_ becomes
   // the diff against the previous accumulated state
