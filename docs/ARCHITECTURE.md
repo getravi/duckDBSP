@@ -136,9 +136,13 @@ by the circuit-IR optimizer, and built into circuit nodes; bound expressions
 are evaluated row-at-a-time through `ExpressionExecutor`.
 
 Because materialized views are not in DuckDB's catalog, views-on-views are
-bound by shadowing every existing MV as an empty TEMP table on the internal
+bound by shadowing referenced MVs as empty TEMP tables on the internal
 connection during plan extraction (the temp schema shadows main, matching
-CDC's own views-before-tables resolution order).
+CDC's own views-before-tables resolution order). Only views whose names
+appear in the SQL text are shadowed — shadowing all N existing views made
+DAG creation O(N^2) in catalog work. `CREATE MATERIALIZED VIEW` statements
+are classified READ by the commit hook (they only read tracked tables), so
+view creation never triggers a tracked-table scan-diff.
 
 `PlannedCircuitView` builds a multi-source operator tree (one shared
 SourceNode per base table) covering:
@@ -367,8 +371,8 @@ static void LoadInternal(DatabaseInstance &instance) {
          SELECT customer, SUM(amount) FROM orders GROUP BY customer
          │
 2. Planner frontend: DuckDB binds and plans the SQL
-   (Connection::ExtractPlan, optimizer off; existing MVs shadowed as
-   empty TEMP tables so views-on-views bind)
+   (Connection::ExtractPlan, optimizer off; SQL-referenced MVs shadowed
+   as empty TEMP tables so views-on-views bind)
          │
          ▼
    LogicalOperator tree → PlanOpSpec tree {
