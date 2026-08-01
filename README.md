@@ -120,8 +120,15 @@ See [examples/](examples/) for more comprehensive demos.
 
 This will:
 1. Download DuckDB source (if not present)
-2. Build the DBSP extension
-3. Output `dbsp.duckdb_extension`
+2. Apply the engine patches from `patches/` (the patch files are the fork —
+   stock DuckDB lacks the transaction-callback symbols the extension needs;
+   idempotent, fails loudly if the tree has drifted from the patch)
+3. Build the DBSP extension (uses `ccache` and Ninja automatically when
+   installed; parallelism capped at `-j 8`)
+4. Output `dbsp.duckdb_extension`
+
+Any change to DuckDB engine sources must land as an updated patch file in
+`patches/` in the same commit — a fresh clone builds only from the patches.
 
 ### Loading the Extension
 
