@@ -91,15 +91,38 @@
   - `scan_view`/`query_view` (the `dbsp_query`/`dbsp_changes`... read
     path) — self-locking `realize_pending_view()`, a cheap shared-lock
     peek before ever taking `view_mutex_` exclusively.
-  - `propagate_changes` — a single sequential pre-pass over the
-    propagation's topological order realizes the view about to receive a
-    delta *and every pending ancestor of it* before any `step_view` runs
-    (Global Constraint: deltas must never apply to un-restored state).
-    Done sequentially, before the per-level loop that may spawn threads
-    under `dbsp_parallel(true)` — `pending_restore_` is one map shared by
-    every view, not a per-view lock, so realizing everything up front
-    keeps the existing "each view's own disjoint state" assumption behind
-    the lock-free parallel `step_view` section true.
+  - `propagate_changes` — a sequential pre-pass realizes, before any
+    `step_view` runs, every view in the delta's topological dependent set
+    (`topo`) **and every view that any of those transitively depends on**
+    (walked via the existing `dep_graph_.get_dependencies` reverse edges —
+    every SQL-declared source `create_view` already records there,
+    arrangement-shared or not), not `topo` alone. **Correction (same-day,
+    reviewer-reproduced Critical):** the first cut of this pre-pass
+    realized only `topo` — source_name's *dependents* — on the mistaken
+    assumption that this also covers "every pending ancestor of it". It
+    does not: a join view whose shared/arrangement-probed side is a
+    *sibling* dependency of the edited table (e.g. `v2 = side1 LEFT JOIN
+    v1`, editing `side1`) has `topo = {v2, v3}` — `v1` is never reached by
+    walking dependents forward from `side1`, however pending it still is.
+    `probe_side` has no `needs_backfill` guard, so an unrealized `v1`'s
+    still-empty arrangement silently produced a NULL-padded join result
+    instead of a real match — a wrong delta that then propagated further
+    downstream in the same pass via `apply_to_arrangements`. Fixed by
+    walking topo's dependency closure too (a small worklist over
+    `get_dependencies`, deliberately the "boringly-safe" superset — it
+    also realizes a still-pending view source that *isn't* actually
+    arrangement-shared, harmlessly, rather than requiring a precise
+    `arrangement_requests()`-only walk). Mirrors the D3c table-side
+    precedent (`materialize_for_delta` sweeps every tracked table before
+    any delta propagates), scoped here to topo's closure rather than
+    every view process-wide, since unlike tables, views already have a
+    dependency graph to scope the sweep with — an unrelated view stays
+    lazily unrealized. Done sequentially, before the per-level loop that
+    may spawn threads under `dbsp_parallel(true)` — `pending_restore_` is
+    one map shared by every view, not a per-view lock, so realizing
+    everything up front keeps the existing "each view's own disjoint
+    state" assumption behind the lock-free parallel `step_view` section
+    true.
   - `create_view`'s warm-replay loop reads a source **view**'s
     `get_result()` directly, so it realizes that source first,
     unconditionally.
@@ -181,13 +204,22 @@
   verbatim, both correct after a second reload); `dbsp_lazy_restore(false)`
   reproduces the eager behavior exactly (0 pending, the lazy decode
   counter never moves). A fifth case added with the register_arrangements
-  fix above: a chained view-on-view DAG (`base -> v1 -> v2 -> v3`, with a
-  shared join arrangement sourced from a middle view in the chain)
-  asserts `pending_restore_count() == 3` immediately after reopen, before
-  any query — the assertion the original (defective) unconditional-realize
-  behavior would have failed at count 0 — then queries only `v3`'s chain
-  and asserts the decode count matches exactly the chain length, then
-  exercises delta-before-query correctness on the same chained shape.
+  fix above: a chained view-on-view DAG (`base -> v1 -> v2 -> v3`, `v2` a
+  `LEFT JOIN` with `v1` as its shared/probe-target side, `v3` the same
+  shape one level down over `v2`) asserts `pending_restore_count() == 3`
+  immediately after reopen, before any query — the assertion the original
+  (defective) unconditional-realize behavior would have failed below 3 —
+  then a delta on `v1`'s own source (`items`) realizes the whole chain in
+  one pre-pass (asserts the decode count moves by exactly 3), then two
+  further deltas each probe one link's backfilled arrangement from the
+  join's other (local) side against the live twins. A sixth case is the
+  reviewer's Critical repro made permanent: the fifth case's first delta
+  always lands on `items` (`v1`'s own source, already in that delta's
+  topological dependent set), so it never exercises the sibling-branch
+  gap above — this case's first delta after reopen instead lands directly
+  on `side1` (`v2`'s *local*, non-shared join side) while `v1` is still
+  fully pending; asserts `v2`'s new row carries `v1`'s real value, not a
+  silent NULL pad, matching the reviewer's exact reproduced shape.
 
 ## Feature: window-view checkpoint state (restore-tail, Task 2) - Jul 2026
 

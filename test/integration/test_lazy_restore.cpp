@@ -385,3 +385,56 @@ TEST_CASE("lazy restore: chained view-on-view DAG defers the whole chain",
     db.exec("SELECT * FROM dbsp_sync('side2')");
     REQUIRE(snapshotView(db, "v3") == snapshotView(db, "v3_live"));
 }
+
+// MANDATORY regression test (reviewer-reproduced Critical, fixed same
+// day): the case above always lands its first delta on `items` -- v1's
+// OWN source -- so v1 is already in that delta's topo (dep_graph_.
+// topological_order("items") = {v1, v2, v3}) and gets realized as a
+// direct descendant, never exercising the actual gap. The real defect
+// only shows when the FIRST post-reopen delta lands on the join's LOCAL
+// side (side1) instead: dep_graph_.topological_order("side1") = {v2, v3}
+// only -- v1 is a SIBLING dependency of v2 (v2 depends on both side1 and
+// v1; side1 does not depend on v1 or vice versa), so walking dependents_
+// forward from side1 never reaches it, however pending it still is. The
+// original (unfixed) pre-pass realized exactly topo and nothing else,
+// leaving v1's shared arrangement `needs_backfill`; v2's LEFT JOIN,
+// applying side1's delta, probes that arrangement for cat='a' (probe_side
+// has no needs_backfill guard) and finds nothing -- a silent NULL pad
+// instead of v1's real SUM(value) = 30 for cat='a'. The reviewer's temp
+// repro observed exactly v2 = ('a', 't3', NULL) against a live twin's
+// ('a', 't3', 30); this test encodes that exact shape permanently.
+TEST_CASE("lazy restore: first post-reopen delta on a join's local side "
+          "still realizes its pending shared-arrangement sibling",
+          "[integration][checkpoint][lazy_restore]") {
+    DuckDBTestHarness db;
+    setupChainTables(db);
+    createChain(db, "");
+    createChain(db, "_live");
+    REQUIRE(db.manager().get_view("v1")->checkpointable());
+    REQUIRE(db.manager().get_view("v2")->checkpointable());
+    REQUIRE(db.manager().get_view("v3")->checkpointable());
+
+    REQUIRE_FALSE(db.query("SELECT * FROM dbsp_save()")->HasError());
+    REQUIRE_FALSE(db.query("SELECT dbsp_drop('v3')")->HasError());
+    REQUIRE_FALSE(db.query("SELECT dbsp_drop('v2')")->HasError());
+    REQUIRE_FALSE(db.query("SELECT dbsp_drop('v1')")->HasError());
+    REQUIRE_FALSE(db.query("SELECT * FROM dbsp_load()")->HasError());
+    REQUIRE(db.manager().pending_restore_count() == 3);
+
+    // The FIRST delta after reopen -- on side1, not items. v1 is still
+    // fully pending, untouched by anything, when this lands.
+    db.exec("INSERT INTO side1 VALUES ('a', 't3')");
+    db.exec("SELECT * FROM dbsp_sync('side1')");
+
+    // v2's new row must carry v1's real total for cat='a' (30 = 10 + 20),
+    // never a NULL pad from an unfilled arrangement -- the exact
+    // reviewer-reproduced shape (their repro: v2 got 'a'|'t3'|NULL here).
+    REQUIRE(snapshotView(db, "v2") == snapshotView(db, "v2_live"));
+
+    // v1 was realized transitively (it feeds v2, which IS in topo) even
+    // though it was never itself queried, edited, or in topo directly --
+    // and v3 (also in topo) too. Nothing pending is left half-swept.
+    REQUIRE(db.manager().pending_restore_count() == 0);
+    REQUIRE(snapshotView(db, "v1") == snapshotView(db, "v1_live"));
+    REQUIRE(snapshotView(db, "v3") == snapshotView(db, "v3_live"));
+}

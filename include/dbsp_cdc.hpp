@@ -3941,22 +3941,65 @@ private:
 
     // D-lazy (Global Constraint): a delta arriving for a pending view, or
     // any of its pending ancestors, must realize it FIRST -- deltas must
-    // never apply to un-restored state. `topo` is exactly source_name's
-    // transitive dependent set (the view about to receive this delta and
-    // every pending ancestor of it, in dependency order), so a single
-    // sequential sweep here covers the whole "or any of its pending
-    // ancestors" clause in one pass. Done here, BEFORE the per-level loop
-    // below (which may run step_view on separate threads when
-    // use_parallel_sync_ is on), rather than inside step_view itself:
-    // realize_pending_view_locked mutates pending_restore_ (a single map
-    // shared by every view, not a per-view lock like table_locks_), and
-    // the parallel-thread section below takes no lock of its own — it
-    // relies on apply_changes_batch touching only each view's own
-    // disjoint state. Sequencing every realize before any thread spawns
-    // keeps that assumption true instead of adding a new lock level.
-    for (const auto &view_name : topo) {
-      if (views_.count(view_name)) {
-        realize_pending_view_locked(view_name);
+    // never apply to un-restored state, and no join node may probe a
+    // still-`needs_backfill` shared arrangement. `topo` is source_name's
+    // transitive DEPENDENT set only (things downstream of source_name) --
+    // it is NOT the same as "every pending ancestor of the views about to
+    // step". Counter-example (reviewer-reproduced): v2 = side1 LEFT JOIN
+    // v1, v1 the shared/arrangement-probed side, v3 depends on v2. Editing
+    // `side1` gives topo = {v2, v3} -- v1 is a SIBLING dependency of v2,
+    // not a descendant of side1, so it is never reached by walking
+    // dependents_ forward from side1, however pending it still is. Realize
+    // topo alone here left v1's arrangement `needs_backfill`; v2's LEFT
+    // JOIN reading side1's delta probes it (probe_side has no
+    // needs_backfill guard) and silently null-pads instead of finding
+    // v1's real row -- a wrong delta that then propagates to v3 via
+    // apply_to_arrangements in this same pass. (The previous version of
+    // this comment claimed the false equivalence above; corrected here.)
+    //
+    // Fix: also realize every view in topo's OWN transitive DEPENDENCY
+    // closure (dep_graph_.get_dependencies, the reverse edge of the same
+    // graph `topo` came from -- every SQL-declared source of a view,
+    // arrangement-shared or not, already recorded there by create_view).
+    // This is deliberately the "boringly-safe" superset, not a precise
+    // arrangement_requests()-only walk: it also realizes a still-pending
+    // view source that ISN'T actually arrangement-shared (harmless -- a
+    // realize is a no-op past the first time, see realize_pending_view_
+    // locked's own early return), in exchange for not having to reach
+    // into PlannedCircuitView-specific arrangement metadata here, and for
+    // working uniformly across every NativeMaterializedView kind. Views
+    // genuinely unrelated to source_name's dependent cone -- not in topo
+    // and not feeding anything in it -- are still never touched, so this
+    // does not regress laziness for the unrelated-view case D-lazy exists
+    // for; it only closes the sibling-branch correctness gap. Mirrors the
+    // D3c table-side precedent (`ensure_no_deferred_before_propagate` /
+    // `materialize_for_delta`), scoped to topo's closure here rather than
+    // that function's every-tracked-table sweep, since views (unlike
+    // tables) already have a dependency graph to scope the sweep with.
+    //
+    // Done here, BEFORE the per-level loop below (which may run step_view
+    // on separate threads when use_parallel_sync_ is on), rather than
+    // inside step_view itself: realize_pending_view_locked mutates
+    // pending_restore_ (a single map shared by every view, not a per-view
+    // lock like table_locks_), and the parallel-thread section below
+    // takes no lock of its own -- it relies on apply_changes_batch
+    // touching only each view's own disjoint state. Sequencing every
+    // realize before any thread spawns keeps that assumption true instead
+    // of adding a new lock level.
+    std::vector<std::string> realize_worklist(topo.begin(), topo.end());
+    std::unordered_set<std::string> realize_seen(topo.begin(), topo.end());
+    for (size_t i = 0; i < realize_worklist.size(); i++) {
+      // By-value copy, not a reference: the push_back below can reallocate
+      // realize_worklist's buffer, which would dangle a reference into it.
+      const std::string name = realize_worklist[i];
+      if (!views_.count(name)) {
+        continue; // a table dependency: nothing to realize, walk stops
+      }
+      realize_pending_view_locked(name);
+      for (const auto &dep : dep_graph_.get_dependencies(name)) {
+        if (realize_seen.insert(dep).second) {
+          realize_worklist.push_back(dep);
+        }
       }
     }
 
