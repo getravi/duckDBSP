@@ -470,6 +470,9 @@ SELECT * FROM dbsp_changes('customer_totals');
   between the two notifies if both halves are needed.
 - Empty result when the view exists but no sync has touched it; error when
   the view does not exist.
+- Empty right after CREATE MATERIALIZED VIEW, even over a populated table:
+  the initial-population delta is dropped at create (bounded-RAM Phase 1a)
+  — only post-create commits populate the buffer.
 - Reading does NOT drain the buffer: an untouched view keeps serving the
   same delta (its create-time initial replay, at worst) until the next sync
   that touches it. Use `dbsp_delta_generations()` to tell fresh buffers

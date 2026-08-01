@@ -459,6 +459,8 @@ public:
   const DuckDBZSet &get_delta() const override { return delta_; }
   const TableSchema &result_schema() const override { return result_schema_; }
 
+  void drop_delta() override { delta_.clear(); }
+
   void account_state(StateBytes &out, StateAccounting &acct) const override {
     NativeMaterializedView::account_state(out, acct); // result + delta
     for (const auto &[key, part] : partitions_) {

@@ -1,5 +1,26 @@
 # Changelog
 
+## Bounded-RAM Phase 1a: transient node outputs dropped post-step - Aug 2026
+
+- **Why**: every circuit node's `output_` z-set kept its LAST step's rows for
+  the view's lifetime — after create, that is the full initial population per
+  node: 11.4GB of a 23GB production-shaped DAG footprint.
+- **What**: `SinkNode` now OWNS its delta (copy = H6 refcount bumps, not
+  Value copies) instead of borrowing the upstream buffer; every other node
+  gets `clear_output()`, called by the owning view after each step
+  (`trim_outputs`). Create-time initial-population deltas are dropped
+  (`drop_delta`) once the generation stamp is taken — nobody consumes them
+  (generation filtering skips create buffers), and they pinned the full
+  result twice. `dbsp_changes` after CREATE on a populated table is now
+  EMPTY (semantics change; post-create edits unaffected).
+- **Measured**: 141-view DAG footprint 23GB -> 15GB; "other" class
+  11.4GB -> 0.6GB; steady edits unchanged (0.03-0.05s).
+- **Also fixed** (pre-existing flake the gate caught): `created_at` doubles
+  as checkpoint LOAD order but was wall-clock milliseconds — back-to-back
+  creates tied and the unstable load sort could order a dependent before
+  its source (intermittent "2 from checkpoint" cold-create fallback). Now
+  strictly monotonic; load sorts stable. lazy_restore 8/8, ctest 44/44.
+
 ## dbsp_view_state(): per-view circuit-state accounting - Aug 2026
 
 - **Why**: bounded-RAM roadmap Phase 0 — you cannot diet or budget state you

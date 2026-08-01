@@ -891,6 +891,11 @@ public:
 
   const DuckDBZSet &output() const { return output_; }
 
+  void clear_output() override {
+    output_.clear();
+    has_output_ = false;
+  }
+
   void account_state(StateBytes &out, StateAccounting &acct) const override {
     for (const auto &[key, gs] : states_) {
       (void)gs;
@@ -2004,6 +2009,11 @@ public:
 
   const DuckDBZSet &output() const { return output_; }
 
+  void clear_output() override {
+    output_.clear();
+    has_output_ = false;
+  }
+
   void account_state(StateBytes &out, StateAccounting &acct) const override {
     auto index_bytes = [&](const Index &idx) {
       size_t b = 0;
@@ -2783,6 +2793,11 @@ public:
 
   const DuckDBZSet &output() const { return output_; }
 
+  void clear_output() override {
+    output_.clear();
+    has_output_ = false;
+  }
+
   void account_state(StateBytes &out, StateAccounting &acct) const override {
     for (const auto &[row, c] : counts_) {
       (void)c;
@@ -2866,6 +2881,11 @@ public:
 
   const DuckDBZSet &output() const { return output_; }
 
+  void clear_output() override {
+    output_.clear();
+    has_output_ = false;
+  }
+
   void account_state(StateBytes &out, StateAccounting &acct) const override {
     for (const auto &[row, ws] : counts_) {
       out.other += acct.row_bytes(row) + 40 + ws.capacity() * sizeof(int64_t);
@@ -2940,6 +2960,11 @@ public:
   bool has_output() const override { return !view_->get_delta().empty(); }
 
   const DuckDBZSet &output() const { return view_->get_delta(); }
+
+  // Inside a bigger circuit this node's output is transient — the outer
+  // sink owns the view-level delta. (CircuitWrappedView, whose delta
+  // surface IS the wrapped buffer, excludes its node from the trim pass.)
+  void clear_output() override { view_->drop_delta(); }
 
   void account_state(StateBytes &out, StateAccounting &acct) const override {
     // The wrapped legacy view (WINDOW/SORT_LIMIT/DISTINCT_ON) is an
@@ -3115,6 +3140,11 @@ public:
 
   const DuckDBZSet &output() const { return output_; }
 
+  void clear_output() override {
+    output_.clear();
+    has_output_ = false;
+  }
+
 private:
   InputFn input_fn_;
   size_t num_filters_;
@@ -3209,6 +3239,11 @@ public:
   }
   bool has_output() const override { return has_output_; }
   const DuckDBZSet &output() const { return output_; }
+
+  void clear_output() override {
+    output_.clear();
+    has_output_ = false;
+  }
 
 private:
   InputFn input_fn_;
@@ -3396,6 +3431,11 @@ public:
   bool has_output() const override { return has_output_; }
 
   const DuckDBZSet &output() const { return output_; }
+
+  void clear_output() override {
+    output_.clear();
+    has_output_ = false;
+  }
 
   void account_state(StateBytes &out, StateAccounting &acct) const override {
     out.recursion += acct.zset_bytes(accumulated_);
@@ -3800,6 +3840,7 @@ public:
       it->second->push_borrowed(changes);
     }
     circuit_.step();
+    trim_outputs();
     ++version_;
   }
 
@@ -3819,8 +3860,23 @@ public:
       }
     }
     circuit_.step();
+    trim_outputs();
     ++version_;
   }
+
+  // Bounded-RAM Phase 1a: the sink owns its delta copy, so every other
+  // node's output buffer is transient — drop them after each step. The
+  // last step's outputs (initial population at worst) used to stay
+  // resident for the view's lifetime: 11.4GB of a 23GB wfp footprint.
+  void trim_outputs() {
+    circuit_.for_each_node([this](dbsp::Node &n) {
+      if (&n != static_cast<const dbsp::Node *>(sink_)) {
+        n.clear_output();
+      }
+    });
+  }
+
+  void drop_delta() override { sink_->drop_delta(); }
 
   const DuckDBZSet &get_result() const override {
     return sink_->materialized();

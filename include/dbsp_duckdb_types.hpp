@@ -753,6 +753,13 @@ public:
     out.other += acct.zset_bytes(get_delta());
   }
 
+  // Drop the buffered dbsp_changes delta (bounded-RAM Phase 1a). Called
+  // after create-time initial replay: nobody consumes the initial
+  // population through dbsp_changes (generation filtering skips it), and
+  // on big views it pins the full result a second time. Views whose delta
+  // surface is droppable override; the default keeps legacy behavior.
+  virtual void drop_delta() {}
+
   // --- Circuit-state checkpointing (D3b) -------------------------------
   // Planner-built views override these; legacy views report false and
   // fall back to rebuild-by-replay on load.

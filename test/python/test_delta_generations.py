@@ -47,8 +47,17 @@ g0 = gens()
 assert set(g0) == {"mva", "mvb"}, f"views missing: {g0}"
 baseline = max(g0.values())
 
-# Edit ta only: mva's generation must advance past the baseline, mvb's must
-# not — even though mvb's dbsp_changes buffer still holds its initial replay.
+# Phase 1a: the create-time initial-population delta is DROPPED (nobody
+# consumes it; generation filtering would skip it anyway).
+created = conn.execute("SELECT count(*) FROM dbsp_changes('mvb')").fetchone()[0]
+assert created == 0, f"initial replay must not linger in the buffer: {created}"
+
+# Give mvb a real buffered delta, then edit ta only: mva's generation must
+# advance, mvb's must not — even though mvb's buffer still holds its OLD
+# (tb-edit) delta.
+conn.execute("UPDATE tb SET v = 1.5 WHERE k = 1")
+g0 = gens()
+baseline = g0["mva"]
 conn.execute("UPDATE ta SET v = 11.0 WHERE k = 1")
 g1 = gens()
 assert g1["mva"] > baseline, f"touched view did not advance: {g1}"

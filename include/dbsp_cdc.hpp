@@ -1050,10 +1050,10 @@ public:
       last_error_ = "View not found: " + only_view;
       return false;
     }
-    std::sort(defs.begin(), defs.end(),
-              [](const ViewDefinition &a, const ViewDefinition &b) {
-                return a.created_at < b.created_at;
-              });
+    std::stable_sort(defs.begin(), defs.end(),
+                     [](const ViewDefinition &a, const ViewDefinition &b) {
+                       return a.created_at < b.created_at;
+                     });
     try {
       // Fresh connection: `context` is mid-query inside a table function.
       InternalQueryGuard guard;
@@ -1372,10 +1372,10 @@ public:
         defs.push_back(def);
       }
     }
-    std::sort(defs.begin(), defs.end(),
-              [](const ViewDefinition &a, const ViewDefinition &b) {
-                return a.created_at < b.created_at;
-              });
+    std::stable_sort(defs.begin(), defs.end(),
+                     [](const ViewDefinition &a, const ViewDefinition &b) {
+                       return a.created_at < b.created_at;
+                     });
     // Drop dependents first: retry passes until no progress (drop_view
     // refuses while dependents exist).
     bool progress = true;
@@ -1600,14 +1600,24 @@ public:
       dep_graph_.add_dependency(view_name, source);
     }
 
-    // Store view definition for persistence
+    // Store view definition for persistence. created_at doubles as the
+    // LOAD ORDER (load_from_duck_table sorts by it), and creation order is
+    // a valid topological order (sources must exist at create time) — so
+    // it must be STRICTLY monotonic. Wall-clock milliseconds alone tie for
+    // views created back-to-back, and the load sort is unstable on ties:
+    // a dependent could load before its source and silently fall back to
+    // cold-create (the intermittent "2 from checkpoint" lazy_restore
+    // failure). Caller holds struct_mutex_ exclusively.
     ViewDefinition def;
     def.name = view_name;
     def.sql = sql;
     def.source_tables = resolved_sources;
-    def.created_at = std::chrono::duration_cast<std::chrono::milliseconds>(
-                         std::chrono::system_clock::now().time_since_epoch())
-                         .count();
+    const uint64_t now_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    last_created_at_ = std::max(now_ms, last_created_at_ + 1);
+    def.created_at = last_created_at_;
     view_definitions_[view_name] = def;
 
     // Save to _dbsp_views table (ignore errors for now). Gated on
@@ -1723,6 +1733,11 @@ public:
       // dbsp_delta_generations() consumers can tell it apart from deltas
       // of later commits.
       view_delta_generation_[view_name] = commit_seq_.load();
+      // Bounded-RAM Phase 1a: nobody consumes the initial population
+      // through dbsp_changes (generation filtering skips create-time
+      // buffers), and on big views it pins the full result a second
+      // time — drop it now.
+      views_[view_name]->drop_delta();
     }
 
     return true;
@@ -4362,6 +4377,9 @@ private:
   // commit_seq_ advances on every propagated baseline mutation and on
   // full rebuilds; guard failures fall back to scan-and-diff, loudly.
   std::atomic<uint64_t> commit_seq_{0};
+  // Strictly monotonic created_at stamp for view definitions (see
+  // create_view) — written under struct_mutex_ exclusive.
+  uint64_t last_created_at_ = 0;
   std::atomic<uint64_t> capture_guard_fallbacks_{0};
   std::atomic<bool> write_capture_enabled_{true};
   // D3c lazy baselines: count of deferred tables (lock-free hot-path
