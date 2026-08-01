@@ -1531,10 +1531,21 @@ public:
     {
       InternalQueryGuard guard;
       // MVs aren't in DuckDB's catalog: hand the translator their schemas so
-      // views-on-views bind (shadowed as empty temp tables during ExtractPlan)
+      // views-on-views bind (shadowed as empty temp tables during ExtractPlan).
+      // Only views the SQL can actually reference are shadowed: shadowing all
+      // N existing views made view creation O(N^2) at DAG scale — each shadow
+      // is a real catalog CREATE paying DependencyManager cost, and profiling
+      // a 1,000-view DAG showed ~83% of create time inside those shadow
+      // creates. Case-insensitive substring match is conservative: a false
+      // positive only creates one extra temp table, while a referenced
+      // identifier always appears verbatim in the SQL text.
       std::vector<std::pair<std::string, TableSchema>> mv_schemas;
-      mv_schemas.reserve(views_.size());
+      const std::string sql_lower = duckdb::StringUtil::Lower(sql);
       for (const auto &[existing_name, existing_view] : views_) {
+        if (sql_lower.find(duckdb::StringUtil::Lower(existing_name)) ==
+            std::string::npos) {
+          continue;
+        }
         mv_schemas.emplace_back(existing_name, existing_view->result_schema());
       }
       auto translated =

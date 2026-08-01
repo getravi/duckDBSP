@@ -1,5 +1,26 @@
 # Changelog
 
+## Perf: view creation shadows only referenced MVs — O(N^2) DAG registration fixed - Aug 2026
+
+- **Symptom**: creating or loading a large view DAG was quadratic in total
+  view count — per-view create cost grew linearly (3.5ms/view at 40 views to
+  28ms/view at 1,000), and peak RSS ran ~5MB per view even for tiny views.
+- **Root cause**: `CDCManager::create_view` handed `PlanTranslator::translate`
+  the schemas of ALL existing MVs; each translate shadowed every one as a
+  `CREATE TEMP TABLE` so views-on-views bind. View #k paid k-1 real catalog
+  creates (DependencyManager dominated — ~83% of create time in a 1,000-view
+  profile), and the shadow tables were also the per-view memory.
+- **Fix**: shadow only views the SQL can reference (case-insensitive substring
+  match on the SQL text — a false positive creates one extra temp table; a
+  referenced identifier always appears verbatim).
+- **Measured** (compiled-DAG bench, depth-4 chains): 500 views create
+  6.5s → 0.97s, load 6.9s → 0.54s, RSS 1.7GB → 134MB; 1,000 views create
+  28s → 2.9s, load 29.4s → 1.2s, RSS ~5GB → 203MB; 2,000 views create 12s
+  (pre-fix projection ~112s). A smaller residual per-view growth remains
+  (~10x lower constant) — separate item.
+- **Tests**: full ctest 44/44; downstream NumPad gated suites (compiled wfp
+  DAG all-MV parity + incremental edit sync) green.
+
 ## Fix: NTILE bucket-boundary math + ungate constant bucket counts (Task 2) - Jul 2026
 
 - **Bug**: `NativeWindowView`'s NTILE (`include/dbsp_window_view.hpp`, two
