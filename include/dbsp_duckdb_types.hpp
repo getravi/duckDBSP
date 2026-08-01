@@ -723,6 +723,21 @@ public:
     return false;
   }
 
+  // --- Lazy per-view checkpoint restore (D-lazy) -------------------------
+  // Mirrors TrackedTable::is_deferred()/mark_deferred() for views: a view
+  // cold-created (skip_init_replay) from the D3b checkpoint fast path with
+  // dbsp_lazy_restore ON has its node/sink blobs stashed, undecoded, in
+  // CDCManager::pending_restore_ instead of being injected immediately.
+  // While pending_restore_ is true the view's own circuit-node state and
+  // get_result() are the cold-create default (empty) -- CDCManager's
+  // realize_pending_view[_locked] decodes the stash and calls
+  // clear_pending_restore() on first need (a query, an incoming delta, or
+  // any other consumer of live state). Guarded by view_mutex_, the same
+  // lock that already protects everything else this class exposes.
+  bool is_pending_restore() const { return pending_restore_; }
+  void mark_pending_restore() { pending_restore_ = true; }
+  void clear_pending_restore() { pending_restore_ = false; }
+
 protected:
   std::string name_;
   std::string sql_;
@@ -730,6 +745,7 @@ protected:
   // apply_changes_batch state (default multi-source path only)
   DuckDBZSet batch_delta_;
   bool batched_ = false;
+  bool pending_restore_ = false;
 };
 
 // Filter view: SELECT * FROM table WHERE condition

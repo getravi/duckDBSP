@@ -491,6 +491,32 @@ State after:
 - On load, checkpointed views restore without circuit replay when the
   watermarks still match; everything else is rebuilt from current table
   data
+- **Lazy per-view restore (D-lazy)**, default ON (`dbsp_lazy_restore`):
+  a watermark-matched load cold-creates the view exactly as before, but
+  instead of decoding its node/sink blobs immediately it stashes the
+  already-read bytes in `CDCManager::pending_restore_` (`name -> {nodes,
+  sink}`) and marks the view pending
+  (`NativeMaterializedView::is_pending_restore()`). `dbsp_load()` returns
+  without paying any per-view decode cost; each view's
+  `realize_pending_view`/`realize_pending_view_locked` decodes on first
+  need — mirrors D3c's `TrackedTable::is_deferred()` +
+  `materialize_deferred_locked` shape (and its locking discipline:
+  `pending_restore_` is guarded by the same `view_mutex_` tier that
+  already owns view content, no new lock level). Realization is wired
+  into every surface that reads a view's live state — `dbsp_query`'s
+  read path (`scan_view`/`query_view`), an incoming delta reaching the
+  view or a pending ancestor of it (`propagate_changes`'s pre-pass, which
+  runs sequentially before any per-level parallel `step_view` work so
+  `pending_restore_`'s single shared map is never touched from more than
+  one thread at a time), a warm `create_view` replay or shared-arrangement
+  backfill reading another view's result as a source, and
+  `dbsp_replace_view`/drop (which discard rather than decode a dropped
+  view's stash). `save_checkpoint` re-saves a still-pending view's stash
+  **verbatim** — valid because "pending" is definitionally "no deltas
+  applied since the stash," so the undecoded bytes are still exactly
+  current. `dbsp_lazy_restore(false)` reproduces the pre-D-lazy eager
+  behavior (every checkpointed view fully restored during the load call
+  itself).
 - A checkpoint blob format version travels alongside the data (a
   dedicated `_dbsp_ckpt_version` table); a checkpoint saved under an
   older layout — or missing the table entirely — is treated as absent

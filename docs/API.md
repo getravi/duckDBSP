@@ -694,6 +694,37 @@ SELECT * FROM dbsp_autopersist_interval(0);    -- off
 SELECT * FROM dbsp_autopersist_interval();     -- query the current interval
 ```
 
+### dbsp_lazy_restore(enable)
+
+Toggle lazy per-view checkpoint restore (D-lazy) — **ON by default**: a
+`dbsp_load()` circuit-state checkpoint fast path cold-creates every
+covered view but decodes each one's node/sink blobs on first need instead
+of eagerly, so reopen returns without paying every view's blob-decode
+cost. The first `dbsp_query()`, incoming delta, or other read of a
+still-pending view's live state decodes it transparently — the query or
+delta still returns/applies the exact same result, just with the decode
+cost deferred to when it's actually needed. A checkpointed view never
+touched between reopen and the next `dbsp_save()` is re-saved verbatim
+(no decode at all).
+
+`dbsp_load()`'s report string counts views left pending separately from
+"sources deferred" (D3c table baselines) and "from checkpoint":
+
+```
+Loaded views from _dbsp_views (43 views, 43 from checkpoint, 0 sources
+deferred, 43 pending lazy restore)
+```
+
+Turn lazy restore off for bulk benchmarks or when debugging a restore
+issue and you want every view's state visibly live immediately after
+`dbsp_load()`:
+
+```sql
+SELECT * FROM dbsp_lazy_restore(true);   -- Enable (default)
+SELECT * FROM dbsp_lazy_restore(false);  -- Disable (eager, pre-D-lazy behavior)
+SELECT * FROM dbsp_lazy_restore();       -- Query status
+```
+
 ### dbsp_stats()
 
 Sync-path observability counters, for monitoring which ingestion path

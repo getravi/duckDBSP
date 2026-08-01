@@ -180,7 +180,10 @@ public:
     // D3c: an out-of-band change invalidated a lazily-restored baseline —
     // reconciliation is impossible incrementally, so views rebuild from
     // committed storage at the next statement boundary (here). Runs even
-    // with auto-sync off (the notify path can schedule it too).
+    // with auto-sync off (the notify path can schedule it too). D-lazy
+    // reuses this same flag/sweep for a corrupt lazy-restored VIEW stash
+    // (realize_pending_view_locked, dbsp_cdc.hpp) — rare either way, same
+    // escape hatch.
     if (manager.rebuild_pending()) {
       try {
         manager.rebuild_all_views(context);

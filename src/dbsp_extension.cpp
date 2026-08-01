@@ -936,6 +936,15 @@ void LoadFunc(ClientContext &context, TableFunctionInput &input,
              " from checkpoint, " +
              std::to_string(manager.last_deferred_sources_count()) +
              " sources deferred";
+      // D-lazy: distinct from "sources deferred" above (TrackedTable
+      // baselines, D3c) -- this is views whose checkpoint blobs this call
+      // stashed but has not decoded (dbsp_lazy_restore ON, the default).
+      // 0 either when lazy restore is off or the checkpoint had nothing to
+      // stash.
+      if (manager.last_pending_restore_count() > 0) {
+        msg += ", " + std::to_string(manager.last_pending_restore_count()) +
+               " pending lazy restore";
+      }
     }
   }
   msg += ")";
@@ -1192,6 +1201,79 @@ void AutoPersistIntervalFunc(ClientContext &context, TableFunctionInput &input,
     output.SetValue(0, 0,
                     Value("Auto-persist checkpoint interval set to " +
                           std::to_string(data.n) + " commits"));
+  }
+  data.done = true;
+}
+
+// ============================================================================
+// dbsp_lazy_restore - Enable/disable lazy per-view checkpoint restore
+// (D-lazy). Default ON: a load_from_duck_table checkpoint fast path
+// cold-creates every covered view but stashes its node/sink blobs
+// undecoded instead of injecting them immediately -- each view decodes on
+// first need (a query, an incoming delta, or anything else that reads its
+// live state; see CDCManager::realize_pending_view). OFF reproduces the
+// pre-D-lazy eager behavior (every checkpointed view fully restored during
+// the load call itself), for bulk benchmarks or debugging a restore issue
+// without the pending indirection in the way.
+// Usage: SELECT * FROM dbsp_lazy_restore(true);   -- Enable (default)
+//        SELECT * FROM dbsp_lazy_restore(false);  -- Disable
+//        SELECT * FROM dbsp_lazy_restore();       -- Query status
+// ============================================================================
+
+struct LazyRestoreBindData : public TableFunctionData {
+  bool enable = false;
+  bool query_only = false;
+  bool done = false;
+};
+
+unique_ptr<FunctionData> LazyRestoreBind(ClientContext &context,
+                                         TableFunctionBindInput &input,
+                                         vector<LogicalType> &return_types,
+                                         vector<string> &names) {
+  auto data = make_uniq<LazyRestoreBindData>();
+
+  if (input.inputs.empty()) {
+    data->query_only = true;
+  } else {
+    data->enable = input.inputs[0].GetValue<bool>();
+  }
+
+  return_types.push_back(LogicalType::VARCHAR);
+  names.push_back("result");
+  return std::move(data);
+}
+
+void LazyRestoreFunc(ClientContext &context, TableFunctionInput &input,
+                     DataChunk &output) {
+  EnsureContextState(context);
+  auto &data = input.bind_data->CastNoConst<LazyRestoreBindData>();
+  if (data.done)
+    return;
+
+  auto &manager = dbsp_native::get_cdc_manager(context);
+
+  if (data.query_only) {
+    bool enabled = manager.lazy_restore_enabled();
+    output.SetCardinality(1);
+    output.SetValue(
+        0, 0,
+        Value(string("Lazy restore is ") + (enabled ? "ENABLED" : "DISABLED")));
+  } else {
+    if (data.enable) {
+      manager.enable_lazy_restore();
+      output.SetCardinality(1);
+      output.SetValue(
+          0, 0,
+          Value("Lazy restore ENABLED: checkpointed views decode on first "
+                "need"));
+    } else {
+      manager.disable_lazy_restore();
+      output.SetCardinality(1);
+      output.SetValue(
+          0, 0,
+          Value("Lazy restore DISABLED: dbsp_load() restores every "
+                "checkpointed view eagerly"));
+    }
   }
   data.done = true;
 }
@@ -1923,6 +2005,11 @@ static void LoadInternal(ExtensionLoader &loader) {
                                           AutoPersistIntervalBind);
   autopersist_interval_func.varargs = LogicalType::BIGINT;
   loader.RegisterFunction(autopersist_interval_func);
+
+  TableFunction lazy_restore_func("dbsp_lazy_restore", {}, LazyRestoreFunc,
+                                  LazyRestoreBind);
+  lazy_restore_func.varargs = LogicalType::BOOLEAN;
+  loader.RegisterFunction(lazy_restore_func);
 
   TableFunction use_planner_func("dbsp_use_planner", {}, UsePlannerFunc,
                                  UsePlannerBind);

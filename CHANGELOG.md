@@ -1,5 +1,92 @@
 # Changelog
 
+## Feature: lazy per-view checkpoint restore (D-lazy, Task 1) - Jul 2026
+
+- **Motivation**: a warm reopen paid the blob-decode cost of every
+  checkpointed view up front, even for views the session might not touch
+  for minutes — e.g. 43 views' worth of `restore_circuit_state`/sink
+  decode before `dbsp_load()` could even return.
+- `load_from_duck_table`'s D3b checkpoint fast path no longer decodes a
+  cold-created view's node/sink blobs immediately. It stashes the
+  already-read (but undecoded) bytes in a new `CDCManager::pending_restore_`
+  map (`name -> {nodes, sink}`) and marks the view pending
+  (`NativeMaterializedView::mark_pending_restore()`), gated by a new
+  `dbsp_lazy_restore(BOOLEAN)` setting, **default ON**. `dbsp_lazy_restore(false)`
+  reproduces the exact pre-D-lazy eager behavior (every checkpointed view
+  fully restored during the load call itself) for bulk benchmarks or
+  debugging a restore issue without the pending indirection in the way.
+- `CDCManager::realize_pending_view[_locked]` decodes a pending view's
+  stash on first need (mirrors D3c's `TrackedTable::is_deferred()` +
+  `materialize_deferred_locked` for table baselines — same
+  lazy-materialize-on-first-need shape, same locking discipline: no new
+  lock level, `pending_restore_` guarded by the existing `view_mutex_`
+  tier that already owns view content). Wired into every surface that
+  reads a view's live state:
+  - `scan_view`/`query_view` (the `dbsp_query`/`dbsp_changes`... read
+    path) — self-locking `realize_pending_view()`, a cheap shared-lock
+    peek before ever taking `view_mutex_` exclusively.
+  - `propagate_changes` — a single sequential pre-pass over the
+    propagation's topological order realizes the view about to receive a
+    delta *and every pending ancestor of it* before any `step_view` runs
+    (Global Constraint: deltas must never apply to un-restored state).
+    Done sequentially, before the per-level loop that may spawn threads
+    under `dbsp_parallel(true)` — `pending_restore_` is one map shared by
+    every view, not a per-view lock, so realizing everything up front
+    keeps the existing "each view's own disjoint state" assumption behind
+    the lock-free parallel `step_view` section true.
+  - `create_view`'s warm-replay loop and `register_arrangements`'s
+    view-sourced arrangement backfill — both read a source **view**'s
+    `get_result()` directly (no watermark/backfill-deferral mechanism
+    exists for view sources, unlike table baselines), so both realize the
+    source first, unconditionally.
+  - `save_checkpoint` re-saves a still-pending view's stash **verbatim**:
+    no decode, no re-encode, byte-identical to what `checkpoint_valid`
+    read. Valid because "pending" is definitionally "zero deltas applied
+    since the stash" (guaranteed by gating every `apply_changes_batch` on
+    a prior realize) — a `DBSP_DEBUG_SYNC`-gated check logs loudly if a
+    pending view's live result is ever non-empty at save time instead of
+    silently trusting the invariant.
+  - `drop_view`/`drop_view_cascade` discard (not realize) a dropped
+    view's pending stash — cheaper than decoding state that's about to be
+    thrown away, and `dbsp_replace_view` gets this for free (it drops via
+    the cascade, then recreates via `create_view`, which is already
+    realize-aware for any view-sourced dependents it touches).
+  - `scan_view_delta` (`dbsp_changes`) and `get_view` (test/debug raw
+    accessor, no production caller) deliberately do **not** realize —
+    audited and found safe: a pending view's last delta is legitimately
+    empty (realize only ever calls `set_result()`, never touches the
+    delta field), and `get_view()` has no call site that exercises the
+    checkpoint fast path today (documented as a known gap for future
+    test authors).
+- A corrupt/mismatched stash (should not happen — the same bytes just
+  round-tripped through `checkpoint_valid`'s read) cannot be handled with
+  the eager path's per-view `drop_view`+`create_view` replay: every
+  `realize_pending_view_locked` call site already holds `view_mutex_`
+  exclusively, and both of those re-acquire it. It escalates instead to
+  the existing D3c `rebuild_pending_` global rebuild-all-views escape
+  hatch (checked at every `QueryBegin`) — same "rare correctness escape
+  hatch" the codebase already accepts for a deferred-baseline watermark
+  mismatch, reused rather than duplicated.
+- `dbsp_load()`'s report string gains a distinct `"N pending lazy
+  restore"` clause alongside the existing checkpoint/deferred-sources
+  counts.
+- New test-observable counter `g_lazy_view_decodes` (g_* convention, see
+  `g_recompute_invocations`) counts actual stash decodes process-wide, for
+  asserting "only this view's chain decoded" without parsing
+  `DBSP_TIMING` stderr output; `realize_pending_view_locked` also emits
+  the same `"blob_decode"` `DBSP_TIMING` phase the eager path already did.
+- **No checkpoint format change**: the stashed bytes are the exact bytes
+  `checkpoint_valid` read and, for a still-pending view, the exact bytes
+  `save_checkpoint` writes back — v5 layout, unchanged.
+- **Tests**: `test/integration/test_lazy_restore.cpp` — first-touch
+  decodes exactly one view's chain (`g_lazy_view_decodes` delta) leaving
+  siblings pending; a delta on a pending view's source realizes it before
+  applying, differential vs a continuously-live twin; save-after-partial-
+  realization round-trips (one view re-encoded, the other re-saved
+  verbatim, both correct after a second reload); `dbsp_lazy_restore(false)`
+  reproduces the eager behavior exactly (0 pending, the lazy decode
+  counter never moves).
+
 ## Feature: window-view checkpoint state (restore-tail, Task 2) - Jul 2026
 
 - Circuit-state checkpointing (D3b) now covers `NativeWindowView` embedded

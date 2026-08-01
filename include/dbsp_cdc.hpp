@@ -51,6 +51,13 @@
 
 namespace dbsp_native {
 
+// D-lazy: number of views realize_pending_view[_locked] has actually
+// decoded (a stash found and processed), across every CDCManager in the
+// process. Test-observable counter (g_* convention, see
+// g_recompute_invocations in dbsp_plan_translator.hpp) for asserting "only
+// this view's chain decoded" without parsing DBSP_TIMING stderr output.
+inline std::atomic<size_t> g_lazy_view_decodes{0};
+
 // DBSP_TIMING=1: emit per-phase wall-clock lines to stderr
 // ("[dbsp-timing] <phase> <detail> ms=..."), for profiling restore cost
 // (source sync / arrangement backfill / blob decode) and commit propagation
@@ -422,6 +429,9 @@ public:
       deferred_seeds_.clear();
     }
     last_deferred_count_ = 0;
+    lazy_restore_ = true;
+    pending_restore_.clear();
+    last_pending_restore_count_ = 0;
   }
 
   // Auto-sync (automatic CDC) control. Flag is atomic so transaction hooks
@@ -452,6 +462,21 @@ public:
   void set_autopersist_interval(size_t n) { autopersist_interval_ = n; }
 
   size_t autopersist_interval() const { return autopersist_interval_; }
+
+  // Lazy per-view checkpoint restore (D-lazy). Default ON: the D3b
+  // checkpoint fast path in load_from_duck_table stashes a cold-created
+  // view's node/sink blobs undecoded instead of injecting them
+  // immediately, so reopen returns without paying every view's blob_decode
+  // cost -- each view decodes on first need (realize_pending_view). OFF
+  // reproduces the pre-D-lazy eager behavior (every checkpointed view
+  // fully restored during load_from_duck_table itself), for bulk
+  // benchmarks or debugging a restore issue without the pending indirection
+  // in the way. Same atomic-flag shape as autopersist_ above.
+  void enable_lazy_restore() { lazy_restore_ = true; }
+
+  void disable_lazy_restore() { lazy_restore_ = false; }
+
+  bool lazy_restore_enabled() const { return lazy_restore_; }
 
   bool has_views() const {
     std::shared_lock<std::shared_mutex> lock(struct_mutex_);
@@ -547,6 +572,35 @@ public:
         auto def_it = view_definitions_.find(name);
         if (def_it != view_definitions_.end()) {
           ck.sql = def_it->second.sql;
+        }
+        // D-lazy: a still-pending view has decoded nothing since its
+        // checkpoint stash was read (realize_pending_view[_locked] is the
+        // only thing that clears pending_restore_, and it always runs
+        // before the first apply_changes_batch -- see propagate_changes's
+        // pre-pass), so its stash is definitionally still-current state.
+        // Re-save it VERBATIM: no decode, no re-encode, byte-identical to
+        // what checkpoint_valid read, and immune to the empty
+        // serialize_circuit_state()/get_result() a cold-created-but-never-
+        // realized view would otherwise silently (and wrongly) produce
+        // below.
+        auto pend_it = pending_restore_.find(name);
+        if (pend_it != pending_restore_.end()) {
+          if (std::getenv("DBSP_DEBUG_SYNC") && !view->get_result().empty()) {
+            // Invariant check: pending == no deltas seen == empty live
+            // result (still the cold-create default). A non-empty result
+            // here means some path applied a delta without realizing
+            // first -- log loudly rather than silently trusting the stash.
+            std::cerr << "[dbsp] invariant violation: pending view '"
+                      << name
+                      << "' has a non-empty live result at save time\n";
+          }
+          ck.nodes.reserve(pend_it->second.nodes.size());
+          for (const auto &[node_id, blob] : pend_it->second.nodes) {
+            ck.nodes.emplace_back(node_id, blob);
+          }
+          ck.sink = pend_it->second.sink;
+          view_blobs.push_back(std::move(ck));
+          continue;
         }
         if (!view->serialize_circuit_state(ck.nodes)) {
           continue;
@@ -802,6 +856,150 @@ public:
     }
   }
 
+  // --- Lazy per-view checkpoint restore (D-lazy) --------------------------
+  // Precedent: D3c's TrackedTable::is_deferred() + materialize_deferred_
+  // locked (baseline materialization). This is the same lazy-materialize-
+  // on-first-need shape applied to a VIEW's checkpoint blobs instead of a
+  // table's storage scan: load_from_duck_table's checkpoint fast path
+  // stashes the already-read (but undecoded) node/sink blobs here instead
+  // of calling restore_view_state eagerly, and marks the view pending
+  // (NativeMaterializedView::mark_pending_restore()). Every surface that
+  // needs a pending view's live state (get_result()/get_delta()) must
+  // realize it first -- see the call-site audit in the Task 1 report.
+  //
+  // Guarded by view_mutex_ (tier 3) -- the same lock that already guards
+  // NativeMaterializedView content -- not a new lock level: presence in
+  // this map is a property of a view's CONTENT (decoded or not), exactly
+  // like TrackedTable::deferred_ is a property of a table's baseline
+  // content and lives on the table's own per-table lock, not struct_mutex_.
+  struct PendingViewCkpt {
+    std::unordered_map<uint64_t, std::vector<uint8_t>> nodes;
+    std::vector<uint8_t> sink;
+  };
+
+  // Stash a checkpointed view's raw node + sink blobs without decoding.
+  // Caller: load_from_duck_table's checkpoint fast path, immediately after
+  // create_view(..., skip_init_replay=true) returns true for a
+  // fingerprint-matched cold create. No-op if the view is missing (should
+  // be unreachable: called right after its own successful create_view).
+  // Takes struct_lock shared + view_lock exclusive, the same locks
+  // restore_view_state takes for the eager equivalent -- caller holds
+  // neither (create_view released both on return, matching
+  // load_from_duck_table's own "must NOT hold struct_mutex_" discipline).
+  void stash_pending_view(const std::string &view_name, const CkptData &ckpt) {
+    std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    std::unique_lock<std::shared_mutex> view_lock(view_mutex_);
+    auto it = views_.find(view_name);
+    if (it == views_.end()) {
+      return;
+    }
+    PendingViewCkpt pv;
+    auto nodes_it = ckpt.nodes.find(view_name);
+    if (nodes_it != ckpt.nodes.end()) {
+      pv.nodes = nodes_it->second;
+    }
+    auto sink_it = ckpt.sinks.find(view_name);
+    if (sink_it != ckpt.sinks.end()) {
+      pv.sink = sink_it->second;
+    }
+    pending_restore_[view_name] = std::move(pv);
+    it->second->mark_pending_restore();
+  }
+
+  // Realize (decode + inject) `view_name`'s stashed checkpoint blobs.
+  // No-op (returns true) when the view isn't pending -- safe to call
+  // unconditionally at every realization call site, mirroring
+  // materialize_deferred_locked's own no-op-when-not-deferred shape.
+  //
+  // Locking: caller already holds view_mutex_ exclusively (create_view,
+  // register_arrangements, and propagate_changes's pre-pass all do, per
+  // their own doc comments) -- this function does NOT lock it itself
+  // (std::shared_mutex is not reentrant; a second exclusive lock on the
+  // same thread is undefined behavior). Use realize_pending_view() (below)
+  // from a context that holds neither struct_mutex_ nor view_mutex_.
+  //
+  // On a corrupt/mismatched stash (should not happen given the same bytes
+  // just round-tripped through checkpoint_valid's read): unlike the eager
+  // restore_view_state failure path in load_from_duck_table -- which can
+  // drop_view()/create_view() a per-view replay rebuild right there -- this
+  // function cannot: its callers already hold view_mutex_ exclusively, and
+  // both drop_view and create_view re-acquire it (deadlock). It instead
+  // escalates to the existing D3c global rebuild_pending_ escape hatch
+  // (checked at every QueryBegin, see dbsp_context_state.hpp), which
+  // drop_view()s and create_view()s every view fresh from committed
+  // storage -- same "rare correctness escape hatch" the codebase already
+  // accepts for a deferred-baseline watermark mismatch.
+  bool realize_pending_view_locked(const std::string &view_name) {
+    auto pend_it = pending_restore_.find(view_name);
+    if (pend_it == pending_restore_.end()) {
+      return true; // not pending: already live, or was never checkpointed
+    }
+    auto view_it = views_.find(view_name);
+    if (view_it == views_.end()) {
+      pending_restore_.erase(pend_it);
+      return true;
+    }
+    DbspScopeTimer timer("blob_decode", view_name);
+    g_lazy_view_decodes++;
+    bool ok;
+    try {
+      ok = view_it->second->restore_circuit_state(pend_it->second.nodes);
+      if (ok) {
+        BlobReader r(pend_it->second.sink.data(), pend_it->second.sink.size());
+        DuckDBZSet result;
+        const uint64_t n = r.u64();
+        for (uint64_t i = 0; i < n; i++) {
+          DuckDBRow row = r.hashed_row();
+          const int64_t w = r.i64();
+          result.insert(row, w);
+        }
+        view_it->second->set_result(result);
+        ok = ok && r.done();
+      }
+    } catch (...) {
+      ok = false;
+    }
+    pending_restore_.erase(pend_it);
+    view_it->second->clear_pending_restore();
+    if (!ok) {
+      rebuild_pending_ = true;
+      record_error_best_effort(
+          "DBSP: lazy-restore stash for view '" + view_name +
+          "' failed to decode; scheduling full rebuild");
+    }
+    return ok;
+  }
+
+  // Self-locking entry point for callers that hold neither struct_mutex_
+  // nor view_mutex_ (dbsp_query's scan_view, query_view). No-op when the
+  // view is not pending. Acquires view_mutex_ shared for a cheap peek
+  // first (avoiding an exclusive lock on the hot already-realized path)
+  // and only re-acquires it exclusively -- released and re-taken, never
+  // upgraded (std::shared_mutex has no upgrade primitive) -- when the peek
+  // finds the view pending; realize_pending_view_locked re-checks under
+  // that exclusive lock, so a racing second caller's peek-then-lock is
+  // harmless (idempotent).
+  void realize_pending_view(const std::string &view_name) {
+    std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    {
+      std::shared_lock<std::shared_mutex> peek(view_mutex_);
+      auto it = views_.find(view_name);
+      if (it == views_.end() || !it->second->is_pending_restore()) {
+        return;
+      }
+    }
+    std::unique_lock<std::shared_mutex> view_lock(view_mutex_);
+    realize_pending_view_locked(view_name);
+  }
+
+  // Count of views whose checkpoint blobs are still stashed (pending) --
+  // observable so tests can assert lazy restore actually deferred work,
+  // and for the dbsp_load() report string.
+  size_t pending_restore_count() const {
+    std::shared_lock<std::shared_mutex> lock(view_mutex_);
+    return pending_restore_.size();
+  }
+
   // Zero-arg dbsp_save(): snapshot all view definitions into a catalog's
   // _dbsp_views table, so they travel with the database file (and backups).
   // When `catalog` is non-empty the table is created/read in that attached
@@ -975,6 +1173,8 @@ public:
     size_t loaded = 0;
     size_t ckpt_restored = 0;
     size_t skipped = 0;
+    size_t pending_now_count = 0;
+    const bool lazy = lazy_restore_.load();
     for (const auto &[name, view_sql] : rows) {
       {
         std::shared_lock<std::shared_mutex> lock(struct_mutex_);
@@ -1001,7 +1201,18 @@ public:
                      "save) -- rebuilding by replay\n";
       }
       if (create_view(context, name, view_sql, /*skip_init_replay=*/cold)) {
-        if (cold && !restore_view_state(name, ckpt)) {
+        if (cold && lazy) {
+          // D-lazy: stash the already-read blobs undecoded instead of
+          // calling restore_view_state eagerly -- realize_pending_view[_
+          // locked] decodes them on first need. stash_pending_view cannot
+          // itself fail the way the eager decode below can (it copies
+          // bytes, it doesn't parse them), so there is no per-view decline
+          // branch here: a corrupt stash surfaces later, at realize time.
+          stash_pending_view(name, ckpt);
+          ckpt_restored++;
+          pending_now_count++;
+          loaded++;
+        } else if (cold && !restore_view_state(name, ckpt)) {
           // Corrupt/mismatched blob: rebuild this view the normal way
           drop_view(name);
           if (create_view(context, name, view_sql)) {
@@ -1035,6 +1246,7 @@ public:
     last_loaded_count_ = loaded;
     last_ckpt_restored_count_ = ckpt_restored;
     last_skipped_count_ = skipped;
+    last_pending_restore_count_ = pending_now_count;
     return true;
   }
 
@@ -1051,6 +1263,11 @@ public:
   // Rows the last load_from_duck_table call skipped because the view was
   // already live in this session (see field comment).
   size_t last_skipped_count() const { return last_skipped_count_; }
+  // Views left pending (checkpoint blobs stashed, not decoded) by the last
+  // load_from_duck_table call (D-lazy; 0 when lazy_restore_ is off).
+  size_t last_pending_restore_count() const {
+    return last_pending_restore_count_;
+  }
 
   // --- D3c lazy baselines: cross-cutting hooks ---------------------------
 
@@ -1463,6 +1680,11 @@ public:
           // their one row only when the circuit steps
           view->apply_changes(source, chunk);
         } else if (views_.count(source)) {
+          // D-lazy: a warm create replaying a view source needs that
+          // source's real result, not the cold-create empty default a
+          // still-pending source would otherwise hand back silently.
+          // Caller (create_view) already holds view_mutex_ exclusively.
+          realize_pending_view_locked(source);
           // Source is a view - use its result
           view->apply_changes(source, views_[source]->get_result());
         }
@@ -1498,6 +1720,17 @@ public:
           tracked_tables_.at(req.table)->is_deferred()) {
         materialize_deferred_locked(context, req.table, nullptr,
                                     /*view_lock_held=*/true);
+      }
+      // D-lazy: an arrangement over a VIEW source is seeded below from
+      // that view's full get_result() (no table-side "defer_fill" analog
+      // exists for views — the backfill is either done now or never,
+      // there is no needs_backfill sweep for view-named arrangement
+      // sources), so a still-pending source view must be realized first,
+      // regardless of `cold` (this governs the CURRENT view being
+      // created, not req.table's own pending state). Caller
+      // (create_view) already holds view_mutex_ exclusively.
+      if (source_is_view) {
+        realize_pending_view_locked(req.table);
       }
       const bool defer_fill =
           source_is_table && tracked_tables_.at(req.table)->is_deferred();
@@ -1598,6 +1831,10 @@ public:
     dep_graph_.remove_node(view_name);
     view_definitions_.erase(view_name);
     table_schemas_.erase(view_name);
+    // D-lazy: realize-or-discard -- dropping the view makes any stashed
+    // checkpoint blobs moot, so just discard them (cheaper than decoding
+    // first only to throw the result away).
+    pending_restore_.erase(view_name);
     return views_.erase(view_name) > 0;
   }
 
@@ -1633,6 +1870,7 @@ public:
       dep_graph_.remove_node(dep);
       view_definitions_.erase(dep);
       table_schemas_.erase(dep);
+      pending_restore_.erase(dep); // D-lazy: discard, see drop_view
       views_.erase(dep);
     }
 
@@ -1652,6 +1890,7 @@ public:
     dep_graph_.remove_node(view_name);
     view_definitions_.erase(view_name);
     table_schemas_.erase(view_name);
+    pending_restore_.erase(view_name); // D-lazy: discard, see drop_view
     return views_.erase(view_name) > 0;
   }
 
@@ -2604,6 +2843,9 @@ public:
   // ========================================================================
 
   const DuckDBZSet *query_view(const std::string &view_name) {
+    // D-lazy: get_result() on a still-pending view is the cold-create
+    // empty default -- realize first (self-locking, no-op if not pending).
+    realize_pending_view(view_name);
     std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
     std::shared_lock<std::shared_mutex> view_lock(view_mutex_);
     auto it = views_.find(view_name);
@@ -2616,6 +2858,14 @@ public:
   // Callers that read view state (scan, get_result) while writers may be
   // active must use scan_view() instead — it holds the read locks for the
   // whole traversal. get_view() remains for single-threaded use (tests).
+  // D-lazy: unlike query_view/scan_view, this does NOT realize a pending
+  // view -- it has no production callers (test/debug only; grep confirms),
+  // and none of its current test call sites exercise the checkpoint fast
+  // path, so a get_result()/scan() on the raw pointer it returns would see
+  // the cold-create empty default if ever called on a pending view. Known
+  // gap: a future test against a lazy-restored view must go through
+  // scan_view()/query_view() instead of get_view(), or call
+  // realize_pending_view() itself first.
   const NativeMaterializedView *get_view(const std::string &view_name) {
     std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
     std::shared_lock<std::shared_mutex> view_lock(view_mutex_);
@@ -2631,6 +2881,9 @@ public:
   // Returns false if the view does not exist.
   bool scan_view(const std::string &view_name,
                  const std::function<void(const DuckDBRow &, Weight)> &cb) {
+    // D-lazy: dbsp_query's read path -- the primary "first touch decodes
+    // this view's chain" trigger. No-op if not pending.
+    realize_pending_view(view_name);
     std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
     std::shared_lock<std::shared_mutex> view_lock(view_mutex_);
     auto it = views_.find(view_name);
@@ -2654,6 +2907,13 @@ public:
   // (rows added/removed by the most recent propagation, weight ±n).
   // Single-generation: overwritten by the next sync that touches the view.
   // Returns false when the view does not exist.
+  // D-lazy: deliberately does NOT realize a pending view. get_delta() is
+  // "rows changed by the most recent apply_changes_batch"; restore_view_
+  // state/realize_pending_view[_locked] only ever call set_result() (the
+  // sink), never touch the delta field, so a still-pending (never
+  // stepped) view's delta is legitimately empty either way -- decoding
+  // its stash here would pay the blob_decode cost for a value realization
+  // cannot change, defeating the point of staying lazy.
   bool scan_view_delta(const std::string &view_name,
                        const std::function<void(const DuckDBRow &, Weight)> &cb) {
     std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
@@ -3598,6 +3858,27 @@ private:
       levels[lvl - 1].push_back(view_name);
     }
 
+    // D-lazy (Global Constraint): a delta arriving for a pending view, or
+    // any of its pending ancestors, must realize it FIRST -- deltas must
+    // never apply to un-restored state. `topo` is exactly source_name's
+    // transitive dependent set (the view about to receive this delta and
+    // every pending ancestor of it, in dependency order), so a single
+    // sequential sweep here covers the whole "or any of its pending
+    // ancestors" clause in one pass. Done here, BEFORE the per-level loop
+    // below (which may run step_view on separate threads when
+    // use_parallel_sync_ is on), rather than inside step_view itself:
+    // realize_pending_view_locked mutates pending_restore_ (a single map
+    // shared by every view, not a per-view lock like table_locks_), and
+    // the parallel-thread section below takes no lock of its own — it
+    // relies on apply_changes_batch touching only each view's own
+    // disjoint state. Sequencing every realize before any thread spawns
+    // keeps that assumption true instead of adding a new lock level.
+    for (const auto &view_name : topo) {
+      if (views_.count(view_name)) {
+        realize_pending_view_locked(view_name);
+      }
+    }
+
     struct StepResult {
       std::string view_name;
       const DuckDBZSet *delta = nullptr; // borrows view state
@@ -3837,6 +4118,10 @@ private:
   std::unordered_map<std::string, TableSchema> table_schemas_;
   std::unordered_map<std::string, std::unique_ptr<NativeMaterializedView>>
       views_;
+  // D-lazy: checkpoint blobs for views the load fast path cold-created but
+  // has not yet decoded (NativeMaterializedView::is_pending_restore()).
+  // Tier 3 (view_mutex_) -- see stash_pending_view/realize_pending_view.
+  std::unordered_map<std::string, PendingViewCkpt> pending_restore_;
   std::unordered_map<std::string, ViewDefinition> view_definitions_;
   DependencyGraph dep_graph_;
   std::string last_error_;
@@ -3880,6 +4165,11 @@ private:
   std::unordered_map<std::string, std::pair<int64_t, std::string>>
       deferred_seeds_;
   size_t last_deferred_count_ = 0;
+  // D-lazy: default ON (see enable_lazy_restore/disable_lazy_restore), and
+  // views left pending by the last load_from_duck_table call (mirrors
+  // last_deferred_count_ above for tables).
+  std::atomic<bool> lazy_restore_{true};
+  size_t last_pending_restore_count_ = 0;
   bool use_parallel_sync_ = false;
   bool spill_enabled_ = false;
   std::string spill_dir_;

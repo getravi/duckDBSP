@@ -216,6 +216,7 @@ automatically. See `dbsp_autopersist` below.
 | `dbsp_auto_sync(bool)` | Toggle automatic sync on commit (default ON; turn off for bulk loads) |
 | `dbsp_autopersist(bool)` | Toggle auto-save-on-close + auto-load-on-reopen (default ON; turn off for bulk loads) |
 | `dbsp_autopersist_interval(n)` | Piggyback a circuit-state checkpoint every `n` commits (default 0 = off) |
+| `dbsp_lazy_restore(bool)` | Toggle lazy per-view checkpoint restore: each view decodes on first need instead of eagerly at load (default ON) |
 | `dbsp_parallel(bool)` | Toggle parallel multi-table sync + same-level view propagation |
 | `dbsp_spill(bool)` | Toggle disk-backed state: baselines, join indexes, top-K windows, big aggregate groups |
 | `dbsp_use_planner([bool])` | No-op since Phase C (planner is the only frontend); kept for script compatibility |
