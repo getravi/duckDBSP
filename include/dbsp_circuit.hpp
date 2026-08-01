@@ -208,12 +208,22 @@ public:
         const ZSetType& delta = input_fn_();
         if (!delta.empty()) {
             delta_own_ = delta;
-            integrated_ += delta;
+            if (integrate_) {
+                integrated_ += delta;
+            }
             has_output_ = true;
         } else {
             delta_own_.clear();
             has_output_ = false;
         }
+    }
+
+    // Bounded-RAM Phase 1c: the view's __mv_ backing table is the result
+    // now — stop integrating and drop the RAM copy. One-way until the
+    // view is rebuilt (set_materialized turns integration back on).
+    void set_table_backed() {
+        integrate_ = false;
+        integrated_.clear();
     }
 
     void reset() override {
@@ -241,6 +251,7 @@ public:
     // Overwrite the integrated state (used by tests/legacy restore paths)
     void set_materialized(const ZSetType& state) {
         integrated_ = state;
+        integrate_ = true; // a restored result means RAM is authoritative
         delta_own_.clear();
         has_output_ = false;
     }
@@ -249,6 +260,7 @@ private:
     InputFn input_fn_;
     ZSetType integrated_;
     ZSetType delta_own_;
+    bool integrate_ = true;
     bool has_output_ = false;
 };
 

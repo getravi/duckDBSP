@@ -1,5 +1,21 @@
 # Changelog
 
+## Bounded-RAM Phase 1c: table-backed reads, results out of RAM - Aug 2026
+
+- With `dbsp_mv_tables(true)`, sinks stop integrating: the __mv_ table IS
+  the view result. `dbsp_query`/scan, create-replay of view sources, and
+  shared-arrangement backfill stream from the table; checkpoint save skips
+  result rows for table-backed views (durable in the table already); the
+  weight-multiplicity fallback rebuilds from the table's own rows + delta
+  (no RAM result needed). Disable schedules a view rebuild (reintegrate).
+- **Fixed en route**: `dbsp_mv_tables` ran its side effect in Bind, and the
+  relation API binds twice per statement — the second enable re-backfilled
+  AFTER the results were dropped, wiping every table to 0 rows. Enable is
+  now idempotent.
+- Measured (141-view DAG): result class 2.3GB -> 0; reads of a 167k-row
+  view from the table in 0.04s; edits 0.17-0.78s; parity suites green.
+  Remaining RAM: join arrangements 7.35GB (Phase 2), window caches 0.85GB.
+
 ## Bounded-RAM Phase 1b: disk-backed MV result tables + lost-update fix - Aug 2026
 
 - **dbsp_mv_tables(enable)**: every view mirrors its result into a

@@ -58,6 +58,11 @@ public:
 
   void drop_delta() override { sink_->drop_delta(); }
 
+  bool set_table_backed() override {
+    sink_->set_table_backed();
+    return true;
+  }
+
   const DuckDBZSet &get_result() const override {
     return sink_->materialized();
   }

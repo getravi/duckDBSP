@@ -753,6 +753,12 @@ public:
     out.other += acct.zset_bytes(get_delta());
   }
 
+  // Bounded-RAM Phase 1c: the caller mirrored this view's result into a
+  // durable backing table and wants the RAM copy dropped (the sink stops
+  // integrating). Returns true when the view supports table-backed mode;
+  // legacy views keep their result and return false.
+  virtual bool set_table_backed() { return false; }
+
   // Drop the buffered dbsp_changes delta (bounded-RAM Phase 1a). Called
   // after create-time initial replay: nobody consumes the initial
   // population through dbsp_changes (generation filtering skips it), and

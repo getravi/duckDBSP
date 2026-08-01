@@ -837,8 +837,17 @@ SELECT * FROM dbsp_mv_tables(true);
 ```
 
 Per-commit apply is DELETE (retractions) + INSERT (additions) via a staged
-temp table; any delta weight beyond ±1 falls back to a full table rewrite.
-Reads still come from circuit state (`dbsp_query`) until Phase 1c.
+temp table; any delta weight beyond ±1 rebuilds the table from its own
+current rows + the delta.
+
+**Table-backed reads (Phase 1c)**: once a view's table is written, the sink
+stops integrating — the RAM result is dropped and the __mv_ table IS the
+result. `dbsp_query`, create-time replay of view sources, and shared-
+arrangement backfill all stream from the table; checkpoints save operator
+state only (rows are already durable). Enable is idempotent (table
+functions can be bound twice per statement — a second backfill would run
+after the results were dropped). Disabling schedules a full view rebuild so
+sinks reintegrate in RAM.
 
 ### dbsp_spill(enable)
 

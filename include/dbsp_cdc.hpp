@@ -606,7 +606,12 @@ public:
           continue;
         }
         BlobWriter w;
-        const auto &result = view->get_result();
+        // Phase 1c: a table-backed view's rows are durable in its __mv_
+        // table — checkpoint operator state only (empty result blob).
+        static const DuckDBZSet kEmptyResult;
+        const auto &result = mv_table_backed_.count(name) > 0
+                                 ? kEmptyResult
+                                 : view->get_result();
         w.u64(result.size());
         for (const auto &[row, weight] : result) {
           w.row(row.columns);
@@ -1722,8 +1727,21 @@ public:
           // still-pending source would otherwise hand back silently.
           // Caller (create_view) already holds view_mutex_ exclusively.
           realize_pending_view_locked(source);
-          // Source is a view - use its result
-          view->apply_changes(source, views_[source]->get_result());
+          if (mv_table_backed_.count(source) > 0 && mv_db_ != nullptr) {
+            // Phase 1c: the source's result lives in its __mv_ table.
+            DuckDBZSet chunk;
+            mv_scan_table(source, [&](const DuckDBRow &row, Weight w) {
+              chunk.insert(row, w);
+              if (chunk.size() >= 65536) {
+                view->apply_changes(source, chunk);
+                chunk = DuckDBZSet();
+              }
+            });
+            view->apply_changes(source, chunk);
+          } else {
+            // Source is a view - use its result
+            view->apply_changes(source, views_[source]->get_result());
+          }
         }
       }
 
@@ -1747,6 +1765,8 @@ public:
           duckdb::Connection mv_con(*mv_db_);
           if (!mv_write_full(mv_con, view_name, *views_[view_name])) {
             mv_tables_enabled_ = false;
+          } else if (views_[view_name]->set_table_backed()) {
+            mv_table_backed_.insert(view_name); // Phase 1c: RAM result dropped
           }
         } catch (const std::exception &e) {
           last_error_ = std::string("mv mirror failed: ") + e.what();
@@ -1867,6 +1887,13 @@ public:
             if (!chunk.empty()) {
               arr->apply(chunk);
             }
+          } else if (mv_table_backed_.count(req.table) > 0 &&
+                     mv_db_ != nullptr) {
+            DuckDBZSet chunk; // Phase 1c: backfill from the backing table
+            mv_scan_table(req.table, [&](const DuckDBRow &row, Weight w) {
+              chunk.insert(row, w);
+            });
+            arr->apply(chunk);
           } else {
             arr->apply(views_.at(req.table)->get_result());
           }
@@ -1922,6 +1949,7 @@ public:
     // first only to throw the result away).
     pending_restore_.erase(view_name);
     view_delta_generation_.erase(view_name);
+    mv_table_backed_.erase(view_name);
     return views_.erase(view_name) > 0;
   }
 
@@ -1959,6 +1987,7 @@ public:
       table_schemas_.erase(dep);
       pending_restore_.erase(dep); // D-lazy: discard, see drop_view
       view_delta_generation_.erase(dep);
+      mv_table_backed_.erase(dep);
       views_.erase(dep);
     }
 
@@ -1980,6 +2009,7 @@ public:
     table_schemas_.erase(view_name);
     pending_restore_.erase(view_name); // D-lazy: discard, see drop_view
     view_delta_generation_.erase(view_name);
+    mv_table_backed_.erase(view_name);
     return views_.erase(view_name) > 0;
   }
 
@@ -2979,8 +3009,36 @@ public:
     if (it == views_.end()) {
       return false;
     }
+    // Bounded-RAM Phase 1c: a table-backed view's result lives in its
+    // __mv_ table (the sink no longer integrates) — serve from disk.
+    if (mv_table_backed_.count(view_name) > 0 && mv_db_ != nullptr) {
+      mv_scan_table(view_name, cb);
+      return true;
+    }
     it->second->scan(cb);
     return true;
+  }
+
+  // Stream a backing table's rows (weight 1 each) through cb. Caller
+  // holds the read locks; the internal connection never re-enters the
+  // manager (InternalQueryGuard).
+  void mv_scan_table(const std::string &view_name,
+                     const std::function<void(const DuckDBRow &, Weight)> &cb) {
+    InternalQueryGuard guard;
+    duckdb::Connection con(*mv_db_);
+    auto res = con.Query("SELECT * FROM " + mv_quote(mv_table_for(view_name)));
+    if (res->HasError()) {
+      throw std::runtime_error("mv table read failed: " + res->GetError());
+    }
+    while (auto chunk = res->Fetch()) {
+      for (duckdb::idx_t r = 0; r < chunk->size(); r++) {
+        DuckDBRow row;
+        for (duckdb::idx_t c = 0; c < chunk->ColumnCount(); c++) {
+          row.columns.push_back(chunk->GetValue(c, r));
+        }
+        cb(row, 1);
+      }
+    }
   }
 
   const TableSchema *get_view_schema(const std::string &view_name) {
@@ -3029,21 +3087,43 @@ public:
   bool mv_tables_enabled() const { return mv_tables_enabled_.load(); }
 
   // Enable/disable mirroring. Enabling backfills a table for every
-  // registered view from its current circuit result.
+  // registered view from its current circuit result. IDEMPOTENT: a repeat
+  // enable is a no-op — table functions can be bound more than once per
+  // statement (relation API double-bind), and a second backfill would run
+  // AFTER set_table_backed dropped the results, wiping every table.
   bool set_mv_tables(duckdb::ClientContext &context, bool enable) {
+    if (enable && mv_tables_enabled_.load()) {
+      return true;
+    }
     if (!enable) {
       mv_tables_enabled_ = false;
+      std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+      std::unique_lock<std::shared_mutex> view_lock(view_mutex_);
+      if (!mv_table_backed_.empty()) {
+        // Table-backed sinks hold no result to fall back to — rebuild the
+        // views so they reintegrate in RAM (next statement boundary).
+        mv_table_backed_.clear();
+        rebuild_pending_ = true;
+      }
       return true;
     }
     std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
-    std::shared_lock<std::shared_mutex> view_lock(view_mutex_);
+    std::unique_lock<std::shared_mutex> view_lock(view_mutex_);
     mv_db_ = &duckdb::DatabaseInstance::GetDatabase(context);
     InternalQueryGuard guard;
     try {
       duckdb::Connection con(*mv_db_);
       for (const auto &[name, view] : views_) {
+        if (mv_table_backed_.count(name) > 0) {
+          continue; // already backed: table is authoritative, result gone
+        }
         if (!mv_write_full(con, name, *view)) {
           return false;
+        }
+        // Phase 1c: the table is authoritative now — drop the sink's
+        // integrated result from RAM where the view supports it.
+        if (view->set_table_backed()) {
+          mv_table_backed_.insert(name);
         }
       }
       mv_tables_enabled_ = true;
@@ -3108,6 +3188,12 @@ private:
     }
     mv_append_rows(con, mv_table_for(name), view.get_result(),
                    /*with_weight=*/false);
+    if (std::getenv("DBSP_MV_DEBUG") != nullptr) {
+      auto chk = con.Query("SELECT count(*) FROM " + qt);
+      fprintf(stderr, "[mv] write_full %s result=%zu table=%s\n",
+              name.c_str(), view.get_result().size(),
+              chk->HasError() ? "ERR" : chk->GetValue(0, 0).ToString().c_str());
+    }
     return mv_meta_upsert(con, name);
   }
 
@@ -3115,11 +3201,13 @@ private:
                       const NativeMaterializedView &view,
                       const DuckDBZSet &delta) {
     // Fast path needs every delta weight at ±1 (retract exactly one copy
-    // per row). Anything else — multiplicities — takes the full rewrite.
+    // per row). Anything else — multiplicities — rebuilds the table from
+    // its own current rows + the delta (the table IS the result for
+    // table-backed views; get_result() may be empty).
     for (const auto &[row, w] : delta) {
       (void)row;
       if (w != 1 && w != -1) {
-        return mv_write_full(con, name, view);
+        return mv_rebuild_from_table(con, name, view, delta);
       }
     }
     const auto &schema = view.result_schema();
@@ -3162,6 +3250,50 @@ private:
       return false;
     }
     con.Query("DROP TABLE __mv_stage");
+    return mv_meta_upsert(con, name);
+  }
+
+  // General fallback: reconstruct the multiset from the CURRENT backing
+  // table (one weight per physical row), apply the delta, rewrite.
+  bool mv_rebuild_from_table(duckdb::Connection &con, const std::string &name,
+                             const NativeMaterializedView &view,
+                             const DuckDBZSet &delta) {
+    const auto &schema = view.result_schema();
+    if (schema.columns.empty()) {
+      return true;
+    }
+    const std::string qt = mv_quote(mv_table_for(name));
+    DuckDBZSet state;
+    auto res = con.Query("SELECT * FROM " + qt);
+    if (res->HasError()) {
+      last_error_ = "mv rebuild read failed: " + res->GetError();
+      return false;
+    }
+    while (auto chunk = res->Fetch()) {
+      for (duckdb::idx_t r = 0; r < chunk->size(); r++) {
+        DuckDBRow row;
+        for (duckdb::idx_t c = 0; c < chunk->ColumnCount(); c++) {
+          row.columns.push_back(chunk->GetValue(c, r));
+        }
+        state.insert(row, 1);
+      }
+    }
+    for (const auto &[row, w] : delta) {
+      state.insert(row, w);
+    }
+    for (const auto &[row, w] : state) {
+      (void)row;
+      if (w < 0) {
+        last_error_ = "mv rebuild: negative net weight in " + name;
+        return false;
+      }
+    }
+    auto del = con.Query("DELETE FROM " + qt);
+    if (del->HasError()) {
+      last_error_ = "mv rebuild clear failed: " + del->GetError();
+      return false;
+    }
+    mv_append_rows(con, mv_table_for(name), state, /*with_weight=*/false);
     return mv_meta_upsert(con, name);
   }
 
@@ -3893,6 +4025,13 @@ private:
         if (!chunk.empty()) {
           arr->apply(chunk);
         }
+      } else if (mv_table_backed_.count(view_it->first) > 0 &&
+                 mv_db_ != nullptr) {
+        DuckDBZSet chunk; // Phase 1c: backfill from the backing table
+        mv_scan_table(view_it->first, [&](const DuckDBRow &row, Weight w) {
+          chunk.insert(row, w);
+        });
+        arr->apply(chunk);
       } else {
         // View source: realize_pending_view_locked already decoded and
         // set_result()'d before calling us, so get_result() is real.
@@ -4621,6 +4760,10 @@ private:
   // propagation). Reads still come from circuit state until Phase 1c.
   std::atomic<bool> mv_tables_enabled_{false};
   duckdb::DatabaseInstance *mv_db_ = nullptr; // captured at create_view
+  // Phase 1c: views whose sink stopped integrating — the __mv_ table IS
+  // the result; reads, replays and backfills stream from it. Guarded by
+  // view_mutex_.
+  std::unordered_set<std::string> mv_table_backed_;
   std::atomic<uint64_t> capture_guard_fallbacks_{0};
   std::atomic<bool> write_capture_enabled_{true};
   // D3c lazy baselines: count of deferred tables (lock-free hot-path

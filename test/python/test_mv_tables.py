@@ -86,6 +86,21 @@ conn.execute("CREATE MATERIALIZED VIEW mv_late AS SELECT g, COUNT(*) AS n FROM t
 VIEWS["mv_late"] = ""
 check_parity(conn, "after late create")
 
+# Phase 1c: table-backed sinks dropped their RAM result — the table IS
+# the read surface now.
+vs = {r[0]: r[1] for r in conn.execute(
+    "SELECT view_name, result_bytes FROM dbsp_view_state()").fetchall()}
+for name in VIEWS:
+    assert vs.get(name, 0) < 10_000, f"{name} result still resident: {vs[name]}"
+
+# Decisive read-path proof: poke the backing table directly — dbsp_query
+# must reflect it (reads come from disk, not circuit state).
+orig = conn.execute('SELECT s FROM "__mv_mv_agg" WHERE g = 0').fetchone()[0]
+conn.execute(f'UPDATE "__mv_mv_agg" SET s = 123456.0 WHERE g = 0')
+poked = dict(conn.execute("SELECT * FROM dbsp_query('mv_agg')").fetchall())
+assert poked[0] == 123456.0, f"dbsp_query not served from table: {poked[0]}"
+conn.execute(f'UPDATE "__mv_mv_agg" SET s = {orig} WHERE g = 0')
+
 # Meta watermarks exist for every mirrored view.
 meta = dict(conn.execute("SELECT view_name, commit_seq FROM __dbsp_mv_meta").fetchall())
 assert set(meta) >= set(VIEWS), f"meta missing views: {set(VIEWS) - set(meta)}"
