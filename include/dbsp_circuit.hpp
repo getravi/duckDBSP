@@ -15,6 +15,11 @@
 #include <unordered_map>
 #include <vector>
 
+namespace dbsp_native {
+struct StateBytes;
+class StateAccounting;
+} // namespace dbsp_native
+
 namespace dbsp {
 
 // Forward declarations
@@ -42,6 +47,15 @@ public:
 
     // Check if this node has output ready
     virtual bool has_output() const = 0;
+
+    // Approximate resident state bytes by class (bounded-RAM Phase 0).
+    // Stateless nodes keep the empty default; stateful plan nodes
+    // (join/aggregate/distinct/set-op/recursive/embedded) override.
+    virtual void account_state(dbsp_native::StateBytes& out,
+                               dbsp_native::StateAccounting& acct) const {
+        (void)out;
+        (void)acct;
+    }
 
     // --- Checkpointing (Phase D3b) ---------------------------------------
     // How this node participates in circuit-state checkpoints. STATELESS

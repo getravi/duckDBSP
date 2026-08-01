@@ -19,6 +19,7 @@
 #include <mutex>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace dbsp_native {
@@ -319,6 +320,71 @@ struct DuckDBValueHash {
 // This makes the dbsp:: circuit nodes (dbsp_circuit.hpp) operate directly on
 // production data with no conversion at the boundary.
 using DuckDBZSet = dbsp::ZSet<DuckDBRow, DuckDBRowHash>;
+
+// ---------------------------------------------------------------------------
+// Circuit-state accounting (bounded-RAM roadmap Phase 0): approximate
+// resident bytes per state class. Trend over precision — constants are
+// calibrated against measured RSS (~600 B/cell with boxed Values on the
+// workforce model), not derived. H6 payload-shared rows are counted once per
+// accounting PASS (the StateAccounting's seen-set spans every view scanned
+// with it), so per-view attribution of a shared payload goes to whichever
+// view is scanned first; totals are what reconcile with RSS.
+struct StateBytes {
+  size_t result = 0;      // view result z-sets
+  size_t arrangement = 0; // join indexes — local per-node; shared reported
+                          // as the synthetic __shared_arrangements row
+  size_t window = 0;      // window partition caches + rendered outputs
+  size_t recursion = 0;   // recursive-step accumulated state
+  size_t other = 0;       // aggregate groups, distinct/set-op counts,
+                          // delta buffers, node outputs
+  size_t total() const {
+    return result + arrangement + window + recursion + other;
+  }
+  void add(const StateBytes &o) {
+    result += o.result;
+    arrangement += o.arrangement;
+    window += o.window;
+    recursion += o.recursion;
+    other += o.other;
+  }
+};
+
+class StateAccounting {
+public:
+  size_t rows_seen = 0;     // every sighting
+  size_t payloads_new = 0;  // first sightings (payload counted in full)
+
+  size_t row_bytes(const DuckDBRow &row) {
+    rows_seen++;
+    const void *pid = row.columns.payload_id();
+    if (pid != nullptr && !seen_.insert(pid).second) {
+      return kRowOverhead; // shared ColumnVec payload already counted
+    }
+    payloads_new++;
+    size_t b = kRowOverhead;
+    for (const auto &v : row.columns) {
+      b += kValueBytes;
+      if (!v.IsNull() && v.type().id() == duckdb::LogicalTypeId::VARCHAR) {
+        b += duckdb::StringValue::Get(v).size();
+      }
+    }
+    return b;
+  }
+  size_t zset_bytes(const DuckDBZSet &zs) {
+    size_t b = zs.size() * kEntryOverhead;
+    for (const auto &[row, w] : zs) {
+      (void)w;
+      b += row_bytes(row);
+    }
+    return b;
+  }
+
+private:
+  static constexpr size_t kRowOverhead = 48;   // ColumnVec + shared_ptr block
+  static constexpr size_t kValueBytes = 72;    // sizeof(duckdb::Value) + slop
+  static constexpr size_t kEntryOverhead = 32; // map entry + weight
+  std::unordered_set<const void *> seen_;
+};
 
 // Column metadata for tracked tables
 struct ColumnInfo {
@@ -675,6 +741,16 @@ public:
     for (const auto &[row, weight] : get_result()) {
       callback(row, weight);
     }
+  }
+
+  // Approximate resident bytes by state class (bounded-RAM Phase 0).
+  // Default covers the result z-set + delta buffer; stateful subclasses
+  // (windows, circuit views) add their private state. A pending
+  // (lazy-restored, never realized) view legitimately reports ~0 — its
+  // state is a stashed checkpoint blob, not resident circuit state.
+  virtual void account_state(StateBytes &out, StateAccounting &acct) const {
+    out.result += acct.zset_bytes(get_result());
+    out.other += acct.zset_bytes(get_delta());
   }
 
   // --- Circuit-state checkpointing (D3b) -------------------------------

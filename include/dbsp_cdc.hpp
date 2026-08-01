@@ -2973,6 +2973,47 @@ public:
   // stepped) view's delta is legitimately empty either way -- decoding
   // its stash here would pay the blob_decode cost for a value realization
   // cannot change, defeating the point of staying lazy.
+  // Per-view resident-state accounting (bounded-RAM Phase 0): one
+  // StateAccounting spans the whole scan so H6 payload-shared rows are
+  // counted once — per-view attribution of a shared payload goes to the
+  // first view scanned; TOTALS are what reconcile with RSS. Emits one extra
+  // synthetic entry "__shared_arrangements" for manager-owned shared join
+  // arrangements (owned by no single view).
+  void scan_view_state(
+      const std::function<void(const std::string &, const StateBytes &)>
+          &cb) {
+    std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    std::shared_lock<std::shared_mutex> view_lock(view_mutex_);
+    StateAccounting acct;
+    for (const auto &[name, view] : views_) {
+      StateBytes b;
+      view->account_state(b, acct);
+      cb(name, b);
+    }
+    StateBytes shared;
+    for (const auto &[table, arrs] : arrangements_by_table_) {
+      (void)table;
+      for (const auto &w : arrs) {
+        auto arr = w.lock();
+        if (!arr) {
+          continue;
+        }
+        for (const auto &[key, rows] : arr->index) {
+          shared.arrangement += acct.row_bytes(key) + 32;
+          for (const auto &[row, wt] : rows) {
+            (void)wt;
+            shared.arrangement += acct.row_bytes(row) + 32;
+          }
+        }
+      }
+    }
+    cb("__shared_arrangements", shared);
+    if (std::getenv("DBSP_ACCT_DEBUG") != nullptr) {
+      fprintf(stderr, "[acct] rows_seen=%zu payloads_new=%zu\n",
+              acct.rows_seen, acct.payloads_new);
+    }
+  }
+
   // (view, generation) snapshot for every registered view — the commit_seq_
   // at which each view's delta buffer was last rewritten (see
   // view_delta_generation_'s member comment). A view whose buffer was never

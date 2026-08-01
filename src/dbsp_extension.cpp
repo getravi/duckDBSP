@@ -547,6 +547,68 @@ void ChangesFunc(ClientContext &context, TableFunctionInput &input,
 }
 
 // ============================================================================
+// dbsp_view_state - Per-view resident circuit-state bytes by class
+// Usage: SELECT * FROM dbsp_view_state();
+// Columns: view_name, result_bytes, arrangement_bytes, window_bytes,
+// recursion_bytes, other_bytes, total_bytes. Approximate (calibrated
+// estimates, payload-shared rows counted once per scan); the synthetic row
+// "__shared_arrangements" carries manager-owned shared join arrangements.
+// ============================================================================
+
+struct ViewStateBindData : public TableFunctionData {
+  struct Row {
+    string name;
+    dbsp_native::StateBytes bytes;
+  };
+  vector<Row> rows;
+  idx_t current = 0;
+};
+
+unique_ptr<FunctionData> ViewStateBind(ClientContext &context,
+                                       TableFunctionBindInput &input,
+                                       vector<LogicalType> &return_types,
+                                       vector<string> &names) {
+  auto data = make_uniq<ViewStateBindData>();
+
+  auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
+  manager.scan_view_state(
+      [&](const string &name, const dbsp_native::StateBytes &b) {
+        data->rows.push_back({name, b});
+      });
+
+  return_types.push_back(LogicalType::VARCHAR);
+  names.push_back("view_name");
+  for (const char *col :
+       {"result_bytes", "arrangement_bytes", "window_bytes",
+        "recursion_bytes", "other_bytes", "total_bytes"}) {
+    return_types.push_back(LogicalType::BIGINT);
+    names.push_back(col);
+  }
+  return std::move(data);
+}
+
+void ViewStateFunc(ClientContext &context, TableFunctionInput &input,
+                   DataChunk &output) {
+  auto &data = input.bind_data->CastNoConst<ViewStateBindData>();
+
+  idx_t count = 0;
+  while (data.current < data.rows.size() && count < STANDARD_VECTOR_SIZE) {
+    const auto &r = data.rows[data.current];
+    output.SetValue(0, count, Value(r.name));
+    output.SetValue(1, count, Value::BIGINT((int64_t)r.bytes.result));
+    output.SetValue(2, count, Value::BIGINT((int64_t)r.bytes.arrangement));
+    output.SetValue(3, count, Value::BIGINT((int64_t)r.bytes.window));
+    output.SetValue(4, count, Value::BIGINT((int64_t)r.bytes.recursion));
+    output.SetValue(5, count, Value::BIGINT((int64_t)r.bytes.other));
+    output.SetValue(6, count, Value::BIGINT((int64_t)r.bytes.total()));
+    data.current++;
+    count++;
+  }
+  output.SetCardinality(count);
+}
+
+// ============================================================================
 // dbsp_delta_generations - Per-view delta-buffer generation
 // Usage: SELECT * FROM dbsp_delta_generations();
 // Columns: view_name VARCHAR, generation BIGINT. `generation` is the commit
@@ -2019,6 +2081,10 @@ static void LoadInternal(ExtensionLoader &loader) {
   TableFunction delta_gen_func("dbsp_delta_generations", {},
                                DeltaGenerationsFunc, DeltaGenerationsBind);
   loader.RegisterFunction(delta_gen_func);
+
+  TableFunction view_state_func("dbsp_view_state", {}, ViewStateFunc,
+                                ViewStateBind);
+  loader.RegisterFunction(view_state_func);
 
   TableFunction list_views_func("dbsp_views", {}, ListViewsFunc, ListViewsBind);
   loader.RegisterFunction(list_views_func);

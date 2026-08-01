@@ -477,6 +477,31 @@ SELECT * FROM dbsp_changes('customer_totals');
 
 ---
 
+### dbsp_view_state()
+
+Per-view resident circuit-state bytes, approximated by class.
+
+```sql
+SELECT * FROM dbsp_view_state();
+```
+
+**Returns:**
+- `view_name` (VARCHAR) — plus one synthetic row `__shared_arrangements`
+  for manager-owned shared join arrangements
+- `result_bytes`, `arrangement_bytes`, `window_bytes`, `recursion_bytes`,
+  `other_bytes`, `total_bytes` (BIGINT)
+
+**Semantics:**
+- Estimates calibrated for trend, not exact heap bytes; H6 payload-shared
+  rows are counted once per scan (attribution goes to the first view
+  scanned; totals are what reconcile with the process footprint).
+- On macOS compare against `footprint(1)`/phys_footprint, not `ps rss` —
+  the compressor hides most cold circuit state from RSS (measured: a DAG
+  reporting 2.5GB RSS had a 23GB physical footprint).
+- `other_bytes` includes per-node output buffers and delta buffers.
+
+---
+
 ### dbsp_delta_generations()
 
 Per-view provenance for the `dbsp_changes` buffer: the commit generation at

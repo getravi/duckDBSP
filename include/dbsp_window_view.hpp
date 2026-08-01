@@ -458,6 +458,22 @@ public:
   void set_result(const DuckDBZSet &result) override { result_ = result; version_++; }
   const DuckDBZSet &get_delta() const override { return delta_; }
   const TableSchema &result_schema() const override { return result_schema_; }
+
+  void account_state(StateBytes &out, StateAccounting &acct) const override {
+    NativeMaterializedView::account_state(out, acct); // result + delta
+    for (const auto &[key, part] : partitions_) {
+      (void)key;
+      for (const auto &row : part.sorted_rows) {
+        out.window += acct.row_bytes(row);
+      }
+    }
+    for (const auto &[key, rows] : partition_outputs_) {
+      (void)key;
+      for (const auto &row : rows) {
+        out.window += acct.row_bytes(row);
+      }
+    }
+  }
   std::vector<std::string> source_tables() const override {
     return {source_table_};
   }

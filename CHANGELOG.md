@@ -1,5 +1,21 @@
 # Changelog
 
+## dbsp_view_state(): per-view circuit-state accounting - Aug 2026
+
+- **Why**: bounded-RAM roadmap Phase 0 — you cannot diet or budget state you
+  cannot see. Measurement on a 141-view production-shaped DAG: 23GB true
+  physical footprint (ps RSS showed 2.5GB — macOS compression hid 90%),
+  ~19.5GB accounted by class: 11.4GB node output/delta buffers, 5.8GB join
+  arrangements (incl shared), 2.3GB result z-sets, 0.8GB window caches.
+- **What**: `account_state(StateBytes&, StateAccounting&)` virtuals on
+  NativeMaterializedView + dbsp::Node (join/aggregate/distinct/set-op/
+  recursive/embedded/window/circuit views); `CDCManager::scan_view_state`;
+  `dbsp_view_state()` table function with per-class bytes and a
+  `__shared_arrangements` synthetic row. H6 payload-shared rows counted once
+  per scan. `DBSP_ACCT_DEBUG=1` prints sighting/payload counters.
+- **Tests**: `test/python/test_view_state.py` (class attribution +
+  monotonic growth); ctest 44/44.
+
 ## dbsp_delta_generations(): per-view delta-buffer provenance - Aug 2026
 
 - **Why**: `dbsp_changes` is a single-generation buffer that reading does not

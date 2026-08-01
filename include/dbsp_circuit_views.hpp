@@ -56,6 +56,12 @@ public:
 
   const DuckDBZSet &get_delta() const override { return sink_->delta(); }
 
+  void account_state(StateBytes &out, StateAccounting &acct) const override {
+    NativeMaterializedView::account_state(out, acct); // sink result + delta
+    circuit_.for_each_node(
+        [&](const dbsp::Node &n) { n.account_state(out, acct); });
+  }
+
   const TableSchema &result_schema() const override { return schema_; }
 
   std::vector<std::string> source_tables() const override {
@@ -469,6 +475,12 @@ public:
 
   const DuckDBZSet &get_delta() const override {
     return node_->applied() ? node_->view().get_delta() : empty_delta_;
+  }
+
+  void account_state(StateBytes &out, StateAccounting &acct) const override {
+    NativeMaterializedView::account_state(out, acct); // wrapped result + delta
+    circuit_.for_each_node(
+        [&](const dbsp::Node &n) { n.account_state(out, acct); });
   }
 
   const TableSchema &result_schema() const override {

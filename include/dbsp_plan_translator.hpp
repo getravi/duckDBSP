@@ -891,6 +891,14 @@ public:
 
   const DuckDBZSet &output() const { return output_; }
 
+  void account_state(StateBytes &out, StateAccounting &acct) const override {
+    for (const auto &[key, gs] : states_) {
+      (void)gs;
+      out.other += acct.row_bytes(key) + 96; // GroupState flat estimate
+    }
+    out.other += acct.zset_bytes(output_);
+  }
+
 private:
   struct AggState {
     int64_t count = 0; // non-NULL argument count (rows for COUNT(*))
@@ -1996,6 +2004,26 @@ public:
 
   const DuckDBZSet &output() const { return output_; }
 
+  void account_state(StateBytes &out, StateAccounting &acct) const override {
+    auto index_bytes = [&](const Index &idx) {
+      size_t b = 0;
+      for (const auto &[key, rows] : idx) {
+        b += acct.row_bytes(key) + 32;
+        for (const auto &[row, w] : rows) {
+          (void)w;
+          b += acct.row_bytes(row) + 32;
+        }
+      }
+      return b;
+    };
+    out.arrangement += index_bytes(left_index_) + index_bytes(right_index_);
+    for (const auto &[row, entry] : mark_state_) {
+      (void)entry;
+      out.arrangement += acct.row_bytes(row) + 48;
+    }
+    out.other += acct.zset_bytes(output_);
+  }
+
   void set_shared_arrangement(bool left,
                               std::shared_ptr<const SharedArrangement> arr,
                               std::vector<duckdb::idx_t> projection = {}) {
@@ -2755,6 +2783,14 @@ public:
 
   const DuckDBZSet &output() const { return output_; }
 
+  void account_state(StateBytes &out, StateAccounting &acct) const override {
+    for (const auto &[row, c] : counts_) {
+      (void)c;
+      out.other += acct.row_bytes(row) + 40;
+    }
+    out.other += acct.zset_bytes(output_);
+  }
+
 private:
   InputFn input_fn_;
   std::unordered_map<DuckDBRow, int64_t, DuckDBRowHash> counts_;
@@ -2830,6 +2866,13 @@ public:
 
   const DuckDBZSet &output() const { return output_; }
 
+  void account_state(StateBytes &out, StateAccounting &acct) const override {
+    for (const auto &[row, ws] : counts_) {
+      out.other += acct.row_bytes(row) + 40 + ws.capacity() * sizeof(int64_t);
+    }
+    out.other += acct.zset_bytes(output_);
+  }
+
 private:
   int64_t multiplicity(const std::vector<int64_t> &counts) const {
     auto at = [&](size_t i) {
@@ -2897,6 +2940,14 @@ public:
   bool has_output() const override { return !view_->get_delta().empty(); }
 
   const DuckDBZSet &output() const { return view_->get_delta(); }
+
+  void account_state(StateBytes &out, StateAccounting &acct) const override {
+    // The wrapped legacy view (WINDOW/SORT_LIMIT/DISTINCT_ON) is an
+    // intermediate operator here — bucket ALL its state as window-class.
+    StateBytes tmp;
+    view_->account_state(tmp, acct);
+    out.window += tmp.total();
+  }
 
   // Checkpointing (Task 2, restore-tail): delegate straight to the wrapped
   // view's own per-node hooks (NativeMaterializedView::circuit_state_kind/
@@ -3346,6 +3397,14 @@ public:
 
   const DuckDBZSet &output() const { return output_; }
 
+  void account_state(StateBytes &out, StateAccounting &acct) const override {
+    out.recursion += acct.zset_bytes(accumulated_);
+    out.other += acct.zset_bytes(output_);
+    StateBytes tmp;
+    step_view_->account_state(tmp, acct); // step circuit's own state
+    out.recursion += tmp.total();
+  }
+
   // Checkpointing (Task 1, restore-tail): SERIALIZABLE iff union_all_ —
   // UNION (set-semantics) recursion's DRed support_/dred bookkeeping is not
   // captured this pass, so it stays UNSUPPORTED, the same decline
@@ -3773,6 +3832,12 @@ public:
   }
 
   const DuckDBZSet &get_delta() const override { return sink_->delta(); }
+
+  void account_state(StateBytes &out, StateAccounting &acct) const override {
+    NativeMaterializedView::account_state(out, acct); // sink result + delta
+    circuit_.for_each_node(
+        [&](const dbsp::Node &n) { n.account_state(out, acct); });
+  }
 
   const TableSchema &result_schema() const override { return schema_; }
 
