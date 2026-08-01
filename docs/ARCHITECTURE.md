@@ -502,7 +502,7 @@ State after:
   a hash-map key immediately (aggregate `states_`, join `Index`/
   `RowWeights`, the sink `DuckDBZSet`), and the lazy path's per-value
   temporary-`Vector` cost otherwise dominates restore time (cold/restore
-  attack, Task 3: ~54x on a 58k-row sink, see CHANGELOG).
+  attack, Task 3: ~51.5x on a 58k-group aggregate, see CHANGELOG).
 
 ### Lifetime
 
