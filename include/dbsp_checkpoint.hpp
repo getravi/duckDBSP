@@ -112,6 +112,12 @@ public:
     raw(tmp.data(), tmp.size());
   }
 
+  // Length-prefixed opaque bytes (packed join-index blobs, Phase 2d).
+  void bytes(const uint8_t *p, size_t n) {
+    u64(n);
+    raw(p, n);
+  }
+
   std::vector<uint8_t> take() { return std::move(bytes_); }
 
 private:
@@ -212,6 +218,17 @@ public:
     const size_t h = hash_row_fast(vals);
     out.columns.assign(std::move(vals));
     out.columns.set_hash(h);
+    return out;
+  }
+
+  // Length-prefixed opaque bytes (see BlobWriter::bytes).
+  std::string byte_string() {
+    const uint64_t n = u64();
+    if (pos_ + n > len_) {
+      throw std::runtime_error("blob truncated");
+    }
+    std::string out(reinterpret_cast<const char *>(data_ + pos_), n);
+    pos_ += n;
     return out;
   }
 

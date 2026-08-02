@@ -59,6 +59,7 @@
 #include "dbsp_instance_registry.hpp"
 #include "dbsp_checkpoint.hpp"
 #include "dbsp_qualified_name.hpp"
+#include "dbsp_packed_row.hpp"
 #include "dbsp_window_view.hpp"
 
 #include "duckdb.hpp"
@@ -1781,6 +1782,9 @@ public:
     pads_right_ = join_type_ == duckdb::JoinType::RIGHT ||
                   join_type_ == duckdb::JoinType::OUTER;
     marks_ = join_type_ == duckdb::JoinType::MARK;
+    // Phase 2d: packed storage for the local indexes (see member block).
+    packed_ok_ = !marks_ && !pads_right_ && packed_types_ok(left_types_) &&
+                 packed_types_ok(right_types_);
     // N3: under spill mode, local indexes of pure probe-target sides go
     // to disk bucket logs (self-padding / mark-preserved sides keep RAM —
     // their pad/weight reconciliation walks full-row structures). Files
@@ -1859,6 +1863,7 @@ public:
     const int shards_cfg = g_intraop_shards.load(std::memory_order_relaxed);
     const bool shardable = shards_cfg > 1 && residuals_.empty() &&
                            !marks_ && !pads_left_ && !pads_right_ &&
+                           !packed_ok_ &&
                            kl.rows.size() + kr.rows.size() >= 4096;
 
     if (shardable) {
@@ -1866,7 +1871,7 @@ public:
     } else if ((shared_right_ &&
                 (shared_right_->is_spilled() ||
                  !shared_proj_right_.empty())) ||
-               (!shared_right_ && local_spill_right_)) {
+               (!shared_right_ && (local_spill_right_ || packed_ok_))) {
       for (size_t i = 0; i < kl.rows.size(); i++) {
         if (!kl.valid[i]) {
           continue;
@@ -1903,7 +1908,7 @@ public:
     } else if ((shared_left_ &&
                 (shared_left_->is_spilled() ||
                  !shared_proj_left_.empty())) ||
-               (!shared_left_ && local_spill_left_)) {
+               (!shared_left_ && (local_spill_left_ || packed_ok_))) {
       for (size_t i = 0; i < kr.rows.size(); i++) {
         if (!kr.valid[i]) {
           continue;
@@ -1988,6 +1993,10 @@ public:
   void reset() override {
     left_index_.clear();
     right_index_.clear();
+    packed_left_.clear();
+    packed_right_.clear();
+    packed_wleft_.clear();
+    packed_wright_.clear();
     if (local_spill_left_) {
       local_spill_left_->discard();
     }
@@ -2027,6 +2036,21 @@ public:
       return b;
     };
     out.arrangement += index_bytes(left_index_) + index_bytes(right_index_);
+    for (const auto *pidx : {&packed_left_, &packed_right_}) {
+      for (const auto &[kb, bucket] : *pidx) {
+        out.arrangement += kb.capacity() + 48;
+        for (const auto &[rb, weight] : bucket) {
+          (void)weight;
+          out.arrangement += rb.capacity() + 24;
+        }
+      }
+    }
+    for (const auto *pw : {&packed_wleft_, &packed_wright_}) {
+      for (const auto &[rb, weight] : *pw) {
+        (void)weight;
+        out.arrangement += rb.capacity() + 48;
+      }
+    }
     for (const auto &[row, entry] : mark_state_) {
       (void)entry;
       out.arrangement += acct.row_bytes(row) + 48;
@@ -2083,6 +2107,13 @@ private:
             left ? probe_scratch_left_ : probe_scratch_right_;
         return probe_local_spill(*spill, key, scratch) ? &scratch : nullptr;
       }
+    }
+    if (!sh && packed_ok_) {
+      // Local packed index — a SHARED side must fall through to
+      // side_index() (the arrangement), which the branch above this one
+      // only handles for spilled/projected arrangements.
+      RowWeights &scratch = left ? probe_scratch_left_ : probe_scratch_right_;
+      return probe_packed(left, key, scratch) ? &scratch : nullptr;
     }
     const Index &idx = side_index(left);
     auto it = idx.find(key);
@@ -2386,6 +2417,10 @@ private:
   }
 
   void integrate(const DeltaKeys &dk, bool left) {
+    if (packed_ok_ && !(left ? local_spill_left_ : local_spill_right_)) {
+      integrate_packed(dk, left);
+      return;
+    }
     Index &index = left ? left_index_ : right_index_;
     const bool track_weights = left ? (pads_left_ || marks_) : pads_right_;
     RowWeights &weights = left ? left_weights_ : right_weights_;
@@ -2489,7 +2524,6 @@ private:
       affected.emplace(row, 0);
     }
     if (!other_delta.empty()) {
-      const Index &own_index = side_index(left);
       std::unordered_map<DuckDBRow, char, DuckDBRowHash> seen_keys;
       for (const auto &[orow, ow] : other_delta) {
         DuckDBRow key;
@@ -2499,24 +2533,21 @@ private:
         if (!seen_keys.emplace(key, 0).second) {
           continue;
         }
-        auto it = own_index.find(key);
-        if (it == own_index.end()) {
+        // probe_side covers all storage modes (shared / spilled / packed /
+        // boxed); the scratch is copied into `affected` immediately.
+        const RowWeights *bucket = probe_side(left, key);
+        if (!bucket) {
           continue;
         }
-        for (const auto &[row, w] : it->second) {
+        for (const auto &[row, w] : *bucket) {
           affected.emplace(row, 0);
         }
       }
     }
 
-    const RowWeights &weights =
-        (left && shared_left_)    ? shared_left_->weights
-        : (!left && shared_right_) ? shared_right_->weights
-        : (left ? left_weights_ : right_weights_);
     RowWeights &pads = left ? left_pad_ : right_pad_;
     for (const auto &[row, unused] : affected) {
-      auto wit = weights.find(row);
-      const int64_t total = wit == weights.end() ? 0 : wit->second;
+      const int64_t total = own_row_weight(row, left);
       const int64_t desired =
           (total > 0 && match_count(row, left) == 0) ? total : 0;
       auto pit = pads.find(row);
@@ -2661,8 +2692,49 @@ public:
   // pre-checkpoint. right_total_/right_null_ are MARK-only bookkeeping
   // (only ever written when marks_, which stays UNSUPPORTED) and are
   // therefore NOT read by reconcile_pads — correctly omitted here.
+  static constexpr uint64_t kPackedStateMagic = 0xDB5B2DFACC0FFEE1ULL;
+
   void serialize_state(std::vector<uint8_t> &out) const override {
     BlobWriter w;
+    if (packed_ok_) {
+      // Packed-native layout (magic-tagged; an old boxed blob starts with a
+      // small map size and can never collide). Pads stay boxed rows.
+      w.u64(kPackedStateMagic);
+      auto write_pindex = [&w](const PackedIndex &idx) {
+        w.u64(idx.size());
+        for (const auto &[kb, bucket] : idx) {
+          w.bytes(reinterpret_cast<const uint8_t *>(kb.data()), kb.size());
+          w.u64(bucket.size());
+          for (const auto &[rb, weight] : bucket) {
+            w.bytes(reinterpret_cast<const uint8_t *>(rb.data()), rb.size());
+            w.i64(weight);
+          }
+        }
+      };
+      auto write_pweights =
+          [&w](const std::unordered_map<std::string, int64_t> &wm) {
+            w.u64(wm.size());
+            for (const auto &[rb, weight] : wm) {
+              w.bytes(reinterpret_cast<const uint8_t *>(rb.data()), rb.size());
+              w.i64(weight);
+            }
+          };
+      auto write_boxed = [&w](const RowWeights &rw) {
+        w.u64(rw.size());
+        for (const auto &[row, weight] : rw) {
+          w.row(row.columns);
+          w.i64(weight);
+        }
+      };
+      write_pindex(packed_left_);
+      write_pindex(packed_right_);
+      write_pweights(packed_wleft_);
+      write_pweights(packed_wright_);
+      write_boxed(left_pad_);
+      write_boxed(right_pad_);
+      out = w.take();
+      return;
+    }
     auto write_weights = [&w](const RowWeights &rw) {
       w.u64(rw.size());
       for (const auto &[row, weight] : rw) {
@@ -2689,6 +2761,52 @@ public:
   bool restore_state(const uint8_t *data, size_t len) override {
     try {
       BlobReader r(data, len);
+      if (packed_ok_) {
+        if (r.u64() != kPackedStateMagic) {
+          return false; // boxed-era blob: rebuild by replay
+        }
+        auto read_pindex = [&r](PackedIndex &idx) {
+          idx.clear();
+          const uint64_t n = r.u64();
+          for (uint64_t i = 0; i < n; i++) {
+            std::string kb = r.byte_string();
+            PackedBucket bucket;
+            const uint64_t m = r.u64();
+            bucket.reserve(m);
+            for (uint64_t j = 0; j < m; j++) {
+              std::string rb = r.byte_string();
+              const int64_t weight = r.i64();
+              bucket.emplace_back(std::move(rb), weight);
+            }
+            idx.emplace(std::move(kb), std::move(bucket));
+          }
+        };
+        auto read_pweights =
+            [&r](std::unordered_map<std::string, int64_t> &wm) {
+              wm.clear();
+              const uint64_t n = r.u64();
+              for (uint64_t i = 0; i < n; i++) {
+                std::string rb = r.byte_string();
+                wm.emplace(std::move(rb), r.i64());
+              }
+            };
+        auto read_boxed = [&r](RowWeights &rw) {
+          rw.clear();
+          const uint64_t n = r.u64();
+          for (uint64_t i = 0; i < n; i++) {
+            DuckDBRow row = r.hashed_row();
+            const int64_t weight = r.i64();
+            rw.emplace(std::move(row), weight);
+          }
+        };
+        read_pindex(packed_left_);
+        read_pindex(packed_right_);
+        read_pweights(packed_wleft_);
+        read_pweights(packed_wright_);
+        read_boxed(left_pad_);
+        read_boxed(right_pad_);
+        return r.done();
+      }
       auto read_weights = [&r](RowWeights &rw) {
         rw.clear();
         const uint64_t n = r.u64();
@@ -2721,6 +2839,157 @@ public:
   }
 
 private:
+  // ---- Phase 2d: packed join-index storage --------------------------------
+  // Boxed DuckDBRow index entries cost ~450-600B resident; packed byte rows
+  // cost tens. Active (packed_ok_) for INNER/LEFT-pad joins whose side
+  // types are all codec-supported; buckets decode into the probe scratch on
+  // access — the same materialize-into-scratch pattern the spilled and
+  // projected shared paths already use. MARK and right-padding joins stay
+  // boxed (their reconcile paths read row objects pervasively and are not
+  // emitted by the compiled plans this exists for).
+  using PackedBucket = std::vector<std::pair<std::string, int64_t>>;
+  using PackedIndex = std::unordered_map<std::string, PackedBucket>;
+  PackedIndex packed_left_, packed_right_;
+  std::unordered_map<std::string, int64_t> packed_wleft_, packed_wright_;
+  bool packed_ok_ = false;
+
+  static bool packed_types_ok(const duckdb::vector<duckdb::LogicalType> &ts) {
+    using duckdb::LogicalTypeId;
+    if (ts.empty()) {
+      return false; // unknown schema: stay boxed
+    }
+    for (const auto &t : ts) {
+      switch (t.id()) {
+      case LogicalTypeId::BOOLEAN:
+      case LogicalTypeId::TINYINT:
+      case LogicalTypeId::SMALLINT:
+      case LogicalTypeId::INTEGER:
+      case LogicalTypeId::BIGINT:
+      case LogicalTypeId::UINTEGER:
+      case LogicalTypeId::UBIGINT:
+      case LogicalTypeId::FLOAT:
+      case LogicalTypeId::DOUBLE:
+      case LogicalTypeId::DATE:
+      case LogicalTypeId::TIMESTAMP:
+      case LogicalTypeId::VARCHAR:
+        continue;
+      default:
+        return false;
+      }
+    }
+    return true;
+  }
+
+  PackedIndex &packed_index(bool left) {
+    return left ? packed_left_ : packed_right_;
+  }
+
+  std::unordered_map<std::string, int64_t> &packed_weights(bool left) {
+    return left ? packed_wleft_ : packed_wright_;
+  }
+
+  void integrate_packed(const DeltaKeys &dk, bool left) {
+    const bool track_weights = left && pads_left_; // marks/right-pads boxed
+    auto &wmap = packed_weights(left);
+    auto &idx = packed_index(left);
+    std::string kb, rb;
+    for (size_t i = 0; i < dk.rows.size(); i++) {
+      const DuckDBRow &row = *dk.rows[i];
+      const int64_t w = dk.weights[i];
+      if (!packed::encode_row(rb, row)) {
+        throw std::runtime_error("packed join index: unencodable row");
+      }
+      if (track_weights) {
+        int64_t &total = wmap[rb];
+        total += w;
+        if (total == 0) {
+          wmap.erase(rb);
+        }
+      }
+      if (!dk.valid[i]) {
+        continue;
+      }
+      if (!packed::encode_row(kb, dk.keys[i])) {
+        throw std::runtime_error("packed join index: unencodable key");
+      }
+      if (std::getenv("DBSP_PACKED_DEBUG") != nullptr) {
+        fprintf(stderr, "[packed] integrate side=%s klen=%zu k0=%02x%02x%02x w=%lld\n",
+                left ? "L" : "R", kb.size(), (unsigned char)kb[0],
+                (unsigned char)kb[4], kb.size() > 5 ? (unsigned char)kb[5] : 0,
+                (long long)w);
+      }
+      auto &bucket = idx[kb];
+      bool merged = false;
+      for (size_t b = 0; b < bucket.size(); b++) {
+        if (bucket[b].first == rb) {
+          bucket[b].second += w;
+          if (bucket[b].second == 0) {
+            bucket[b] = std::move(bucket.back());
+            bucket.pop_back();
+          }
+          merged = true;
+          break;
+        }
+      }
+      if (!merged) {
+        bucket.emplace_back(rb, w);
+      }
+      if (bucket.empty()) {
+        idx.erase(kb);
+      }
+    }
+  }
+
+  bool probe_packed(bool left, const DuckDBRow &key, RowWeights &out) {
+    out.clear();
+    std::string kb;
+    if (!packed::encode_row(kb, key)) {
+      return false;
+    }
+    const auto &idx = left ? packed_left_ : packed_right_;
+    auto it = idx.find(kb);
+    if (std::getenv("DBSP_PACKED_DEBUG") != nullptr) {
+      fprintf(stderr, "[packed] probe side=%s klen=%zu k0=%02x%02x%02x hit=%d\n",
+              left ? "L" : "R", kb.size(), (unsigned char)kb[0],
+              (unsigned char)kb[4], kb.size() > 5 ? (unsigned char)kb[5] : 0,
+              it != idx.end());
+    }
+    if (it == idx.end() || it->second.empty()) {
+      return false;
+    }
+    for (const auto &[bytes, w] : it->second) {
+      DuckDBRow row;
+      packed::decode_row(bytes, row);
+      out.emplace(std::move(row), w);
+    }
+    return true;
+  }
+
+  // The padded side's own-row weight total for one row, across the three
+  // storage modes (shared arrangement / packed / boxed).
+  int64_t own_row_weight(const DuckDBRow &row, bool left) {
+    if (left && shared_left_) {
+      auto it = shared_left_->weights.find(row);
+      return it == shared_left_->weights.end() ? 0 : it->second;
+    }
+    if (!left && shared_right_) {
+      auto it = shared_right_->weights.find(row);
+      return it == shared_right_->weights.end() ? 0 : it->second;
+    }
+    if (packed_ok_) {
+      std::string rb;
+      if (!packed::encode_row(rb, row)) {
+        return 0;
+      }
+      const auto &wmap = left ? packed_wleft_ : packed_wright_;
+      auto it = wmap.find(rb);
+      return it == wmap.end() ? 0 : it->second;
+    }
+    const RowWeights &weights = left ? left_weights_ : right_weights_;
+    auto it = weights.find(row);
+    return it == weights.end() ? 0 : it->second;
+  }
+
   duckdb::JoinType join_type_;
   // Buffered inner-join emits for the vectorized output-hash preseed
   std::shared_ptr<PlanKeepAlive> keep_alive_join_;

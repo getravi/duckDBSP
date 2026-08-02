@@ -1,5 +1,26 @@
 # Changelog
 
+## Bounded-RAM Phase 2d: packed join-index rows - Aug 2026
+
+- PlanJoinNode's local indexes store rows as compact self-describing byte
+  strings (dbsp_packed_row.hpp: tag+payload per value; ~450-600B boxed ->
+  tens of bytes) for INNER/LEFT-pad joins whose side types are all
+  codec-supported. Buckets decode into the probe scratch on access — the
+  same materialize-into-scratch pattern the spilled/projected shared paths
+  use — so probe/pads/match_count route through probe_side unchanged.
+  MARK and right-padding joins stay boxed (not emitted by compiled plans).
+- Serialization: packed-native blob layout behind a magic header; boxed-era
+  checkpoints decline cleanly (rebuild by replay). own_row_weight() unifies
+  the shared/packed/boxed weight lookup for pad reconciliation.
+- Measured (141-view wfp DAG): arrangement class 7.35GB -> 2.43GB,
+  accounted total 9.65 -> 4.83GB, process footprint 13-15 -> 11-12GB.
+  Cost: cold create +~34s (encode at replay; background + once per model
+  lifetime under Phase 3 reattach) and steady edits 0.17 -> ~0.2s.
+- Fixed during bring-up (LEFT JOIN differentials caught it): the packed
+  probe branch must yield to a SHARED side — intercepting before
+  side_index() probed an empty local map and pads never retracted.
+- Remaining boxed: shared arrangements (~1GB) and window caches — next.
+
 ## dbsp_realize(view): background warming with RAM-budget feedback - Aug 2026
 
 - New TF: realizes ONE pending (lazy-restored) view's circuit state and
