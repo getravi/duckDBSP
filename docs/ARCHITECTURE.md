@@ -515,9 +515,18 @@ State after:
 - **Durable baselines**: file-backed databases keep spill logs in
   `<dbfile>.dbsp_spill/`; `dbsp_save` writes a digest-index sidecar
   under the checkpoint watermark, and a clean reopen's first table
-  touch adopts the log+index pair (one bulk read) instead of rescanning
-  the table. Watermark or log-size mismatch rejects the sidecar and
-  rescans
+  touch adopts the log+index pair instead of rescanning the table.
+  Watermark or log-size mismatch rejects the sidecar and rescans
+- **Flat restore layers (tier 2)**: reopen paths never rebuild hash
+  maps. The baseline index sidecar (v2) is digest-sorted and mmap'd
+  read-only (binary-search lookups, mutation overlay on top); packed
+  join checkpoint blobs decode into a contiguous arena + key-sorted
+  directory (`dbsp_flat_packed.hpp`); shared packed arrangements get a
+  fingerprint sidecar written at save and ADOPTED at register over a
+  watermark-verified deferred table (`sharr_*.flat`) — first edit after
+  reopen stops paying a whole-baseline backfill. Serialization folds
+  flat + overlay back into one stream; a dirty save at big-model scale
+  pays the fold
 - **Lazy per-view restore (D-lazy)**, default ON (`dbsp_lazy_restore`):
   a watermark-matched load cold-creates the view exactly as before, but
   instead of decoding its node/sink blobs immediately it stashes the
