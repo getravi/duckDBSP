@@ -694,9 +694,13 @@ public:
         }
       }
       for (const auto &t : table_names) {
-        auto wm = con.Query("SELECT COUNT(*), CAST(bit_xor(hash(t)) AS "
-                            "VARCHAR) FROM " +
-                            quote_table_key(t) + " t");
+        // Alias must not be shadowable by a same-named column: `hash(x)`
+        // resolves to the COLUMN x when one exists, silently hashing a
+        // single column instead of the row and blinding the watermark to
+        // every other column's updates.
+        auto wm = con.Query("SELECT COUNT(*), CAST(bit_xor(hash("
+                            "__dbsp_wm_row)) AS VARCHAR) FROM " +
+                            quote_table_key(t) + " __dbsp_wm_row");
         if (wm->HasError() || wm->RowCount() != 1) {
           con.Query("ROLLBACK");
           last_error_ = "checkpoint watermark failed for " + t;
@@ -794,9 +798,10 @@ public:
       }
       for (duckdb::idx_t i = 0; i < meta->RowCount(); i++) {
         const std::string t = meta->GetValue(0, i).ToString();
-        auto live = con.Query("SELECT COUNT(*), CAST(bit_xor(hash(t)) AS "
-                              "VARCHAR) FROM " +
-                              quote_table_key(t) + " t");
+        // Shadow-proof alias — see save_checkpoint's watermark loop.
+        auto live = con.Query("SELECT COUNT(*), CAST(bit_xor(hash("
+                              "__dbsp_wm_row)) AS VARCHAR) FROM " +
+                              quote_table_key(t) + " __dbsp_wm_row");
         if (live->HasError() || live->RowCount() != 1 ||
             live->GetValue(0, 0) != meta->GetValue(1, i) ||
             live->GetValue(1, 0).ToString() !=
@@ -4020,9 +4025,10 @@ private:
     try {
       InternalQueryGuard guard;
       duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
-      auto wm = con.Query("SELECT COUNT(*), CAST(bit_xor(hash(t)) AS "
-                          "VARCHAR) FROM " +
-                          quote_table_key(table_key) + " t");
+      // Shadow-proof alias — see save_checkpoint's watermark loop.
+      auto wm = con.Query("SELECT COUNT(*), CAST(bit_xor(hash("
+                          "__dbsp_wm_row)) AS VARCHAR) FROM " +
+                          quote_table_key(table_key) + " __dbsp_wm_row");
       if (wm->HasError() || wm->RowCount() != 1) {
         return false;
       }
