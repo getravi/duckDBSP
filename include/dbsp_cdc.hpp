@@ -22,6 +22,7 @@
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
@@ -693,6 +694,8 @@ public:
           return false;
         }
       }
+      std::unordered_map<std::string, std::pair<int64_t, std::string>>
+          saved_wms;
       for (const auto &t : table_names) {
         // Alias must not be shadowable by a same-named column: `hash(x)`
         // resolves to the COLUMN x when one exists, silently hashing a
@@ -713,10 +716,31 @@ public:
           last_error_ = r->GetError();
           return false;
         }
+        saved_wms[t] = {wm->GetValue(0, 0).GetValue<int64_t>(),
+                        wm->GetValue(1, 0).ToString()};
       }
       con.Query("COMMIT");
       last_ckpt_saved_count_ = view_blobs.size();
       mark_saved();
+      // Recovery inc B: persist each durable spilled baseline's digest
+      // index under the watermark just written — a reopen whose live
+      // table still matches it adopts the pair instead of rescanning.
+      // Best-effort: a missing/failed sidecar only costs the rescan.
+      {
+        std::shared_lock<std::shared_mutex> sl(struct_mutex_);
+        for (const auto &[t, wm] : saved_wms) {
+          auto tt_it = tracked_tables_.find(t);
+          if (tt_it == tracked_tables_.end()) {
+            continue;
+          }
+          auto lk = table_locks_.find(t);
+          std::shared_lock<std::shared_mutex> tl;
+          if (lk != table_locks_.end()) {
+            tl = std::shared_lock<std::shared_mutex>(*lk->second);
+          }
+          tt_it->second->save_spill_index(wm.first, wm.second);
+        }
+      }
       return true;
     } catch (const std::exception &e) {
       last_error_ = std::string("checkpoint save failed: ") + e.what();
@@ -1674,9 +1698,10 @@ public:
     // concrete spill path up front so a baseline crossing the row
     // threshold can migrate itself mid-scan. Directory creation is a
     // one-time mkdir; failure just leaves auto-spill off for the table.
+    note_db_path(context);
     if (ensure_spill_dir()) {
       tracked_tables_[table_name]->set_spill_path_hint(
-          spill_path(table_name));
+          spill_path(table_name), spill_durable_dir_);
     }
     if (spill_enabled_) {
       tracked_tables_[table_name]->enable_spill(spill_path(table_name));
@@ -4306,6 +4331,17 @@ private:
     DbspScopeTimer timer("baseline_materialize", table_name);
     auto &tt = *it->second;
 
+    // Recovery inc B fast path: adopt the durable spill log + index saved
+    // for exactly this watermark instead of rescanning the table. The
+    // adopted baseline is the SAVE-TIME content — pre-pending by
+    // construction — so the pending subtraction below does not apply;
+    // the pending delta flows through the normal delta path afterwards.
+    if (tt.try_adopt_durable_spill()) {
+      deferred_tables_--;
+      backfill_deferred_arrangements_locked(table_name, view_lock_held);
+      return true;
+    }
+
     int64_t expected = tt.deferred_weight();
     if (pending) {
       for (const auto &[row, w] : *pending) {
@@ -4516,9 +4552,10 @@ private:
     // concrete spill path up front so a baseline crossing the row
     // threshold can migrate itself mid-scan. Directory creation is a
     // one-time mkdir; failure just leaves auto-spill off for the table.
+    note_db_path(context);
     if (ensure_spill_dir()) {
       tracked_tables_[table_name]->set_spill_path_hint(
-          spill_path(table_name));
+          spill_path(table_name), spill_durable_dir_);
     }
     if (spill_enabled_) {
       tracked_tables_[table_name]->enable_spill(spill_path(table_name));
@@ -4556,18 +4593,47 @@ private:
   // (144M rows ≈ 29GB thrown away by the caller) and, in spill mode,
   // paid a per-row apply_row/fflush instead of the batched rebuild
   // writer. The rebuild flow also lets the baseline auto-spill mid-scan.
+  //
+  // Speed lever: a pre-counted big table spills BEFORE the scan and, when
+  // every column type has a fast path, streams PRE-SERIALIZED rows
+  // straight off the chunk vectors — no per-cell Value boxing anywhere.
   bool sync_table_internal(duckdb::ClientContext &context,
                            const std::string &table_name) {
     auto it = tracked_tables_.find(table_name);
     if (it == tracked_tables_.end())
       return false;
+    TrackedTable &tt = *it->second;
 
     try {
-      it->second->begin_rebuild();
-      stream_table_rows(context, table_name, [&](DuckDBRow &&row) {
-        it->second->add_scanned_row(std::move(row));
-      });
-      it->second->install_rebuild();
+      if (!tt.spilled()) {
+        const size_t th = TrackedTable::auto_spill_threshold();
+        if (th != 0) {
+          InternalQueryGuard guard;
+          duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+          auto cnt = con.Query("SELECT COUNT(*) FROM " +
+                               quote_table_key(table_name));
+          if (!cnt->HasError() && cnt->RowCount() == 1 &&
+              static_cast<size_t>(cnt->GetValue(0, 0).GetValue<int64_t>()) >=
+                  th) {
+            tt.request_spill_now();
+          }
+        }
+      }
+      tt.begin_rebuild();
+      bool streamed = false;
+      if (tt.spilled() && tt.schema_types_fast()) {
+        streamed = stream_table_serialized(
+            context, table_name,
+            [&](const std::vector<uint8_t> &bytes) {
+              tt.add_scanned_bytes(bytes);
+            });
+      }
+      if (!streamed) {
+        stream_table_rows(context, table_name, [&](DuckDBRow &&row) {
+          tt.add_scanned_row(std::move(row));
+        });
+      }
+      tt.install_rebuild();
       return true;
     } catch (const std::exception &e) {
       (void)e;
@@ -4575,6 +4641,45 @@ private:
     } catch (...) {
       return false;
     }
+  }
+
+  // Vectorized variant of stream_table_rows: serialized row bytes straight
+  // from flattened chunk vectors. Returns false BEFORE emitting anything
+  // if the first chunk's types lack a fast path (caller falls back to the
+  // boxed row scan); a mid-scan type surprise throws (schema can't change
+  // mid-table).
+  static bool stream_table_serialized(
+      duckdb::ClientContext &context, const std::string &table_key,
+      const std::function<void(const std::vector<uint8_t> &)> &emit) {
+    InternalQueryGuard guard;
+    auto &fresh_db = duckdb::DatabaseInstance::GetDatabase(context);
+    duckdb::Connection fresh_con(fresh_db);
+    auto sql_result =
+        fresh_con.SendQuery("SELECT * FROM " + quote_table_key(table_key));
+    if (!sql_result || sql_result->HasError()) {
+      throw std::runtime_error(
+          "Failed to scan table '" + table_key + "': " +
+          (sql_result ? sql_result->GetError() : "null result"));
+    }
+    bool first = true;
+    while (true) {
+      auto chunk_ptr = sql_result->Fetch();
+      if (!chunk_ptr || chunk_ptr->size() == 0) {
+        break;
+      }
+      auto &chunk = *chunk_ptr;
+      chunk.Flatten();
+      if (!chunk_types_fast(chunk)) {
+        if (first) {
+          return false;
+        }
+        throw std::runtime_error("column types changed mid-scan of '" +
+                                 table_key + "'");
+      }
+      first = false;
+      serialize_chunk(chunk, emit);
+    }
+    return true;
   }
 
   bool get_table_schema(duckdb::ClientContext &context,
@@ -5132,21 +5237,61 @@ private:
   bool use_parallel_sync_ = false;
   bool spill_enabled_ = false;
   std::string spill_dir_;
+  bool spill_durable_dir_ = false; // <dbfile>.dbsp_spill (survives exit)
+  std::string db_path_;            // default catalog's file; "" = in-memory
   uint64_t arrangement_file_seq_ = 0;
 
   std::string spill_path(const std::string &table_name) const {
     return spill_dir_ + "/" + table_name + ".dbspill";
   }
 
+  // Best-effort capture of the default catalog's file path (durable spill
+  // dir lives next to it). In-memory databases leave db_path_ empty.
+  void note_db_path(duckdb::ClientContext &context) {
+    if (!db_path_.empty()) {
+      return;
+    }
+    try {
+      auto &db_manager = duckdb::DatabaseManager::Get(context);
+      auto default_db = db_manager.GetDatabase(
+          context, duckdb::DatabaseManager::GetDefaultDatabase(context));
+      if (default_db) {
+        auto &storage = default_db->GetStorageManager();
+        if (!storage.InMemory()) {
+          db_path_ = storage.GetDBPath();
+        }
+      }
+    } catch (...) {
+      // no durable default catalog
+    }
+  }
+
   // Idempotent per-process spill directory setup (struct_mutex_ held by
   // caller). Factored out of set_spill so table tracking can hand every
   // TrackedTable a concrete spill-path hint for threshold auto-spill
   // (bounded-RAM Phase 5) without the global mode being on.
+  //
+  // Durable mode (recovery inc B): when the database is file-backed, the
+  // spill dir is `<dbfile>.dbsp_spill/` — files survive process exit and
+  // save_checkpoint writes index sidecars so a reopen adopts baselines
+  // instead of rescanning tables. Tmp mode (in-memory DBs) keeps the old
+  // per-pid disposable dir + sweeper.
   bool ensure_spill_dir() {
     if (!spill_dir_.empty()) {
       return true;
     }
     namespace fs = std::filesystem;
+    if (!db_path_.empty()) {
+      std::error_code dec;
+      const std::string durable = db_path_ + ".dbsp_spill";
+      fs::create_directories(durable, dec);
+      if (!dec) {
+        spill_dir_ = durable;
+        spill_durable_dir_ = true;
+        return true;
+      }
+      // fall through to tmp mode on failure
+    }
     std::error_code ec;
     const fs::path tmp = fs::temp_directory_path(ec);
     // Self-cleaning: sweep spill directories left by processes that

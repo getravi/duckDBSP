@@ -32,6 +32,7 @@
 #include <functional>
 #include <list>
 #include <string>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
@@ -166,6 +167,107 @@ inline void serialize_row(const std::vector<duckdb::Value> &row,
   }
 }
 
+// Vectorized serialization (bounded-RAM speed levers): true when every
+// column of the chunk has a typed fast path below. The whole table takes
+// the boxed row path otherwise — coverage is an optimization knob.
+inline bool chunk_types_fast(const duckdb::DataChunk &chunk) {
+  for (duckdb::idx_t c = 0; c < chunk.ColumnCount(); c++) {
+    switch (chunk.data[c].GetType().id()) {
+    case duckdb::LogicalTypeId::INTEGER:
+    case duckdb::LogicalTypeId::BIGINT:
+    case duckdb::LogicalTypeId::DOUBLE:
+    case duckdb::LogicalTypeId::VARCHAR:
+    case duckdb::LogicalTypeId::BOOLEAN:
+      continue;
+    default:
+      return false;
+    }
+  }
+  return true;
+}
+
+// Serialize every row of a FLATTENED chunk straight from vector data —
+// byte-identical to serialize_row, no per-cell duckdb::Value. Caller
+// checked chunk_types_fast.
+inline void
+serialize_chunk(duckdb::DataChunk &chunk,
+                const std::function<void(const std::vector<uint8_t> &)> &emit) {
+  using namespace rowcodec;
+  const duckdb::idx_t n = chunk.size();
+  const duckdb::idx_t ncols = chunk.ColumnCount();
+  struct Col {
+    uint8_t tag;
+    uint8_t type_id;
+    const void *data;
+    duckdb::ValidityMask *validity;
+  };
+  std::vector<Col> cols(ncols);
+  for (duckdb::idx_t c = 0; c < ncols; c++) {
+    auto &vec = chunk.data[c];
+    Col &col = cols[c];
+    col.type_id = static_cast<uint8_t>(vec.GetType().id());
+    col.validity = &duckdb::FlatVector::Validity(vec);
+    switch (vec.GetType().id()) {
+    case duckdb::LogicalTypeId::INTEGER:
+      col.tag = kInt32;
+      col.data = duckdb::FlatVector::GetData<int32_t>(vec);
+      break;
+    case duckdb::LogicalTypeId::BIGINT:
+      col.tag = kInt64;
+      col.data = duckdb::FlatVector::GetData<int64_t>(vec);
+      break;
+    case duckdb::LogicalTypeId::DOUBLE:
+      col.tag = kDouble;
+      col.data = duckdb::FlatVector::GetData<double>(vec);
+      break;
+    case duckdb::LogicalTypeId::VARCHAR:
+      col.tag = kVarchar;
+      col.data = duckdb::FlatVector::GetData<duckdb::string_t>(vec);
+      break;
+    default: // BOOLEAN (chunk_types_fast admits nothing else)
+      col.tag = kBool;
+      col.data = duckdb::FlatVector::GetData<bool>(vec);
+      break;
+    }
+  }
+  std::vector<uint8_t> bytes;
+  for (duckdb::idx_t i = 0; i < n; i++) {
+    bytes.clear();
+    put_raw(bytes, static_cast<uint32_t>(ncols));
+    for (duckdb::idx_t c = 0; c < ncols; c++) {
+      const Col &col = cols[c];
+      if (!col.validity->RowIsValid(i)) {
+        bytes.push_back(kNull);
+        bytes.push_back(col.type_id);
+        continue;
+      }
+      bytes.push_back(col.tag);
+      switch (col.tag) {
+      case kInt32:
+        put_raw(bytes, static_cast<const int32_t *>(col.data)[i]);
+        break;
+      case kInt64:
+        put_raw(bytes, static_cast<const int64_t *>(col.data)[i]);
+        break;
+      case kDouble:
+        put_raw(bytes, static_cast<const double *>(col.data)[i]);
+        break;
+      case kVarchar: {
+        const auto &s = static_cast<const duckdb::string_t *>(col.data)[i];
+        put_raw(bytes, static_cast<uint32_t>(s.GetSize()));
+        const auto *sp = reinterpret_cast<const uint8_t *>(s.GetData());
+        bytes.insert(bytes.end(), sp, sp + s.GetSize());
+        break;
+      }
+      default: // kBool
+        bytes.push_back(static_cast<const bool *>(col.data)[i] ? 1 : 0);
+        break;
+      }
+    }
+    emit(bytes);
+  }
+}
+
 inline std::vector<duckdb::Value> deserialize_row(const uint8_t *data,
                                                   size_t len) {
   using namespace rowcodec;
@@ -241,6 +343,124 @@ public:
 
   bool empty() const { return index_.empty(); }
 
+  // ---- durable mode (bounded-RAM speed levers / recovery inc B) ---------
+  // Spill files in a per-DATABASE directory survive process exit; with a
+  // saved index sidecar, a reopen rebuilds the baseline by one bulk index
+  // read instead of rescanning the whole table (the dominant cost of the
+  // first edit after attach). The record log + index are only trusted
+  // when the caller's watermark (count + row-hash, verified against live
+  // storage) matches what the index was saved under AND the log file size
+  // is exactly what the save recorded — any append/rebuild since then
+  // invalidates the pair and forces the ordinary rescan.
+
+  void set_keep_files(bool keep) { keep_files_ = keep; }
+
+  static constexpr uint64_t kIdxMagic = 0xDB5B1DE0BA5E11FEULL;
+  static constexpr uint32_t kIdxVersion = 1;
+
+  std::string idx_path() const { return path_ + ".idx"; }
+
+  // Persist the digest index next to the record log. Caller supplies the
+  // watermark the baseline currently corresponds to (save_checkpoint's
+  // just-computed values). fsyncs the log first so the recorded file size
+  // is durable before the index that references it.
+  bool save_index(int64_t wm_count, const std::string &wm_hash) {
+    if (new_file_ != nullptr) {
+      return false; // rebuild in flight: not a consistent generation
+    }
+    if (file_ != nullptr) {
+      std::fflush(file_);
+      ::fsync(fileno(file_));
+    }
+    std::error_code ec;
+    const uint64_t fsize = std::filesystem::exists(path_, ec)
+                               ? std::filesystem::file_size(path_, ec)
+                               : 0;
+    std::FILE *f = std::fopen((idx_path() + ".tmp").c_str(), "wb");
+    if (f == nullptr) {
+      return false;
+    }
+    auto put = [&](const void *p, size_t n) {
+      std::fwrite(p, 1, n, f);
+    };
+    const uint64_t magic = kIdxMagic;
+    const uint32_t ver = kIdxVersion;
+    const uint32_t hlen = static_cast<uint32_t>(wm_hash.size());
+    const uint64_t n = index_.size();
+    put(&magic, 8);
+    put(&ver, 4);
+    put(&wm_count, 8);
+    put(&hlen, 4);
+    put(wm_hash.data(), hlen);
+    put(&fsize, 8);
+    put(&n, 8);
+    for (const auto &[d, slot] : index_) {
+      put(&d.hi, 8);
+      put(&d.lo, 8);
+      put(&slot.offset, 8);
+      put(&slot.length, 4);
+      put(&slot.weight, 8);
+    }
+    std::fflush(f);
+    ::fsync(fileno(f));
+    std::fclose(f);
+    std::filesystem::rename(idx_path() + ".tmp", idx_path(), ec);
+    return !ec;
+  }
+
+  // Adopt a durable log+index pair for the given watermark. On success
+  // the baseline is fully usable (index resident, payloads on disk). Any
+  // mismatch leaves this object empty and returns false — caller rescans.
+  bool try_load_index(int64_t wm_count, const std::string &wm_hash) {
+    std::error_code ec;
+    if (!std::filesystem::exists(idx_path(), ec) ||
+        !std::filesystem::exists(path_, ec)) {
+      return false;
+    }
+    std::FILE *f = std::fopen(idx_path().c_str(), "rb");
+    if (f == nullptr) {
+      return false;
+    }
+    auto get = [&](void *p, size_t n) {
+      return std::fread(p, 1, n, f) == n;
+    };
+    uint64_t magic = 0, fsize = 0, n = 0;
+    uint32_t ver = 0, hlen = 0;
+    int64_t count = 0;
+    bool ok = get(&magic, 8) && magic == kIdxMagic && get(&ver, 4) &&
+              ver == kIdxVersion && get(&count, 8) && get(&hlen, 4);
+    std::string hash(hlen, '\0');
+    ok = ok && (hlen == 0 || get(hash.data(), hlen)) && get(&fsize, 8) &&
+         get(&n, 8);
+    if (!ok || count != wm_count || hash != wm_hash ||
+        fsize != (std::filesystem::exists(path_, ec)
+                      ? std::filesystem::file_size(path_, ec)
+                      : 0)) {
+      std::fclose(f);
+      return false;
+    }
+    std::unordered_map<RowDigest, Slot, RowDigestHash> idx;
+    idx.reserve(static_cast<size_t>(n));
+    int64_t total = 0;
+    for (uint64_t i = 0; i < n; i++) {
+      RowDigest d;
+      Slot s;
+      if (!(get(&d.hi, 8) && get(&d.lo, 8) && get(&s.offset, 8) &&
+            get(&s.length, 4) && get(&s.weight, 8))) {
+        std::fclose(f);
+        return false; // truncated index: rescan
+      }
+      total += s.weight;
+      idx.emplace(d, s);
+    }
+    std::fclose(f);
+    index_ = std::move(idx);
+    total_weight_ = total;
+    append_offset_ = fsize;
+    appendable_ = false;
+    return true;
+  }
+
   // ---- rebuild path (scan-and-diff sync) -------------------------------
   // Usage: begin_rebuild(); add() every scanned row; end_rebuild()
   // reports the delta vs the previous generation and atomically swaps
@@ -257,6 +477,12 @@ public:
   RowDigest add(const std::vector<duckdb::Value> &row, int64_t w = 1) {
     std::vector<uint8_t> &bytes = scratch_bytes_;
     serialize_row(row, bytes);
+    return add_serialized(bytes, w);
+  }
+
+  // Same, for a row the caller already serialized (vectorized scan path:
+  // bytes come straight from chunk vectors, no per-cell Value boxing).
+  RowDigest add_serialized(const std::vector<uint8_t> &bytes, int64_t w = 1) {
     const RowDigest d = digest_bytes(bytes.data(), bytes.size());
     auto &slot = pending_[d];
     if (slot.weight == 0) {
@@ -389,7 +615,14 @@ public:
     pending_.clear();
     total_weight_ = 0;
     std::error_code ec;
-    std::filesystem::remove(path_, ec);
+    // Durable mode keeps the log (+ index sidecar) across process exit —
+    // that is the whole point; a stale pair is rejected by the watermark
+    // + file-size check on the next adopt. The in-flight tmp file is
+    // always garbage.
+    if (!keep_files_) {
+      std::filesystem::remove(path_, ec);
+      std::filesystem::remove(idx_path(), ec);
+    }
     std::filesystem::remove(tmp_path(), ec);
   }
 
@@ -480,6 +713,7 @@ private:
   std::string path_;
   std::FILE *file_ = nullptr;     // current generation
   std::FILE *new_file_ = nullptr; // rebuild in progress
+  bool keep_files_ = false;       // durable mode: survive process exit
   bool appendable_ = false;
   uint64_t new_offset_ = 0;
   uint64_t append_offset_ = 0;

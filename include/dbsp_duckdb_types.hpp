@@ -443,13 +443,89 @@ public:
   // CDCManager supplies the concrete spill file path up front so the
   // migration can happen deep inside a scan with no manager callback.
   // Empty hint = auto-spill off for this table (standalone/unit use).
-  void set_spill_path_hint(std::string p) { spill_path_hint_ = std::move(p); }
+  void set_spill_path_hint(std::string p, bool durable = false) {
+    spill_path_hint_ = std::move(p);
+    spill_durable_ = durable;
+    if (spill_) {
+      spill_->set_keep_files(durable);
+    }
+  }
+
+  // Persist the digest index sidecar for a durable spilled baseline
+  // (called from save_checkpoint with the just-computed watermark).
+  bool save_spill_index(int64_t wm_count, const std::string &wm_hash) {
+    if (spill_ == nullptr || !spill_durable_) {
+      return false;
+    }
+    return spill_->save_index(wm_count, wm_hash);
+  }
+
+  // Deferred-baseline fast path (recovery inc B): adopt the durable
+  // log+index pair saved for this table's restore-time watermark instead
+  // of rescanning the whole table. Returns false (leaving the table
+  // deferred, nothing allocated) on any mismatch.
+  bool try_adopt_durable_spill() {
+    if (!deferred_ || spill_ != nullptr || !spill_durable_ ||
+        spill_path_hint_.empty()) {
+      return false;
+    }
+    auto candidate = std::make_unique<SpilledBaseline>(spill_path_hint_);
+    candidate->set_keep_files(true);
+    if (!candidate->try_load_index(deferred_weight_, deferred_hash_)) {
+      return false; // dtor keeps the (possibly stale) files for later saves
+    }
+    spill_ = std::move(candidate);
+    pending_changes_.clear();
+    sequence_++;
+    deferred_ = false;
+    deferred_hash_.clear();
+    return true;
+  }
+
+  // Spill immediately (speed lever: a pre-counted big table spills BEFORE
+  // its initial scan — no boxed peak, no mid-scan migration, and the
+  // vectorized serialized-bytes scan path becomes available).
+  bool request_spill_now() {
+    if (spill_ != nullptr) {
+      return true;
+    }
+    if (spill_path_hint_.empty()) {
+      return false;
+    }
+    enable_spill(spill_path_hint_);
+    return true;
+  }
+
+  // Rebuild feed for rows the scan already serialized (vectorized path;
+  // spill mode only — callers gate on spilled()).
+  void add_scanned_bytes(const std::vector<uint8_t> &bytes) {
+    spill_->add_serialized(bytes, 1);
+  }
+
+  // True when every column type has a vectorized serialize fast path —
+  // must mirror chunk_types_fast (dbsp_spill_store.hpp).
+  bool schema_types_fast() const {
+    for (const auto &col : schema_.columns) {
+      switch (col.type.id()) {
+      case duckdb::LogicalTypeId::INTEGER:
+      case duckdb::LogicalTypeId::BIGINT:
+      case duckdb::LogicalTypeId::DOUBLE:
+      case duckdb::LogicalTypeId::VARCHAR:
+      case duckdb::LogicalTypeId::BOOLEAN:
+        continue;
+      default:
+        return false;
+      }
+    }
+    return !schema_.columns.empty();
+  }
 
   void enable_spill(const std::string &path) {
     if (spill_) {
       return;
     }
     spill_ = std::make_unique<SpilledBaseline>(path);
+    spill_->set_keep_files(spill_durable_);
     if (!current_state_.empty()) {
       // Migrate the in-RAM baseline, then free it. install_rebuild swaps
       // the generation in without diffing — a migration has no delta by
@@ -747,6 +823,7 @@ private:
   DuckDBZSet pending_changes_;
   std::unique_ptr<SpilledBaseline> spill_;
   std::string spill_path_hint_; // set by CDCManager; empty = no auto-spill
+  bool spill_durable_ = false;  // files survive process exit (per-DB dir)
   uint64_t sequence_;
   // Deferred baseline (D3c): true until the first operation that needs
   // table state materializes it from a storage scan.
