@@ -4109,6 +4109,15 @@ private:
       }
       return nullptr;
     };
+    // Bounded-RAM Phase 2 NOTE (attempted, reverted): letting a
+    // self-padding LEFT side share looked cheap — reconcile_pads and
+    // side_index already read shared_left_ — but init is ORDER-DEPENDENT:
+    // with the arrangement backfilled at registration and the left replay
+    // not skipped, a source replayed before the left table double-counts
+    // matches (L_full⋈Δr now, Δl⋈R again later), and with the replay
+    // skipped the pads are never emitted. A correct version needs an
+    // explicit init-pads pass in the join node (emit pads for unmatched
+    // shared-left rows after init) — tracked in the bounded-RAM spec.
     auto eligible = [&](size_t child) {
       const PlanOpSpec *src = scan_of(*spec.children[child]);
       return src && source_refs_[src->table] == 1 &&

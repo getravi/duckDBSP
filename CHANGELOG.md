@@ -1,5 +1,24 @@
 # Changelog
 
+## Bounded-RAM Phase 2 findings: shared padding-left attempted + reverted - Aug 2026
+
+- Attempted: shared arrangements for self-padding LEFT join sides (the
+  compiled dense-driver plans put one static cross table on the LEFT of
+  every view's LEFT JOIN; a probe showed 8 such views dropping 196MB of
+  private indexes to 0 with one 51MB shared arrangement, pad-transition
+  parity clean).
+- Reverted: init is ORDER-DEPENDENT — with the arrangement backfilled at
+  registration and the left replay not skipped, a source replayed before
+  the left table double-counts matches; with the replay skipped, pads are
+  never emitted (planner_frontend LEFT/FULL differentials caught it). A
+  correct version needs an explicit init-pads pass in PlanJoinNode; the
+  eligibility gate now documents this. ctest back to 44/44.
+- Measured for the record (141-view DAG, disk-backed): private
+  arrangements 7.05GB — dominated by CHAINED-join intermediate left
+  indexes, which no sharing can address; spill toggled post-attach costs
+  13s and reaches 5.97GB (digest+cache resident). Remaining reduction
+  requires packed row representation (spec Phase 2d).
+
 ## Bounded-RAM Phase 1c: table-backed reads, results out of RAM - Aug 2026
 
 - With `dbsp_mv_tables(true)`, sinks stop integrating: the __mv_ table IS
