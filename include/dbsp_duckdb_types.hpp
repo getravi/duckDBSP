@@ -763,8 +763,10 @@ public:
       return b; // nothing materialized yet
     }
     if (spill_) {
-      // digest index only: RowDigest(16) + Slot(24) + map node overhead
-      return b + spill_->distinct_rows() * kSpillIndexEntryBytes;
+      // digest index only: RowDigest(16) + Slot(24) + map node overhead.
+      // An mmap'd flat layer is page-cache, not process heap — only the
+      // resident (overlay) entries count.
+      return b + spill_->resident_index_entries() * kSpillIndexEntryBytes;
     }
     return b + acct.zset_bytes(current_state_);
   }

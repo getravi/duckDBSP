@@ -24,14 +24,17 @@
 #include "duckdb/common/serializer/memory_stream.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
 #include <filesystem>
 #include <functional>
 #include <list>
 #include <string>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
@@ -337,11 +340,33 @@ public:
   SpilledBaseline(const SpilledBaseline &) = delete;
   SpilledBaseline &operator=(const SpilledBaseline &) = delete;
 
-  size_t distinct_rows() const { return index_.size(); }
+  size_t distinct_rows() const {
+    if (flat_entries_ != nullptr) {
+      return static_cast<size_t>(flat_count_) + overlay_new_ - overlay_dead_;
+    }
+    return index_.size();
+  }
 
   int64_t total_weight() const { return total_weight_; }
 
-  bool empty() const { return index_.empty(); }
+  bool empty() const { return distinct_rows() == 0; }
+
+  // Live weight of one digest across flat + overlay (overlay masks flat).
+  int64_t live_weight(const RowDigest &d) const {
+    auto it = index_.find(d);
+    if (it != index_.end()) {
+      return it->second.weight;
+    }
+    Slot s;
+    return flat_find(d, s) ? s.weight : 0;
+  }
+
+  // Resident RAM attributable to the index: the mmap'd flat layer is
+  // page-cache (evictable, not process-owned) — only the overlay counts.
+  size_t resident_index_entries() const {
+    return flat_entries_ != nullptr ? index_.size() : index_.size();
+  }
+  bool flat_mapped() const { return flat_entries_ != nullptr; }
 
   // ---- durable mode (bounded-RAM speed levers / recovery inc B) ---------
   // Spill files in a per-DATABASE directory survive process exit; with a
@@ -356,17 +381,30 @@ public:
   void set_keep_files(bool keep) { keep_files_ = keep; }
 
   static constexpr uint64_t kIdxMagic = 0xDB5B1DE0BA5E11FEULL;
-  static constexpr uint32_t kIdxVersion = 1;
+  // v2 (tier-2 mmap): entries SORTED by digest; adopt maps the file
+  // read-only and binary-searches it — zero build cost, size-independent
+  // reopen. index_ becomes a mutation OVERLAY on top (absolute slots;
+  // weight 0 = tombstone masking a flat entry). v1 indexes are rejected
+  // (one rescan on upgrade).
+  static constexpr uint32_t kIdxVersion = 2;
+  static constexpr size_t kFlatEntryBytes = 36; // hi8 lo8 off8 len4 w8
 
   std::string idx_path() const { return path_ + ".idx"; }
 
-  // Persist the digest index next to the record log. Caller supplies the
-  // watermark the baseline currently corresponds to (save_checkpoint's
-  // just-computed values). fsyncs the log first so the recorded file size
-  // is durable before the index that references it.
+  // Persist the digest index next to the record log, entries SORTED by
+  // digest (v2 mmap format). Caller supplies the watermark the baseline
+  // currently corresponds to (save_checkpoint's just-computed values).
+  // fsyncs the log first so the recorded file size is durable before the
+  // index that references it. Skipped for free when an adopted flat
+  // generation is still clean (no overlay, same watermark) — the sidecar
+  // on disk is already exactly this content.
   bool save_index(int64_t wm_count, const std::string &wm_hash) {
     if (new_file_ != nullptr) {
       return false; // rebuild in flight: not a consistent generation
+    }
+    if (flat_entries_ != nullptr && index_.empty() &&
+        wm_count == flat_wm_count_ && wm_hash == flat_wm_hash_) {
+      return true;
     }
     if (file_ != nullptr) {
       std::fflush(file_);
@@ -376,6 +414,24 @@ public:
     const uint64_t fsize = std::filesystem::exists(path_, ec)
                                ? std::filesystem::file_size(path_, ec)
                                : 0;
+    // Gather live entries (flat ∖ tombstones ∪ overlay) as packed bytes,
+    // then sort by digest.
+    std::vector<std::array<uint8_t, kFlatEntryBytes>> entries;
+    entries.reserve(distinct_rows());
+    for_each_slot([&](const RowDigest &d, const Slot &s) {
+      std::array<uint8_t, kFlatEntryBytes> e;
+      uint8_t *p = e.data();
+      std::memcpy(p, &d.hi, 8);
+      std::memcpy(p + 8, &d.lo, 8);
+      std::memcpy(p + 16, &s.offset, 8);
+      std::memcpy(p + 24, &s.length, 4);
+      std::memcpy(p + 28, &s.weight, 8);
+      entries.push_back(e);
+    });
+    std::sort(entries.begin(), entries.end(),
+              [](const auto &a, const auto &b) {
+                return std::memcmp(a.data(), b.data(), 16) < 0;
+              });
     std::FILE *f = std::fopen((idx_path() + ".tmp").c_str(), "wb");
     if (f == nullptr) {
       return false;
@@ -386,7 +442,7 @@ public:
     const uint64_t magic = kIdxMagic;
     const uint32_t ver = kIdxVersion;
     const uint32_t hlen = static_cast<uint32_t>(wm_hash.size());
-    const uint64_t n = index_.size();
+    const uint64_t n = entries.size();
     put(&magic, 8);
     put(&ver, 4);
     put(&wm_count, 8);
@@ -394,12 +450,8 @@ public:
     put(wm_hash.data(), hlen);
     put(&fsize, 8);
     put(&n, 8);
-    for (const auto &[d, slot] : index_) {
-      put(&d.hi, 8);
-      put(&d.lo, 8);
-      put(&slot.offset, 8);
-      put(&slot.length, 4);
-      put(&slot.weight, 8);
+    for (const auto &e : entries) {
+      put(e.data(), kFlatEntryBytes);
     }
     std::fflush(f);
     ::fsync(fileno(f));
@@ -408,9 +460,10 @@ public:
     return !ec;
   }
 
-  // Adopt a durable log+index pair for the given watermark. On success
-  // the baseline is fully usable (index resident, payloads on disk). Any
-  // mismatch leaves this object empty and returns false — caller rescans.
+  // Adopt a durable log+index pair for the given watermark: mmap the
+  // sorted index read-only — O(1) regardless of row count; lookups
+  // binary-search the mapping and pages fault in on demand. Any mismatch
+  // leaves this object empty and returns false — caller rescans.
   bool try_load_index(int64_t wm_count, const std::string &wm_hash) {
     std::error_code ec;
     if (!std::filesystem::exists(idx_path(), ec) ||
@@ -432,33 +485,127 @@ public:
     std::string hash(hlen, '\0');
     ok = ok && (hlen == 0 || get(hash.data(), hlen)) && get(&fsize, 8) &&
          get(&n, 8);
-    if (!ok || count != wm_count || hash != wm_hash ||
+    const long header_end = ok ? std::ftell(f) : -1;
+    std::fclose(f);
+    if (!ok || count != wm_count || hash != wm_hash || header_end < 0 ||
         fsize != (std::filesystem::exists(path_, ec)
                       ? std::filesystem::file_size(path_, ec)
                       : 0)) {
-      std::fclose(f);
       return false;
     }
-    std::unordered_map<RowDigest, Slot, RowDigestHash> idx;
-    idx.reserve(static_cast<size_t>(n));
-    int64_t total = 0;
-    for (uint64_t i = 0; i < n; i++) {
-      RowDigest d;
-      Slot s;
-      if (!(get(&d.hi, 8) && get(&d.lo, 8) && get(&s.offset, 8) &&
-            get(&s.length, 4) && get(&s.weight, 8))) {
-        std::fclose(f);
-        return false; // truncated index: rescan
-      }
-      total += s.weight;
-      idx.emplace(d, s);
+    const uint64_t need =
+        static_cast<uint64_t>(header_end) + n * kFlatEntryBytes;
+    const uint64_t actual = std::filesystem::file_size(idx_path(), ec);
+    if (ec || actual < need) {
+      return false; // truncated index: rescan
     }
-    std::fclose(f);
-    index_ = std::move(idx);
-    total_weight_ = total;
+    const int fd = ::open(idx_path().c_str(), O_RDONLY);
+    if (fd < 0) {
+      return false;
+    }
+    void *map = ::mmap(nullptr, static_cast<size_t>(need), PROT_READ,
+                       MAP_PRIVATE, fd, 0);
+    if (map == MAP_FAILED) {
+      ::close(fd);
+      return false;
+    }
+    flat_unmap();
+    flat_fd_ = fd;
+    flat_map_ = map;
+    flat_map_len_ = static_cast<size_t>(need);
+    flat_entries_ = static_cast<const uint8_t *>(map) + header_end;
+    flat_count_ = n;
+    flat_wm_count_ = wm_count;
+    flat_wm_hash_ = wm_hash;
+    index_.clear();
+    overlay_new_ = 0;
+    overlay_dead_ = 0;
+    // Total weight == the verified watermark COUNT(*) by definition (the
+    // baseline is exactly the committed table content).
+    total_weight_ = wm_count;
     append_offset_ = fsize;
     appendable_ = false;
     return true;
+  }
+
+  // ---- flat layer internals ---------------------------------------------
+
+  RowDigest flat_digest(uint64_t i) const {
+    RowDigest d;
+    const uint8_t *p = flat_entries_ + i * kFlatEntryBytes;
+    std::memcpy(&d.hi, p, 8);
+    std::memcpy(&d.lo, p + 8, 8);
+    return d;
+  }
+
+  Slot flat_slot(uint64_t i) const {
+    Slot s;
+    const uint8_t *p = flat_entries_ + i * kFlatEntryBytes;
+    std::memcpy(&s.offset, p + 16, 8);
+    std::memcpy(&s.length, p + 24, 4);
+    std::memcpy(&s.weight, p + 28, 8);
+    return s;
+  }
+
+  bool flat_find(const RowDigest &d, Slot &out) const {
+    if (flat_entries_ == nullptr) {
+      return false;
+    }
+    uint64_t lo = 0, hi = flat_count_;
+    uint8_t key[16];
+    std::memcpy(key, &d.hi, 8);
+    std::memcpy(key + 8, &d.lo, 8);
+    while (lo < hi) {
+      const uint64_t mid = lo + (hi - lo) / 2;
+      const int c =
+          std::memcmp(flat_entries_ + mid * kFlatEntryBytes, key, 16);
+      if (c == 0) {
+        out = flat_slot(mid);
+        return true;
+      }
+      if (c < 0) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return false;
+  }
+
+  // Every LIVE (digest, slot): flat entries not masked by the overlay,
+  // plus overlay entries with nonzero weight.
+  void for_each_slot(
+      const std::function<void(const RowDigest &, const Slot &)> &fn) const {
+    for (uint64_t i = 0; i < flat_count_; i++) {
+      const RowDigest d = flat_digest(i);
+      if (index_.count(d) > 0) {
+        continue; // overlay overrides (possibly a tombstone)
+      }
+      fn(d, flat_slot(i));
+    }
+    for (const auto &[d, slot] : index_) {
+      if (slot.weight != 0) {
+        fn(d, slot);
+      }
+    }
+  }
+
+  void flat_unmap() {
+    if (flat_map_ != nullptr) {
+      ::munmap(flat_map_, flat_map_len_);
+      flat_map_ = nullptr;
+    }
+    if (flat_fd_ >= 0) {
+      ::close(flat_fd_);
+      flat_fd_ = -1;
+    }
+    flat_entries_ = nullptr;
+    flat_count_ = 0;
+    flat_map_len_ = 0;
+    flat_wm_hash_.clear();
+    flat_wm_count_ = 0;
+    overlay_new_ = 0;
+    overlay_dead_ = 0;
   }
 
   // ---- rebuild path (scan-and-diff sync) -------------------------------
@@ -520,8 +667,7 @@ public:
     // file; read back sequentially (offsets ascend by construction)
     std::vector<std::pair<RowDigest, int64_t>> added;
     for (const auto &[d, slot] : pending_) {
-      auto it = index_.find(d);
-      const int64_t old_w = it == index_.end() ? 0 : it->second.weight;
+      const int64_t old_w = live_weight(d);
       if (slot.weight > old_w) {
         added.emplace_back(d, slot.weight - old_w);
       }
@@ -534,16 +680,16 @@ public:
     std::fclose(nf);
 
     // Rows removed or with decreased weight: payload only in the OLD file
-    if (file_ == nullptr && !path_.empty() && !index_.empty()) {
+    if (file_ == nullptr && !path_.empty() && !empty()) {
       file_ = open_file(path_, "rb");
     }
-    for (const auto &[d, slot] : index_) {
+    for_each_slot([&](const RowDigest &d, const Slot &slot) {
       auto it = pending_.find(d);
       const int64_t new_w = it == pending_.end() ? 0 : it->second.weight;
       if (slot.weight > new_w) {
         on_removed(read_row(file_, slot), slot.weight - new_w);
       }
-    }
+    });
 
     swap_in_pending();
   }
@@ -557,10 +703,17 @@ public:
     serialize_row(row, bytes);
     const RowDigest d = digest_bytes(bytes.data(), bytes.size());
     auto it = index_.find(d);
-    if (it == index_.end()) {
-      if (w == 0) {
-        return;
-      }
+    Slot flat;
+    const bool in_overlay = it != index_.end();
+    const bool in_flat = !in_overlay && flat_find(d, flat);
+    const int64_t cur_w = in_overlay ? it->second.weight
+                          : in_flat  ? flat.weight
+                                     : 0;
+    if (cur_w == 0 && !in_flat && w == 0) {
+      return;
+    }
+    if (cur_w == 0 && !in_flat && !in_overlay) {
+      // brand new row: append payload, land it in the overlay/full map
       ensure_append_file();
       Slot slot;
       slot.offset = append_offset_;
@@ -570,10 +723,44 @@ public:
       std::fflush(file_);
       append_offset_ += sizeof(uint32_t) + bytes.size();
       index_.emplace(d, slot);
+      if (flat_entries_ != nullptr) {
+        overlay_new_++;
+      }
     } else {
-      it->second.weight += w;
-      if (it->second.weight == 0) {
-        index_.erase(it);
+      Slot next = in_overlay ? it->second : flat;
+      const int64_t new_w = next.weight + w;
+      next.weight = new_w;
+      if (flat_entries_ != nullptr) {
+        // Overlay is ABSOLUTE and masks the flat entry; weight 0 stays as
+        // a tombstone when the row exists in the flat layer. An overlay
+        // entry at weight 0 is by construction a flat-origin tombstone
+        // (overlay-born rows are erased at 0, never tombstoned).
+        const bool tombstone = in_overlay && cur_w == 0;
+        const bool flat_origin = in_flat || tombstone;
+        const bool was_live = cur_w != 0;
+        const bool now_live = new_w != 0;
+        if (flat_origin) {
+          if (was_live && !now_live) {
+            overlay_dead_++;
+          } else if (!was_live && now_live) {
+            overlay_dead_--; // resurrection of a tombstoned flat row
+          }
+          index_[d] = next;
+        } else {
+          // overlay-born row
+          if (was_live && !now_live) {
+            overlay_new_--;
+            index_.erase(it);
+          } else {
+            index_[d] = next;
+          }
+        }
+      } else {
+        if (new_w == 0) {
+          index_.erase(it);
+        } else {
+          it->second = next;
+        }
       }
     }
     total_weight_ += w;
@@ -582,7 +769,7 @@ public:
   // ---- streaming read (view init / arrangement backfill) ---------------
   void scan(const std::function<void(const std::vector<duckdb::Value> &,
                                      int64_t)> &fn) {
-    if (index_.empty()) {
+    if (empty()) {
       return;
     }
     reopen_read();
@@ -591,10 +778,10 @@ public:
     // = minutes of cache misses under memory pressure, measured); the POD
     // copy sorts contiguously in seconds.
     std::vector<Slot> slots;
-    slots.reserve(index_.size());
-    for (const auto &[d, slot] : index_) {
+    slots.reserve(distinct_rows());
+    for_each_slot([&](const RowDigest &, const Slot &slot) {
       slots.push_back(slot);
-    }
+    });
     std::sort(slots.begin(), slots.end(),
               [](const Slot &a, const Slot &b) {
                 return a.offset < b.offset;
@@ -614,6 +801,7 @@ public:
       std::fclose(new_file_);
       new_file_ = nullptr;
     }
+    flat_unmap();
     index_.clear();
     pending_.clear();
     total_weight_ = 0;
@@ -673,7 +861,9 @@ private:
       }
       return;
     }
-    file_ = open_file(path_, index_.empty() ? "wb+" : "ab+");
+    // empty() spans the flat layer too: after a v2 adopt the overlay map
+    // is empty while the log holds every row — "wb+" would truncate it.
+    file_ = open_file(path_, empty() ? "wb+" : "ab+");
     appendable_ = true;
     std::fseek(file_, 0, SEEK_END);
     append_offset_ = static_cast<uint64_t>(std::ftell(file_));
@@ -699,6 +889,8 @@ private:
       std::fclose(new_file_);
       new_file_ = nullptr;
     }
+    // A fresh generation supersedes any adopted flat layer entirely.
+    flat_unmap();
     std::error_code ec;
     std::filesystem::rename(tmp_path(), path_, ec);
     if (ec) {
@@ -717,6 +909,17 @@ private:
   std::FILE *file_ = nullptr;     // current generation
   std::FILE *new_file_ = nullptr; // rebuild in progress
   bool keep_files_ = false;       // durable mode: survive process exit
+  // Flat mmap layer (v2 adopt): immutable sorted entries; index_ becomes
+  // the mutation overlay while mapped.
+  int flat_fd_ = -1;
+  void *flat_map_ = nullptr;
+  size_t flat_map_len_ = 0;
+  const uint8_t *flat_entries_ = nullptr;
+  uint64_t flat_count_ = 0;
+  int64_t flat_wm_count_ = 0;
+  std::string flat_wm_hash_;
+  size_t overlay_new_ = 0;  // overlay-born live rows
+  size_t overlay_dead_ = 0; // flat rows tombstoned by the overlay
   bool appendable_ = false;
   uint64_t new_offset_ = 0;
   uint64_t append_offset_ = 0;

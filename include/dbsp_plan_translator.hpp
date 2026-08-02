@@ -59,6 +59,7 @@
 #include "dbsp_instance_registry.hpp"
 #include "dbsp_checkpoint.hpp"
 #include "dbsp_qualified_name.hpp"
+#include "dbsp_flat_packed.hpp"
 #include "dbsp_packed_row.hpp"
 #include "dbsp_window_view.hpp"
 
@@ -1480,6 +1481,11 @@ struct SharedArrangement {
   bool packed_ok = false;
   std::unordered_map<std::string, std::vector<std::pair<std::string, int64_t>>>
       packed;
+  // Recovery inc 3: adopted durable layer (immutable, key-sorted; loaded
+  // from the fingerprint sidecar when the source table's watermark
+  // matched at register time). `packed` above becomes the delta overlay;
+  // weights sum across layers at probe.
+  flatpacked::FlatPackedIndex flat;
 
   bool probe_packed(const DuckDBRow &key, RowWeights &out,
                     const std::vector<duckdb::idx_t> *proj) const {
@@ -1489,10 +1495,12 @@ struct SharedArrangement {
       return false;
     }
     auto it = packed.find(kb);
-    if (it == packed.end() || it->second.empty()) {
+    const flatpacked::DirEnt *fe = flat.find(kb);
+    const bool have_overlay = it != packed.end() && !it->second.empty();
+    if (!have_overlay && fe == nullptr) {
       return false;
     }
-    for (const auto &[bytes, w] : it->second) {
+    auto emit = [&](const std::string &bytes, int64_t w) {
       DuckDBRow row;
       packed::decode_row(bytes, row);
       if (proj) {
@@ -1508,8 +1516,118 @@ struct SharedArrangement {
       } else {
         out[std::move(row)] += w;
       }
+    };
+    if (fe != nullptr && !have_overlay) {
+      for (uint32_t b = 0; b < fe->bucket_n; b++) {
+        const auto &be = flat.buckets[fe->bucket_off + b];
+        emit(std::string(reinterpret_cast<const char *>(flat.arena.data() +
+                                                        be.row_off),
+                         be.row_len),
+             be.weight);
+      }
+    } else if (fe == nullptr) {
+      for (const auto &[bytes, w] : it->second) {
+        emit(bytes, w);
+      }
+    } else {
+      // merge by row bytes: flat weight + overlay delta
+      std::unordered_map<std::string, int64_t> merged;
+      for (uint32_t b = 0; b < fe->bucket_n; b++) {
+        const auto &be = flat.buckets[fe->bucket_off + b];
+        merged.emplace(
+            std::string(reinterpret_cast<const char *>(flat.arena.data() +
+                                                       be.row_off),
+                        be.row_len),
+            be.weight);
+      }
+      for (const auto &[bytes, w] : it->second) {
+        merged[bytes] += w;
+      }
+      for (const auto &[bytes, w] : merged) {
+        if (w != 0) {
+          emit(bytes, w);
+        }
+      }
     }
-    return true;
+    // projection collapse can cancel to zero-weight rows; drop them
+    for (auto mit = out.begin(); mit != out.end();) {
+      if (mit->second == 0) {
+        mit = out.erase(mit);
+      } else {
+        ++mit;
+      }
+    }
+    return !out.empty();
+  }
+
+  // Fold flat + overlay into one FlatPackedIndex (sidecar save).
+  void fold_packed(flatpacked::FlatPackedIndex &out) const {
+    out.clear();
+    auto add_bucket = [&](const std::string &kb,
+                          const std::vector<std::pair<std::string, int64_t>>
+                              &rows) {
+      if (rows.empty()) {
+        return;
+      }
+      flatpacked::DirEnt de;
+      de.key_off = out.append_bytes(kb);
+      de.key_len = static_cast<uint32_t>(kb.size());
+      de.bucket_off = out.buckets.size();
+      de.bucket_n = static_cast<uint32_t>(rows.size());
+      for (const auto &[rb, w] : rows) {
+        flatpacked::BucketEnt be;
+        be.row_off = out.append_bytes(rb);
+        be.row_len = static_cast<uint32_t>(rb.size());
+        be.weight = w;
+        out.buckets.push_back(be);
+      }
+      out.dir.push_back(de);
+    };
+    std::vector<std::pair<std::string, int64_t>> scratch;
+    for (uint64_t i = 0; i < flat.dir.size(); i++) {
+      const auto &de = flat.dir[i];
+      const std::string kb(
+          reinterpret_cast<const char *>(flat.arena.data() + de.key_off),
+          de.key_len);
+      auto ov = packed.find(kb);
+      scratch.clear();
+      if (ov == packed.end()) {
+        for (uint32_t b = 0; b < de.bucket_n; b++) {
+          const auto &be = flat.buckets[de.bucket_off + b];
+          scratch.emplace_back(
+              std::string(reinterpret_cast<const char *>(flat.arena.data() +
+                                                         be.row_off),
+                          be.row_len),
+              be.weight);
+        }
+      } else {
+        std::unordered_map<std::string, int64_t> m;
+        for (uint32_t b = 0; b < de.bucket_n; b++) {
+          const auto &be = flat.buckets[de.bucket_off + b];
+          m.emplace(std::string(reinterpret_cast<const char *>(
+                                    flat.arena.data() + be.row_off),
+                                be.row_len),
+                    be.weight);
+        }
+        for (const auto &[rb, dw] : ov->second) {
+          m[rb] += dw;
+        }
+        for (const auto &[rb, w] : m) {
+          if (w != 0) {
+            scratch.emplace_back(rb, w);
+          }
+        }
+      }
+      add_bucket(kb, scratch);
+    }
+    for (const auto &[kb, rows] : packed) {
+      if (flat.find(kb) != nullptr) {
+        continue; // already merged above
+      }
+      scratch.assign(rows.begin(), rows.end());
+      add_bucket(kb, scratch);
+    }
+    out.finish_build();
   }
 
   // D3c lazy restore: arrangement was registered over a deferred-baseline
@@ -2086,6 +2204,10 @@ public:
     packed_right_.clear();
     packed_wleft_.clear();
     packed_wright_.clear();
+    flat_left_.clear();
+    flat_right_.clear();
+    flat_wleft_.clear();
+    flat_wright_.clear();
     if (local_spill_left_) {
       local_spill_left_->discard();
     }
@@ -2140,6 +2262,10 @@ public:
         out.arrangement += rb.capacity() + 48;
       }
     }
+    out.arrangement += flat_left_.resident_bytes() +
+                       flat_right_.resident_bytes() +
+                       flat_wleft_.resident_bytes() +
+                       flat_wright_.resident_bytes();
     for (const auto &[row, entry] : mark_state_) {
       (void)entry;
       out.arrangement += acct.row_bytes(row) + 48;
@@ -2795,23 +2921,163 @@ public:
       // Packed-native layout (magic-tagged; an old boxed blob starts with a
       // small map size and can never collide). Pads stay boxed rows.
       w.u64(kPackedStateMagic);
-      auto write_pindex = [&w](const PackedIndex &idx) {
-        w.u64(idx.size());
-        for (const auto &[kb, bucket] : idx) {
-          w.bytes(reinterpret_cast<const uint8_t *>(kb.data()), kb.size());
-          w.u64(bucket.size());
-          for (const auto &[rb, weight] : bucket) {
+      // Fold flat (restored) + overlay (post-restore deltas) into one
+      // stream. With no flat layer this is exactly the old map dump; with
+      // a clean overlay it is a straight flat re-emit.
+      auto write_pindex = [&w](const PackedIndex &idx,
+                               const flatpacked::FlatPackedIndex &flat) {
+        if (flat.empty()) {
+          w.u64(idx.size());
+          for (const auto &[kb, bucket] : idx) {
+            w.bytes(reinterpret_cast<const uint8_t *>(kb.data()), kb.size());
+            w.u64(bucket.size());
+            for (const auto &[rb, weight] : bucket) {
+              w.bytes(reinterpret_cast<const uint8_t *>(rb.data()),
+                      rb.size());
+              w.i64(weight);
+            }
+          }
+          return;
+        }
+        // Merged key set: every flat key + overlay-only keys. Buckets
+        // merge by row bytes with weights summed; zero-weight rows and
+        // empty buckets are dropped.
+        std::vector<std::pair<std::string, PackedBucket>> merged_extra;
+        std::vector<const std::pair<const std::string, PackedBucket> *>
+            overlay_only;
+        for (const auto &kv : idx) {
+          if (flat.find(kv.first) == nullptr) {
+            overlay_only.push_back(&kv);
+          }
+        }
+        // First pass counts live keys.
+        uint64_t live = 0;
+        std::vector<PackedBucket> flat_merged(flat.dir.size());
+        for (size_t i = 0; i < flat.dir.size(); i++) {
+          const auto &de = flat.dir[i];
+          const std::string kb(
+              reinterpret_cast<const char *>(flat.arena.data() + de.key_off),
+              de.key_len);
+          PackedBucket &bucket = flat_merged[i];
+          auto ov = idx.find(kb);
+          if (ov == idx.end()) {
+            bucket.reserve(de.bucket_n);
+            for (uint32_t b = 0; b < de.bucket_n; b++) {
+              const auto &be = flat.buckets[de.bucket_off + b];
+              bucket.emplace_back(
+                  std::string(reinterpret_cast<const char *>(
+                                  flat.arena.data() + be.row_off),
+                              be.row_len),
+                  be.weight);
+            }
+          } else {
+            std::unordered_map<std::string, int64_t> m;
+            for (uint32_t b = 0; b < de.bucket_n; b++) {
+              const auto &be = flat.buckets[de.bucket_off + b];
+              m.emplace(std::string(reinterpret_cast<const char *>(
+                                        flat.arena.data() + be.row_off),
+                                    be.row_len),
+                        be.weight);
+            }
+            for (const auto &[rb, dw] : ov->second) {
+              m[rb] += dw;
+            }
+            for (auto &[rb, wt] : m) {
+              if (wt != 0) {
+                bucket.emplace_back(rb, wt);
+              }
+            }
+          }
+          if (!bucket.empty()) {
+            live++;
+          }
+        }
+        for (const auto *kv : overlay_only) {
+          if (!kv->second.empty()) {
+            live++;
+          }
+        }
+        w.u64(live);
+        for (size_t i = 0; i < flat.dir.size(); i++) {
+          if (flat_merged[i].empty()) {
+            continue;
+          }
+          const auto &de = flat.dir[i];
+          w.bytes(flat.arena.data() + de.key_off, de.key_len);
+          w.u64(flat_merged[i].size());
+          for (const auto &[rb, weight] : flat_merged[i]) {
             w.bytes(reinterpret_cast<const uint8_t *>(rb.data()), rb.size());
             w.i64(weight);
           }
         }
+        for (const auto *kv : overlay_only) {
+          if (kv->second.empty()) {
+            continue;
+          }
+          w.bytes(reinterpret_cast<const uint8_t *>(kv->first.data()),
+                  kv->first.size());
+          w.u64(kv->second.size());
+          for (const auto &[rb, weight] : kv->second) {
+            w.bytes(reinterpret_cast<const uint8_t *>(rb.data()), rb.size());
+            w.i64(weight);
+          }
+        }
+        (void)merged_extra;
       };
       auto write_pweights =
-          [&w](const std::unordered_map<std::string, int64_t> &wm) {
-            w.u64(wm.size());
-            for (const auto &[rb, weight] : wm) {
-              w.bytes(reinterpret_cast<const uint8_t *>(rb.data()), rb.size());
-              w.i64(weight);
+          [&w](const std::unordered_map<std::string, int64_t> &wm,
+               const flatpacked::FlatPackedWeights &flat) {
+            if (flat.empty()) {
+              w.u64(wm.size());
+              for (const auto &[rb, weight] : wm) {
+                w.bytes(reinterpret_cast<const uint8_t *>(rb.data()),
+                        rb.size());
+                w.i64(weight);
+              }
+              return;
+            }
+            uint64_t live = 0;
+            for (const auto &we : flat.dir) {
+              const std::string rb(
+                  reinterpret_cast<const char *>(flat.arena.data() +
+                                                 we.row_off),
+                  we.row_len);
+              auto ov = wm.find(rb);
+              const int64_t total =
+                  we.weight + (ov == wm.end() ? 0 : ov->second);
+              if (total != 0) {
+                live++;
+              }
+            }
+            for (const auto &[rb, dw] : wm) {
+              if (flat.find(rb) == 0 && dw != 0) {
+                // overlay-only row (flat.find returns 0 for absent —
+                // a flat row with true weight 0 cannot exist)
+                live++;
+              }
+            }
+            w.u64(live);
+            for (const auto &we : flat.dir) {
+              const std::string rb(
+                  reinterpret_cast<const char *>(flat.arena.data() +
+                                                 we.row_off),
+                  we.row_len);
+              auto ov = wm.find(rb);
+              const int64_t total =
+                  we.weight + (ov == wm.end() ? 0 : ov->second);
+              if (total == 0) {
+                continue;
+              }
+              w.bytes(reinterpret_cast<const uint8_t *>(rb.data()),
+                      rb.size());
+              w.i64(total);
+            }
+            for (const auto &[rb, dw] : wm) {
+              if (flat.find(rb) == 0 && dw != 0) {
+                w.bytes(reinterpret_cast<const uint8_t *>(rb.data()),
+                        rb.size());
+                w.i64(dw);
+              }
             }
           };
       auto write_boxed = [&w](const RowWeights &rw) {
@@ -2821,10 +3087,10 @@ public:
           w.i64(weight);
         }
       };
-      write_pindex(packed_left_);
-      write_pindex(packed_right_);
-      write_pweights(packed_wleft_);
-      write_pweights(packed_wright_);
+      write_pindex(packed_left_, flat_left_);
+      write_pindex(packed_right_, flat_right_);
+      write_pweights(packed_wleft_, flat_wleft_);
+      write_pweights(packed_wright_, flat_wright_);
       write_boxed(left_pad_);
       write_boxed(right_pad_);
       out = w.take();
@@ -2860,31 +3126,54 @@ public:
         if (r.u64() != kPackedStateMagic) {
           return false; // boxed-era blob: rebuild by replay
         }
-        auto read_pindex = [&r](PackedIndex &idx) {
-          idx.clear();
+        // Tier 2: decode into the contiguous flat layer (append + one
+        // sort), NOT the hash maps — the 36M-insert map build was ~all of
+        // the first-edit-after-reopen cost. The maps stay empty and serve
+        // as the mutation overlay from here on.
+        auto read_flat_index = [&r](PackedIndex &overlay,
+                                    flatpacked::FlatPackedIndex &flat) {
+          overlay.clear();
+          flat.clear();
           const uint64_t n = r.u64();
+          flat.dir.reserve(n);
           for (uint64_t i = 0; i < n; i++) {
             std::string kb = r.byte_string();
-            PackedBucket bucket;
+            flatpacked::DirEnt de;
+            de.key_off = flat.append_bytes(kb);
+            de.key_len = static_cast<uint32_t>(kb.size());
+            de.bucket_off = flat.buckets.size();
             const uint64_t m = r.u64();
-            bucket.reserve(m);
+            de.bucket_n = static_cast<uint32_t>(m);
             for (uint64_t j = 0; j < m; j++) {
               std::string rb = r.byte_string();
-              const int64_t weight = r.i64();
-              bucket.emplace_back(std::move(rb), weight);
+              flatpacked::BucketEnt be;
+              be.row_off = flat.append_bytes(rb);
+              be.row_len = static_cast<uint32_t>(rb.size());
+              be.weight = r.i64();
+              flat.buckets.push_back(be);
             }
-            idx.emplace(std::move(kb), std::move(bucket));
+            flat.dir.push_back(de);
           }
+          flat.finish_build();
         };
-        auto read_pweights =
-            [&r](std::unordered_map<std::string, int64_t> &wm) {
-              wm.clear();
-              const uint64_t n = r.u64();
-              for (uint64_t i = 0; i < n; i++) {
-                std::string rb = r.byte_string();
-                wm.emplace(std::move(rb), r.i64());
-              }
-            };
+        auto read_flat_weights = [&r](std::unordered_map<std::string, int64_t>
+                                          &overlay,
+                                      flatpacked::FlatPackedWeights &flat) {
+          overlay.clear();
+          flat.clear();
+          const uint64_t n = r.u64();
+          flat.dir.reserve(n);
+          for (uint64_t i = 0; i < n; i++) {
+            std::string rb = r.byte_string();
+            flatpacked::WeightEnt we;
+            we.row_off = flat.arena.size();
+            flat.arena.insert(flat.arena.end(), rb.begin(), rb.end());
+            we.row_len = static_cast<uint32_t>(rb.size());
+            we.weight = r.i64();
+            flat.dir.push_back(we);
+          }
+          flat.finish_build();
+        };
         auto read_boxed = [&r](RowWeights &rw) {
           rw.clear();
           const uint64_t n = r.u64();
@@ -2894,10 +3183,10 @@ public:
             rw.emplace(std::move(row), weight);
           }
         };
-        read_pindex(packed_left_);
-        read_pindex(packed_right_);
-        read_pweights(packed_wleft_);
-        read_pweights(packed_wright_);
+        read_flat_index(packed_left_, flat_left_);
+        read_flat_index(packed_right_, flat_right_);
+        read_flat_weights(packed_wleft_, flat_wleft_);
+        read_flat_weights(packed_wright_, flat_wright_);
         read_boxed(left_pad_);
         read_boxed(right_pad_);
         return r.done();
@@ -2947,6 +3236,20 @@ private:
   PackedIndex packed_left_, packed_right_;
   std::unordered_map<std::string, int64_t> packed_wleft_, packed_wright_;
   bool packed_ok_ = false;
+  // Tier-2 restore layer: checkpoint blobs decode into these contiguous,
+  // key-sorted structures (append + one sort — no 36M-insert hash-map
+  // build). Immutable; the packed_* maps above act as a DELTA overlay on
+  // top (weights sum across layers). serialize_state folds both layers
+  // back into one blob stream.
+  flatpacked::FlatPackedIndex flat_left_, flat_right_;
+  flatpacked::FlatPackedWeights flat_wleft_, flat_wright_;
+
+  flatpacked::FlatPackedIndex &flat_index(bool left) {
+    return left ? flat_left_ : flat_right_;
+  }
+  flatpacked::FlatPackedWeights &flat_weights(bool left) {
+    return left ? flat_wleft_ : flat_wright_;
+  }
 
   PackedIndex &packed_index(bool left) {
     return left ? packed_left_ : packed_right_;
@@ -3015,22 +3318,59 @@ private:
       return false;
     }
     const auto &idx = left ? packed_left_ : packed_right_;
+    const auto &flat = left ? flat_left_ : flat_right_;
     auto it = idx.find(kb);
-    if (std::getenv("DBSP_PACKED_DEBUG") != nullptr) {
-      fprintf(stderr, "[packed] probe side=%s klen=%zu k0=%02x%02x%02x hit=%d\n",
-              left ? "L" : "R", kb.size(), (unsigned char)kb[0],
-              (unsigned char)kb[4], kb.size() > 5 ? (unsigned char)kb[5] : 0,
-              it != idx.end());
-    }
-    if (it == idx.end() || it->second.empty()) {
+    const flatpacked::DirEnt *fe = flat.find(kb);
+    if (it == idx.end() && fe == nullptr) {
       return false;
     }
+    // Merge layers by row bytes: flat weight + overlay delta. The common
+    // cases are flat-only (post-restore reads) and overlay-only (models
+    // built this session), both of which skip the merge map.
+    if (fe != nullptr && it == idx.end()) {
+      for (uint32_t b = 0; b < fe->bucket_n; b++) {
+        const auto &be = flat.buckets[fe->bucket_off + b];
+        DuckDBRow row;
+        std::string bytes(
+            reinterpret_cast<const char *>(flat.arena.data() + be.row_off),
+            be.row_len);
+        packed::decode_row(bytes, row);
+        out.emplace(std::move(row), be.weight);
+      }
+      return !out.empty();
+    }
+    if (fe == nullptr) {
+      if (it->second.empty()) {
+        return false;
+      }
+      for (const auto &[bytes, w] : it->second) {
+        DuckDBRow row;
+        packed::decode_row(bytes, row);
+        out.emplace(std::move(row), w);
+      }
+      return true;
+    }
+    std::unordered_map<std::string, int64_t> merged;
+    for (uint32_t b = 0; b < fe->bucket_n; b++) {
+      const auto &be = flat.buckets[fe->bucket_off + b];
+      merged.emplace(
+          std::string(
+              reinterpret_cast<const char *>(flat.arena.data() + be.row_off),
+              be.row_len),
+          be.weight);
+    }
     for (const auto &[bytes, w] : it->second) {
+      merged[bytes] += w;
+    }
+    for (const auto &[bytes, w] : merged) {
+      if (w == 0) {
+        continue;
+      }
       DuckDBRow row;
       packed::decode_row(bytes, row);
       out.emplace(std::move(row), w);
     }
-    return true;
+    return !out.empty();
   }
 
   // The padded side's own-row weight total for one row, across the three
@@ -3051,7 +3391,9 @@ private:
       }
       const auto &wmap = left ? packed_wleft_ : packed_wright_;
       auto it = wmap.find(rb);
-      return it == wmap.end() ? 0 : it->second;
+      const int64_t overlay = it == wmap.end() ? 0 : it->second;
+      const auto &fw = left ? flat_wleft_ : flat_wright_;
+      return overlay + fw.find(rb);
     }
     const RowWeights &weights = left ? left_weights_ : right_weights_;
     auto it = weights.find(row);

@@ -740,6 +740,32 @@ public:
           }
           tt_it->second->save_spill_index(wm.first, wm.second);
         }
+        // Recovery inc 3: fingerprint sidecars for shared packed
+        // arrangements, under the same just-saved watermarks. Skipped for
+        // free when an adopted flat layer is still clean. Best-effort —
+        // a missing sidecar only costs the baseline backfill on reopen.
+        if (spill_durable_dir_) {
+          std::shared_lock<std::shared_mutex> vl(view_mutex_);
+          for (const auto &[fp, weak] : arrangements_) {
+            auto arr = weak.lock();
+            if (!arr || !arr->packed_ok || arr->track_weights ||
+                arr->track_counters || arr->needs_backfill) {
+              continue;
+            }
+            auto wm_it = saved_wms.find(arr->table);
+            if (wm_it == saved_wms.end()) {
+              continue;
+            }
+            if (arr->packed.empty() && !arr->flat.empty()) {
+              continue; // adopted and untouched: sidecar already current
+            }
+            flatpacked::FlatPackedIndex folded;
+            arr->fold_packed(folded);
+            flatpacked::write_flat_index_file(sharr_path(fp), fp,
+                                              wm_it->second.first,
+                                              wm_it->second.second, folded);
+          }
+        }
       }
       return true;
     } catch (const std::exception &e) {
@@ -2186,7 +2212,24 @@ public:
         // flagged so realize_pending_view_locked's backfill (below) fills
         // it once the source view itself decodes.
         if (defer_fill) {
-          arr->needs_backfill = true;
+          // Recovery inc 3: adopt the fingerprint sidecar written by the
+          // last save instead of backfilling from a 36M-row baseline scan
+          // at first edit. Only over a DEFERRED table (its watermark was
+          // verified against live storage at load) and only for plain
+          // packed arrangements — pads/marks keep the backfill path.
+          bool adopted = false;
+          if (source_is_table && spill_durable_dir_ && arr->packed_ok &&
+              !arr->track_weights && !arr->track_counters) {
+            const auto &tt = tracked_tables_.at(req.table);
+            adopted = flatpacked::load_flat_index_file(
+                sharr_path(req.fingerprint), req.fingerprint,
+                tt->deferred_weight(), tt->deferred_hash(), arr->flat);
+            if (std::getenv("DBSP_DEBUG_SYNC") && adopted) {
+              std::cerr << "[dbsp] shared arrangement adopted from sidecar"
+                           " for table '" << req.table << "'\n";
+            }
+          }
+          arr->needs_backfill = !adopted;
         } else {
           DbspScopeTimer timer("arr_backfill", req.table);
           if (source_is_table) {
@@ -3726,6 +3769,7 @@ public:
             shared.arrangement += rb.capacity() + 24;
           }
         }
+        shared.arrangement += arr->flat.resident_bytes();
       }
     }
     cb("__shared_arrangements", shared);
@@ -5252,6 +5296,16 @@ private:
 
   std::string spill_path(const std::string &table_name) const {
     return spill_dir_ + "/" + table_name + ".dbspill";
+  }
+
+  // Sidecar path for a shared arrangement, keyed by fingerprint hash (the
+  // full fingerprint is verified inside the file header).
+  std::string sharr_path(const std::string &fingerprint) const {
+    char hex[24];
+    std::snprintf(hex, sizeof(hex), "%016llx",
+                  static_cast<unsigned long long>(
+                      std::hash<std::string>{}(fingerprint)));
+    return spill_dir_ + "/sharr_" + hex + ".flat";
   }
 
   // Best-effort capture of the default catalog's file path (durable spill
