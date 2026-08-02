@@ -1607,6 +1607,14 @@ public:
 
     tracked_tables_[table_name] =
         std::make_unique<TrackedTable>(table_name, schema);
+    // Threshold auto-spill (bounded-RAM Phase 5): every table gets a
+    // concrete spill path up front so a baseline crossing the row
+    // threshold can migrate itself mid-scan. Directory creation is a
+    // one-time mkdir; failure just leaves auto-spill off for the table.
+    if (ensure_spill_dir()) {
+      tracked_tables_[table_name]->set_spill_path_hint(
+          spill_path(table_name));
+    }
     if (spill_enabled_) {
       tracked_tables_[table_name]->enable_spill(spill_path(table_name));
     }
@@ -2647,34 +2655,8 @@ public:
     if (enable == spill_enabled_) {
       return true;
     }
-    if (enable) {
-      namespace fs = std::filesystem;
-      std::error_code ec;
-      const fs::path tmp = fs::temp_directory_path(ec);
-      // Self-cleaning: sweep spill directories left by processes that
-      // are gone (crashes, kills — normal teardown discards files but
-      // the per-pid directory lingers). Keeps the temp dir from
-      // accumulating one directory per test run.
-      for (const auto &entry : fs::directory_iterator(tmp, ec)) {
-        const std::string name = entry.path().filename().string();
-        if (name.rfind("dbsp_spill_", 0) != 0) {
-          continue;
-        }
-        const pid_t pid =
-            static_cast<pid_t>(std::atoll(name.c_str() + 11));
-        if (pid > 0 && pid != ::getpid() && ::kill(pid, 0) == -1 &&
-            errno == ESRCH) {
-          std::error_code rec;
-          fs::remove_all(entry.path(), rec);
-        }
-      }
-      spill_dir_ =
-          (tmp / ("dbsp_spill_" + std::to_string(::getpid()))).string();
-      fs::create_directories(spill_dir_, ec);
-      if (ec) {
-        last_error_ = "Cannot create spill directory: " + spill_dir_;
-        return false;
-      }
+    if (enable && !ensure_spill_dir()) {
+      return false;
     }
     for (auto &[name, table] : tracked_tables_) {
       auto lock_it = table_locks_.find(name);
@@ -4373,6 +4355,14 @@ private:
 
     tracked_tables_[table_name] =
         std::make_unique<TrackedTable>(table_name, schema);
+    // Threshold auto-spill (bounded-RAM Phase 5): every table gets a
+    // concrete spill path up front so a baseline crossing the row
+    // threshold can migrate itself mid-scan. Directory creation is a
+    // one-time mkdir; failure just leaves auto-spill off for the table.
+    if (ensure_spill_dir()) {
+      tracked_tables_[table_name]->set_spill_path_hint(
+          spill_path(table_name));
+    }
     if (spill_enabled_) {
       tracked_tables_[table_name]->enable_spill(spill_path(table_name));
     }
@@ -5023,6 +5013,44 @@ private:
 
   std::string spill_path(const std::string &table_name) const {
     return spill_dir_ + "/" + table_name + ".dbspill";
+  }
+
+  // Idempotent per-process spill directory setup (struct_mutex_ held by
+  // caller). Factored out of set_spill so table tracking can hand every
+  // TrackedTable a concrete spill-path hint for threshold auto-spill
+  // (bounded-RAM Phase 5) without the global mode being on.
+  bool ensure_spill_dir() {
+    if (!spill_dir_.empty()) {
+      return true;
+    }
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path tmp = fs::temp_directory_path(ec);
+    // Self-cleaning: sweep spill directories left by processes that
+    // are gone (crashes, kills — normal teardown discards files but
+    // the per-pid directory lingers). Keeps the temp dir from
+    // accumulating one directory per test run.
+    for (const auto &entry : fs::directory_iterator(tmp, ec)) {
+      const std::string name = entry.path().filename().string();
+      if (name.rfind("dbsp_spill_", 0) != 0) {
+        continue;
+      }
+      const pid_t pid = static_cast<pid_t>(std::atoll(name.c_str() + 11));
+      if (pid > 0 && pid != ::getpid() && ::kill(pid, 0) == -1 &&
+          errno == ESRCH) {
+        std::error_code rec;
+        fs::remove_all(entry.path(), rec);
+      }
+    }
+    spill_dir_ =
+        (tmp / ("dbsp_spill_" + std::to_string(::getpid()))).string();
+    fs::create_directories(spill_dir_, ec);
+    if (ec) {
+      last_error_ = "Cannot create spill directory: " + spill_dir_;
+      spill_dir_.clear();
+      return false;
+    }
+    return true;
   }
 };
 

@@ -424,6 +424,27 @@ public:
 
   bool spilled() const { return spill_ != nullptr; }
 
+  // ---- auto-spill (bounded-RAM Phase 5) ---------------------------------
+  // Boxed baselines are ~300 B/row; above a row threshold the baseline
+  // spills itself to the digest form (~72 B/row indexed) without waiting
+  // for a global dbsp_spill(true). The threshold is rows, not bytes —
+  // row count is the one thing every build path knows for free.
+  // DBSP_SPILL_THRESHOLD_ROWS overrides; 0 disables auto-spill.
+
+  static size_t auto_spill_threshold() {
+    static const size_t v = [] {
+      const char *e = std::getenv("DBSP_SPILL_THRESHOLD_ROWS");
+      return e != nullptr ? static_cast<size_t>(std::atoll(e))
+                          : static_cast<size_t>(2'000'000);
+    }();
+    return v;
+  }
+
+  // CDCManager supplies the concrete spill file path up front so the
+  // migration can happen deep inside a scan with no manager callback.
+  // Empty hint = auto-spill off for this table (standalone/unit use).
+  void set_spill_path_hint(std::string p) { spill_path_hint_ = std::move(p); }
+
   void enable_spill(const std::string &path) {
     if (spill_) {
       return;
@@ -456,6 +477,7 @@ public:
 
   // Apply changes
   void insert(const DuckDBRow &row) {
+    maybe_auto_spill();
     if (spill_) {
       spill_->apply_row(row_values(row), 1);
     } else {
@@ -489,6 +511,7 @@ public:
   // sync: the delta is propagated by the caller, so pending_changes_ is
   // not involved)
   void apply_delta(const DuckDBZSet &delta) {
+    maybe_auto_spill();
     for (const auto &[row, w] : delta) {
       if (spill_) {
         spill_->apply_row(row_values(row), w);
@@ -513,6 +536,12 @@ public:
   }
 
   void add_scanned_row(DuckDBRow &&row) {
+    if (spill_ == nullptr && !spill_path_hint_.empty()) {
+      const size_t th = auto_spill_threshold();
+      if (th != 0 && rebuild_state_.size() >= th) {
+        spill_mid_rebuild();
+      }
+    }
     if (spill_) {
       spill_->add(row_values(row), 1);
     } else {
@@ -664,6 +693,34 @@ public:
 private:
   static constexpr size_t kSpillIndexEntryBytes = 72;
 
+  // Non-rebuild growth paths (captured deltas, direct inserts): spill once
+  // the settled baseline crosses the threshold. Never fires mid-rebuild
+  // (rebuild growth is handled by add_scanned_row's own check).
+  void maybe_auto_spill() {
+    if (spill_ != nullptr || spill_path_hint_.empty()) {
+      return;
+    }
+    const size_t th = auto_spill_threshold();
+    if (th != 0 && current_state_.size() >= th) {
+      enable_spill(spill_path_hint_);
+    }
+  }
+
+  // A scan crossed the threshold with a boxed rebuild in flight: move the
+  // OLD baseline into the spill index (enable_spill migrates
+  // current_state_), open the pending generation, replay the partial scan
+  // into it, and let the rest of the scan stream to disk. finish/install
+  // then run entirely on the spill path.
+  void spill_mid_rebuild() {
+    DuckDBZSet partial = std::move(rebuild_state_);
+    rebuild_state_ = DuckDBZSet();
+    enable_spill(spill_path_hint_);
+    spill_->begin_rebuild();
+    for (const auto &[row, w] : partial) {
+      spill_->add(row_values(row), w);
+    }
+  }
+
   static std::vector<duckdb::Value> row_values(const DuckDBRow &row) {
     std::vector<duckdb::Value> vals;
     vals.reserve(row.columns.size());
@@ -686,6 +743,7 @@ private:
   DuckDBZSet rebuild_state_; // RAM-mode rebuild in progress
   DuckDBZSet pending_changes_;
   std::unique_ptr<SpilledBaseline> spill_;
+  std::string spill_path_hint_; // set by CDCManager; empty = no auto-spill
   uint64_t sequence_;
   // Deferred baseline (D3c): true until the first operation that needs
   // table state materializes it from a storage scan.

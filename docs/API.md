@@ -521,6 +521,11 @@ SELECT * FROM dbsp_table_state();
 - `mode` (VARCHAR) — `boxed` (full rows in a RAM Z-set), `spilled`
   (disk record log + ~72 B/row digest index), or `deferred` (lazy-restore
   fast path: nothing materialized until first use)
+
+Baselines auto-spill above `DBSP_SPILL_THRESHOLD_ROWS` (default 2,000,000
+rows; `0` disables) — including mid-scan during the initial baseline
+build, so big tables never pay the boxed peak. Small tables stay boxed
+for speed; `dbsp_spill(true)` still force-spills everything.
 - `distinct_rows` (BIGINT) — deferred tables report the restore-time
   COUNT(*) upper bound
 - `resident_bytes` (BIGINT) — baseline plus pending-changes buffer,
