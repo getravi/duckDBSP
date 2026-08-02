@@ -849,6 +849,17 @@ functions can be bound twice per statement — a second backfill would run
 after the results were dropped). Disabling schedules a full view rebuild so
 sinks reintegrate in RAM.
 
+### dbsp_realize(view_name)
+
+Realize one pending (lazy-restored) view's circuit state now instead of on
+first touch. Returns `realized` (whether it WAS pending) and `state_bytes`
+(the view's resident state after realization) — sum the latter to warm
+within a RAM budget and leave the tail lazy.
+
+```sql
+SELECT * FROM dbsp_realize('customer_totals');
+```
+
 ### dbsp_wait_teardown()
 
 Wait (bounded, ~30s max) for detached close-time teardown threads. Call from

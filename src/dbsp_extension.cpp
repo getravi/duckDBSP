@@ -607,6 +607,62 @@ void MvTablesFunc(ClientContext &context, TableFunctionInput &input,
 }
 
 // ============================================================================
+// dbsp_realize - Realize one pending (lazy-restored) view's circuit state
+// Usage: SELECT * FROM dbsp_realize('view_name');
+// Returns realized=true when the view WAS pending and its operator state
+// was decoded now; false when it was already live (or never checkpointed).
+// Lets an embedder warm lazy state in the background instead of paying the
+// decode on the first touching edit.
+// ============================================================================
+
+struct RealizeBindData : public TableFunctionData {
+  bool was_pending = false;
+  int64_t state_bytes = 0;
+  bool done = false;
+};
+
+unique_ptr<FunctionData> RealizeBind(ClientContext &context,
+                                     TableFunctionBindInput &input,
+                                     vector<LogicalType> &return_types,
+                                     vector<string> &names) {
+  EnsureContextState(context);
+  auto data = make_uniq<RealizeBindData>();
+  if (input.inputs.empty()) {
+    throw InvalidInputException("dbsp_realize(view_name)");
+  }
+  const string view_name = input.inputs[0].GetValue<string>();
+  auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
+  data->was_pending = manager.is_view_pending(view_name);
+  if (data->was_pending) {
+    manager.realize_pending_view(view_name);
+  }
+  // Resident bytes of THIS view after (possible) realization — a warming
+  // loop sums these to stay inside a RAM budget and leave the tail lazy.
+  manager.scan_one_view_state(view_name, [&](const dbsp_native::StateBytes &b) {
+    data->state_bytes = static_cast<int64_t>(b.total());
+  });
+  return_types.push_back(LogicalType::BOOLEAN);
+  names.push_back("realized");
+  return_types.push_back(LogicalType::BIGINT);
+  names.push_back("state_bytes");
+  return std::move(data);
+}
+
+void RealizeFunc(ClientContext &context, TableFunctionInput &input,
+                 DataChunk &output) {
+  auto &data = input.bind_data->CastNoConst<RealizeBindData>();
+  if (data.done) {
+    output.SetCardinality(0);
+    return;
+  }
+  output.SetValue(0, 0, Value::BOOLEAN(data.was_pending));
+  output.SetValue(1, 0, Value::BIGINT(data.state_bytes));
+  output.SetCardinality(1);
+  data.done = true;
+}
+
+// ============================================================================
 // dbsp_wait_teardown - Wait for detached close-time teardown threads
 // Usage (from any connection — e.g. a throwaway in-memory one AFTER closing
 // the last real connection): SELECT * FROM dbsp_wait_teardown();
@@ -2219,6 +2275,10 @@ static void LoadInternal(ExtensionLoader &loader) {
   TableFunction wait_teardown_func("dbsp_wait_teardown", {},
                                    WaitTeardownFunc, WaitTeardownBind);
   loader.RegisterFunction(wait_teardown_func);
+
+  TableFunction realize_func("dbsp_realize", {LogicalType::VARCHAR},
+                             RealizeFunc, RealizeBind);
+  loader.RegisterFunction(realize_func);
 
   TableFunction list_views_func("dbsp_views", {}, ListViewsFunc, ListViewsBind);
   loader.RegisterFunction(list_views_func);

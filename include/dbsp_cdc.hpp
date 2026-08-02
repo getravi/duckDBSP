@@ -3545,6 +3545,25 @@ public:
     }
   }
 
+  // Single-view state accounting (dbsp_realize's budget feedback): cheap
+  // relative to the full scan_view_state sweep. Payload dedupe is scoped
+  // to this one view (fresh StateAccounting), so shared rows count fully —
+  // an overestimate, which is the safe direction for a RAM budget.
+  bool scan_one_view_state(const std::string &view_name,
+                           const std::function<void(const StateBytes &)> &cb) {
+    std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    std::shared_lock<std::shared_mutex> view_lock(view_mutex_);
+    auto it = views_.find(view_name);
+    if (it == views_.end()) {
+      return false;
+    }
+    StateAccounting acct;
+    StateBytes b;
+    it->second->account_state(b, acct);
+    cb(b);
+    return true;
+  }
+
   // (view, generation) snapshot for every registered view — the commit_seq_
   // at which each view's delta buffer was last rewritten (see
   // view_delta_generation_'s member comment). A view whose buffer was never
@@ -3595,6 +3614,14 @@ public:
   bool is_table_tracked(const std::string &table_name) const {
     std::shared_lock<std::shared_mutex> lock(struct_mutex_);
     return tracked_tables_.find(table_name) != tracked_tables_.end();
+  }
+
+  // A view restored lazily from checkpoint whose circuit state has not
+  // been decoded yet (dbsp_realize / background warming asks this).
+  bool is_view_pending(const std::string &view_name) {
+    std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    std::shared_lock<std::shared_mutex> view_lock(view_mutex_);
+    return pending_restore_.count(view_name) > 0;
   }
 
   bool is_view_registered(const std::string &view_name) const {

@@ -1,5 +1,19 @@
 # Changelog
 
+## dbsp_realize(view): background warming with RAM-budget feedback - Aug 2026
+
+- New TF: realizes ONE pending (lazy-restored) view's circuit state and
+  returns (realized BOOLEAN, state_bytes BIGINT) — the view's resident
+  bytes after realization (single-view accounting scan). An embedder pumps
+  it on a worker thread after reattach, summing state_bytes against a RAM
+  budget so warming stops and the tail stays lazy.
+- scan_one_view_state(): per-view StateBytes accounting (fresh dedupe
+  scope — overestimates shared rows, the safe direction for a budget).
+- CALLER NOTE: the TF's side effect runs in Bind — use execute()/fetch
+  paths that bind once; the relation API's double-bind reports
+  was_pending=false on its second pass (the side effect itself stays
+  correct/idempotent).
+
 ## Bounded-RAM Phase 3: reattach instead of replay - Aug 2026
 
 - **Reattach**: a reopened disk-backed database ADOPTS its __mv_ tables.
