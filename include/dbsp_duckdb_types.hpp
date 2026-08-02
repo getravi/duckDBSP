@@ -451,13 +451,14 @@ public:
     }
     spill_ = std::make_unique<SpilledBaseline>(path);
     if (!current_state_.empty()) {
-      // Migrate the in-RAM baseline, then free it
+      // Migrate the in-RAM baseline, then free it. install_rebuild swaps
+      // the generation in without diffing — a migration has no delta by
+      // definition, and the diff path reads every payload back from disk.
       spill_->begin_rebuild();
       for (const auto &[row, w] : current_state_) {
         spill_->add(row_values(row), w);
       }
-      spill_->end_rebuild([](const std::vector<duckdb::Value> &, int64_t) {},
-                          [](const std::vector<duckdb::Value> &, int64_t) {});
+      spill_->install_rebuild();
       current_state_ = DuckDBZSet();
     }
   }
@@ -573,8 +574,10 @@ public:
   // table was deferred). Clears the deferred flag.
   void install_rebuild() {
     if (spill_) {
-      spill_->end_rebuild([](const std::vector<duckdb::Value> &, int64_t) {},
-                          [](const std::vector<duckdb::Value> &, int64_t) {});
+      // No diff wanted: swap the generation in directly. The end_rebuild
+      // diff path reads every added payload back from disk — hours at
+      // 144M rows, all handed to a no-op.
+      spill_->install_rebuild();
     } else {
       current_state_ = std::move(rebuild_state_);
       rebuild_state_ = DuckDBZSet();

@@ -738,8 +738,16 @@ public:
     std::unordered_map<std::string, std::string> sql_fingerprints;
     // Verified per-source watermarks (COUNT, bit_xor(hash) as VARCHAR) —
     // seeds for lazy (deferred) baselines on the load fast path (D3c).
+    // Only tables whose live content MATCHED the save-time watermark
+    // appear here; changed tables land in stale_tables instead.
     std::unordered_map<std::string, std::pair<int64_t, std::string>>
         watermarks;
+    // Tables whose live content diverged from the save-time watermark
+    // (crash lost an edit, out-of-band write). O(delta) recovery
+    // increment A: a mismatch no longer discards the checkpoint — views
+    // whose source closure touches a stale table cold-replay, everything
+    // else restores from the checkpoint.
+    std::unordered_set<std::string> stale_tables;
     // Phase 3 (reattach): when true, nodes/sinks hold EMPTY placeholder
     // blobs — the bytes stay in _dbsp_ckpt and are fetched per view at
     // realize time. Set only for disk-backed (mv-table) databases, where
@@ -806,7 +814,12 @@ public:
             live->GetValue(0, 0) != meta->GetValue(1, i) ||
             live->GetValue(1, 0).ToString() !=
                 meta->GetValue(2, i).ToString()) {
-          return false; // table gone or changed since save
+          // O(delta) recovery increment A: the table changed (or vanished)
+          // since the save. Don't discard the whole checkpoint — record
+          // the table as stale; the loader cold-replays only views whose
+          // source closure touches it.
+          out.stale_tables.insert(t);
+          continue;
         }
         out.watermarks[t] = {meta->GetValue(1, i).GetValue<int64_t>(),
                              meta->GetValue(2, i).ToString()};
@@ -1230,7 +1243,12 @@ public:
       return false;
     }
     const std::string qtable = qualify(catalog, storage_table);
-    std::vector<std::pair<std::string, std::string>> rows;
+    struct LoadRow {
+      std::string name;
+      std::string sql;
+      std::vector<std::string> sources;
+    };
+    std::vector<LoadRow> rows;
     try {
       InternalQueryGuard guard;
       duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
@@ -1253,7 +1271,7 @@ public:
         last_error_ = "Storage table not found: " + qtable;
         return false;
       }
-      auto res = con.Query("SELECT name, sql FROM " + qtable +
+      auto res = con.Query("SELECT name, sql, sources FROM " + qtable +
                            " ORDER BY created_at");
       if (res->HasError()) {
         last_error_ = res->GetError();
@@ -1264,8 +1282,28 @@ public:
         // escapes characters like " as \x22, which breaks the stored SQL.
         auto name_val = res->GetValue(0, i);
         auto sql_val = res->GetValue(1, i);
-        rows.emplace_back(duckdb::StringValue::Get(name_val),
-                          duckdb::StringValue::Get(sql_val));
+        LoadRow row;
+        row.name = duckdb::StringValue::Get(name_val);
+        row.sql = duckdb::StringValue::Get(sql_val);
+        auto src_val = res->GetValue(2, i);
+        if (!src_val.IsNull()) {
+          // CSV of resolved source names, written by create_view — same
+          // key space as the checkpoint watermarks (stale-closure walk).
+          const std::string csv = duckdb::StringValue::Get(src_val);
+          size_t start = 0;
+          while (start <= csv.size() && !csv.empty()) {
+            const size_t comma = csv.find(',', start);
+            const size_t end = comma == std::string::npos ? csv.size() : comma;
+            if (end > start) {
+              row.sources.push_back(csv.substr(start, end - start));
+            }
+            if (comma == std::string::npos) {
+              break;
+            }
+            start = comma + 1;
+          }
+        }
+        rows.push_back(std::move(row));
       }
     } catch (const std::exception &e) {
       last_error_ = std::string("Load failed: ") + e.what();
@@ -1326,7 +1364,27 @@ public:
     size_t pending_now_count = 0;
     ckpt_restored_views_.clear();
     const bool lazy = lazy_restore_.load();
-    for (const auto &[name, view_sql] : rows) {
+    // O(delta) recovery increment A: views whose source closure touches a
+    // stale table (changed since the checkpoint was saved — crash lost an
+    // edit, out-of-band write) must cold-replay from live state; every
+    // other view keeps its checkpoint. rows are in created_at order — a
+    // valid topological order — so one forward pass computes the closure.
+    std::unordered_set<std::string> stale_views;
+    for (const LoadRow &row : rows) {
+      const std::string &name = row.name;
+      const std::string &view_sql = row.sql;
+      bool stale_sources = false;
+      if (have_ckpt) {
+        for (const auto &src : row.sources) {
+          if (ckpt.stale_tables.count(src) > 0 || stale_views.count(src) > 0) {
+            stale_sources = true;
+            break;
+          }
+        }
+        if (stale_sources) {
+          stale_views.insert(name);
+        }
+      }
       {
         std::shared_lock<std::shared_mutex> lock(struct_mutex_);
         if (views_.count(name)) {
@@ -1343,13 +1401,18 @@ public:
       const bool fingerprint_ok = have_ckpt &&
                                   ckpt.sql_fingerprints.count(name) > 0 &&
                                   ckpt.sql_fingerprints.at(name) == view_sql;
-      const bool cold =
-          have_ckpt && ckpt.sinks.count(name) > 0 && fingerprint_ok;
+      const bool cold = have_ckpt && ckpt.sinks.count(name) > 0 &&
+                        fingerprint_ok && !stale_sources;
       if (have_ckpt && ckpt.sinks.count(name) > 0 && !fingerprint_ok &&
           std::getenv("DBSP_DEBUG_SYNC")) {
         std::cerr << "[dbsp] checkpoint declined for '" << name
                   << "': SQL fingerprint mismatch (view redefined since "
                      "save) -- rebuilding by replay\n";
+      }
+      if (stale_sources && std::getenv("DBSP_DEBUG_SYNC")) {
+        std::cerr << "[dbsp] checkpoint declined for '" << name
+                  << "': a source table changed since save -- rebuilding "
+                     "by replay\n";
       }
       if (create_view(context, name, view_sql, /*skip_init_replay=*/cold)) {
         if (cold && lazy) {
@@ -1828,6 +1891,55 @@ public:
         register_arrangements(context, *pview, skip_init_replay);
       }
 
+      // Bounded-RAM Phase 5 (streaming mirror): with mirroring on, the
+      // sink must never integrate the full initial result in RAM — a
+      // 144M-row leaf view is ~43GB boxed, bigger than the machine. Mark
+      // the view table-backed BEFORE replay (integration off), create the
+      // empty backing table, and flush each replay step's delta straight
+      // to the table. The post-replay mirror block then only writes meta.
+      // Failure is a hard create error: past the first flushed chunk
+      // there is no RAM result to fall back to.
+      bool streaming_mirror = false;
+      if (mv_tables_enabled_.load() && !skip_init_replay &&
+          !view->result_schema().columns.empty()) {
+        mv_db_ = &duckdb::DatabaseInstance::GetDatabase(context);
+        InternalQueryGuard mv_guard;
+        duckdb::Connection mv_con(*mv_db_);
+        if (mv_create_table(mv_con, view_name, *view) &&
+            view->set_table_backed()) {
+          streaming_mirror = true;
+          mv_table_backed_.insert(view_name);
+        } else if (mv_tables_enabled_.load()) {
+          last_error_ = "mv streaming mirror unavailable for " + view_name +
+                        (last_error_.empty() ? "" : (": " + last_error_));
+        }
+      }
+
+      // One replay step + optional table flush. Weight-±1 deltas append/
+      // retract in O(delta); multiplicity deltas fall back to
+      // mv_rebuild_from_table inside mv_apply_delta (correct, but O(result)
+      // transient — acceptable: duplicate-row results are rare and small).
+      bool stream_failed = false;
+      auto apply_step = [&](const std::string &src, const DuckDBZSet &delta) {
+        if (stream_failed) {
+          return;
+        }
+        view->apply_changes(src, delta);
+        if (!streaming_mirror) {
+          return;
+        }
+        const DuckDBZSet &out = view->get_batch_delta();
+        if (!out.empty()) {
+          InternalQueryGuard mv_guard;
+          duckdb::Connection mv_con(*mv_db_);
+          if (!mv_apply_delta(mv_con, view_name, *view, out)) {
+            stream_failed = true;
+            return;
+          }
+        }
+        view->drop_delta();
+      };
+
       // Initialize view with current data from sources
       // struct_mutex_ held exclusively so no concurrent mutations to tracked
       // tables or other views can occur; reads are safe without table_locks_
@@ -1854,13 +1966,13 @@ public:
           table->scan_state([&](const DuckDBRow &row, int64_t w) {
             chunk.insert(row, w);
             if (chunk.size() >= 65536) {
-              view->apply_changes(source, chunk);
+              apply_step(source, chunk);
               chunk = DuckDBZSet();
             }
           });
           // Final chunk applies even when empty: global aggregates emit
           // their one row only when the circuit steps
-          view->apply_changes(source, chunk);
+          apply_step(source, chunk);
         } else if (views_.count(source)) {
           // D-lazy: a warm create replaying a view source needs that
           // source's real result, not the cold-create empty default a
@@ -1873,16 +1985,28 @@ public:
             mv_scan_table(source, [&](const DuckDBRow &row, Weight w) {
               chunk.insert(row, w);
               if (chunk.size() >= 65536) {
-                view->apply_changes(source, chunk);
+                apply_step(source, chunk);
                 chunk = DuckDBZSet();
               }
             });
-            view->apply_changes(source, chunk);
+            apply_step(source, chunk);
           } else {
             // Source is a view - use its result
-            view->apply_changes(source, views_[source]->get_result());
+            apply_step(source, views_[source]->get_result());
           }
         }
+      }
+
+      if (stream_failed) {
+        // Partial table + no RAM result: the view cannot exist. Undo the
+        // registration side effects made so far and fail the create.
+        mv_table_backed_.erase(view_name);
+        table_schemas_.erase(view_name);
+        view_definitions_.erase(view_name);
+        dep_graph_.remove_node(view_name);
+        last_error_ = "mv streaming mirror failed for " + view_name + ": " +
+                      last_error_;
+        return false;
       }
 
       views_[view_name] = std::move(view);
@@ -1903,8 +2027,22 @@ public:
       // skipped — its result is EMPTY by design (rows live in the adopted
       // __mv_ table) and writing it would wipe the table.
       mv_db_ = &duckdb::DatabaseInstance::GetDatabase(context);
-      if (mv_tables_enabled_.load() && skip_init_replay &&
-          mv_table_backed_.count(view_name) > 0) {
+      if (streaming_mirror) {
+        // Phase 5: the table was populated chunk-by-chunk during replay —
+        // writing the (deliberately empty) RAM result would wipe it. Only
+        // the meta watermark is still owed.
+        InternalQueryGuard mv_guard;
+        try {
+          duckdb::Connection mv_con(*mv_db_);
+          if (!mv_meta_upsert(mv_con, view_name)) {
+            mv_tables_enabled_ = false;
+          }
+        } catch (const std::exception &e) {
+          last_error_ = std::string("mv mirror failed: ") + e.what();
+          mv_tables_enabled_ = false;
+        }
+      } else if (mv_tables_enabled_.load() && skip_init_replay &&
+                 mv_table_backed_.count(view_name) > 0) {
         // adopted: table already authoritative
       } else if (mv_tables_enabled_.load()) {
         InternalQueryGuard mv_guard;
@@ -3313,6 +3451,25 @@ private:
     appender.Close();
   }
 
+  // Create/replace an EMPTY backing table for a view about to stream its
+  // initial population chunk-by-chunk (bounded-RAM Phase 5 streaming
+  // mirror). Split from mv_write_full, which writes the full RAM result.
+  bool mv_create_table(duckdb::Connection &con, const std::string &name,
+                       const NativeMaterializedView &view) {
+    const auto &schema = view.result_schema();
+    if (schema.columns.empty()) {
+      return false; // schema-less legacy view: no streaming
+    }
+    const std::string qt = mv_quote(mv_table_for(name));
+    auto res = con.Query("CREATE OR REPLACE TABLE " + qt + " (" +
+                         mv_columns_ddl(schema) + ")");
+    if (res->HasError()) {
+      last_error_ = "mv table create failed: " + res->GetError();
+      return false;
+    }
+    return true;
+  }
+
   bool mv_write_full(duckdb::Connection &con, const std::string &name,
                      const NativeMaterializedView &view) {
     const auto &schema = view.result_schema();
@@ -4392,6 +4549,13 @@ private:
     return true;
   }
 
+  // Initial baseline population for a freshly tracked table (single
+  // caller: track_table_internal, which discards pending changes right
+  // after). Bounded-RAM Phase 5: this MUST use the rebuild flow, not
+  // per-row insert() — insert() boxed every row into pending_changes_
+  // (144M rows ≈ 29GB thrown away by the caller) and, in spill mode,
+  // paid a per-row apply_row/fflush instead of the batched rebuild
+  // writer. The rebuild flow also lets the baseline auto-spill mid-scan.
   bool sync_table_internal(duckdb::ClientContext &context,
                            const std::string &table_name) {
     auto it = tracked_tables_.find(table_name);
@@ -4399,55 +4563,14 @@ private:
       return false;
 
     try {
-      // Resolve the tracked key through the catalog (attached dbs too; D2)
-      auto table_entry_ptr = resolve_table_entry(context, table_name);
-      if (!table_entry_ptr) {
-        return false;
-      }
-
-      auto &table_entry = *table_entry_ptr;
-      auto &data_table = table_entry.GetStorage();
-
-      // Transaction of the table's own catalog, not main's
-      auto &transaction =
-          duckdb::DuckTransaction::Get(context, table_entry.ParentCatalog());
-      duckdb::TableScanState scan_state;
-
-      // Get all column indices
-      duckdb::vector<duckdb::StorageIndex> column_ids;
-      auto &columns = table_entry.GetColumns();
-      for (idx_t i = 0; i < columns.PhysicalColumnCount(); i++) {
-        column_ids.push_back(duckdb::StorageIndex(i));
-      }
-
-      // Initialize scan
-      data_table.InitializeScan(context, transaction, scan_state, column_ids);
-
-      // Scan data chunks
-      duckdb::DataChunk chunk;
-      chunk.Initialize(context, data_table.GetTypes());
-
-      while (true) {
-        chunk.Reset();
-        data_table.Scan(transaction, chunk, scan_state);
-
-        if (chunk.size() == 0) {
-          break; // No more data
-        }
-
-        // Extract rows from chunk
-        for (idx_t row_idx = 0; row_idx < chunk.size(); row_idx++) {
-          DuckDBRow dbsp_row;
-          for (idx_t col_idx = 0; col_idx < chunk.ColumnCount(); col_idx++) {
-            dbsp_row.columns.push_back(chunk.GetValue(col_idx, row_idx));
-          }
-          it->second->insert(dbsp_row);
-        }
-      }
-
+      it->second->begin_rebuild();
+      stream_table_rows(context, table_name, [&](DuckDBRow &&row) {
+        it->second->add_scanned_row(std::move(row));
+      });
+      it->second->install_rebuild();
       return true;
-
     } catch (const std::exception &e) {
+      (void)e;
       return false;
     } catch (...) {
       return false;

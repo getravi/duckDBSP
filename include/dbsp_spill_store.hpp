@@ -269,6 +269,16 @@ public:
     return d;
   }
 
+  // Install the new generation WITHOUT diffing (fresh baselines, deferred
+  // installs — anywhere the caller discards the delta). end_rebuild with
+  // no-op callbacks still reads every added row's payload back from disk
+  // just to hand it to the callback: at 144M rows that is hours of
+  // record reads for nothing (bounded-RAM Phase 5).
+  void install_rebuild() {
+    std::fflush(new_file_);
+    swap_in_pending();
+  }
+
   // Diff the new generation against the old one. `on_added` fires with
   // the row and positive weight for rows gaining weight; `on_removed`
   // with the reconstructed row and positive weight for rows losing it.
