@@ -1,5 +1,18 @@
 # Changelog
 
+## Bounded-RAM Phase 2d increment 2: packed shared arrangements - Aug 2026
+
+- SharedArrangement stores its buckets packed (same codec/pattern as the
+  join-node indexes: packed_ok at registration when side types are
+  codec-clean and no MARK counters; probes decode into consumer scratch
+  incl. O4 projection; spill migrates both directions).
+- Measured (141-view wfp DAG): arrangement class 2.43GB -> 1.66GB,
+  accounted total 4.83 -> 4.07GB, footprint 10-11GB. Edits 0.2s steady.
+- Window partition caches (0.85GB) deliberately left boxed: packing them
+  would force decode inside the sort/positional fast paths for ~0.5GB —
+  poor risk/reward at current sizes. Revisit only if soak shows models
+  where window state dominates.
+
 ## Bounded-RAM Phase 2d: packed join-index rows - Aug 2026
 
 - PlanJoinNode's local indexes store rows as compact self-describing byte

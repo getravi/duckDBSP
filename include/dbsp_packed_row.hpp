@@ -187,6 +187,35 @@ inline void decode_row(const std::string &bytes, RowT &row) {
   }
 }
 
+// True when every column type round-trips through this codec — the gate
+// for packed storage (join indexes, shared arrangements).
+inline bool types_ok(const duckdb::vector<duckdb::LogicalType> &ts) {
+  using duckdb::LogicalTypeId;
+  if (ts.empty()) {
+    return false; // unknown schema: stay boxed
+  }
+  for (const auto &t : ts) {
+    switch (t.id()) {
+    case LogicalTypeId::BOOLEAN:
+    case LogicalTypeId::TINYINT:
+    case LogicalTypeId::SMALLINT:
+    case LogicalTypeId::INTEGER:
+    case LogicalTypeId::BIGINT:
+    case LogicalTypeId::UINTEGER:
+    case LogicalTypeId::UBIGINT:
+    case LogicalTypeId::FLOAT:
+    case LogicalTypeId::DOUBLE:
+    case LogicalTypeId::DATE:
+    case LogicalTypeId::TIMESTAMP:
+    case LogicalTypeId::VARCHAR:
+      continue;
+    default:
+      return false;
+    }
+  }
+  return true;
+}
+
 } // namespace packed
 
 } // namespace dbsp_native

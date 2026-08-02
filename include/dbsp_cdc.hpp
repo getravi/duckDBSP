@@ -1993,6 +1993,11 @@ public:
                 req.keep_alive, *e, req.side_types));
           }
         }
+        // Phase 2d inc2: packed byte storage when the side types are
+        // codec-clean and no MARK counters are tracked. Decided BEFORE the
+        // backfill below so the initial fill lands packed.
+        arr->packed_ok =
+            !arr->track_counters && packed::types_ok(req.side_types);
         if (spill_enabled_) {
           arr->enable_spill(spill_dir_ + "/arr_" +
                             std::to_string(arrangement_file_seq_++) +
@@ -3534,6 +3539,13 @@ public:
           for (const auto &[row, wt] : rows) {
             (void)wt;
             shared.arrangement += acct.row_bytes(row) + 32;
+          }
+        }
+        for (const auto &[kb, bucket] : arr->packed) {
+          shared.arrangement += kb.capacity() + 48;
+          for (const auto &[rb, wt] : bucket) {
+            (void)wt;
+            shared.arrangement += rb.capacity() + 24;
           }
         }
       }
