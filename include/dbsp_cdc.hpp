@@ -2813,6 +2813,15 @@ public:
   // Enable/disable baseline spilling (Phase K1). Existing tables migrate
   // immediately: enabling moves their baselines to disk record logs,
   // disabling reloads them into RAM. New tables follow the current mode.
+  // Context-aware wrapper: learn the database file path BEFORE the spill
+  // dir is pinned. Without it, dbsp_spill(true) issued before any table
+  // is tracked pinned the dir to disposable tmp mode and silently
+  // disabled durable baselines for the whole session.
+  bool set_spill(duckdb::ClientContext &context, bool enable) {
+    note_db_path(context);
+    return set_spill(enable);
+  }
+
   bool set_spill(bool enable) {
     std::unique_lock<std::shared_mutex> struct_lock(struct_mutex_);
     if (enable == spill_enabled_) {

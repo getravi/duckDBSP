@@ -586,18 +586,21 @@ public:
       return;
     }
     reopen_read();
-    // Sequential order: sort slots by offset
-    std::vector<const Slot *> slots;
+    // Sequential order: sort slots by offset. COPIES, not pointers — a
+    // pointer sort's comparator chases scattered hash-map nodes (36M rows
+    // = minutes of cache misses under memory pressure, measured); the POD
+    // copy sorts contiguously in seconds.
+    std::vector<Slot> slots;
     slots.reserve(index_.size());
     for (const auto &[d, slot] : index_) {
-      slots.push_back(&slot);
+      slots.push_back(slot);
     }
     std::sort(slots.begin(), slots.end(),
-              [](const Slot *a, const Slot *b) {
-                return a->offset < b->offset;
+              [](const Slot &a, const Slot &b) {
+                return a.offset < b.offset;
               });
-    for (const Slot *slot : slots) {
-      fn(read_row(file_, *slot), slot->weight);
+    for (const Slot &slot : slots) {
+      fn(read_row(file_, slot), slot.weight);
     }
   }
 

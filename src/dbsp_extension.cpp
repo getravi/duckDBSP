@@ -1713,7 +1713,7 @@ void SpillFunc(ClientContext &context, TableFunctionInput &input,
     output.SetValue(0, 0,
                     Value(string("Baseline spill is ") +
                           (enabled ? "ENABLED" : "DISABLED")));
-  } else if (!manager.set_spill(data.enable)) {
+  } else if (!manager.set_spill(context, data.enable)) {
     output.SetCardinality(1);
     output.SetValue(0, 0, Value("Spill toggle FAILED: " +
                                 manager.last_error()));
