@@ -509,7 +509,15 @@ State after:
   `pending_changes_`), baselines auto-spill above
   `DBSP_SPILL_THRESHOLD_ROWS` (default 2M) including mid-scan, and
   `SpilledBaseline::install_rebuild()` swaps a generation in without
-  the diff path's payload read-back
+  the diff path's payload read-back. Big-table scans stream
+  pre-serialized row bytes straight off flattened chunk vectors
+  (`serialize_chunk`) — no per-cell `duckdb::Value` on the build path
+- **Durable baselines**: file-backed databases keep spill logs in
+  `<dbfile>.dbsp_spill/`; `dbsp_save` writes a digest-index sidecar
+  under the checkpoint watermark, and a clean reopen's first table
+  touch adopts the log+index pair (one bulk read) instead of rescanning
+  the table. Watermark or log-size mismatch rejects the sidecar and
+  rescans
 - **Lazy per-view restore (D-lazy)**, default ON (`dbsp_lazy_restore`):
   a watermark-matched load cold-creates the view exactly as before, but
   instead of decoding its node/sink blobs immediately it stashes the
