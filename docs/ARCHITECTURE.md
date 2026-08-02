@@ -493,8 +493,23 @@ State after:
   containing any other UNSUPPORTED node, and sort/limit/distinct-on
   embedded views stay UNSUPPORTED (rebuild-by-replay).
 - On load, checkpointed views restore without circuit replay when the
-  watermarks still match; everything else is rebuilt from current table
-  data
+  watermarks still match. Watermark validity is **per table** (O(delta)
+  recovery, increment A): a changed table lands in
+  `CkptData.stale_tables`, and only views whose source closure (walked
+  from the persisted `sources` column in `created_at` order) touches a
+  stale table rebuild by replay — every other view keeps its
+  checkpoint. A crash that lost one edit to one table costs a replay of
+  that table's dependents, not the whole DAG
+- **Streaming create mirror** (bounded-RAM Phase 5): with mv tables
+  enabled, `create_view` marks the sink table-backed *before* the
+  initial replay and flushes each replay step's delta straight into the
+  `__mv_` backing table — a view's initial result never integrates in
+  RAM. Companion bounds on the same path: initial baseline population
+  runs through the rebuild flow (never per-row `insert()` into
+  `pending_changes_`), baselines auto-spill above
+  `DBSP_SPILL_THRESHOLD_ROWS` (default 2M) including mid-scan, and
+  `SpilledBaseline::install_rebuild()` swaps a generation in without
+  the diff path's payload read-back
 - **Lazy per-view restore (D-lazy)**, default ON (`dbsp_lazy_restore`):
   a watermark-matched load cold-creates the view exactly as before, but
   instead of decoding its node/sink blobs immediately it stashes the
