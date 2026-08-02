@@ -59,6 +59,11 @@
 
 namespace duckdb {
 
+// In-flight detached close-time teardown threads (process-global). Process
+// exit during the detached teardown (view destruction, auto-save) segfaults
+// in static destructors — dbsp_wait_teardown() lets an embedder wait it out.
+static std::atomic<int> g_teardown_threads{0};
+
 // Helper: Ensure DBSPContextState is attached to the context
 // This is necessary because OnConnectionOpened isn't always called for the
 // initial connection when loading the extension
@@ -592,6 +597,45 @@ unique_ptr<FunctionData> MvTablesBind(ClientContext &context,
 void MvTablesFunc(ClientContext &context, TableFunctionInput &input,
                   DataChunk &output) {
   auto &data = input.bind_data->CastNoConst<MvTablesBindData>();
+  if (data.done) {
+    output.SetCardinality(0);
+    return;
+  }
+  output.SetValue(0, 0, Value(data.message));
+  output.SetCardinality(1);
+  data.done = true;
+}
+
+// ============================================================================
+// dbsp_wait_teardown - Wait for detached close-time teardown threads
+// Usage (from any connection — e.g. a throwaway in-memory one AFTER closing
+// the last real connection): SELECT * FROM dbsp_wait_teardown();
+// ============================================================================
+
+struct WaitTeardownBindData : public TableFunctionData {
+  string message = "teardown drained";
+  bool done = false;
+};
+
+unique_ptr<FunctionData> WaitTeardownBind(ClientContext &context,
+                                          TableFunctionBindInput &input,
+                                          vector<LogicalType> &return_types,
+                                          vector<string> &names) {
+  auto data = make_uniq<WaitTeardownBindData>();
+  for (int i = 0; i < 3000; i++) {
+    if (g_teardown_threads.load() <= 0) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return_types.push_back(LogicalType::VARCHAR);
+  names.push_back("result");
+  return std::move(data);
+}
+
+void WaitTeardownFunc(ClientContext &context, TableFunctionInput &input,
+                      DataChunk &output) {
+  auto &data = input.bind_data->CastNoConst<WaitTeardownBindData>();
   if (data.done) {
     output.SetCardinality(0);
     return;
@@ -2052,8 +2096,21 @@ public:
     //   - `dbg` (DBSP_DEBUG_TEARDOWN) is captured by value so a failed save
     //     (return-false or thrown) logs on this thread too, not just the
     //     view-teardown path below.
+    g_teardown_threads.fetch_add(1);
     std::thread([m = std::move(manager), db, dbg]() mutable {
-      if (m->autopersist_enabled() && m->has_views()) {
+      struct Dec {
+        ~Dec() { g_teardown_threads.fetch_sub(1); }
+      } dec;
+      // Skip when nothing changed since the last explicit/auto save: a
+      // host that called dbsp_save() before its final close gets a pure
+      // in-RAM teardown here — no SQL racing process exit (observed
+      // segfault: exit()'s static teardown vs this thread mid-INSERT).
+      if (dbg) {
+        std::cerr << "[dbsp] teardown: autopersist=" << m->autopersist_enabled()
+                  << " views=" << m->has_views()
+                  << " dirty=" << m->dirty_since_save() << "\n";
+      }
+      if (m->autopersist_enabled() && m->has_views() && m->dirty_since_save()) {
         try {
           duckdb::Connection save_con(*db);
           bool saved_defs = m->save_to_duck_table(*save_con.context);
@@ -2158,6 +2215,10 @@ static void LoadInternal(ExtensionLoader &loader) {
   TableFunction mv_tables_func("dbsp_mv_tables", {LogicalType::BOOLEAN},
                                MvTablesFunc, MvTablesBind);
   loader.RegisterFunction(mv_tables_func);
+
+  TableFunction wait_teardown_func("dbsp_wait_teardown", {},
+                                   WaitTeardownFunc, WaitTeardownBind);
+  loader.RegisterFunction(wait_teardown_func);
 
   TableFunction list_views_func("dbsp_views", {}, ListViewsFunc, ListViewsBind);
   loader.RegisterFunction(list_views_func);

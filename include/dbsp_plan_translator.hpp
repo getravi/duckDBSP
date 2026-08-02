@@ -2798,6 +2798,36 @@ public:
     has_output_ = false;
   }
 
+  // Bounded-RAM Phase 3 (reattach): DISTINCT state is one weight per row —
+  // trivially serializable. Without this, every view containing DISTINCT
+  // declined checkpointing and cold-replayed at every load.
+  StateKind state_kind() const override { return StateKind::SERIALIZABLE; }
+
+  void serialize_state(std::vector<uint8_t> &out) const override {
+    BlobWriter w;
+    w.u64(counts_.size());
+    for (const auto &[row, c] : counts_) {
+      w.row(row.columns);
+      w.i64(c);
+    }
+    out = w.take();
+  }
+
+  bool restore_state(const uint8_t *data, size_t len) override {
+    try {
+      BlobReader r(data, len);
+      counts_.clear();
+      const uint64_t n = r.u64();
+      for (uint64_t i = 0; i < n; i++) {
+        DuckDBRow row = r.hashed_row();
+        counts_[std::move(row)] = r.i64();
+      }
+      return r.done();
+    } catch (...) {
+      return false;
+    }
+  }
+
   void account_state(StateBytes &out, StateAccounting &acct) const override {
     for (const auto &[row, c] : counts_) {
       (void)c;
@@ -2884,6 +2914,45 @@ public:
   void clear_output() override {
     output_.clear();
     has_output_ = false;
+  }
+
+  // Bounded-RAM Phase 3 (reattach): set-op state is per-row input counts —
+  // serializable. Without this, every UNION view (all compiled u_li_
+  // rollup unions) declined checkpointing and cold-replayed at every load,
+  // cascading realizes through the whole DAG at reattach.
+  StateKind state_kind() const override { return StateKind::SERIALIZABLE; }
+
+  void serialize_state(std::vector<uint8_t> &out) const override {
+    BlobWriter w;
+    w.u64(counts_.size());
+    for (const auto &[row, ws] : counts_) {
+      w.row(row.columns);
+      w.u64(ws.size());
+      for (const int64_t c : ws) {
+        w.i64(c);
+      }
+    }
+    out = w.take();
+  }
+
+  bool restore_state(const uint8_t *data, size_t len) override {
+    try {
+      BlobReader r(data, len);
+      counts_.clear();
+      const uint64_t n = r.u64();
+      for (uint64_t i = 0; i < n; i++) {
+        DuckDBRow row = r.hashed_row();
+        const uint64_t k = r.u64();
+        std::vector<int64_t> ws(k);
+        for (uint64_t j = 0; j < k; j++) {
+          ws[j] = r.i64();
+        }
+        counts_[std::move(row)] = std::move(ws);
+      }
+      return r.done();
+    } catch (...) {
+      return false;
+    }
   }
 
   void account_state(StateBytes &out, StateAccounting &acct) const override {

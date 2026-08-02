@@ -849,6 +849,18 @@ functions can be bound twice per statement — a second backfill would run
 after the results were dropped). Disabling schedules a full view rebuild so
 sinks reintegrate in RAM.
 
+### dbsp_wait_teardown()
+
+Wait (bounded, ~30s max) for detached close-time teardown threads. Call from
+a throwaway connection after closing your last real connection and before
+process exit — exiting during the detached teardown segfaults in static
+destructors. Pair with an explicit `dbsp_save()` before the final close so
+the teardown has no SQL left to run.
+
+```sql
+SELECT * FROM dbsp_wait_teardown();
+```
+
 ### dbsp_spill(enable)
 
 Toggle disk-backed state (default off): tracked-table baselines, join

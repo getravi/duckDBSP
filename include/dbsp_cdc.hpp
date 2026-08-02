@@ -712,6 +712,7 @@ public:
       }
       con.Query("COMMIT");
       last_ckpt_saved_count_ = view_blobs.size();
+      mark_saved();
       return true;
     } catch (const std::exception &e) {
       last_error_ = std::string("checkpoint save failed: ") + e.what();
@@ -735,6 +736,12 @@ public:
     // seeds for lazy (deferred) baselines on the load fast path (D3c).
     std::unordered_map<std::string, std::pair<int64_t, std::string>>
         watermarks;
+    // Phase 3 (reattach): when true, nodes/sinks hold EMPTY placeholder
+    // blobs — the bytes stay in _dbsp_ckpt and are fetched per view at
+    // realize time. Set only for disk-backed (mv-table) databases, where
+    // operator state runs to GBs and eager blob reads dominated reattach.
+    bool lazy_blobs = false;
+    std::string blob_catalog;
   };
 
   bool checkpoint_valid(duckdb::ClientContext &context, CkptData &out,
@@ -798,6 +805,41 @@ public:
         }
         out.watermarks[t] = {meta->GetValue(1, i).GetValue<int64_t>(),
                              meta->GetValue(2, i).ToString()};
+      }
+      // Phase 3 (reattach): on a disk-backed database (mv tables present,
+      // marked earlier in load_from_duck_table) operator blobs run to GBs
+      // — read only the CATALOG of blobs here (names/ids, no bytes) and
+      // fetch per view at realize time. SQL fingerprints are tiny and
+      // always eager.
+      out.lazy_blobs = mv_tables_enabled_.load();
+      out.blob_catalog = catalog;
+      if (out.lazy_blobs) {
+        auto rows = con.Query("SELECT kind, name, node_id FROM " + ckpt_tbl +
+                              " WHERE kind IN ('node', 'sink')");
+        if (rows->HasError()) {
+          return false;
+        }
+        for (duckdb::idx_t i = 0; i < rows->RowCount(); i++) {
+          const std::string kind = rows->GetValue(0, i).ToString();
+          const std::string name = rows->GetValue(1, i).ToString();
+          const auto node_id =
+              static_cast<uint64_t>(rows->GetValue(2, i).GetValue<int64_t>());
+          if (kind == "node") {
+            out.nodes[name][node_id] = {};
+          } else {
+            out.sinks[name] = {};
+          }
+        }
+        auto fps = con.Query("SELECT name, data FROM " + ckpt_tbl +
+                             " WHERE kind = 'sql'");
+        if (fps->HasError()) {
+          return false;
+        }
+        for (duckdb::idx_t i = 0; i < fps->RowCount(); i++) {
+          out.sql_fingerprints[fps->GetValue(0, i).ToString()] =
+              duckdb::StringValue::Get(fps->GetValue(1, i));
+        }
+        return !out.sinks.empty();
       }
       auto rows = con.Query("SELECT kind, name, node_id, data FROM " + ckpt_tbl);
       if (rows->HasError()) {
@@ -880,6 +922,10 @@ public:
   struct PendingViewCkpt {
     std::unordered_map<uint64_t, std::vector<uint8_t>> nodes;
     std::vector<uint8_t> sink;
+    // Phase 3: blobs above are placeholders; fetch bytes from _dbsp_ckpt
+    // (in blob_catalog) at realize time.
+    bool lazy_from_table = false;
+    std::string blob_catalog;
   };
 
   // Stash a checkpointed view's raw node + sink blobs without decoding.
@@ -907,6 +953,8 @@ public:
     if (sink_it != ckpt.sinks.end()) {
       pv.sink = sink_it->second;
     }
+    pv.lazy_from_table = ckpt.lazy_blobs;
+    pv.blob_catalog = ckpt.blob_catalog;
     pending_restore_[view_name] = std::move(pv);
     it->second->mark_pending_restore();
   }
@@ -946,6 +994,41 @@ public:
     }
     DbspScopeTimer timer("blob_decode", view_name);
     g_lazy_view_decodes++;
+    // Phase 3 (reattach): the stash holds placeholders — fetch this view's
+    // bytes from _dbsp_ckpt now (mv_db_ is set whenever lazy_from_table
+    // was, both keyed on the mv-table marker at load).
+    if (pend_it->second.lazy_from_table && mv_db_ != nullptr) {
+      try {
+        InternalQueryGuard fetch_guard;
+        duckdb::Connection fcon(*mv_db_);
+        auto rows = fcon.Query(
+            "SELECT kind, node_id, data FROM " +
+            qualify(pend_it->second.blob_catalog, "_dbsp_ckpt") +
+            " WHERE name = '" + escape_string(view_name) +
+            "' AND kind IN ('node', 'sink')");
+        if (rows->HasError()) {
+          throw std::runtime_error(rows->GetError());
+        }
+        for (duckdb::idx_t i = 0; i < rows->RowCount(); i++) {
+          const auto blob_str = duckdb::StringValue::Get(rows->GetValue(2, i));
+          std::vector<uint8_t> blob(blob_str.begin(), blob_str.end());
+          if (rows->GetValue(0, i).ToString() == "node") {
+            pend_it->second.nodes[static_cast<uint64_t>(
+                rows->GetValue(1, i).GetValue<int64_t>())] = std::move(blob);
+          } else {
+            pend_it->second.sink = std::move(blob);
+          }
+        }
+      } catch (...) {
+        pending_restore_.erase(pend_it);
+        view_it->second->clear_pending_restore();
+        rebuild_pending_ = true;
+        record_error_best_effort(
+            "DBSP: lazy checkpoint fetch for view '" + view_name +
+            "' failed; scheduling full rebuild");
+        return false;
+      }
+    }
     bool ok;
     try {
       ok = view_it->second->restore_circuit_state(pend_it->second.nodes);
@@ -963,6 +1046,14 @@ public:
       }
     } catch (...) {
       ok = false;
+    }
+    // Phase 3 (reattach): set_result turned sink integration back on; an
+    // adopted table-backed view must stay table-backed — its checkpoint
+    // result blob is deliberately empty (rows live in __mv_), and letting
+    // the sink integrate again would grow a partial RAM result no reader
+    // uses.
+    if (mv_table_backed_.count(view_name) > 0) {
+      view_it->second->set_table_backed();
     }
     pending_restore_.erase(pend_it);
     view_it->second->clear_pending_restore();
@@ -1175,6 +1266,39 @@ public:
       last_error_ = std::string("Load failed: ") + e.what();
       return false;
     }
+    // Phase 3 (reattach): __dbsp_mv_meta marks views whose results are
+    // durable in __mv_ tables. Mark them BEFORE any view is created so
+    // load-time consumers — a cold-created sibling replaying a restored
+    // view source, arrangement backfills, first reads — stream from the
+    // tables instead of the checkpoint's deliberately-EMPTY result blobs,
+    // and so mirroring resumes for this session. A view the checkpoint
+    // declines (fingerprint mismatch) is cold-created below; create_view's
+    // own mirror block then REWRITES its table from the fresh result
+    // (the adopted-view guard there keys on ckpt_restored_views_).
+    try {
+      InternalQueryGuard meta_guard;
+      duckdb::Connection meta_con(
+          duckdb::DatabaseInstance::GetDatabase(context));
+      auto meta = meta_con.Query("SELECT view_name FROM " +
+                                 qualify(catalog, "__dbsp_mv_meta"));
+      if (!meta->HasError()) {
+        std::unique_lock<std::shared_mutex> vl(view_mutex_);
+        size_t marked = 0;
+        while (auto chunk = meta->Fetch()) {
+          for (duckdb::idx_t r = 0; r < chunk->size(); r++) {
+            mv_table_backed_.insert(chunk->GetValue(0, r).ToString());
+            marked++;
+          }
+        }
+        if (marked > 0) {
+          mv_db_ = &duckdb::DatabaseInstance::GetDatabase(context);
+          mv_tables_enabled_ = true;
+        }
+      }
+    } catch (...) {
+      // no meta table = not a disk-backed database; nothing to mark
+    }
+
     // Fast path (D3b): when a circuit-state checkpoint exists and every
     // source watermark matches the live tables, cold-create the covered
     // views (sources tracked + synced + arrangements backfilled, but no
@@ -1195,6 +1319,7 @@ public:
     size_t ckpt_restored = 0;
     size_t skipped = 0;
     size_t pending_now_count = 0;
+    ckpt_restored_views_.clear();
     const bool lazy = lazy_restore_.load();
     for (const auto &[name, view_sql] : rows) {
       {
@@ -1230,6 +1355,7 @@ public:
           // bytes, it doesn't parse them), so there is no per-view decline
           // branch here: a corrupt stash surfaces later, at realize time.
           stash_pending_view(name, ckpt);
+          ckpt_restored_views_.insert(name); // Phase 3: adoption-eligible
           ckpt_restored++;
           pending_now_count++;
           loaded++;
@@ -1241,6 +1367,7 @@ public:
           }
         } else {
           if (cold) {
+            ckpt_restored_views_.insert(name); // Phase 3: adoption-eligible
             ckpt_restored++;
           }
           loaded++;
@@ -1751,6 +1878,7 @@ public:
       // dbsp_delta_generations() consumers can tell it apart from deltas
       // of later commits.
       view_delta_generation_[view_name] = commit_seq_.load();
+      dirty_since_save_ = true;
       // Bounded-RAM Phase 1a: nobody consumes the initial population
       // through dbsp_changes (generation filtering skips create-time
       // buffers), and on big views it pins the full result a second
@@ -1758,8 +1886,14 @@ public:
       views_[view_name]->drop_delta();
       // Bounded-RAM Phase 1b: mirror the new view's result to its
       // __mv_ table (internal connection; guard keeps hooks out).
+      // Phase 3: a checkpoint-restored view was created with its replay
+      // skipped — its result is EMPTY by design (rows live in the adopted
+      // __mv_ table) and writing it would wipe the table.
       mv_db_ = &duckdb::DatabaseInstance::GetDatabase(context);
-      if (mv_tables_enabled_.load()) {
+      if (mv_tables_enabled_.load() && skip_init_replay &&
+          mv_table_backed_.count(view_name) > 0) {
+        // adopted: table already authoritative
+      } else if (mv_tables_enabled_.load()) {
         InternalQueryGuard mv_guard;
         try {
           duckdb::Connection mv_con(*mv_db_);
@@ -3113,9 +3247,30 @@ public:
     InternalQueryGuard guard;
     try {
       duckdb::Connection con(*mv_db_);
+      // Phase 3 (reattach): views restored from the checkpoint fast path
+      // ADOPT their existing __mv_ tables — the tables were mirrored at
+      // every commit up to the checkpoint, so they ARE the result; a
+      // re-backfill would copy from a (possibly empty, table-backed-saved)
+      // restored result and wipe them.
+      std::unordered_set<std::string> meta_views;
+      auto meta = con.Query("SELECT view_name FROM __dbsp_mv_meta");
+      if (!meta->HasError()) {
+        while (auto chunk = meta->Fetch()) {
+          for (duckdb::idx_t r = 0; r < chunk->size(); r++) {
+            meta_views.insert(chunk->GetValue(0, r).ToString());
+          }
+        }
+      }
       for (const auto &[name, view] : views_) {
         if (mv_table_backed_.count(name) > 0) {
           continue; // already backed: table is authoritative, result gone
+        }
+        if (ckpt_restored_views_.count(name) > 0 &&
+            meta_views.count(name) > 0) {
+          if (view->set_table_backed()) {
+            mv_table_backed_.insert(name); // adopt, no write
+            continue;
+          }
         }
         if (!mv_write_full(con, name, *view)) {
           return false;
@@ -3505,6 +3660,8 @@ public:
   // commit time (an interleaved commit may have invalidated the capture's
   // committed-state read). See docs/DESIGN_WRITE_CAPTURE.md.
   uint64_t commit_seq() const { return commit_seq_; }
+  bool dirty_since_save() const { return dirty_since_save_.load(); }
+  void mark_saved() { dirty_since_save_ = false; }
 
   // Write-capture commit-guard failures (each one fell back to
   // scan-and-diff — loud, countable, never silent)
@@ -4335,6 +4492,7 @@ private:
     // compare against this to detect interleaved commits (see
     // docs/DESIGN_WRITE_CAPTURE.md).
     commit_seq_++;
+    dirty_since_save_ = true;
 
     // Auto-persist checkpoint interval (Feature 1): count commits here
     // (cheap, lock-free) but defer the actual save_checkpoint() call to
@@ -4751,6 +4909,10 @@ private:
   // commit_seq_ advances on every propagated baseline mutation and on
   // full rebuilds; guard failures fall back to scan-and-diff, loudly.
   std::atomic<uint64_t> commit_seq_{0};
+  // Set by anything that changes persistable state (commits, view DDL);
+  // cleared by a successful save_checkpoint. The close-time auto-save
+  // skips entirely when clean — see OnConnectionClosed.
+  std::atomic<bool> dirty_since_save_{true};
   // Strictly monotonic created_at stamp for view definitions (see
   // create_view) — written under struct_mutex_ exclusive.
   uint64_t last_created_at_ = 0;
@@ -4764,6 +4926,12 @@ private:
   // the result; reads, replays and backfills stream from it. Guarded by
   // view_mutex_.
   std::unordered_set<std::string> mv_table_backed_;
+  // Phase 3 (reattach): views restored from the checkpoint fast path in
+  // the most recent load — their circuit state is ckpt-time-consistent
+  // with the __mv_ tables (mirrored at every commit), so enabling mv
+  // tables ADOPTS their tables instead of re-backfilling. Cold-created
+  // views (no/declined checkpoint) recompute fresh and must backfill.
+  std::unordered_set<std::string> ckpt_restored_views_;
   std::atomic<uint64_t> capture_guard_fallbacks_{0};
   std::atomic<bool> write_capture_enabled_{true};
   // D3c lazy baselines: count of deferred tables (lock-free hot-path

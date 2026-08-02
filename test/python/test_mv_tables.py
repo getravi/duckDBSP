@@ -107,6 +107,7 @@ assert set(meta) >= set(VIEWS), f"meta missing views: {set(VIEWS) - set(meta)}"
 
 # Durability: backing tables are plain tables — they survive reopen and are
 # readable WITHOUT any DBSP state.
+conn.execute("SELECT * FROM dbsp_save()")  # sync save: detached auto-save skips
 conn.close()
 plain = duckdb.connect(DB, config={"allow_unsigned_extensions": "true"})
 rows = plain.execute('SELECT count(*) FROM "__mv_mv_agg"').fetchone()[0]
@@ -120,5 +121,47 @@ conn.execute("UPDATE t SET v = v + 777.0 WHERE k = 1")
 stale = sorted(map(tuple, conn.execute('SELECT * FROM "__mv_mv_agg"').fetchall()))
 live = sorted(map(tuple, conn.execute("SELECT * FROM dbsp_query('mv_agg')").fetchall()))
 assert stale != live, "disable must stop mirroring"
+conn.execute("SELECT * FROM dbsp_save()")  # sync save: exit must not race a dirty auto-save
+conn.close()
+
+
+
+
+# ── Phase 3: reattach + crash consistency ─────────────────────────────────
+import subprocess
+
+DB2 = tempfile.mktemp(suffix=".duckdb")
+child = f'''
+import duckdb, os
+c = duckdb.connect({DB2!r}, config={{"allow_unsigned_extensions": "true"}})
+c.execute("LOAD {EXT!r}")
+c.execute("CREATE TABLE t2 (k INTEGER, v DOUBLE)")
+c.execute("INSERT INTO t2 SELECT range, range * 1.0 FROM range(100)")
+c.execute("CREATE MATERIALIZED VIEW mv2 AS SELECT k % 5 AS g, SUM(v) AS s FROM t2 GROUP BY k % 5")
+c.execute("SELECT * FROM dbsp_mv_tables(true)")
+c.execute("UPDATE t2 SET v = v + 10.0 WHERE k = 1")
+os._exit(9)  # crash: no clean close, no checkpoint save
+'''
+r = subprocess.run([sys.executable, "-c", child])
+assert r.returncode == 9
+crash = duckdb.connect(DB2, config={"allow_unsigned_extensions": "true"})
+crash.execute(f"LOAD '{EXT}'")
+live = sorted(crash.execute("SELECT * FROM dbsp_query('mv2')").fetchall())
+want = sorted(crash.execute("SELECT k % 5 AS g, SUM(v) FROM t2 GROUP BY k % 5").fetchall())
+assert live == want, f"crash recovery diverged: {live[:2]} vs {want[:2]}"
+crash.execute("UPDATE t2 SET v = 0.0 WHERE k = 2")
+live = sorted(crash.execute("SELECT * FROM dbsp_query('mv2')").fetchall())
+want = sorted(crash.execute("SELECT k % 5 AS g, SUM(v) FROM t2 GROUP BY k % 5").fetchall())
+assert live == want, "post-crash edit diverged"
+crash.execute("SELECT * FROM dbsp_save()")  # sync save before exit
+crash.close()
+
+
+# Wait out the detached close-time teardown before the interpreter exits
+# (exit during it segfaults in static destructors).
+drain = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+drain.execute(f"LOAD '{EXT}'")
+drain.execute("SELECT * FROM dbsp_wait_teardown()")
+drain.close()
 
 print("PASS")

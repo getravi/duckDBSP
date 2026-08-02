@@ -1,5 +1,29 @@
 # Changelog
 
+## Bounded-RAM Phase 3: reattach instead of replay - Aug 2026
+
+- **Reattach**: a reopened disk-backed database ADOPTS its __mv_ tables.
+  __dbsp_mv_meta is read at LOAD start (before any view exists), marking
+  views table-backed so load-time consumers stream from tables instead of
+  the checkpoint's deliberately-empty result blobs; checkpoint-restored
+  views skip backfill; fingerprint-declined views cold-create and rewrite
+  their tables. 141-view DAG: reattach 0.45s vs 48.9s cold; first read
+  0.16s; post-reattach edits incremental (first touch realizes its cone).
+- **Serializable UNION/DISTINCT state**: PlanSetOpNode/PlanDistinctNode
+  now checkpoint (per-row counts) — they previously declined, forcing
+  every union view to cold-replay at each load (13.9s of the reattach).
+- **True-lazy checkpoint blobs**: on disk-backed databases the load reads
+  only the blob CATALOG; bytes are fetched per view at realize time.
+- **Exit-race hardening**: the detached close-time auto-save could run
+  SQL while the host process exits (segfault in static destructors). The
+  auto-save now skips when nothing changed since the last save
+  (dirty_since_save_), dbsp_save() is the explicit sync path, and
+  dbsp_wait_teardown() lets an embedder drain the teardown thread before
+  exiting. Contract: call dbsp_save() before your final close, then
+  dbsp_wait_teardown() from a throwaway connection if exiting immediately.
+- **Tests**: test_mv_tables.py grew reattach + kill-crash recovery
+  sections (8/8 stable); ctest 44/44.
+
 ## Bounded-RAM Phase 2 findings: shared padding-left attempted + reverted - Aug 2026
 
 - Attempted: shared arrangements for self-padding LEFT join sides (the
