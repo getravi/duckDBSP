@@ -502,6 +502,29 @@ SELECT * FROM dbsp_view_state();
   the compressor hides most cold circuit state from RSS (measured: a DAG
   reporting 2.5GB RSS had a 23GB physical footprint).
 - `other_bytes` includes per-node output buffers and delta buffers.
+- Tracked-table baselines are NOT included — see `dbsp_table_state()`;
+  a RAM budget must sum both functions.
+
+---
+
+### dbsp_table_state()
+
+Per-tracked-table baseline residency. Boxed baselines (~300 B/row) are the
+dominant big-model RAM class and are invisible to `dbsp_view_state()`.
+
+```sql
+SELECT * FROM dbsp_table_state();
+```
+
+**Returns:**
+- `table_name` (VARCHAR)
+- `mode` (VARCHAR) — `boxed` (full rows in a RAM Z-set), `spilled`
+  (disk record log + ~72 B/row digest index), or `deferred` (lazy-restore
+  fast path: nothing materialized until first use)
+- `distinct_rows` (BIGINT) — deferred tables report the restore-time
+  COUNT(*) upper bound
+- `resident_bytes` (BIGINT) — baseline plus pending-changes buffer,
+  calibrated estimate
 
 ---
 

@@ -636,7 +636,34 @@ public:
   // scan_state); kept for code paths that need Z-set semantics directly
   const DuckDBZSet &current_state() const { return current_state_; }
 
+  // ---- resident-bytes accounting (bounded-RAM Phase 5) ------------------
+  // Boxed baselines are the dominant big-model RAM class (~500 B/row
+  // measured at 18M rows) and were invisible to dbsp_view_state — anything
+  // unmetered can't be budgeted. Approximate, same calibration philosophy
+  // as StateBytes.
+
+  const char *state_mode() const {
+    if (deferred_) {
+      return "deferred";
+    }
+    return spill_ ? "spilled" : "boxed";
+  }
+
+  size_t resident_bytes(StateAccounting &acct) const {
+    size_t b = acct.zset_bytes(pending_changes_);
+    if (deferred_) {
+      return b; // nothing materialized yet
+    }
+    if (spill_) {
+      // digest index only: RowDigest(16) + Slot(24) + map node overhead
+      return b + spill_->distinct_rows() * kSpillIndexEntryBytes;
+    }
+    return b + acct.zset_bytes(current_state_);
+  }
+
 private:
+  static constexpr size_t kSpillIndexEntryBytes = 72;
+
   static std::vector<duckdb::Value> row_values(const DuckDBRow &row) {
     std::vector<duckdb::Value> vals;
     vals.reserve(row.columns.size());

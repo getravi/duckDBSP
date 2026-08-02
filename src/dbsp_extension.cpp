@@ -765,6 +765,67 @@ void ViewStateFunc(ClientContext &context, TableFunctionInput &input,
 }
 
 // ============================================================================
+// dbsp_table_state - Per-tracked-table baseline residency (bounded-RAM
+// Phase 5). Usage: SELECT * FROM dbsp_table_state();
+// Columns: table_name VARCHAR, mode VARCHAR (boxed|spilled|deferred),
+// distinct_rows BIGINT, resident_bytes BIGINT. Boxed baselines are the
+// dominant big-model RAM class and are NOT in dbsp_view_state — budget
+// against the SUM of both functions.
+// ============================================================================
+
+struct TableStateBindData : public TableFunctionData {
+  struct Row {
+    string name;
+    string mode;
+    int64_t rows;
+    int64_t bytes;
+  };
+  vector<Row> rows;
+  idx_t current = 0;
+};
+
+unique_ptr<FunctionData> TableStateBind(ClientContext &context,
+                                        TableFunctionBindInput &input,
+                                        vector<LogicalType> &return_types,
+                                        vector<string> &names) {
+  EnsureContextState(context);
+  auto data = make_uniq<TableStateBindData>();
+
+  auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
+  manager.scan_table_state(
+      [&](const string &name, const string &mode, int64_t rows,
+          int64_t bytes) { data->rows.push_back({name, mode, rows, bytes}); });
+
+  return_types.push_back(LogicalType::VARCHAR);
+  names.push_back("table_name");
+  return_types.push_back(LogicalType::VARCHAR);
+  names.push_back("mode");
+  return_types.push_back(LogicalType::BIGINT);
+  names.push_back("distinct_rows");
+  return_types.push_back(LogicalType::BIGINT);
+  names.push_back("resident_bytes");
+  return std::move(data);
+}
+
+void TableStateFunc(ClientContext &context, TableFunctionInput &input,
+                    DataChunk &output) {
+  auto &data = input.bind_data->CastNoConst<TableStateBindData>();
+
+  idx_t count = 0;
+  while (data.current < data.rows.size() && count < STANDARD_VECTOR_SIZE) {
+    const auto &r = data.rows[data.current];
+    output.SetValue(0, count, Value(r.name));
+    output.SetValue(1, count, Value(r.mode));
+    output.SetValue(2, count, Value::BIGINT(r.rows));
+    output.SetValue(3, count, Value::BIGINT(r.bytes));
+    data.current++;
+    count++;
+  }
+  output.SetCardinality(count);
+}
+
+// ============================================================================
 // dbsp_delta_generations - Per-view delta-buffer generation
 // Usage: SELECT * FROM dbsp_delta_generations();
 // Columns: view_name VARCHAR, generation BIGINT. `generation` is the commit
@@ -2263,6 +2324,10 @@ static void LoadInternal(ExtensionLoader &loader) {
   TableFunction delta_gen_func("dbsp_delta_generations", {},
                                DeltaGenerationsFunc, DeltaGenerationsBind);
   loader.RegisterFunction(delta_gen_func);
+
+  TableFunction table_state_func("dbsp_table_state", {}, TableStateFunc,
+                                 TableStateBind);
+  loader.RegisterFunction(table_state_func);
 
   TableFunction view_state_func("dbsp_view_state", {}, ViewStateFunc,
                                 ViewStateBind);

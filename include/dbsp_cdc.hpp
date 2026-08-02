@@ -3562,6 +3562,27 @@ public:
     }
   }
 
+  // Per-tracked-table baseline accounting (bounded-RAM Phase 5): boxed
+  // baselines (~500 B/row) were the largest UNMETERED RAM class — at 18M
+  // input rows dbsp_view_state reported 4MB while the process held 10GB.
+  // Emits (table, mode, distinct_rows, resident_bytes) per tracked table;
+  // mode is boxed | spilled | deferred.
+  void scan_table_state(
+      const std::function<void(const std::string &, const std::string &,
+                               int64_t, int64_t)> &cb) {
+    std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    StateAccounting acct;
+    for (const auto &[name, tt] : tracked_tables_) {
+      auto lock_it = table_locks_.find(name);
+      std::shared_lock<std::shared_mutex> tl;
+      if (lock_it != table_locks_.end()) {
+        tl = std::shared_lock<std::shared_mutex>(*lock_it->second);
+      }
+      cb(name, tt->state_mode(), static_cast<int64_t>(tt->state_size()),
+         static_cast<int64_t>(tt->resident_bytes(acct)));
+    }
+  }
+
   // Single-view state accounting (dbsp_realize's budget feedback): cheap
   // relative to the full scan_view_state sweep. Payload dedupe is scoped
   // to this one view (fresh StateAccounting), so shared rows count fully —
