@@ -52,6 +52,7 @@
 #include "duckdb/storage/storage_manager.hpp"
 
 #include <atomic>
+#include <thread>
 #include <iostream>
 #include <unordered_map>
 #include <unordered_set>
@@ -203,6 +204,9 @@ public:
     // With auto-sync OFF this parse runs only while baselines are deferred
     // (D3c) — the write check below is the sole consumer.
     stmt_ = classify(context.GetCurrentQuery());
+    if (std::getenv("DBSP_DEBUG_SYNC")) {
+      last_query_dbg_ = context.GetCurrentQuery();
+    }
     // D3c: a write is about to execute. Deferred (lazy-restored) baselines
     // must materialize from PRE-write storage: this is the only moment the
     // scan is guaranteed to equal the restore-time content exactly. (The
@@ -410,6 +414,7 @@ public:
       }
       const bool know_all_writes =
           capture_.saw_statements && !capture_.unknown_writes;
+      const bool saw_statements = capture_.saw_statements;
       std::vector<std::string> touched(capture_.touched.begin(),
                                        capture_.touched.end());
       capture_ = {};
@@ -417,10 +422,27 @@ public:
       if (know_all_writes && touched.empty()) {
         return; // read-only commit: nothing can have changed
       }
+      // Engine-hook mode: the patched engine reports EVERY tuple write at
+      // commit (the engine_fed branch above), so a commit that reaches
+      // here with nothing fed, nothing captured, and NO statement seen
+      // provably wrote nothing — fresh connections fire setup/teardown
+      // commits with exactly this signature, and the pre-H1 sync_all
+      // safety net turned each one into a full scan-diff of every tracked
+      // table. DDL cannot hide here (it is statement-shaped and folds as
+      // WRITE_UNKNOWN, so saw_statements is true and the sync below still
+      // runs). Stock builds keep the pessimistic net: Appender writes
+      // really are invisible to them.
+      if (engine_hook_active() && !saw_statements &&
+          stmt_.kind == StmtClass::NONE) {
+        return;
+      }
       if (std::getenv("DBSP_DEBUG_SYNC")) {
         std::cerr << "[dbsp] commit fallback sync: know_all="
                   << know_all_writes << " touched=" << touched.size()
-                  << " stmt_kind=" << static_cast<int>(stmt_.kind) << "\n";
+                  << " stmt_kind=" << static_cast<int>(stmt_.kind)
+                  << " thread=" << std::this_thread::get_id() << " ctx="
+                  << &context << " tracked=" << manager.tracked_table_total()
+                  << " last_q='" << last_query_dbg_.substr(0, 60) << "'\n";
       }
       // The transaction has already committed successfully at this point.
       // We can safely read the post-commit state and pass the transaction
@@ -537,6 +559,7 @@ private:
     bool captured = false; // WRITE_KNOWN served by write capture: not dirty
   };
   StmtClass stmt_;
+  std::string last_query_dbg_; // DBSP_DEBUG_SYNC only: last classified query
 
   // H2 guard cache: one internal connection + a prepared COUNT(*) per table
   std::unique_ptr<duckdb::Connection> guard_con_;

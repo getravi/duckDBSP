@@ -4153,6 +4153,12 @@ public:
   // sync scoping skips untouched tables)
   uint64_t scan_syncs() const { return scan_syncs_; }
 
+  // Number of tracked tables (diagnostics; sync-scoping decisions).
+  size_t tracked_table_total() const {
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
+    return tracked_tables_.size();
+  }
+
   size_t get_tracked_table_count(const std::string &table_name) const {
     std::shared_lock<std::shared_mutex> lock(struct_mutex_);
     auto it = tracked_tables_.find(table_name);

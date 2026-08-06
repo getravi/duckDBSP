@@ -1,5 +1,25 @@
 # Changelog
 
+## Statement-less commits stop triggering full scans (engine-hook mode) - Aug 2026
+
+- Fresh connections fire implicit setup/teardown commits that never ran a
+  classified statement (stmt NONE, nothing captured). The pre-H1 safety
+  net treated them as "writes we could not attribute" and ran sync_all —
+  a full scan-diff of every tracked table, 1-2x nondeterministically per
+  session (thread/WAL timing). With the engine hook proven live
+  (first-delivery latch), such a commit provably wrote nothing: every
+  tuple write is delivered by the patched engine's commit callback, and
+  DDL is statement-shaped (classifies WRITE_UNKNOWN, still syncs). The
+  fallback now returns early in that exact signature; stock builds keep
+  the pessimistic net (Appender writes are invisible without the patch).
+- Residual (documented): strays BEFORE the first tracked-table delivery
+  (e.g. during initial model create, where inserts precede tracking)
+  still scan — one-time create-phase cost; adopted state survives them
+  via the empty-diff rebuild discard.
+- Diagnostics: DBSP_DEBUG_SYNC now attributes fallback syncs (thread,
+  context, tracked-table count, last classified query) and save_index
+  branch decisions.
+
 ## Delta-append sidecars: dirty save O(changed rows) - Aug 2026
 
 - A dirty dbsp_save folded and rewrote every durable sidecar wholesale —
