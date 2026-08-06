@@ -1,5 +1,31 @@
 # Changelog
 
+## Multi-table commit = one circuit pass - Aug 2026
+
+- A transaction writing several tracked tables used to propagate once per
+  table at COMMIT. Each pass rewrote every downstream view's
+  single-generation dbsp_changes buffer — a view reading BOTH tables kept
+  only the last table's effects for dbsp_changes consumers — and a join
+  both of whose sides changed in one commit missed its −Δl⋈Δr
+  both-shared correction. All three commit paths now collect every
+  table's delta first and run ONE propagation pass:
+  - engine-hook fast path: `CDCManager::apply_captured_deltas` (new)
+    applies every baseline then propagates once; failed tables still fall
+    to the scan path per table.
+  - write-capture fast path (`apply_captured`): merged per-table deltas
+    go through the same `apply_captured_deltas`.
+  - scan fallback (`sync_tables`): scans/consumes every table first, then
+    one `propagate_changes_multi` pass.
+- `propagate_changes_multi(sources)` generalizes `propagate_changes` (now
+  a delegating wrapper): pending map seeded with all sources, arrangements
+  updated for each source before any view steps, levels built over the
+  union topo order (`DependencyGraph::topological_order(vector)` — new
+  overload). One commit_seq_ bump per pass, so every stepped view shares
+  the pass's delta generation.
+- Regression: test/python/test_multi_table_commit.py (two-table commit;
+  per-source views, a both-tables view, both-sides join insert, shared
+  generation stamp).
+
 ## Bounded-RAM Phase 2d increment 2: packed shared arrangements - Aug 2026
 
 - SharedArrangement stores its buckets packed (same codec/pattern as the

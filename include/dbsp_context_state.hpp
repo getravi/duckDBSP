@@ -349,14 +349,13 @@ public:
         auto deltas = std::move(capture_.engine_deltas);
         capture_ = {};
         clear_tee();
-        std::vector<std::string> failed;
-        for (auto &[table, delta] : deltas) {
-          if (!manager.apply_captured_delta(table, delta, &context)) {
-            // untracked-by-now or deferred-baseline rebuild scheduled:
-            // reconcile that table by scan below
-            failed.push_back(table);
-          }
-        }
+        // ALL tables in ONE propagation pass — per-table applies kept only
+        // the last table's downstream deltas (single-generation buffers)
+        // and missed join both-shared corrections. Tables the manager
+        // could not serve (untracked-by-now or deferred-baseline rebuild
+        // scheduled) are reconciled by scan below.
+        std::vector<std::string> failed =
+            manager.apply_captured_deltas(deltas, &context);
         if (unknown) {
           manager.sync_all(context, &transaction);
         } else if (!failed.empty()) {
@@ -1108,8 +1107,9 @@ private:
     if (wrote && manager.commit_seq() != capture_.seq_snapshot) {
       return fail();
     }
-    // Merge appends + write deltas per table: one apply (and one
-    // propagation) per table keeps the commit a single consistent step
+    // Merge appends + write deltas per table; all tables then propagate
+    // in ONE pass (apply_captured_deltas) — the commit is a single
+    // circuit step, so multi-source views keep every table's effects
     std::unordered_map<std::string, DuckDBZSet> merged;
     for (const auto &[table, slot] : capture_.appends) {
       auto &dst = merged[table];
@@ -1144,12 +1144,10 @@ private:
         return fail();
       }
     }
-    for (const auto &[table, delta] : merged) {
-      if (!manager.apply_captured_delta(table, delta, &context)) {
-        return false;
-      }
-    }
-    return true;
+    // Applied-and-propagated tables are served; any failed table falls to
+    // the caller's scan path, whose scan-and-consume diffs against the
+    // (unchanged) baseline — no double-propagation for the served ones.
+    return manager.apply_captured_deltas(merged, &context).empty();
   }
 };
 

@@ -287,7 +287,28 @@ public:
   // Returns nodes in order they should be updated
   std::vector<std::string>
   topological_order(const std::string &changed_node) const {
-    std::vector<std::string> dependents = get_all_dependents(changed_node);
+    return topological_order(std::vector<std::string>{changed_node});
+  }
+
+  // Multi-source variant: one Kahn pass over the UNION of the sources'
+  // dependent cones. Feeding all of a commit's changed tables through one
+  // pass is what lets a multi-table commit run as a single circuit step —
+  // see CDCManager::propagate_changes_multi.
+  std::vector<std::string>
+  topological_order(const std::vector<std::string> &changed_nodes) const {
+    std::unordered_set<std::string> changed(changed_nodes.begin(),
+                                            changed_nodes.end());
+    std::unordered_set<std::string> seen;
+    std::vector<std::string> dependents;
+    for (const auto &node : changed_nodes) {
+      for (auto &dep : get_all_dependents(node)) {
+        // A source is "already processed" (it carries this pass's input
+        // delta), even when it sits inside another source's cone.
+        if (!changed.count(dep) && seen.insert(dep).second) {
+          dependents.push_back(std::move(dep));
+        }
+      }
+    }
     if (dependents.empty())
       return {};
 
@@ -2793,34 +2814,29 @@ public:
       }
     }
 
+    // Scan and consume EVERY table's delta first, then run ONE propagation
+    // pass over all of them. Propagating per table stepped the circuit once
+    // per table, and each step rewrote every downstream view's
+    // single-generation delta buffer — a multi-table commit kept only the
+    // LAST table's effects for dbsp_changes consumers, and a join both of
+    // whose sides changed in the commit missed its both-shared correction.
+    std::vector<std::optional<DuckDBZSet>> deltas(table_names.size());
     if (do_parallel) {
       // TRUE parallelism: each thread acquires its own per-table lock.
       // DB scans for different tables run simultaneously.
-      // Propagation serializes at view_mutex_ (fast; not the bottleneck).
       std::vector<std::future<void>> futures;
-      for (const auto &table_name : table_names) {
+      for (size_t i = 0; i < table_names.size(); i++) {
         futures.push_back(std::async(std::launch::async,
-            [this, &context, table_name, meta_transaction]() {
+            [this, &context, &table_names, &deltas, i, meta_transaction]() {
           std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
 
-          auto lock_it = table_locks_.find(table_name);
+          auto lock_it = table_locks_.find(table_names[i]);
           if (lock_it == table_locks_.end())
             return;
 
-          std::optional<DuckDBZSet> delta_opt;
-          {
-            std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
-            delta_opt = sync_table_scan_and_consume(context, table_name,
-                                                    meta_transaction);
-          }
-
-          if (!delta_opt.has_value())
-            return;
-
-          if (!delta_opt->empty()) {
-            ensure_no_deferred_before_propagate(context, table_name);
-            propagate_changes(table_name, *delta_opt);
-          }
+          std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
+          deltas[i] = sync_table_scan_and_consume(context, table_names[i],
+                                                  meta_transaction);
         }));
       }
       for (auto &f : futures) {
@@ -2830,25 +2846,28 @@ public:
       // Sequential: hold struct_mutex_ shared for the entire loop so the
       // table_locks_ map stays stable; acquire each table lock in turn.
       std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
-      for (const auto &name : table_names) {
-        auto lock_it = table_locks_.find(name);
+      for (size_t i = 0; i < table_names.size(); i++) {
+        auto lock_it = table_locks_.find(table_names[i]);
         if (lock_it == table_locks_.end())
           continue;
 
-        std::optional<DuckDBZSet> delta_opt;
-        {
-          std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
-          delta_opt = sync_table_scan_and_consume(context, name,
-                                                  meta_transaction);
-        }
+        std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
+        deltas[i] = sync_table_scan_and_consume(context, table_names[i],
+                                                meta_transaction);
+      }
+    }
 
-        if (!delta_opt.has_value())
-          continue;
-
-        if (!delta_opt->empty()) {
-          ensure_no_deferred_before_propagate(context, name);
-          propagate_changes(name, *delta_opt);
+    std::vector<std::pair<std::string, const DuckDBZSet *>> sources;
+    {
+      std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+      for (size_t i = 0; i < table_names.size(); i++) {
+        if (deltas[i].has_value() && !deltas[i]->empty()) {
+          ensure_no_deferred_before_propagate(context, table_names[i]);
+          sources.emplace_back(table_names[i], &*deltas[i]);
         }
+      }
+      if (!sources.empty()) {
+        propagate_changes_multi(sources);
       }
     }
   }
@@ -3933,6 +3952,58 @@ public:
     return true;
   }
 
+  // Multi-table engine-hook commit: apply EVERY captured table's delta to
+  // its baseline first, then run ONE propagation pass over all of them.
+  // Calling apply_captured_delta per table stepped the circuit once per
+  // table — each pass rewrote every downstream view's single-generation
+  // delta buffer (a view reading both tables kept only the LAST table's
+  // effects) and a join both of whose sides changed in the commit missed
+  // its both-shared correction (see propagate_changes_multi). Returns the
+  // tables that could not be served (untracked, or a deferred-baseline
+  // rebuild was scheduled) — the caller reconciles those by scan.
+  std::vector<std::string> apply_captured_deltas(
+      const std::unordered_map<std::string, DuckDBZSet> &deltas,
+      duckdb::ClientContext *context = nullptr) {
+    std::vector<std::string> failed;
+    std::vector<std::pair<std::string, const DuckDBZSet *>> sources;
+    sources.reserve(deltas.size());
+    std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    for (const auto &[table_name, delta] : deltas) {
+      if (delta.empty()) {
+        continue;
+      }
+      auto it = tracked_tables_.find(table_name);
+      if (it == tracked_tables_.end()) {
+        failed.push_back(table_name);
+        continue;
+      }
+      auto lock_it = table_locks_.find(table_name);
+      if (lock_it == table_locks_.end()) {
+        failed.push_back(table_name);
+        continue;
+      }
+      if (has_deferred() &&
+          !prepare_deferred_for_delta(context, table_name, delta)) {
+        failed.push_back(table_name);
+        continue;
+      }
+      DbspScopeTimer t_total("apply_captured_delta",
+                             table_name + " rows=" +
+                                 std::to_string(delta.size()));
+      {
+        std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
+        it->second->apply_delta(delta);
+      }
+      sources.emplace_back(table_name, &delta);
+    }
+    if (!sources.empty()) {
+      propagate_changes_multi(sources);
+      // Observable per-TABLE, matching the single-table path's count.
+      captured_delta_syncs_ += sources.size();
+    }
+    return failed;
+  }
+
   // Number of commits served by captured deltas instead of scan-and-diff
   // (observable so tests can prove the fast path actually ran)
   uint64_t captured_delta_syncs() const { return captured_delta_syncs_; }
@@ -4823,11 +4894,33 @@ private:
   // O(Δ) end to end — no view is ever reset or recomputed from full state.
   void propagate_changes(const std::string &source_name,
                          const DuckDBZSet &delta) {
-    if (delta.empty())
+    propagate_changes_multi({{source_name, &delta}});
+  }
+
+  // One circuit pass for ALL of a commit's table deltas. Stepping once per
+  // source is not just slower — it is WRONG twice over for a multi-table
+  // commit: (1) each pass rewrites every downstream view's
+  // single-generation delta buffer, so dbsp_changes consumers keep only
+  // the LAST source's effects; (2) a join both of whose sides changed in
+  // the commit needs both deltas in ONE apply_changes_batch for its
+  // −Δl⋈Δr both-shared correction to fire. Duplicate source names are a
+  // caller error (last one wins in the pending map).
+  void propagate_changes_multi(
+      const std::vector<std::pair<std::string, const DuckDBZSet *>>
+          &all_sources) {
+    std::vector<std::pair<std::string, const DuckDBZSet *>> sources;
+    sources.reserve(all_sources.size());
+    for (const auto &s : all_sources) {
+      if (s.second != nullptr && !s.second->empty()) {
+        sources.push_back(s);
+      }
+    }
+    if (sources.empty())
       return;
     // Every baseline mutation lands here; write-capture commit guards
     // compare against this to detect interleaved commits (see
-    // docs/DESIGN_WRITE_CAPTURE.md).
+    // docs/DESIGN_WRITE_CAPTURE.md). One bump per PASS: all views stepped
+    // below share this pass's delta generation.
     commit_seq_++;
     dirty_since_save_ = true;
 
@@ -4853,14 +4946,16 @@ private:
     // view applies at most once per pass (topological order guarantees
     // every dependent reads first).
     std::unordered_map<std::string, const DuckDBZSet *> pending;
-    pending[source_name] = &delta;
+    for (const auto &s : sources) {
+      pending[s.first] = s.second;
+    }
 
     // Shared arrangements are updated BEFORE any consuming view steps —
     // join nodes rely on the arrangement being post-delta and drop their
     // Δl⋈Δr term to compensate (Δl⋈R_new = Δl⋈R_old + Δl⋈Δr)
-    {
-      DbspScopeTimer t_arr("arrangements", source_name);
-      apply_to_arrangements(source_name, delta);
+    for (const auto &s : sources) {
+      DbspScopeTimer t_arr("arrangements", s.first);
+      apply_to_arrangements(s.first, *s.second);
     }
 
     // Group the topological order into levels: views in the same level
@@ -4868,10 +4963,17 @@ private:
     // Everything they read while stepping is frozen for the level —
     // pending deltas from earlier levels, shared arrangements (updated
     // before views step / between levels), and their own private state.
+    std::vector<std::string> source_names;
+    source_names.reserve(sources.size());
+    for (const auto &s : sources) {
+      source_names.push_back(s.first);
+    }
     const std::vector<std::string> topo =
-        dep_graph_.topological_order(source_name);
+        dep_graph_.topological_order(source_names);
     std::unordered_map<std::string, size_t> level_of;
-    level_of[source_name] = 0;
+    for (const auto &name : source_names) {
+      level_of[name] = 0;
+    }
     std::vector<std::vector<std::string>> levels;
     for (const auto &view_name : topo) {
       auto it = views_.find(view_name);
@@ -4894,8 +4996,8 @@ private:
     // D-lazy (Global Constraint): a delta arriving for a pending view, or
     // any of its pending ancestors, must realize it FIRST -- deltas must
     // never apply to un-restored state, and no join node may probe a
-    // still-`needs_backfill` shared arrangement. `topo` is source_name's
-    // transitive DEPENDENT set only (things downstream of source_name) --
+    // still-`needs_backfill` shared arrangement. `topo` is the sources'
+    // transitive DEPENDENT set only (things downstream of the sources) --
     // it is NOT the same as "every pending ancestor of the views about to
     // step". Counter-example (reviewer-reproduced): v2 = side1 LEFT JOIN
     // v1, v1 the shared/arrangement-probed side, v3 depends on v2. Editing
@@ -4920,7 +5022,7 @@ private:
     // locked's own early return), in exchange for not having to reach
     // into PlannedCircuitView-specific arrangement metadata here, and for
     // working uniformly across every NativeMaterializedView kind. Views
-    // genuinely unrelated to source_name's dependent cone -- not in topo
+    // genuinely unrelated to the sources' dependent cones -- not in topo
     // and not feeding anything in it -- are still never touched, so this
     // does not regress laziness for the unrelated-view case D-lazy exists
     // for; it only closes the sibling-branch correctness gap. Mirrors the

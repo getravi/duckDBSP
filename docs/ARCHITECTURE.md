@@ -325,7 +325,8 @@ public:
     bool load_from_table(ClientContext& ctx);
 
 private:
-    void propagate_changes(const std::string& source);
+    void propagate_changes(const std::string& source);      // delegates ↓
+    void propagate_changes_multi(sources);  // ONE pass for a whole commit
 };
 ```
 
@@ -426,6 +427,16 @@ two sibling views over one base table) receives all of their deltas in
 ONE `apply_changes_batch` call = one circuit step — required for the
 join's both-shared bilinear correction (−Δl⋈Δr) to fire. Per-source
 sequential applies would overcount Δl⋈Δr and strand stale rows.
+
+The same rule holds one level up, at the commit boundary: a transaction
+that wrote SEVERAL tracked tables runs as ONE propagation pass
+(`propagate_changes_multi` — every commit path collects all table deltas
+first: engine-hook and write-capture via `apply_captured_deltas`, the
+scan fallback via `sync_tables`). Per-table passes would rewrite each
+downstream view's single-generation `dbsp_changes` buffer (a view over
+both tables keeps only the last table's effects) and miss the join
+both-shared correction above. All views stepped in the pass share one
+delta generation.
 
 ### Incremental Aggregation Example
 
