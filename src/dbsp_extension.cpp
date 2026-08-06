@@ -304,6 +304,34 @@ unique_ptr<FunctionData> NotifyBind(ClientContext &context,
   return std::move(data);
 }
 
+// Cast a notify row to the tracked table's schema types. Literal arguments
+// keep their parsed types (5000.0 is DECIMAL(5,1), not DOUBLE) and every
+// downstream consumer — packed arrangements/join indexes above all — expects
+// schema-typed rows; a differently-typed row also would not cancel its
+// baseline twin. Untracked tables pass through (on_insert/on_delete no-op).
+// A failed cast or arity mismatch throws (loud beats a silently wrong delta).
+static dbsp_native::DuckDBRow CastNotifyRow(dbsp_native::CDCManager &manager,
+                                            const string &canonical_name,
+                                            const dbsp_native::DuckDBRow &row) {
+  auto types = manager.tracked_column_types(canonical_name);
+  if (types.empty()) {
+    return row;
+  }
+  if (types.size() != row.columns.size()) {
+    throw InvalidInputException(
+        "dbsp_notify: table %s has %llu columns, got %llu values",
+        canonical_name, (unsigned long long)types.size(),
+        (unsigned long long)row.columns.size());
+  }
+  dbsp_native::DuckDBRow cast = row;
+  for (idx_t i = 0; i < types.size(); i++) {
+    if (cast.columns[i].type() != types[i]) {
+      cast.columns[i] = cast.columns[i].DefaultCastAs(types[i]);
+    }
+  }
+  return cast;
+}
+
 void NotifyInsertFunc(ClientContext &context, TableFunctionInput &input,
                       DataChunk &output) {
   EnsureContextState(context);
@@ -312,7 +340,8 @@ void NotifyInsertFunc(ClientContext &context, TableFunctionInput &input,
     return;
 
   auto &manager = dbsp_native::get_cdc_manager(context);
-  manager.on_insert(CanonicalTableRef(context, data.table_name), data.row,
+  const string canonical = CanonicalTableRef(context, data.table_name);
+  manager.on_insert(canonical, CastNotifyRow(manager, canonical, data.row),
                     &context);
 
   output.SetCardinality(1);
@@ -328,7 +357,8 @@ void NotifyDeleteFunc(ClientContext &context, TableFunctionInput &input,
     return;
 
   auto &manager = dbsp_native::get_cdc_manager(context);
-  manager.on_delete(CanonicalTableRef(context, data.table_name), data.row,
+  const string canonical = CanonicalTableRef(context, data.table_name);
+  manager.on_delete(canonical, CastNotifyRow(manager, canonical, data.row),
                     &context);
 
   output.SetCardinality(1);

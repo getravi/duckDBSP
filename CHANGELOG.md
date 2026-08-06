@@ -1,5 +1,17 @@
 # Changelog
 
+## Notify rows cast to tracked schema types - Aug 2026
+
+- `dbsp_notify_insert/delete` passed raw argument Values into the delta:
+  a literal like `5000.0` parses as DECIMAL(5,1), not the column's
+  DOUBLE. Packed arrangements/join indexes encode by schema type and
+  threw "unencodable row" (test_checkpoint_restore /
+  test_quack_checkpoint); even boxed, a differently-typed row would not
+  cancel its baseline twin. Notify rows are now cast to the tracked
+  table's column types (`CDCManager::tracked_column_types` + notify-side
+  `CastNotifyRow`); arity mismatches and failed casts throw. Untracked
+  tables pass through unchanged.
+
 ## Multi-table commit = one circuit pass - Aug 2026
 
 - A transaction writing several tracked tables used to propagate once per

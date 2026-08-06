@@ -2743,6 +2743,28 @@ public:
     }
   }
 
+  // Column types of a tracked table (empty when not tracked). Notify-style
+  // callers MUST cast raw values to these before building a delta row:
+  // every other ingestion path (scan, write-capture, engine hook) produces
+  // schema-typed rows, and packed arrangements/join indexes encode by
+  // schema type — an untyped literal (5000.0 parses as DECIMAL, not
+  // DOUBLE) is unencodable, and even boxed, a differently-typed row would
+  // not cancel its baseline twin.
+  std::vector<duckdb::LogicalType>
+  tracked_column_types(const std::string &table_name) const {
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
+    auto it = tracked_tables_.find(table_name);
+    if (it == tracked_tables_.end()) {
+      return {};
+    }
+    std::vector<duckdb::LogicalType> types;
+    types.reserve(it->second->schema().columns.size());
+    for (const auto &col : it->second->schema().columns) {
+      types.push_back(col.type);
+    }
+    return types;
+  }
+
   // Sync tracked table with actual DuckDB table
   bool sync_table(duckdb::ClientContext &context,
                   const std::string &table_ref) {
