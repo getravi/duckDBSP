@@ -1630,11 +1630,65 @@ struct SharedArrangement {
     out.finish_build();
   }
 
+  // Fold ONLY the keys touched since adopt into replacement buckets (the
+  // delta-append sidecar payload): merge flat + overlay per dirty key,
+  // O(touched buckets) instead of the whole arrangement. An empty
+  // replacement stays in `out` — it masks a base bucket the overlay
+  // emptied.
+  void fold_packed_touched(flatpacked::ReplacementBuckets &out) const {
+    out.clear();
+    out.reserve(packed.size());
+    for (const auto &[kb, rows] : packed) {
+      std::vector<std::pair<std::string, int64_t>> repl;
+      const auto *fe = flat.find(kb);
+      if (fe == nullptr) {
+        std::unordered_map<std::string, int64_t> m;
+        for (const auto &[rb, dw] : rows) {
+          m[rb] += dw;
+        }
+        for (const auto &[rb, w] : m) {
+          if (w != 0) {
+            repl.emplace_back(rb, w);
+          }
+        }
+      } else {
+        std::unordered_map<std::string, int64_t> m;
+        for (uint32_t b = 0; b < fe->bucket_n; b++) {
+          const auto &be = flat.buckets[fe->bucket_off + b];
+          m.emplace(std::string(reinterpret_cast<const char *>(
+                                    flat.arena.data() + be.row_off),
+                                be.row_len),
+                    be.weight);
+        }
+        for (const auto &[rb, dw] : rows) {
+          m[rb] += dw;
+        }
+        for (const auto &[rb, w] : m) {
+          if (w != 0) {
+            repl.emplace_back(rb, w);
+          }
+        }
+      }
+      out.emplace_back(kb, std::move(repl));
+    }
+  }
+
   // D3c lazy restore: arrangement was registered over a deferred-baseline
   // table and holds no rows yet. CDCManager backfills it (and clears the
   // flag) when the table's baseline materializes — always before any delta
   // is propagated through a consuming join node.
   bool needs_backfill = false;
+
+  // Delta-append sidecars: identity (register-time watermark) of the base
+  // file `flat` was adopted from; -1 = flat was not adopted from a file,
+  // so a delta save has no base to chain to and the save folds fully.
+  int64_t flat_file_wm_count = -1;
+  std::string flat_file_wm_hash;
+  // Watermark of the last sidecar write this session (full or delta): a
+  // save at the same watermark skips. Saves are serialized by the
+  // dbsp_save caller; these fields are only touched on that path.
+  int64_t sidecar_saved_wm_count = -1;
+  std::string sidecar_saved_wm_hash;
 
   // K2: index spilled to a disk bucket log (dbsp_spill). Probes go
   // through probe_spilled() with an internal mutex — concurrent

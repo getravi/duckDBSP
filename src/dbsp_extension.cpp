@@ -1172,9 +1172,12 @@ void SaveFunc(ClientContext &context, TableFunctionInput &input,
     // Table mode (D3): view definitions into a table in the target catalog,
     // so they travel with the database file and its backups.
     // D3b: also snapshot circuit state so the next load can skip replay.
-    ok = manager.save_to_duck_table(context, data.target,
-                                    data.save_all ? "" : data.view_name,
-                                    data.catalog);
+    {
+      dbsp_native::DbspScopeTimer t_defs("save_view_defs", data.target);
+      ok = manager.save_to_duck_table(context, data.target,
+                                      data.save_all ? "" : data.view_name,
+                                      data.catalog);
+    }
     std::string ckpt_note;
     if (ok && data.save_all) {
       // Report how many views actually made it into the checkpoint —

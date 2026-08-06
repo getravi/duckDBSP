@@ -214,6 +214,127 @@ inline bool write_flat_index_file(
   return !ec;
 }
 
+// ---- delta sidecar (delta-append saves) ---------------------------------
+// REPLACEMENT buckets for the keys touched since the base file was
+// adopted, chained to the base by ITS watermark: a dirty save writes
+// O(touched buckets) instead of folding the whole arrangement. An empty
+// replacement masks the base bucket (key emptied). The loader adopts the
+// base, then converts each replacement into overlay deltas.
+
+constexpr uint64_t kFlatDeltaMagic = 0xDB5BF1A7DE17A5F1ULL;
+constexpr uint32_t kFlatDeltaVersion = 1;
+
+using ReplacementBuckets =
+    std::vector<std::pair<std::string,
+                          std::vector<std::pair<std::string, int64_t>>>>;
+
+inline bool write_flat_delta_file(const std::string &path,
+                                  const std::string &fingerprint,
+                                  int64_t wm_count, const std::string &wm_hash,
+                                  int64_t base_wm_count,
+                                  const std::string &base_wm_hash,
+                                  const ReplacementBuckets &buckets) {
+  std::FILE *f = std::fopen((path + ".tmp").c_str(), "wb");
+  if (f == nullptr) {
+    return false;
+  }
+  auto put = [&](const void *p, size_t n) { std::fwrite(p, 1, n, f); };
+  const uint64_t magic = kFlatDeltaMagic;
+  const uint32_t ver = kFlatDeltaVersion;
+  const uint32_t fplen = static_cast<uint32_t>(fingerprint.size());
+  const uint32_t hlen = static_cast<uint32_t>(wm_hash.size());
+  const uint32_t bhlen = static_cast<uint32_t>(base_wm_hash.size());
+  const uint64_t nkeys = buckets.size();
+  put(&magic, 8);
+  put(&ver, 4);
+  put(&fplen, 4);
+  put(fingerprint.data(), fplen);
+  put(&wm_count, 8);
+  put(&hlen, 4);
+  put(wm_hash.data(), hlen);
+  put(&base_wm_count, 8);
+  put(&bhlen, 4);
+  put(base_wm_hash.data(), bhlen);
+  put(&nkeys, 8);
+  for (const auto &[kb, rows] : buckets) {
+    const uint32_t klen = static_cast<uint32_t>(kb.size());
+    const uint64_t nrows = rows.size();
+    put(&klen, 4);
+    put(kb.data(), klen);
+    put(&nrows, 8);
+    for (const auto &[rb, w] : rows) {
+      const uint32_t rlen = static_cast<uint32_t>(rb.size());
+      put(&rlen, 4);
+      put(rb.data(), rlen);
+      put(&w, 8);
+    }
+  }
+  std::fflush(f);
+  ::fsync(fileno(f));
+  std::fclose(f);
+  std::error_code ec;
+  std::filesystem::rename(path + ".tmp", path, ec);
+  return !ec;
+}
+
+inline bool load_flat_delta_file(const std::string &path,
+                                 const std::string &fingerprint,
+                                 int64_t wm_count, const std::string &wm_hash,
+                                 int64_t &base_wm_count_out,
+                                 std::string &base_wm_hash_out,
+                                 ReplacementBuckets &out) {
+  std::FILE *f = std::fopen(path.c_str(), "rb");
+  if (f == nullptr) {
+    return false;
+  }
+  auto get = [&](void *p, size_t n) { return std::fread(p, 1, n, f) == n; };
+  uint64_t magic = 0, nkeys = 0;
+  uint32_t ver = 0, fplen = 0, hlen = 0, bhlen = 0;
+  int64_t count = 0, base_count = 0;
+  bool ok = get(&magic, 8) && magic == kFlatDeltaMagic && get(&ver, 4) &&
+            ver == kFlatDeltaVersion && get(&fplen, 4);
+  std::string fp_in(fplen, '\0');
+  ok = ok && (fplen == 0 || get(fp_in.data(), fplen)) && get(&count, 8) &&
+       get(&hlen, 4);
+  std::string hash(hlen, '\0');
+  ok = ok && (hlen == 0 || get(hash.data(), hlen)) && get(&base_count, 8) &&
+       get(&bhlen, 4);
+  std::string base_hash(bhlen, '\0');
+  ok = ok && (bhlen == 0 || get(base_hash.data(), bhlen)) && get(&nkeys, 8);
+  if (!ok || fp_in != fingerprint || count != wm_count || hash != wm_hash) {
+    std::fclose(f);
+    return false;
+  }
+  ReplacementBuckets loaded;
+  loaded.reserve(nkeys);
+  for (uint64_t i = 0; ok && i < nkeys; i++) {
+    uint32_t klen = 0;
+    uint64_t nrows = 0;
+    ok = get(&klen, 4);
+    std::string kb(klen, '\0');
+    ok = ok && (klen == 0 || get(kb.data(), klen)) && get(&nrows, 8);
+    std::vector<std::pair<std::string, int64_t>> rows;
+    rows.reserve(nrows);
+    for (uint64_t r = 0; ok && r < nrows; r++) {
+      uint32_t rlen = 0;
+      int64_t w = 0;
+      ok = get(&rlen, 4);
+      std::string rb(rlen, '\0');
+      ok = ok && (rlen == 0 || get(rb.data(), rlen)) && get(&w, 8);
+      rows.emplace_back(std::move(rb), w);
+    }
+    loaded.emplace_back(std::move(kb), std::move(rows));
+  }
+  std::fclose(f);
+  if (!ok) {
+    return false;
+  }
+  base_wm_count_out = base_count;
+  base_wm_hash_out = std::move(base_hash);
+  out = std::move(loaded);
+  return true;
+}
+
 inline bool load_flat_index_file(const std::string &path,
                                  const std::string &fingerprint,
                                  int64_t wm_count, const std::string &wm_hash,

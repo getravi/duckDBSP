@@ -583,6 +583,7 @@ public:
     std::vector<ViewCkpt> view_blobs;
     std::vector<std::string> table_names;
     {
+      DbspScopeTimer t_ser("ckpt_serialize", "all views");
       std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
       std::shared_lock<std::shared_mutex> view_lock(view_mutex_);
       for (const auto &[name, view] : views_) {
@@ -652,6 +653,7 @@ public:
     const std::string ckpt_ver_tbl = qualify(catalog, "_dbsp_ckpt_version");
 
     try {
+      DbspScopeTimer t_write("ckpt_write", "tables+watermarks");
       InternalQueryGuard guard;
       duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
       con.Query("BEGIN");
@@ -717,6 +719,7 @@ public:
       }
       std::unordered_map<std::string, std::pair<int64_t, std::string>>
           saved_wms;
+      DbspScopeTimer t_wm("ckpt_watermarks", std::to_string(table_names.size()) + " tables");
       for (const auto &t : table_names) {
         // Alias must not be shadowable by a same-named column: `hash(x)`
         // resolves to the COLUMN x when one exists, silently hashing a
@@ -754,11 +757,16 @@ public:
           if (tt_it == tracked_tables_.end()) {
             continue;
           }
+          // UNIQUE: a full-fold save adopts the file it just wrote (the
+          // overlay folds into a fresh mmap so later saves skip or write
+          // small deltas) — that mutates baseline state, which a shared
+          // lock must not do under concurrent readers.
           auto lk = table_locks_.find(t);
-          std::shared_lock<std::shared_mutex> tl;
+          std::unique_lock<std::shared_mutex> tl;
           if (lk != table_locks_.end()) {
-            tl = std::shared_lock<std::shared_mutex>(*lk->second);
+            tl = std::unique_lock<std::shared_mutex>(*lk->second);
           }
+          DbspScopeTimer t_idx("ckpt_spill_index", t);
           tt_it->second->save_spill_index(wm.first, wm.second);
         }
         // Recovery inc 3: fingerprint sidecars for shared packed
@@ -780,11 +788,40 @@ public:
             if (arr->packed.empty() && !arr->flat.empty()) {
               continue; // adopted and untouched: sidecar already current
             }
+            if (arr->sidecar_saved_wm_count == wm_it->second.first &&
+                arr->sidecar_saved_wm_hash == wm_it->second.second) {
+              continue; // this exact content is already on disk
+            }
+            DbspScopeTimer t_fp("ckpt_arr_sidecar", arr->table);
+            // Delta-append: with an adopted base and a small overlay,
+            // write only the touched keys' replacement buckets chained to
+            // the base — O(touched) instead of a whole-arrangement fold.
+            if (arr->flat_file_wm_count >= 0 &&
+                arr->packed.size() * 10 < arr->flat.dir.size()) {
+              flatpacked::ReplacementBuckets touched;
+              arr->fold_packed_touched(touched);
+              if (flatpacked::write_flat_delta_file(
+                      sharr_path(fp) + ".d", fp, wm_it->second.first,
+                      wm_it->second.second, arr->flat_file_wm_count,
+                      arr->flat_file_wm_hash, touched)) {
+                arr->sidecar_saved_wm_count = wm_it->second.first;
+                arr->sidecar_saved_wm_hash = wm_it->second.second;
+                continue;
+              }
+              // fall through to the full fold on a delta-write failure
+            }
             flatpacked::FlatPackedIndex folded;
             arr->fold_packed(folded);
-            flatpacked::write_flat_index_file(sharr_path(fp), fp,
-                                              wm_it->second.first,
-                                              wm_it->second.second, folded);
+            if (flatpacked::write_flat_index_file(sharr_path(fp), fp,
+                                                  wm_it->second.first,
+                                                  wm_it->second.second,
+                                                  folded)) {
+              // A full fold supersedes any delta chained to the old base.
+              std::error_code fec;
+              std::filesystem::remove(sharr_path(fp) + ".d", fec);
+              arr->sidecar_saved_wm_count = wm_it->second.first;
+              arr->sidecar_saved_wm_hash = wm_it->second.second;
+            }
           }
         }
       }
@@ -2242,12 +2279,63 @@ public:
           if (source_is_table && spill_durable_dir_ && arr->packed_ok &&
               !arr->track_weights && !arr->track_counters) {
             const auto &tt = tracked_tables_.at(req.table);
-            adopted = flatpacked::load_flat_index_file(
-                sharr_path(req.fingerprint), req.fingerprint,
-                tt->deferred_weight(), tt->deferred_hash(), arr->flat);
+            // Delta chain first: a delta sidecar whose watermark matches
+            // the live table names the base it overlays; adopt that base
+            // and convert each replacement bucket into overlay deltas.
+            int64_t base_wc = -1;
+            std::string base_wh;
+            flatpacked::ReplacementBuckets repl;
+            if (flatpacked::load_flat_delta_file(
+                    sharr_path(req.fingerprint) + ".d", req.fingerprint,
+                    tt->deferred_weight(), tt->deferred_hash(), base_wc,
+                    base_wh, repl) &&
+                flatpacked::load_flat_index_file(
+                    sharr_path(req.fingerprint), req.fingerprint, base_wc,
+                    base_wh, arr->flat)) {
+              for (auto &[kb, rows] : repl) {
+                // overlay delta = replacement − base bucket
+                std::unordered_map<std::string, int64_t> m;
+                for (const auto &[rb, w] : rows) {
+                  m[rb] += w;
+                }
+                const auto *fe = arr->flat.find(kb);
+                if (fe != nullptr) {
+                  for (uint32_t b = 0; b < fe->bucket_n; b++) {
+                    const auto &be = arr->flat.buckets[fe->bucket_off + b];
+                    m[std::string(reinterpret_cast<const char *>(
+                                      arr->flat.arena.data() + be.row_off),
+                                  be.row_len)] -= be.weight;
+                  }
+                }
+                std::vector<std::pair<std::string, int64_t>> deltas;
+                for (auto &[rb, w] : m) {
+                  if (w != 0) {
+                    deltas.emplace_back(rb, w);
+                  }
+                }
+                if (!deltas.empty()) {
+                  arr->packed[kb] = std::move(deltas);
+                }
+              }
+              arr->flat_file_wm_count = base_wc;
+              arr->flat_file_wm_hash = base_wh;
+              // The delta's content is already on disk for this watermark.
+              arr->sidecar_saved_wm_count = tt->deferred_weight();
+              arr->sidecar_saved_wm_hash = tt->deferred_hash();
+              adopted = true;
+            } else {
+              adopted = flatpacked::load_flat_index_file(
+                  sharr_path(req.fingerprint), req.fingerprint,
+                  tt->deferred_weight(), tt->deferred_hash(), arr->flat);
+              if (adopted) {
+                arr->flat_file_wm_count = tt->deferred_weight();
+                arr->flat_file_wm_hash = tt->deferred_hash();
+              }
+            }
             if (std::getenv("DBSP_DEBUG_SYNC") && adopted) {
               std::cerr << "[dbsp] shared arrangement adopted from sidecar"
-                           " for table '" << req.table << "'\n";
+                           " for table '" << req.table << "'"
+                        << (arr->packed.empty() ? "" : " (+delta)") << "\n";
             }
           }
           arr->needs_backfill = !adopted;

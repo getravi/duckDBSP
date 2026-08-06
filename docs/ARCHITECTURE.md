@@ -536,8 +536,17 @@ State after:
   fingerprint sidecar written at save and ADOPTED at register over a
   watermark-verified deferred table (`sharr_*.flat`) — first edit after
   reopen stops paying a whole-baseline backfill. Serialization folds
-  flat + overlay back into one stream; a dirty save at big-model scale
-  pays the fold
+  flat + overlay back into one stream
+- **Delta-append sidecars**: with an adopted base and a small overlay, a
+  dirty save writes only the changes — the digest-index overlay as
+  `.idx.d` and per-arrangement replacement buckets for touched keys as
+  `<sharr>.d` — each chained to its base by watermark (+ entry count /
+  live log size); adopt loads base + delta, any chain mismatch rescans.
+  Oversized overlays compact into a fresh self-adopted base. Every save
+  records the watermark it saved under, so a same-content save writes
+  nothing. An empty-diff `end_rebuild` discards instead of swapping — a
+  no-change sync must not destroy the adopted flat layer or the delta
+  chain. Measured 18M rows: dirty save 7.1s → 0.03s
 - **Lazy per-view restore (D-lazy)**, default ON (`dbsp_lazy_restore`):
   a watermark-matched load cold-creates the view exactly as before, but
   instead of decoding its node/sink blobs immediately it stashes the

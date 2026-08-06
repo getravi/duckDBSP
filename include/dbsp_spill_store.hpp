@@ -29,9 +29,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <fcntl.h>
 #include <filesystem>
 #include <functional>
+#include <iostream>
 #include <list>
 #include <string>
 #include <sys/mman.h>
@@ -389,7 +391,19 @@ public:
   static constexpr uint32_t kIdxVersion = 2;
   static constexpr size_t kFlatEntryBytes = 36; // hi8 lo8 off8 len4 w8
 
+  // Delta sidecar (delta-append saves): the whole current OVERLAY written
+  // as a small file next to the base index — a dirty save is O(changed
+  // rows), not O(baseline). Chained to its base by the base's watermark
+  // and entry count; any mismatch (or a log append after the delta save)
+  // invalidates the pair and the adopt falls back to the ordinary rescan.
+  static constexpr uint64_t kIdxDeltaMagic = 0xDB5B1DE17ADE17A5ULL;
+  static constexpr uint32_t kIdxDeltaVersion = 1;
+  // Compaction threshold: fold delta into a fresh base once the overlay
+  // exceeds this fraction of the base (denominator; 10 = 10%).
+  static constexpr uint64_t kIdxDeltaMaxFraction = 10;
+
   std::string idx_path() const { return path_ + ".idx"; }
+  std::string idx_delta_path() const { return path_ + ".idx.d"; }
 
   // Persist the digest index next to the record log, entries SORTED by
   // digest (v2 mmap format). Caller supplies the watermark the baseline
@@ -402,8 +416,18 @@ public:
     if (new_file_ != nullptr) {
       return false; // rebuild in flight: not a consistent generation
     }
+    // Clean skip: the sidecars on disk already describe exactly this
+    // content — the watermark identifies table content, and every
+    // successful save (full OR delta) records the watermark it saved
+    // under. (The old check required an untouched adopted base, so the
+    // first dirty save permanently disabled skipping for the session.)
+    if (wm_count == saved_wm_count_ && wm_hash == saved_wm_hash_) {
+      return true;
+    }
     if (flat_entries_ != nullptr && index_.empty() &&
         wm_count == flat_wm_count_ && wm_hash == flat_wm_hash_) {
+      saved_wm_count_ = wm_count;
+      saved_wm_hash_ = wm_hash;
       return true;
     }
     if (file_ != nullptr) {
@@ -414,8 +438,25 @@ public:
     const uint64_t fsize = std::filesystem::exists(path_, ec)
                                ? std::filesystem::file_size(path_, ec)
                                : 0;
-    // Gather live entries (flat ∖ tombstones ∪ overlay) as packed bytes,
-    // then sort by digest.
+    // Delta-append save: with an adopted base and a small overlay, write
+    // ONLY the overlay (tombstones included — weight 0 masks a base
+    // entry) chained to the base. O(changed rows) instead of O(baseline).
+    if (std::getenv("DBSP_DEBUG_SYNC")) {
+      std::cerr << "[dbsp] save_index " << path_ << ": flat="
+                << (flat_entries_ != nullptr ? "yes" : "NO") << " flat_n="
+                << flat_count_ << " overlay=" << index_.size() << "\n";
+    }
+    if (flat_entries_ != nullptr &&
+        index_.size() * kIdxDeltaMaxFraction < flat_count_) {
+      if (save_index_delta(wm_count, wm_hash, fsize)) {
+        saved_wm_count_ = wm_count;
+        saved_wm_hash_ = wm_hash;
+        return true;
+      }
+      // fall through to the full fold on any delta-write failure
+    }
+    // Full fold: gather live entries (flat ∖ tombstones ∪ overlay) as
+    // packed bytes, then sort by digest.
     std::vector<std::array<uint8_t, kFlatEntryBytes>> entries;
     entries.reserve(distinct_rows());
     for_each_slot([&](const RowDigest &d, const Slot &s) {
@@ -457,14 +498,189 @@ public:
     ::fsync(fileno(f));
     std::fclose(f);
     std::filesystem::rename(idx_path() + ".tmp", idx_path(), ec);
+    if (ec) {
+      return false;
+    }
+    // A full fold supersedes any delta chained to the OLD base.
+    std::filesystem::remove(idx_delta_path(), ec);
+    // Adopt the just-written base: the overlay folds into the mmap so the
+    // next save skips (clean) or writes a small fresh delta, instead of
+    // re-folding the whole baseline every save.
+    try_load_index(wm_count, wm_hash);
+    saved_wm_count_ = wm_count;
+    saved_wm_hash_ = wm_hash;
+    return true;
+  }
+
+  // Write the current overlay as a delta sidecar chained to the adopted
+  // base (base watermark + entry count + current log size). tmp+rename.
+  bool save_index_delta(int64_t wm_count, const std::string &wm_hash,
+                        uint64_t log_fsize) {
+    std::vector<std::array<uint8_t, kFlatEntryBytes>> entries;
+    entries.reserve(index_.size());
+    for (const auto &[d, s] : index_) {
+      std::array<uint8_t, kFlatEntryBytes> e;
+      uint8_t *p = e.data();
+      std::memcpy(p, &d.hi, 8);
+      std::memcpy(p + 8, &d.lo, 8);
+      std::memcpy(p + 16, &s.offset, 8);
+      std::memcpy(p + 24, &s.length, 4);
+      std::memcpy(p + 28, &s.weight, 8);
+      entries.push_back(e);
+    }
+    std::sort(entries.begin(), entries.end(),
+              [](const auto &a, const auto &b) {
+                return std::memcmp(a.data(), b.data(), 16) < 0;
+              });
+    std::FILE *f = std::fopen((idx_delta_path() + ".tmp").c_str(), "wb");
+    if (f == nullptr) {
+      return false;
+    }
+    auto put = [&](const void *p, size_t n) {
+      std::fwrite(p, 1, n, f);
+    };
+    const uint64_t magic = kIdxDeltaMagic;
+    const uint32_t ver = kIdxDeltaVersion;
+    const uint32_t hlen = static_cast<uint32_t>(wm_hash.size());
+    const uint32_t base_hlen = static_cast<uint32_t>(flat_wm_hash_.size());
+    const uint64_t n = entries.size();
+    put(&magic, 8);
+    put(&ver, 4);
+    put(&wm_count, 8);
+    put(&hlen, 4);
+    put(wm_hash.data(), hlen);
+    put(&log_fsize, 8);
+    put(&flat_wm_count_, 8);
+    put(&base_hlen, 4);
+    put(flat_wm_hash_.data(), base_hlen);
+    put(&flat_count_, 8);
+    put(&n, 8);
+    for (const auto &e : entries) {
+      put(e.data(), kFlatEntryBytes);
+    }
+    std::fflush(f);
+    ::fsync(fileno(f));
+    std::fclose(f);
+    std::error_code ec;
+    std::filesystem::rename(idx_delta_path() + ".tmp", idx_delta_path(), ec);
     return !ec;
   }
 
   // Adopt a durable log+index pair for the given watermark: mmap the
   // sorted index read-only — O(1) regardless of row count; lookups
-  // binary-search the mapping and pages fault in on demand. Any mismatch
-  // leaves this object empty and returns false — caller rescans.
+  // binary-search the mapping and pages fault in on demand. A delta
+  // sidecar chained to the base (delta-append saves) loads into the
+  // overlay on top. Any mismatch leaves this object empty and returns
+  // false — caller rescans.
   bool try_load_index(int64_t wm_count, const std::string &wm_hash) {
+    if (try_load_index_with_delta(wm_count, wm_hash)) {
+      return true;
+    }
+    if (!adopt_base_file(wm_count, wm_hash, /*check_log_fsize=*/true)) {
+      return false;
+    }
+    saved_wm_count_ = wm_count;
+    saved_wm_hash_ = wm_hash;
+    return true;
+  }
+
+  // Delta-chain adopt: the delta's watermark must match the caller's, its
+  // recorded log size must match the live log (an append since the delta
+  // save invalidates the pair), and its recorded base identity must match
+  // the base file — then the base mmaps as usual and the delta entries
+  // populate the overlay.
+  bool try_load_index_with_delta(int64_t wm_count,
+                                 const std::string &wm_hash) {
+    std::error_code ec;
+    if (!std::filesystem::exists(idx_delta_path(), ec) ||
+        !std::filesystem::exists(path_, ec)) {
+      return false;
+    }
+    std::FILE *f = std::fopen(idx_delta_path().c_str(), "rb");
+    if (f == nullptr) {
+      return false;
+    }
+    auto get = [&](void *p, size_t n) {
+      return std::fread(p, 1, n, f) == n;
+    };
+    uint64_t magic = 0, fsize = 0, base_n = 0, n = 0;
+    uint32_t ver = 0, hlen = 0, base_hlen = 0;
+    int64_t count = 0, base_count = 0;
+    bool ok = get(&magic, 8) && magic == kIdxDeltaMagic && get(&ver, 4) &&
+              ver == kIdxDeltaVersion && get(&count, 8) && get(&hlen, 4);
+    std::string hash(hlen, '\0');
+    ok = ok && (hlen == 0 || get(hash.data(), hlen)) && get(&fsize, 8) &&
+         get(&base_count, 8) && get(&base_hlen, 4);
+    std::string base_hash(base_hlen, '\0');
+    ok = ok && (base_hlen == 0 || get(base_hash.data(), base_hlen)) &&
+         get(&base_n, 8) && get(&n, 8);
+    std::vector<std::array<uint8_t, kFlatEntryBytes>> entries(n);
+    for (uint64_t i = 0; ok && i < n; i++) {
+      ok = get(entries[i].data(), kFlatEntryBytes);
+    }
+    std::fclose(f);
+    if (!ok || count != wm_count || hash != wm_hash ||
+        fsize != (std::filesystem::exists(path_, ec)
+                      ? std::filesystem::file_size(path_, ec)
+                      : 0)) {
+      if (std::getenv("DBSP_DEBUG_SYNC")) {
+        std::cerr << "[dbsp] delta adopt DECLINED " << path_ << ": ok=" << ok
+                  << " count=" << count << "/" << wm_count << " hash="
+                  << (hash == wm_hash) << " fsize=" << fsize << "/"
+                  << (std::filesystem::exists(path_, ec)
+                          ? std::filesystem::file_size(path_, ec)
+                          : 0)
+                  << "\n";
+      }
+      return false;
+    }
+    if (!adopt_base_file(base_count, base_hash,
+                         /*check_log_fsize=*/false)) {
+      if (std::getenv("DBSP_DEBUG_SYNC")) {
+        std::cerr << "[dbsp] delta adopt: base DECLINED " << path_ << "\n";
+      }
+      return false;
+    }
+    if (flat_count_ != base_n) {
+      flat_unmap(); // base is not the one the delta was chained to
+      index_.clear();
+      total_weight_ = 0;
+      return false;
+    }
+    for (const auto &e : entries) {
+      RowDigest d;
+      Slot s;
+      const uint8_t *p = e.data();
+      std::memcpy(&d.hi, p, 8);
+      std::memcpy(&d.lo, p + 8, 8);
+      std::memcpy(&s.offset, p + 16, 8);
+      std::memcpy(&s.length, p + 24, 4);
+      std::memcpy(&s.weight, p + 28, 8);
+      index_[d] = s;
+      Slot flat;
+      const bool in_flat = flat_find(d, flat);
+      if (s.weight == 0) {
+        overlay_dead_++; // tombstone masking a base entry
+      } else if (!in_flat) {
+        overlay_new_++; // overlay-born row
+      }
+    }
+    // Content count is the verified watermark; the log grew to the
+    // delta-recorded size (its overlay offsets point into that tail).
+    total_weight_ = wm_count;
+    append_offset_ = fsize;
+    appendable_ = false;
+    saved_wm_count_ = wm_count;
+    saved_wm_hash_ = wm_hash;
+    return true;
+  }
+
+  // mmap the base index file, verifying its recorded watermark. The log
+  // size check applies only for a base-only adopt — under a delta chain
+  // the log has legitimately grown past the base's recorded size and the
+  // delta's own size check governs.
+  bool adopt_base_file(int64_t wm_count, const std::string &wm_hash,
+                       bool check_log_fsize) {
     std::error_code ec;
     if (!std::filesystem::exists(idx_path(), ec) ||
         !std::filesystem::exists(path_, ec)) {
@@ -487,10 +703,26 @@ public:
          get(&n, 8);
     const long header_end = ok ? std::ftell(f) : -1;
     std::fclose(f);
-    if (!ok || count != wm_count || hash != wm_hash || header_end < 0 ||
+    if (!ok || count != wm_count || hash != wm_hash || header_end < 0) {
+      if (std::getenv("DBSP_DEBUG_SYNC")) {
+        std::cerr << "[dbsp] base adopt DECLINED " << path_ << ": ok=" << ok
+                  << " count=" << count << "/" << wm_count << " hash="
+                  << (hash == wm_hash) << "\n";
+      }
+      return false;
+    }
+    if (check_log_fsize &&
         fsize != (std::filesystem::exists(path_, ec)
                       ? std::filesystem::file_size(path_, ec)
                       : 0)) {
+      if (std::getenv("DBSP_DEBUG_SYNC")) {
+        std::cerr << "[dbsp] base adopt DECLINED " << path_ << ": fsize="
+                  << fsize << "/"
+                  << (std::filesystem::exists(path_, ec)
+                          ? std::filesystem::file_size(path_, ec)
+                          : 0)
+                  << "\n";
+      }
       return false;
     }
     const uint64_t need =
@@ -606,6 +838,10 @@ public:
     flat_wm_count_ = 0;
     overlay_new_ = 0;
     overlay_dead_ = 0;
+    // The disk pair no longer matches live state (rebuild swap replaces
+    // the log wholesale) — a same-watermark save must NOT skip.
+    saved_wm_count_ = -1;
+    saved_wm_hash_.clear();
   }
 
   // ---- rebuild path (scan-and-diff sync) -------------------------------
@@ -655,7 +891,12 @@ public:
   // Diff the new generation against the old one. `on_added` fires with
   // the row and positive weight for rows gaining weight; `on_removed`
   // with the reconstructed row and positive weight for rows losing it.
-  // Then the new generation replaces the old (atomic rename).
+  // Then the new generation replaces the old (atomic rename) — UNLESS the
+  // diff is empty: a no-change sync must be a NO-OP on state. Swapping
+  // anyway would rewrite the log and drop the adopted flat layer, the
+  // saved-watermark skip, and any delta-sidecar chain — an unattributable
+  // read-only commit (fallback sync_all) used to silently destroy all
+  // three, forcing full sidecar refolds at the next save.
   void end_rebuild(
       const std::function<void(const std::vector<duckdb::Value> &, int64_t)>
           &on_added,
@@ -680,6 +921,7 @@ public:
     std::fclose(nf);
 
     // Rows removed or with decreased weight: payload only in the OLD file
+    bool any_removed = false;
     if (file_ == nullptr && !path_.empty() && !empty()) {
       file_ = open_file(path_, "rb");
     }
@@ -687,11 +929,28 @@ public:
       auto it = pending_.find(d);
       const int64_t new_w = it == pending_.end() ? 0 : it->second.weight;
       if (slot.weight > new_w) {
+        any_removed = true;
         on_removed(read_row(file_, slot), slot.weight - new_w);
       }
     });
 
+    if (added.empty() && !any_removed) {
+      discard_rebuild();
+      return;
+    }
     swap_in_pending();
+  }
+
+  // Throw away an in-flight rebuild, keeping the current generation (log,
+  // flat layer, overlay, saved-watermark state) untouched.
+  void discard_rebuild() {
+    if (new_file_) {
+      std::fclose(new_file_);
+      new_file_ = nullptr;
+    }
+    pending_.clear();
+    std::error_code ec;
+    std::filesystem::remove(tmp_path(), ec);
   }
 
   // ---- point mutations (captured-delta commits, manual CDC) ------------
@@ -813,8 +1072,10 @@ public:
     if (!keep_files_) {
       std::filesystem::remove(path_, ec);
       std::filesystem::remove(idx_path(), ec);
+      std::filesystem::remove(idx_delta_path(), ec);
     }
     std::filesystem::remove(tmp_path(), ec);
+    std::filesystem::remove(idx_delta_path() + ".tmp", ec);
   }
 
 private:
@@ -918,6 +1179,13 @@ private:
   uint64_t flat_count_ = 0;
   int64_t flat_wm_count_ = 0;
   std::string flat_wm_hash_;
+  // Watermark of the last successful save_index (full or delta): a save
+  // asked to persist the same content again skips for free. -1 = never.
+  // Reset whenever the on-disk pair goes stale (flat_unmap: rebuild swap,
+  // discard) — a rewritten log invalidates saved offsets even when the
+  // content watermark is identical.
+  int64_t saved_wm_count_ = -1;
+  std::string saved_wm_hash_;
   size_t overlay_new_ = 0;  // overlay-born live rows
   size_t overlay_dead_ = 0; // flat rows tombstoned by the overlay
   bool appendable_ = false;

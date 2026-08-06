@@ -1,5 +1,37 @@
 # Changelog
 
+## Delta-append sidecars: dirty save O(changed rows) - Aug 2026
+
+- A dirty dbsp_save folded and rewrote every durable sidecar wholesale —
+  the baseline digest index (fold+sort+write of all entries) and each
+  shared-arrangement fingerprint file (fold_packed of flat+overlay).
+  Measured at 18M rows: 7.1-7.8s dirty, 3.4s "clean" (the skip only held
+  until the first dirty save). Now 0.03s for both:
+  - Digest index: with an adopted base and a small overlay (<10% of the
+    base), save writes ONLY the overlay as `.idx.d` (sorted, watermark-
+    stamped, chained to the base by its watermark + entry count + live
+    log size). Adopt loads base mmap + delta into the overlay. A big
+    overlay compacts: full fold, delta deleted, and the just-written
+    file is SELF-ADOPTED (fresh mmap, cleared overlay) so later saves
+    skip or write small deltas.
+  - Arrangement sidecars: replacement buckets for the keys touched since
+    adopt (`fold_packed_touched`, O(touched)) written as `<sharr>.d`,
+    chained to the base by the register-time watermark; the loader diffs
+    them back into the packed overlay. Non-adopted (backfill-built)
+    arrangements keep the full fold.
+  - Clean-skip fixed both places: every successful save records the
+    watermark it saved under; a same-watermark save writes nothing.
+- `end_rebuild` with an EMPTY diff now discards the rebuild instead of
+  swapping: a no-change sync is a no-op on state. The swap used to
+  rewrite the log and silently destroy the adopted flat layer, the
+  saved-watermark skip, and any delta chain — triggered nondeterministically
+  by unattributable commits (stmt-less, e.g. WAL-checkpoint timing)
+  falling back to sync_all. OPEN follow-up: root-cause that stray
+  commit classification; its full scan cost remains.
+- Regression: test/python/test_delta_append_sidecars.py (bases untouched
+  by dirty save, delta files appear, delta-chain reopen exact, clean-save
+  writes nothing, compaction folds and reopens exact).
+
 ## Notify rows cast to tracked schema types - Aug 2026
 
 - `dbsp_notify_insert/delete` passed raw argument Values into the delta:

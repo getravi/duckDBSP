@@ -417,6 +417,11 @@ public:
       if (know_all_writes && touched.empty()) {
         return; // read-only commit: nothing can have changed
       }
+      if (std::getenv("DBSP_DEBUG_SYNC")) {
+        std::cerr << "[dbsp] commit fallback sync: know_all="
+                  << know_all_writes << " touched=" << touched.size()
+                  << " stmt_kind=" << static_cast<int>(stmt_.kind) << "\n";
+      }
       // The transaction has already committed successfully at this point.
       // We can safely read the post-commit state and pass the transaction
       // for proper catalog access.
