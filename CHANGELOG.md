@@ -1,5 +1,16 @@
 # Changelog
 
+## Streaming construction: 144M create measured complete - Aug 2026
+
+- With streaming scans/backfills (no build maps), the 144M leafjoin
+  create COMPLETES in 10min13s with a 4.4GB end footprint (the 22GB
+  transient peak is DuckDB's own uncapped buffer pool on the create
+  connection). Reopen attach 0.7-2s; dirty save 0.19-0.39s; clean save
+  0.17s. Known one-time cost: the first edit after the first reopen
+  pages in ~11GB of mapped indexes (~3min); subsequent edits ~6s at
+  144M. Prior attempts died at 9h/39GB (map era) and 22GB-climbing
+  (fold era).
+
 ## Memory-mapped shared-arrangement arenas - Aug 2026
 
 - FlatPackedIndex gains a MAPPED mode behind read accessors
