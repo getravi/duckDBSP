@@ -802,7 +802,7 @@ public:
             // write only the touched keys' replacement buckets chained to
             // the base — O(touched) instead of a whole-arrangement fold.
             if (arr->flat_file_wm_count >= 0 &&
-                arr->packed.size() * 10 < arr->flat.dir.size()) {
+                arr->packed.size() * 10 < arr->flat.dir_size()) {
               flatpacked::ReplacementBuckets touched;
               arr->fold_packed_touched(touched);
               if (flatpacked::write_flat_delta_file(
@@ -2314,9 +2314,9 @@ public:
                 const auto *fe = arr->flat.find(kb);
                 if (fe != nullptr) {
                   for (uint32_t b = 0; b < fe->bucket_n; b++) {
-                    const auto &be = arr->flat.buckets[fe->bucket_off + b];
+                    const auto &be = arr->flat.bucket_at(fe->bucket_off + b);
                     m[std::string(reinterpret_cast<const char *>(
-                                      arr->flat.arena.data() + be.row_off),
+                                      arr->flat.arena_data() + be.row_off),
                                   be.row_len)] -= be.weight;
                   }
                 }
@@ -2380,6 +2380,44 @@ public:
           // Lever B: initial fill complete — fold the mutable bucket maps
           // into the flat arena (no probes yet; deltas overlay from here).
           arr->compact_to_flat();
+          // Arena-mmap increment: with a durable dir and COMMIT-STABLE
+          // content (we are inside the CREATE VIEW statement), write the
+          // v2 sidecar NOW and re-point `flat` at the mapping — the arena
+          // leaves process RAM for the rest of the create, the reopen
+          // adopt is prewritten, and the first save skips this
+          // arrangement entirely. Runs under the create path's exclusive
+          // locks — no concurrent probes.
+          if (source_is_table && spill_durable_dir_ && !arr->flat.empty() &&
+              !arr->flat.mapped()) {
+            try {
+              DbspScopeTimer t_early("arr_sidecar_early", req.table);
+              InternalQueryGuard iguard;
+              duckdb::Connection con(
+                  duckdb::DatabaseInstance::GetDatabase(context));
+              auto wm = con.Query(
+                  "SELECT COUNT(*), CAST(bit_xor(hash(__dbsp_wm_row)) AS "
+                  "VARCHAR) FROM " +
+                  quote_table_key(req.table) + " __dbsp_wm_row");
+              if (!wm->HasError() && wm->RowCount() == 1) {
+                const int64_t wc = wm->GetValue(0, 0).GetValue<int64_t>();
+                const std::string wh = wm->GetValue(1, 0).ToString();
+                if (flatpacked::write_flat_index_file(
+                        sharr_path(req.fingerprint), req.fingerprint, wc, wh,
+                        arr->flat) &&
+                    flatpacked::load_flat_index_file(
+                        sharr_path(req.fingerprint), req.fingerprint, wc, wh,
+                        arr->flat)) {
+                  arr->flat_file_wm_count = wc;
+                  arr->flat_file_wm_hash = wh;
+                  arr->sidecar_saved_wm_count = wc;
+                  arr->sidecar_saved_wm_hash = wh;
+                }
+              }
+            } catch (...) {
+              // Best-effort: the owned flat stays; the first save writes
+              // the sidecar as before.
+            }
+          }
         }
         arrangements_[req.fingerprint] = arr;
         arrangements_by_table_[req.table].push_back(arr);

@@ -1,5 +1,22 @@
 # Changelog
 
+## Memory-mapped shared-arrangement arenas - Aug 2026
+
+- FlatPackedIndex gains a MAPPED mode behind read accessors
+  (dir_at/bucket_at/arena_data): the v2 sidecar file (sections 8-byte
+  aligned; v1 rejected — one backfill on first reopen after upgrade)
+  mmaps read-only and the arena-class bytes become reclaimable page
+  cache instead of process-resident vectors. Move-only (owns fd +
+  mapping); build paths keep owned vectors.
+- Wiring: create writes the v2 sidecar at backfill completion
+  (commit-stable inside CREATE VIEW) and re-points `flat` at the
+  mapping — the FIRST SAVE then skips the arrangement entirely; reopen
+  adopt maps instead of copying.
+- Measured 18M create end: footprint 4513 (pre-fold) / 2708 (folded) ->
+  1581MB mapped; accounted arrangement state 1475 -> 179MB; first save
+  11.7s -> 0.0s; reopen attach 0.12s with parity exact through
+  create-edit-save-reopen-edit. Battery PASS, ctest 44/44.
+
 ## Tier-2 formats on the create path - Aug 2026
 
 - Checkpointable-mode create held its working state in mutable maps until

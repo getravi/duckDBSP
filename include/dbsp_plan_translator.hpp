@@ -1519,8 +1519,8 @@ struct SharedArrangement {
     };
     if (fe != nullptr && !have_overlay) {
       for (uint32_t b = 0; b < fe->bucket_n; b++) {
-        const auto &be = flat.buckets[fe->bucket_off + b];
-        emit(std::string(reinterpret_cast<const char *>(flat.arena.data() +
+        const auto &be = flat.bucket_at(fe->bucket_off + b);
+        emit(std::string(reinterpret_cast<const char *>(flat.arena_data() +
                                                         be.row_off),
                          be.row_len),
              be.weight);
@@ -1533,9 +1533,9 @@ struct SharedArrangement {
       // merge by row bytes: flat weight + overlay delta
       std::unordered_map<std::string, int64_t> merged;
       for (uint32_t b = 0; b < fe->bucket_n; b++) {
-        const auto &be = flat.buckets[fe->bucket_off + b];
+        const auto &be = flat.bucket_at(fe->bucket_off + b);
         merged.emplace(
-            std::string(reinterpret_cast<const char *>(flat.arena.data() +
+            std::string(reinterpret_cast<const char *>(flat.arena_data() +
                                                        be.row_off),
                         be.row_len),
             be.weight);
@@ -1584,18 +1584,18 @@ struct SharedArrangement {
       out.dir.push_back(de);
     };
     std::vector<std::pair<std::string, int64_t>> scratch;
-    for (uint64_t i = 0; i < flat.dir.size(); i++) {
-      const auto &de = flat.dir[i];
+    for (uint64_t i = 0; i < flat.dir_size(); i++) {
+      const auto &de = flat.dir_at(i);
       const std::string kb(
-          reinterpret_cast<const char *>(flat.arena.data() + de.key_off),
+          reinterpret_cast<const char *>(flat.arena_data() + de.key_off),
           de.key_len);
       auto ov = packed.find(kb);
       scratch.clear();
       if (ov == packed.end()) {
         for (uint32_t b = 0; b < de.bucket_n; b++) {
-          const auto &be = flat.buckets[de.bucket_off + b];
+          const auto &be = flat.bucket_at(de.bucket_off + b);
           scratch.emplace_back(
-              std::string(reinterpret_cast<const char *>(flat.arena.data() +
+              std::string(reinterpret_cast<const char *>(flat.arena_data() +
                                                          be.row_off),
                           be.row_len),
               be.weight);
@@ -1603,9 +1603,9 @@ struct SharedArrangement {
       } else {
         std::unordered_map<std::string, int64_t> m;
         for (uint32_t b = 0; b < de.bucket_n; b++) {
-          const auto &be = flat.buckets[de.bucket_off + b];
+          const auto &be = flat.bucket_at(de.bucket_off + b);
           m.emplace(std::string(reinterpret_cast<const char *>(
-                                    flat.arena.data() + be.row_off),
+                                    flat.arena_data() + be.row_off),
                                 be.row_len),
                     be.weight);
         }
@@ -1654,9 +1654,9 @@ struct SharedArrangement {
       } else {
         std::unordered_map<std::string, int64_t> m;
         for (uint32_t b = 0; b < fe->bucket_n; b++) {
-          const auto &be = flat.buckets[fe->bucket_off + b];
+          const auto &be = flat.bucket_at(fe->bucket_off + b);
           m.emplace(std::string(reinterpret_cast<const char *>(
-                                    flat.arena.data() + be.row_off),
+                                    flat.arena_data() + be.row_off),
                                 be.row_len),
                     be.weight);
         }
