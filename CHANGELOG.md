@@ -1,5 +1,18 @@
 # Changelog
 
+## First-edit page-in + bulk-ingest: measured, bounded, documented - Aug 2026
+
+- 144M first-edit-after-reopen (176s one-time, cold page cache):
+  MADV_WILLNEED prefetch at adopt was tried and REVERTED with data —
+  macOS executes it aggressively enough that every attach paid ~10s and
+  steady edits regressed 7s -> 15s (prefetch competing with the very
+  faults it should soften). The one-time cold cost stands as the better
+  trade: attach 0.7-0.8s, steady edits ~7s, saves 0.2s at 144M.
+- Bulk single-statement UPDATE (360k rows, 10.2s at 18M): engine-visible
+  stages account for ~1.25s (apply 0.75s, circuit 0.5s); an
+  `engine_ingest` timer now instruments the hook's boxing for when that
+  path delivers. Non-product shape; further chasing parked.
+
 ## Streaming construction: 144M create measured complete - Aug 2026
 
 - With streaming scans/backfills (no build maps), the 144M leafjoin

@@ -137,11 +137,17 @@ inline void ingest_engine_modifications(duckdb::ClientContext &context, duckdb::
   }
   try {
     DuckDBZSet delta;
-    if (mods.old_rows) {
-      engine_cdc_to_zset(*mods.old_rows, -1, delta);
-    }
-    if (mods.new_rows) {
-      engine_cdc_to_zset(*mods.new_rows, +1, delta);
+    {
+      DbspScopeTimer t_ing("engine_ingest",
+                           std::to_string((mods.old_rows ? mods.old_rows->Count() : 0) +
+                                          (mods.new_rows ? mods.new_rows->Count() : 0)) +
+                               " rows");
+      if (mods.old_rows) {
+        engine_cdc_to_zset(*mods.old_rows, -1, delta);
+      }
+      if (mods.new_rows) {
+        engine_cdc_to_zset(*mods.new_rows, +1, delta);
+      }
     }
     engine_hook_stats().tables_ingested.fetch_add(1, std::memory_order_relaxed);
     engine_hook_stats().rows_ingested.fetch_add(delta.size(), std::memory_order_relaxed);
