@@ -448,24 +448,39 @@ TEST_CASE("Window UNBOUNDED PRECEDING frame: edit into and out of an "
   requireViewMatchesQuery(harness, "w_nullcumedit", sql);
 }
 
-TEST_CASE("NTH_VALUE constant N stays gated (scope boundary)",
+TEST_CASE("NTH_VALUE constant N accepted and frame-relative",
           "[integration][window][constant-frame]") {
+  // The gate was deliberately narrow while the render indexed the whole
+  // PARTITION; the render is frame-relative now (nth row of the frame,
+  // NULL before it exists), so constant N is accepted and must match
+  // stock DuckDB — default frame and explicit ROWS frames, through edits.
   DuckDBTestHarness harness;
   harness.exec("CREATE TABLE t (grp INTEGER, tidx INTEGER, v DOUBLE)");
   for (int i = 0; i < 10; i++) {
-    harness.exec("INSERT INTO t VALUES (1, " + std::to_string(i) + ", " +
-                 std::to_string(i) + ".0)");
+    harness.exec("INSERT INTO t VALUES (" + std::to_string(1 + i / 5) + ", " +
+                 std::to_string(i % 5) + ", " + std::to_string(i) + ".0)");
   }
   harness.exec("SELECT * FROM dbsp_track('t')");
   harness.exec("SELECT * FROM dbsp_sync('t')");
 
-  auto nth_value = harness.query(
-      "SELECT * FROM dbsp_create_view('w_nth', "
-      "'SELECT grp, tidx, NTH_VALUE(v, 3) OVER (PARTITION BY grp ORDER BY "
-      "tidx ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS n "
-      "FROM t')");
-  REQUIRE(nth_value->HasError());
-  REQUIRE(nth_value->GetError().find("non-constant N") != std::string::npos);
+  const std::string sql_default =
+      "SELECT grp, tidx, NTH_VALUE(v, 3) OVER (PARTITION BY grp ORDER BY "
+      "tidx) AS n FROM t";
+  harness.exec("SELECT * FROM dbsp_create_view('w_nth_default', '" +
+               sql_default + "')");
+  requireViewMatchesQuery(harness, "w_nth_default", sql_default);
+
+  const std::string sql_rows =
+      "SELECT grp, tidx, NTH_VALUE(v, 2) OVER (PARTITION BY grp ORDER BY "
+      "tidx ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS n FROM t";
+  harness.exec("SELECT * FROM dbsp_create_view('w_nth_rows', '" + sql_rows +
+               "')");
+  requireViewMatchesQuery(harness, "w_nth_rows", sql_rows);
+
+  harness.exec("UPDATE t SET v = 50.0 WHERE grp = 1 AND tidx = 2");
+  harness.exec("SELECT * FROM dbsp_sync('t')");
+  requireViewMatchesQuery(harness, "w_nth_default", sql_default);
+  requireViewMatchesQuery(harness, "w_nth_rows", sql_rows);
 }
 
 // NTILE(n) differential vs stock DuckDB, covering every bucket-boundary

@@ -165,13 +165,33 @@ private:
         }
         out_row.columns.push_back(result);
       } else if (win.function == "NTH_VALUE") {
+        // Frame-relative (stock semantics): the nth row OF THE FRAME, not
+        // the partition — under the default frame (UNBOUNDED PRECEDING..
+        // CURRENT ROW) rows before the nth are NULL. Same ROWS-boundary
+        // math as LAST_VALUE above.
+        duckdb::Value result;
         int n = win.offset;
-        if (n > 0 && (size_t)(n - 1) < rows.size() && win.arg_column_idx >= 0 &&
-            (size_t)win.arg_column_idx < rows[n - 1].columns.size()) {
-          out_row.columns.push_back(rows[n - 1].columns[win.arg_column_idx]);
-        } else {
-          out_row.columns.push_back(duckdb::Value());
+        if (n > 0 && !rows.empty() && win.arg_column_idx >= 0) {
+          size_t frame_end_idx = row_idx; // default CURRENT_ROW
+          if (win.end == duckdb::WindowBoundary::UNBOUNDED_FOLLOWING)
+            frame_end_idx = rows.size() - 1;
+          else if (win.end == duckdb::WindowBoundary::EXPR_FOLLOWING_ROWS)
+            frame_end_idx =
+                std::min(row_idx + (size_t)win.end_offset, rows.size() - 1);
+          size_t frame_start = 0;
+          if (win.start == duckdb::WindowBoundary::CURRENT_ROW_ROWS)
+            frame_start = row_idx;
+          else if (win.start == duckdb::WindowBoundary::EXPR_PRECEDING_ROWS)
+            frame_start = row_idx >= (size_t)win.start_offset
+                              ? row_idx - (size_t)win.start_offset
+                              : 0;
+          const size_t idx = frame_start + (size_t)(n - 1);
+          if (idx <= frame_end_idx &&
+              (size_t)win.arg_column_idx < rows[idx].columns.size()) {
+            result = rows[idx].columns[win.arg_column_idx];
+          }
         }
+        out_row.columns.push_back(result);
       } else if (win.function == "NTILE") {
         // Stock semantics (DuckDB's WindowNtileExecutor,
         // duckdb/src/function/window/window_rownumber_function.cpp): if
@@ -901,16 +921,32 @@ public:
             }
             out_row.columns.push_back(ff_result);
           } else if (win.function == "NTH_VALUE") {
+            // Frame-relative (stock semantics) — nth row OF THE FRAME;
+            // mirrors the render_row() copy of this branch above.
+            duckdb::Value result;
             int n = win.offset; // NTH_VALUE uses offset as N
-            if (n > 0 && (size_t)(n - 1) < partition_rows.size() &&
-                win.arg_column_idx >= 0 &&
-                (size_t)win.arg_column_idx <
-                    partition_rows[n - 1].columns.size()) {
-              out_row.columns.push_back(
-                  partition_rows[n - 1].columns[win.arg_column_idx]);
-            } else {
-              out_row.columns.push_back(duckdb::Value());
+            if (n > 0 && !partition_rows.empty() && win.arg_column_idx >= 0) {
+              size_t frame_end_idx = row_idx; // default CURRENT_ROW
+              if (win.end == duckdb::WindowBoundary::UNBOUNDED_FOLLOWING)
+                frame_end_idx = partition_rows.size() - 1;
+              else if (win.end == duckdb::WindowBoundary::EXPR_FOLLOWING_ROWS)
+                frame_end_idx = std::min(row_idx + (size_t)win.end_offset,
+                                         partition_rows.size() - 1);
+              size_t frame_start = 0;
+              if (win.start == duckdb::WindowBoundary::CURRENT_ROW_ROWS)
+                frame_start = row_idx;
+              else if (win.start == duckdb::WindowBoundary::EXPR_PRECEDING_ROWS)
+                frame_start = row_idx >= (size_t)win.start_offset
+                                  ? row_idx - (size_t)win.start_offset
+                                  : 0;
+              const size_t idx = frame_start + (size_t)(n - 1);
+              if (idx <= frame_end_idx &&
+                  (size_t)win.arg_column_idx <
+                      partition_rows[idx].columns.size()) {
+                result = partition_rows[idx].columns[win.arg_column_idx];
+              }
             }
+            out_row.columns.push_back(result);
           } else if (win.function == "NTILE") {
             // Same stock-matching algorithm as the render_row() copy of
             // this branch above -- see the comment there for the

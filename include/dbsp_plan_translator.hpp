@@ -4832,6 +4832,9 @@ private:
   // plan, used for arrangement sharing) and from step_view->source_tables()
   // (deduped — one entry per distinct table regardless of ref count):
   // neither gives a ref count scoped to one step subtree.
+  // PUBLIC: the planner frontend (Walker::visit_recursive_cte) reuses this
+  // scan to REJECT row-collapsing recursive steps at translate time.
+public:
   struct StepLinearity {
     size_t sentinel_refs = 0;
     bool has_weight_nonlinear_op = false;
@@ -4878,6 +4881,7 @@ private:
     }
   }
 
+private:
   // v1 eligibility: side is a bare SOURCE referenced exactly once in the
   // whole plan (so init replay can skip that table wholesale) and no more
   // than one side per join shares (keeps init = plain local-side replay).
@@ -6346,16 +6350,10 @@ private:
     // NativeWindowView's NTILE bucket-boundary math (both render call
     // sites in include/dbsp_window_view.hpp) was rewritten to match stock
     // DuckDB's WindowNtileExecutor first, so widening the gate here no
-    // longer ships a silently-wrong result. NTH_VALUE's N deliberately
-    // keeps using bare_constant_int (unchanged, still gated): reading its
-    // render logic found it always indexes the N-th row of the whole
-    // PARTITION, ignoring the window's frame bounds entirely -- diverges
-    // from stock DuckDB's frame-relative NTH_VALUE whenever the frame is
-    // narrower than the full partition (the common case, since the
-    // default frame is RANGE UNBOUNDED PRECEDING AND CURRENT ROW).
-    // Widening NTH_VALUE's gate needs that fixed first. See
-    // docs/superpowers/plans/2026-07-31-lazy-restore-ntile.md Task 2 and
-    // TODO.md.
+    // longer ships a silently-wrong result. NTH_VALUE followed the same
+    // path (Aug 2026): its render is frame-relative now (nth row of the
+    // FRAME, both call sites in dbsp_window_view.hpp), so its N uses
+    // constant_int like every other frame literal.
     static bool constant_int(const duckdb::Expression &expr, int64_t &out) {
       const duckdb::Expression *cur = &expr;
       while (cur->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CAST) {
@@ -6479,7 +6477,10 @@ private:
           }
           def.arg_column_idx = resolve_col(*w.children[0]);
           if (t == duckdb::ExpressionType::WINDOW_NTH_VALUE) {
-            if (w.children.size() < 2 || !bare_constant_int(*w.children[1], n)) {
+            // constant_int (cast-unwrapping), not bare_constant_int: the
+            // render is frame-relative now (see dbsp_window_view.hpp), so
+            // the deliberate narrow gate documented above is lifted.
+            if (w.children.size() < 2 || !constant_int(*w.children[1], n)) {
               return unsupported("NTH_VALUE with non-constant N");
             }
             def.offset = static_cast<int>(n);
@@ -6657,6 +6658,23 @@ private:
       auto step = visit(*op.children[1]);
       if (!step) {
         return nullptr;
+      }
+      // Row-collapsing operators inside a recursive STEP (AGGREGATE /
+      // DISTINCT / DISTINCT_ON / WINDOW / SORT_LIMIT / non-UNION-ALL set
+      // ops) do not obey the fixpoint's frontier semantics on ANY current
+      // execution path — the step iterates on frontiers and accumulated
+      // state, not SQL's per-iteration working table, so results silently
+      // diverge from stock recursion. These shapes used to be ACCEPTED
+      // and wrong (hosts had to guard themselves, e.g. NuEPM's
+      // assert_step_linear); reject loudly instead.
+      PlannedCircuitView::StepLinearity step_shape;
+      PlannedCircuitView::scan_step_linearity(
+          *step, rec_cte_sentinel(op.table_index), step_shape);
+      if (step_shape.has_weight_nonlinear_op) {
+        return unsupported(
+            "recursive step contains a row-collapsing operator "
+            "(DISTINCT/GROUP BY/LIMIT/window/set-op): results would "
+            "silently diverge from SQL recursion semantics");
       }
       columns = std::move(anchor_cols);
       auto spec = std::make_unique<PlanOpSpec>();

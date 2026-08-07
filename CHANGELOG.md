@@ -1,5 +1,27 @@
 # Changelog
 
+## NTH_VALUE frame-relative + recursive-step shape guard - Aug 2026
+
+- NTH_VALUE: both render call sites (dbsp_window_view.hpp) indexed the
+  nth row of the whole PARTITION, ignoring frame bounds — wrong for the
+  default frame (rows before the nth must be NULL) and for explicit ROWS
+  frames. Now frame-relative (same boundary math as LAST_VALUE); the
+  deliberately narrow bare_constant_int gate is lifted (constant_int,
+  cast-tolerant) per the recorded plan "fix render first, then widen".
+  Regression: test/python/test_nth_value_frames.py (default frame,
+  sliding ROWS frame, unbounded frame, through inserts and a delete, vs
+  stock DuckDB truth); integration test updated from "stays gated" to
+  "accepted and frame-relative".
+- Recursive steps containing row-collapsing operators (DISTINCT /
+  GROUP BY / window / non-UNION-ALL set ops) were ACCEPTED and silently
+  wrong on every execution path (the fixpoint iterates frontiers, not
+  SQL's per-iteration working table). The planner frontend now rejects
+  them loudly at CREATE (reusing scan_step_linearity); LIMIT is already
+  a stock parse error inside recursion. Hosts no longer need their own
+  guard (NuEPM's assert_step_linear stays as defense in depth).
+  Regression: test/python/test_recursive_step_guard.py (linear recursion
+  still works incrementally; DISTINCT/GROUP BY/LIMIT steps reject).
+
 ## Statement-less commits stop triggering full scans (engine-hook mode) - Aug 2026
 
 - Fresh connections fire implicit setup/teardown commits that never ran a
