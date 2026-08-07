@@ -1673,6 +1673,117 @@ struct SharedArrangement {
     }
   }
 
+  // STREAMING INITIAL FILL (M-tier create): during backfill the rows
+  // stream into flat PODs — a small key->id map (join keys are low
+  // cardinality), one row-bytes arena, and 24B entries — instead of the
+  // mutable bucket maps (whose nodes+strings peaked at ~12GB during a
+  // 144M backfill). finish_initial_fill() integer-sorts the entries,
+  // merges duplicate (key,row) weights, and builds the FlatPackedIndex
+  // AROUND the row arena (rows never copy; unique key bytes append at
+  // the arena tail). Only plain packed arrangements stream; everything
+  // else keeps the ordinary apply() path and the RAM fold fallback.
+  struct BulkBuilder {
+    struct Ent {
+      uint32_t key_id;
+      uint32_t rb_len;
+      uint64_t rb_off;
+      int64_t w;
+    };
+    std::unordered_map<std::string, uint32_t> key_ids;
+    std::vector<std::string> key_bytes;
+    std::vector<Ent> entries;
+    std::vector<uint8_t> rb_arena;
+  };
+  std::unique_ptr<BulkBuilder> bulk;
+
+  void begin_initial_fill() {
+    if (packed_ok && !track_weights && !track_counters && !is_spilled() &&
+        packed.empty() && flat.empty()) {
+      bulk = std::make_unique<BulkBuilder>();
+    }
+  }
+
+  void finish_initial_fill() {
+    if (!bulk) {
+      compact_to_flat(); // non-streaming shapes keep the fold fallback
+      return;
+    }
+    auto b = std::move(bulk);
+    // Key order for the directory = key BYTES order (find() binary
+    // searches by bytes); entries group by integer id first (fast sort).
+    std::vector<uint32_t> key_order(b->key_bytes.size());
+    for (uint32_t i = 0; i < key_order.size(); i++) {
+      key_order[i] = i;
+    }
+    std::sort(key_order.begin(), key_order.end(),
+              [&](uint32_t a, uint32_t c) {
+                return b->key_bytes[a] < b->key_bytes[c];
+              });
+    const uint8_t *ra = b->rb_arena.data();
+    std::sort(b->entries.begin(), b->entries.end(),
+              [&](const BulkBuilder::Ent &x, const BulkBuilder::Ent &y) {
+                if (x.key_id != y.key_id) {
+                  return x.key_id < y.key_id;
+                }
+                return flatpacked::cmp_bytes(ra + x.rb_off, x.rb_len,
+                                             ra + y.rb_off, y.rb_len) < 0;
+              });
+    // Per-key entry ranges (entries sorted by key_id).
+    std::vector<std::pair<size_t, size_t>> range(b->key_bytes.size(),
+                                                 {0, 0});
+    for (size_t i = 0; i < b->entries.size();) {
+      size_t j = i + 1;
+      while (j < b->entries.size() &&
+             b->entries[j].key_id == b->entries[i].key_id) {
+        j++;
+      }
+      range[b->entries[i].key_id] = {i, j};
+      i = j;
+    }
+    flatpacked::FlatPackedIndex built;
+    built.arena = std::move(b->rb_arena); // rows never copy
+    for (const uint32_t id : key_order) {
+      auto [lo, hi] = range[id];
+      flatpacked::DirEnt de;
+      de.bucket_off = built.buckets.size();
+      size_t i = lo;
+      while (i < hi) {
+        size_t j = i + 1;
+        int64_t w = b->entries[i].w;
+        while (j < hi &&
+               flatpacked::cmp_bytes(
+                   built.arena.data() + b->entries[j].rb_off,
+                   b->entries[j].rb_len,
+                   built.arena.data() + b->entries[i].rb_off,
+                   b->entries[i].rb_len) == 0) {
+          w += b->entries[j].w;
+          j++;
+        }
+        if (w != 0) {
+          flatpacked::BucketEnt be;
+          be.row_off = b->entries[i].rb_off;
+          be.row_len = b->entries[i].rb_len;
+          be.weight = w;
+          built.buckets.push_back(be);
+        }
+        i = j;
+      }
+      de.bucket_n = static_cast<uint32_t>(built.buckets.size() -
+                                          de.bucket_off);
+      if (de.bucket_n == 0) {
+        continue; // key net-emptied
+      }
+      de.key_off = built.arena.size();
+      de.key_len = static_cast<uint32_t>(b->key_bytes[id].size());
+      built.arena.insert(built.arena.end(), b->key_bytes[id].begin(),
+                         b->key_bytes[id].end());
+      built.dir.push_back(de);
+    }
+    // dir was emitted in key-bytes order already — no finish_build sort.
+    flat = std::move(built);
+    packed.clear();
+  }
+
   // Lever B (create-path RAM): fold the mutable packed bucket maps into
   // the immutable flat arena the moment the initial fill completes — the
   // same two-layer (flat + overlay) shape a sidecar adopt produces, built
@@ -1994,6 +2105,22 @@ struct SharedArrangement {
         if (!packed::encode_row(kb, keys[i]) ||
             !packed::encode_row(rb, row)) {
           throw std::runtime_error("packed arrangement: unencodable row");
+        }
+        if (bulk) {
+          // Streaming initial fill: flat PODs, no bucket maps.
+          auto kit = bulk->key_ids.try_emplace(
+              kb, static_cast<uint32_t>(bulk->key_bytes.size()));
+          if (kit.second) {
+            bulk->key_bytes.push_back(kb);
+          }
+          BulkBuilder::Ent e;
+          e.key_id = kit.first->second;
+          e.rb_len = static_cast<uint32_t>(rb.size());
+          e.rb_off = bulk->rb_arena.size();
+          e.w = w;
+          bulk->rb_arena.insert(bulk->rb_arena.end(), rb.begin(), rb.end());
+          bulk->entries.push_back(e);
+          continue;
         }
         auto &bucket = packed[std::move(kb)];
         bool merged = false;

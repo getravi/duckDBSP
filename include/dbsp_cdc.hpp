@@ -2354,6 +2354,7 @@ public:
           arr->needs_backfill = !adopted;
         } else {
           DbspScopeTimer timer("arr_backfill", req.table);
+          arr->begin_initial_fill(); // streaming build (flat PODs)
           if (source_is_table) {
             DuckDBZSet chunk;
             tracked_tables_.at(req.table)
@@ -2377,9 +2378,10 @@ public:
           } else {
             arr->apply(views_.at(req.table)->get_result());
           }
-          // Lever B: initial fill complete — fold the mutable bucket maps
-          // into the flat arena (no probes yet; deltas overlay from here).
-          arr->compact_to_flat();
+          // Initial fill complete: the streamed build (or, for
+          // non-streaming shapes, a fold of the bucket maps) becomes the
+          // flat arena. No probes yet; deltas overlay from here.
+          arr->finish_initial_fill();
           // Arena-mmap increment: with a durable dir and COMMIT-STABLE
           // content (we are inside the CREATE VIEW statement), write the
           // v2 sidecar NOW and re-point `flat` at the mapping — the arena
@@ -4705,6 +4707,7 @@ private:
         continue;
       }
       DbspScopeTimer timer("arr_backfill", source_name);
+      arr->begin_initial_fill(); // streaming build (flat PODs)
       if (tt_it != tracked_tables_.end()) {
         DuckDBZSet chunk;
         tt_it->second->scan_state([&](const DuckDBRow &row, int64_t w) {
@@ -4729,8 +4732,8 @@ private:
         // set_result()'d before calling us, so get_result() is real.
         arr->apply(view_it->second->get_result());
       }
-      // Lever B: same fold as the register-time backfill above.
-      arr->compact_to_flat();
+      // Same streamed-build finish as the register-time backfill above.
+      arr->finish_initial_fill();
       arr->needs_backfill = false;
     }
   }

@@ -424,7 +424,7 @@ public:
     if (wm_count == saved_wm_count_ && wm_hash == saved_wm_hash_) {
       return true;
     }
-    if (flat_entries_ != nullptr && index_.empty() &&
+    if (flat_from_file_ && flat_entries_ != nullptr && index_.empty() &&
         wm_count == flat_wm_count_ && wm_hash == flat_wm_hash_) {
       saved_wm_count_ = wm_count;
       saved_wm_hash_ = wm_hash;
@@ -446,7 +446,7 @@ public:
                 << (flat_entries_ != nullptr ? "yes" : "NO") << " flat_n="
                 << flat_count_ << " overlay=" << index_.size() << "\n";
     }
-    if (flat_entries_ != nullptr &&
+    if (flat_from_file_ && flat_entries_ != nullptr &&
         index_.size() * kIdxDeltaMaxFraction < flat_count_) {
       if (save_index_delta(wm_count, wm_hash, fsize)) {
         saved_wm_count_ = wm_count;
@@ -454,6 +454,21 @@ public:
         return true;
       }
       // fall through to the full fold on any delta-write failure
+    }
+    // Full write, fast route: with an EMPTY overlay the flat layer (an
+    // owned finished run or a mapping) is already sorted, deduped,
+    // packed file-section bytes — stream it, no gather, no sort. This is
+    // the streaming-construction path: a fresh scan's run becomes the
+    // sidecar with one sequential write.
+    if (index_.empty() && flat_entries_ != nullptr) {
+      if (write_index_file_from(flat_entries_, flat_count_, wm_count,
+                                wm_hash, fsize)) {
+        try_load_index(wm_count, wm_hash);
+        saved_wm_count_ = wm_count;
+        saved_wm_hash_ = wm_hash;
+        return true;
+      }
+      return false;
     }
     // Full fold: gather live entries (flat ∖ tombstones ∪ overlay) as
     // packed bytes, then sort by digest.
@@ -473,42 +488,56 @@ public:
               [](const auto &a, const auto &b) {
                 return std::memcmp(a.data(), b.data(), 16) < 0;
               });
-    std::FILE *f = std::fopen((idx_path() + ".tmp").c_str(), "wb");
-    if (f == nullptr) {
+    if (!write_index_file_from(
+            entries.empty() ? nullptr : entries[0].data(), entries.size(),
+            wm_count, wm_hash, fsize)) {
       return false;
     }
-    auto put = [&](const void *p, size_t n) {
-      std::fwrite(p, 1, n, f);
-    };
-    const uint64_t magic = kIdxMagic;
-    const uint32_t ver = kIdxVersion;
-    const uint32_t hlen = static_cast<uint32_t>(wm_hash.size());
-    const uint64_t n = entries.size();
-    put(&magic, 8);
-    put(&ver, 4);
-    put(&wm_count, 8);
-    put(&hlen, 4);
-    put(wm_hash.data(), hlen);
-    put(&fsize, 8);
-    put(&n, 8);
-    for (const auto &e : entries) {
-      put(e.data(), kFlatEntryBytes);
-    }
-    std::fflush(f);
-    ::fsync(fileno(f));
-    std::fclose(f);
-    std::filesystem::rename(idx_path() + ".tmp", idx_path(), ec);
-    if (ec) {
-      return false;
-    }
-    // A full fold supersedes any delta chained to the OLD base.
-    std::filesystem::remove(idx_delta_path(), ec);
     // Adopt the just-written base: the overlay folds into the mmap so the
     // next save skips (clean) or writes a small fresh delta, instead of
     // re-folding the whole baseline every save.
     try_load_index(wm_count, wm_hash);
     saved_wm_count_ = wm_count;
     saved_wm_hash_ = wm_hash;
+    return true;
+  }
+
+  // Write a base .idx from CONTIGUOUS packed entries (36B stride) — the
+  // shared tail of the fold path and the streaming fast route. tmp+rename;
+  // does NOT touch in-RAM state (callers self-adopt on success).
+  bool write_index_file_from(const uint8_t *entries, uint64_t n,
+                             int64_t wm_count, const std::string &wm_hash,
+                             uint64_t log_fsize) {
+    std::FILE *f = std::fopen((idx_path() + ".tmp").c_str(), "wb");
+    if (f == nullptr) {
+      return false;
+    }
+    auto put = [&](const void *p, size_t len) {
+      std::fwrite(p, 1, len, f);
+    };
+    const uint64_t magic = kIdxMagic;
+    const uint32_t ver = kIdxVersion;
+    const uint32_t hlen = static_cast<uint32_t>(wm_hash.size());
+    put(&magic, 8);
+    put(&ver, 4);
+    put(&wm_count, 8);
+    put(&hlen, 4);
+    put(wm_hash.data(), hlen);
+    put(&log_fsize, 8);
+    put(&n, 8);
+    if (n > 0) {
+      put(entries, n * kFlatEntryBytes);
+    }
+    std::fflush(f);
+    ::fsync(fileno(f));
+    std::fclose(f);
+    std::error_code ec;
+    std::filesystem::rename(idx_path() + ".tmp", idx_path(), ec);
+    if (ec) {
+      return false;
+    }
+    // A full base supersedes any delta chained to the OLD base.
+    std::filesystem::remove(idx_delta_path(), ec);
     return true;
   }
 
@@ -747,6 +776,7 @@ public:
     flat_map_len_ = static_cast<size_t>(need);
     flat_entries_ = static_cast<const uint8_t *>(map) + header_end;
     flat_count_ = n;
+    flat_from_file_ = true;
     flat_wm_count_ = wm_count;
     flat_wm_hash_ = wm_hash;
     index_.clear();
@@ -834,6 +864,9 @@ public:
     flat_entries_ = nullptr;
     flat_count_ = 0;
     flat_map_len_ = 0;
+    flat_owned_run_.clear();
+    flat_owned_run_.shrink_to_fit();
+    flat_from_file_ = false;
     flat_wm_hash_.clear();
     flat_wm_count_ = 0;
     overlay_new_ = 0;
@@ -848,9 +881,19 @@ public:
   // Usage: begin_rebuild(); add() every scanned row; end_rebuild()
   // reports the delta vs the previous generation and atomically swaps
   // the files.
+  //
+  // STREAMING CONSTRUCTION (M-tier create): the scan appends packed
+  // 36-byte index entries to a flat run — the SAME layout as the flat
+  // mmap layer and the .idx file section — and one sort+merge at the end
+  // turns the run itself into the owned flat layer. No hash map is ever
+  // built (the old pending_ map cost ~100B/row and peaked at 14GB during
+  // a 144M scan, plus a map+entries fold spike after it). A row whose
+  // digest repeats writes its payload again (the merge sums the weights;
+  // the extra payload is dead log space until the next compaction) —
+  // duplicate-heavy tables trade log bytes for the map.
 
   void begin_rebuild() {
-    pending_.clear();
+    run_.clear();
     new_file_ = open_file(tmp_path(), "wb");
     new_offset_ = 0;
   }
@@ -867,14 +910,18 @@ public:
   // bytes come straight from chunk vectors, no per-cell Value boxing).
   RowDigest add_serialized(const std::vector<uint8_t> &bytes, int64_t w = 1) {
     const RowDigest d = digest_bytes(bytes.data(), bytes.size());
-    auto &slot = pending_[d];
-    if (slot.weight == 0) {
-      slot.offset = new_offset_;
-      slot.length = static_cast<uint32_t>(bytes.size());
-      write_record(new_file_, bytes);
-      new_offset_ += sizeof(uint32_t) + bytes.size();
-    }
-    slot.weight += w;
+    std::array<uint8_t, kFlatEntryBytes> e;
+    uint8_t *p = e.data();
+    const uint64_t off = new_offset_;
+    const uint32_t len = static_cast<uint32_t>(bytes.size());
+    std::memcpy(p, &d.hi, 8);
+    std::memcpy(p + 8, &d.lo, 8);
+    std::memcpy(p + 16, &off, 8);
+    std::memcpy(p + 24, &len, 4);
+    std::memcpy(p + 28, &w, 8);
+    run_.push_back(e);
+    write_record(new_file_, bytes);
+    new_offset_ += sizeof(uint32_t) + bytes.size();
     return d;
   }
 
@@ -885,7 +932,71 @@ public:
   // record reads for nothing (bounded-RAM Phase 5).
   void install_rebuild() {
     std::fflush(new_file_);
+    finish_run();
     swap_in_pending();
+  }
+
+  // Sort the scan run by digest and merge duplicates in place (weights
+  // sum; net-zero rows drop; first payload wins). After this the run IS
+  // flat-layer content: same 36-byte packed layout, sorted.
+  void finish_run() {
+    std::sort(run_.begin(), run_.end(), [](const auto &a, const auto &b) {
+      return std::memcmp(a.data(), b.data(), 16) < 0;
+    });
+    size_t out = 0;
+    size_t i = 0;
+    while (i < run_.size()) {
+      size_t j = i + 1;
+      int64_t w = ent_slot(run_[i]).weight;
+      while (j < run_.size() &&
+             std::memcmp(run_[i].data(), run_[j].data(), 16) == 0) {
+        w += ent_slot(run_[j]).weight;
+        j++;
+      }
+      if (w != 0) {
+        run_[out] = run_[i];
+        std::memcpy(run_[out].data() + 28, &w, 8);
+        out++;
+      }
+      i = j;
+    }
+    run_.resize(out);
+  }
+
+  static RowDigest ent_digest(const std::array<uint8_t, kFlatEntryBytes> &e) {
+    RowDigest d;
+    std::memcpy(&d.hi, e.data(), 8);
+    std::memcpy(&d.lo, e.data() + 8, 8);
+    return d;
+  }
+
+  static Slot ent_slot(const std::array<uint8_t, kFlatEntryBytes> &e) {
+    Slot s;
+    std::memcpy(&s.offset, e.data() + 16, 8);
+    std::memcpy(&s.length, e.data() + 24, 4);
+    std::memcpy(&s.weight, e.data() + 28, 8);
+    return s;
+  }
+
+  // Weight of a digest in the FINISHED run (binary search; 0 if absent).
+  int64_t run_weight(const RowDigest &d) const {
+    uint8_t key[16];
+    std::memcpy(key, &d.hi, 8);
+    std::memcpy(key + 8, &d.lo, 8);
+    size_t lo = 0, hi = run_.size();
+    while (lo < hi) {
+      const size_t mid = lo + (hi - lo) / 2;
+      const int c = std::memcmp(run_[mid].data(), key, 16);
+      if (c == 0) {
+        return ent_slot(run_[mid]).weight;
+      }
+      if (c < 0) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return 0;
   }
 
   // Diff the new generation against the old one. `on_added` fires with
@@ -903,20 +1014,20 @@ public:
       const std::function<void(const std::vector<duckdb::Value> &, int64_t)>
           &on_removed) {
     std::fflush(new_file_);
+    finish_run();
 
     // Rows added or with increased weight: payload available in the new
-    // file; read back sequentially (offsets ascend by construction)
-    std::vector<std::pair<RowDigest, int64_t>> added;
-    for (const auto &[d, slot] : pending_) {
-      const int64_t old_w = live_weight(d);
-      if (slot.weight > old_w) {
-        added.emplace_back(d, slot.weight - old_w);
-      }
-    }
+    // file, at each merged entry's recorded offset.
+    bool any_added = false;
     std::FILE *nf = open_file(tmp_path(), "rb");
-    for (const auto &[d, w] : added) {
-      const Slot &slot = pending_.at(d);
-      on_added(read_row(nf, slot), w);
+    for (const auto &e : run_) {
+      const RowDigest d = ent_digest(e);
+      const Slot s = ent_slot(e);
+      const int64_t old_w = live_weight(d);
+      if (s.weight > old_w) {
+        any_added = true;
+        on_added(read_row(nf, s), s.weight - old_w);
+      }
     }
     std::fclose(nf);
 
@@ -926,15 +1037,14 @@ public:
       file_ = open_file(path_, "rb");
     }
     for_each_slot([&](const RowDigest &d, const Slot &slot) {
-      auto it = pending_.find(d);
-      const int64_t new_w = it == pending_.end() ? 0 : it->second.weight;
+      const int64_t new_w = run_weight(d);
       if (slot.weight > new_w) {
         any_removed = true;
         on_removed(read_row(file_, slot), slot.weight - new_w);
       }
     });
 
-    if (added.empty() && !any_removed) {
+    if (!any_added && !any_removed) {
       discard_rebuild();
       return;
     }
@@ -948,7 +1058,8 @@ public:
       std::fclose(new_file_);
       new_file_ = nullptr;
     }
-    pending_.clear();
+    run_.clear();
+    run_.shrink_to_fit();
     std::error_code ec;
     std::filesystem::remove(tmp_path(), ec);
   }
@@ -1068,7 +1179,8 @@ public:
     }
     flat_unmap();
     index_.clear();
-    pending_.clear();
+    run_.clear();
+    run_.shrink_to_fit();
     total_weight_ = 0;
     std::error_code ec;
     // Durable mode keeps the log (+ index sidecar) across process exit —
@@ -1163,12 +1275,24 @@ private:
     if (ec) {
       throw std::runtime_error("dbsp spill: rename failed: " + ec.message());
     }
-    index_ = std::move(pending_);
-    pending_.clear();
+    // The finished run BECOMES the flat layer (owned, sorted, deduped —
+    // byte-identical to a mapped .idx section). The overlay starts empty;
+    // there is no map to move. flat_from_file_ stays false until a
+    // save_index writes the sidecar and self-adopts it.
+    flat_owned_run_ = std::move(run_);
+    run_.clear();
+    index_.clear();
+    flat_entries_ =
+        flat_owned_run_.empty() ? nullptr : flat_owned_run_[0].data();
+    flat_count_ = flat_owned_run_.size();
+    flat_wm_count_ = 0;
+    flat_wm_hash_.clear();
+    overlay_new_ = 0;
+    overlay_dead_ = 0;
     appendable_ = false;
     total_weight_ = 0;
-    for (const auto &[d, slot] : index_) {
-      total_weight_ += slot.weight;
+    for (const auto &e : flat_owned_run_) {
+      total_weight_ += ent_slot(e).weight;
     }
   }
 
@@ -1200,7 +1324,15 @@ private:
   int64_t total_weight_ = 0;
   std::unordered_map<RowDigest, Slot, RowDigestHash> index_;
   std::vector<uint8_t> scratch_bytes_;
-  std::unordered_map<RowDigest, Slot, RowDigestHash> pending_;
+  // Scan run (rebuild in flight): packed 36-byte entries, one per scanned
+  // row occurrence; finish_run() sorts+merges them into flat-layer form.
+  std::vector<std::array<uint8_t, kFlatEntryBytes>> run_;
+  // Owned flat layer: the finished run adopted in place (no sidecar file
+  // yet — flat_from_file_ false until save_index writes and self-adopts).
+  std::vector<std::array<uint8_t, kFlatEntryBytes>> flat_owned_run_;
+  // True when flat_entries_ views a durable sidecar (mmap adopt): only
+  // then can saves clean-skip or write delta chains against it.
+  bool flat_from_file_ = false;
 };
 
 // Disk-backed key → bucket index for join arrangements (Phase K2).
