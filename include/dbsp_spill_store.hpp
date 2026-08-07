@@ -972,14 +972,20 @@ public:
       return;
     }
     if (cur_w == 0 && !in_flat && !in_overlay) {
-      // brand new row: append payload, land it in the overlay/full map
+      // brand new row: append payload, land it in the overlay/full map.
+      // NO per-row fflush: a 5M-row captured delta paid one flush syscall
+      // per row (measured 41min for a 5.1M-row UPDATE at 36M). Buffered
+      // writes are safe — every read path fseeks first (read_row; C stdio
+      // requires it between write and read anyway), reopen_read and
+      // save_index flush before observing the file, and durability never
+      // depended on the log (DuckDB storage is the only durable source;
+      // save_index fsyncs before recording the size it trusts).
       ensure_append_file();
       Slot slot;
       slot.offset = append_offset_;
       slot.length = static_cast<uint32_t>(bytes.size());
       slot.weight = w;
       write_record(file_, bytes);
-      std::fflush(file_);
       append_offset_ += sizeof(uint32_t) + bytes.size();
       index_.emplace(d, slot);
       if (flat_entries_ != nullptr) {
