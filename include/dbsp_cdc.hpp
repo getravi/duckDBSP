@@ -785,8 +785,13 @@ public:
             if (wm_it == saved_wms.end()) {
               continue;
             }
-            if (arr->packed.empty() && !arr->flat.empty()) {
-              continue; // adopted and untouched: sidecar already current
+            if (arr->packed.empty() && !arr->flat.empty() &&
+                arr->flat_file_wm_count >= 0) {
+              // Adopted (or previously saved) and untouched: the sidecar
+              // on disk is already exactly this content. A LOCALLY folded
+              // flat (compact_to_flat, flat_file_wm_count == -1) has no
+              // file yet and must fall through to the full write.
+              continue;
             }
             if (arr->sidecar_saved_wm_count == wm_it->second.first &&
                 arr->sidecar_saved_wm_hash == wm_it->second.second) {
@@ -821,6 +826,13 @@ public:
               std::filesystem::remove(sharr_path(fp) + ".d", fec);
               arr->sidecar_saved_wm_count = wm_it->second.first;
               arr->sidecar_saved_wm_hash = wm_it->second.second;
+              // The just-written file IS a valid delta-chain base: future
+              // replacement buckets are absolute per key (merge of the
+              // live layers), so chaining them to this file's watermark is
+              // correct whether `flat` was adopted, locally folded, or
+              // still layered under `packed`.
+              arr->flat_file_wm_count = wm_it->second.first;
+              arr->flat_file_wm_hash = wm_it->second.second;
             }
           }
         }
@@ -1664,6 +1676,7 @@ public:
             table.add_scanned_row(std::move(row));
           });
           table.install_rebuild();
+          fold_fresh_baseline(context, name, table);
           if (was_deferred) {
             deferred_tables_--;
           }
@@ -2364,6 +2377,9 @@ public:
           } else {
             arr->apply(views_.at(req.table)->get_result());
           }
+          // Lever B: initial fill complete — fold the mutable bucket maps
+          // into the flat arena (no probes yet; deltas overlay from here).
+          arr->compact_to_flat();
         }
         arrangements_[req.fingerprint] = arr;
         arrangements_by_table_[req.table].push_back(arr);
@@ -4675,6 +4691,8 @@ private:
         // set_result()'d before calling us, so get_result() is real.
         arr->apply(view_it->second->get_result());
       }
+      // Lever B: same fold as the register-time backfill above.
+      arr->compact_to_flat();
       arr->needs_backfill = false;
     }
   }
@@ -4837,6 +4855,40 @@ private:
   // Speed lever: a pre-counted big table spills BEFORE the scan and, when
   // every column type has a fast path, streams PRE-SERIALIZED rows
   // straight off the chunk vectors — no per-cell Value boxing anywhere.
+  // Lever A (create-path RAM): a freshly scanned SPILLED baseline holds
+  // its whole digest index as a RAM hash map (~100B/row — ~14GB at 144M)
+  // until the first save folds it into the sorted mmap'd sidecar. Fold
+  // and self-adopt IMMEDIATELY after the scan instead: the same fold the
+  // first save would pay (that save then clean-skips), and the map is
+  // freed for the rest of the create. Only called where table content is
+  // COMMIT-STABLE (initial track scan, rebuild refresh) — never from the
+  // mid-statement materialize path, whose SQL watermark could observe
+  // in-flight writes. No-op unless spilled, durable, and not already
+  // flat-mapped. Caller holds the table lock.
+  void fold_fresh_baseline(duckdb::ClientContext &context,
+                           const std::string &table_name, TrackedTable &tt) {
+    if (!tt.spilled() || tt.baseline_flat_mapped()) {
+      return;
+    }
+    try {
+      InternalQueryGuard guard;
+      duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+      auto wm = con.Query(
+          "SELECT COUNT(*), CAST(bit_xor(hash(__dbsp_wm_row)) AS VARCHAR) "
+          "FROM " +
+          quote_table_key(table_name) + " __dbsp_wm_row");
+      if (wm->HasError() || wm->RowCount() != 1) {
+        return;
+      }
+      DbspScopeTimer t("baseline_fold", table_name);
+      tt.save_spill_index(wm->GetValue(0, 0).GetValue<int64_t>(),
+                          wm->GetValue(1, 0).ToString());
+    } catch (...) {
+      // Best-effort: a failed fold just leaves the RAM map in place; the
+      // first save folds it as before.
+    }
+  }
+
   bool sync_table_internal(duckdb::ClientContext &context,
                            const std::string &table_name) {
     auto it = tracked_tables_.find(table_name);
@@ -4874,6 +4926,7 @@ private:
         });
       }
       tt.install_rebuild();
+      fold_fresh_baseline(context, table_name, tt);
       return true;
     } catch (const std::exception &e) {
       (void)e;

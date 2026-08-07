@@ -453,6 +453,12 @@ public:
 
   // Persist the digest index sidecar for a durable spilled baseline
   // (called from save_checkpoint with the just-computed watermark).
+  // True when the spilled baseline serves from an mmap'd flat index (its
+  // RAM digest map is folded away).
+  bool baseline_flat_mapped() const {
+    return spill_ != nullptr && spill_->flat_mapped();
+  }
+
   bool save_spill_index(int64_t wm_count, const std::string &wm_hash) {
     if (spill_ == nullptr || !spill_durable_) {
       return false;

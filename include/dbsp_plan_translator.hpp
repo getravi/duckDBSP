@@ -1673,6 +1673,28 @@ struct SharedArrangement {
     }
   }
 
+  // Lever B (create-path RAM): fold the mutable packed bucket maps into
+  // the immutable flat arena the moment the initial fill completes — the
+  // same two-layer (flat + overlay) shape a sidecar adopt produces, built
+  // locally. The maps cost ~3x the arena (string keys + node overhead,
+  // ~12GB at 144M); the arena is contiguous. Probes already merge
+  // flat+overlay; subsequent deltas land in `packed` as overlay deltas —
+  // exactly the adopt-time invariant. Plain packed arrangements only
+  // (pads/marks/spilled keep their paths); no-op when a flat layer
+  // already exists (folding would need a merge and the overlay is small
+  // then anyway). Callers run at backfill completion, before any
+  // concurrent probes.
+  void compact_to_flat() {
+    if (!packed_ok || track_weights || track_counters || is_spilled() ||
+        packed.empty() || !flat.empty()) {
+      return;
+    }
+    flatpacked::FlatPackedIndex folded;
+    fold_packed(folded);
+    flat = std::move(folded);
+    packed.clear();
+  }
+
   // D3c lazy restore: arrangement was registered over a deferred-baseline
   // table and holds no rows yet. CDCManager backfills it (and clears the
   // flag) when the table's baseline materializes — always before any delta
@@ -1764,7 +1786,9 @@ struct SharedArrangement {
       return;
     }
     spilled = std::make_unique<SpilledBucketIndex>(path);
-    for (const auto &[kb, bucket] : packed) {
+    auto emit_bucket = [&](const std::string &kb,
+                           const std::vector<std::pair<std::string, int64_t>>
+                               &bucket) {
       SpilledBucketIndex::Bucket delta;
       delta.reserve(bucket.size());
       DuckDBRow key;
@@ -1780,6 +1804,37 @@ struct SharedArrangement {
         delta.emplace_back(std::move(vals), w);
       }
       spilled->update(digest_of_row(key), delta);
+    };
+    if (!flat.empty()) {
+      // Rows may live in the immutable flat arena (compact_to_flat or a
+      // sidecar adopt) with `packed` holding only overlay deltas: migrate
+      // the MERGED view of both layers, then drop them.
+      flatpacked::FlatPackedIndex merged;
+      fold_packed(merged);
+      std::vector<std::pair<std::string, int64_t>> bucket;
+      for (const auto &de : merged.dir) {
+        const std::string kb(
+            reinterpret_cast<const char *>(merged.arena.data() + de.key_off),
+            de.key_len);
+        bucket.clear();
+        bucket.reserve(de.bucket_n);
+        for (uint32_t b = 0; b < de.bucket_n; b++) {
+          const auto &be = merged.buckets[de.bucket_off + b];
+          bucket.emplace_back(
+              std::string(reinterpret_cast<const char *>(merged.arena.data() +
+                                                         be.row_off),
+                          be.row_len),
+              be.weight);
+        }
+        emit_bucket(kb, bucket);
+      }
+      flat.clear();
+      flat_file_wm_count = -1; // no flat layer -> no delta-chain base
+      flat_file_wm_hash.clear();
+    } else {
+      for (const auto &[kb, bucket] : packed) {
+        emit_bucket(kb, bucket);
+      }
     }
     packed.clear();
     for (const auto &[key, bucket] : index) {

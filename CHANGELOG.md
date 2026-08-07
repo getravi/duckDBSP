@@ -1,5 +1,23 @@
 # Changelog
 
+## Tier-2 formats on the create path - Aug 2026
+
+- Checkpointable-mode create held its working state in mutable maps until
+  the first save folded them: 39GB footprint at 144M (measured, killed).
+  Baselines now fold+self-adopt into the mmap'd digest sidecar right
+  after their commit-stable initial scan (fold_fresh_baseline), and
+  shared arrangements fold their bucket maps into the flat arena at
+  backfill completion (compact_to_flat) — the same two-layer shape a
+  sidecar adopt produces, built locally.
+- Interplay: enable_spill migrates the merged flat+overlay view (K2 live
+  migration previously walked only the maps); the sidecar save writes a
+  base file for locally folded flats (the old skip assumed flat implies
+  file) and records any full write as a delta-chain base.
+- Measured 18M create end: footprint 4513 -> 2708MB (-40%), parity exact,
+  save 3.1s (folds no longer in it). Projected 144M: ~39GB -> ~14-16GB;
+  remaining resident class is the arrangement arena (~12GB at 144M) —
+  next increment if needed: write+mmap its sidecar at compact time.
+
 ## NTH_VALUE frame-relative + recursive-step shape guard - Aug 2026
 
 - NTH_VALUE: both render call sites (dbsp_window_view.hpp) indexed the
