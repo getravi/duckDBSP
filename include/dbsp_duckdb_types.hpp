@@ -1612,23 +1612,56 @@ public:
       }
 
       DuckDBRow result_row = project_ ? project_(row) : row;
-      result_.insert(result_row, weight);
       delta_.insert(result_row, weight);
     }
+    // result_ is LAZY (same contract as NativeWindowView's): the one
+    // production construction is embedded behind EmbeddedViewNode, which
+    // propagates get_delta() only; the presentation-root ordered read path
+    // (PlannedCircuitView::scan -> ordered_view_->scan) iterates
+    // sorted_rows_, never result_. With a projection, result_ was a full
+    // UNSHARED second copy of every row.
+    result_.clear();
+    result_valid_ = false;
     ++version_;
   }
 
-  const DuckDBZSet &get_result() const override { return result_; }
-  void set_result(const DuckDBZSet &result) override { result_ = result; version_++; }
+  const DuckDBZSet &get_result() const override {
+    if (!result_valid_) {
+      result_.clear();
+      for (const auto &row : sorted_rows_) {
+        result_.insert(project_ ? project_(row) : row, 1);
+      }
+      result_valid_ = true;
+    }
+    return result_;
+  }
+  void set_result(const DuckDBZSet &result) override {
+    result_ = result;
+    result_valid_ = true;
+    version_++;
+  }
   const DuckDBZSet &get_delta() const override { return delta_; }
   const TableSchema &result_schema() const override { return schema_; }
   std::vector<std::string> source_tables() const override {
     return {source_table_};
   }
 
+  // Direct-member accounting: the base impl calls get_result(), which
+  // would materialize the lazy result_ during a RAM-accounting pass. The
+  // resident state is sorted_rows_ (+ delta buffer + whatever result_ a
+  // reader materialized).
+  void account_state(StateBytes &out, StateAccounting &acct) const override {
+    out.result += acct.zset_bytes(result_);
+    out.other += acct.zset_bytes(delta_);
+    for (const auto &row : sorted_rows_) {
+      out.other += acct.row_bytes(row) + 32;
+    }
+  }
+
   void reset() override {
     sorted_rows_.clear();
     result_.clear();
+    result_valid_ = true; // empty view: empty result is correct
     delta_.clear();
     version_ = 0;
   }
@@ -1704,7 +1737,8 @@ private:
   RowComparator comparator_;
   std::multiset<DuckDBRow, RowComparator> sorted_rows_;
   ProjectFn project_;
-  DuckDBZSet result_;
+  mutable DuckDBZSet result_; // lazy — see apply_changes/get_result
+  mutable bool result_valid_ = true;
   DuckDBZSet delta_;
 };
 

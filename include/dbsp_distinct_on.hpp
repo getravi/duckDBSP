@@ -77,11 +77,9 @@ public:
 
       if (changed) {
         if (old_first.has_value()) {
-          result_.insert(old_first.value(), -1);
           delta_.insert(old_first.value(), -1);
         }
         if (new_first.has_value()) {
-          result_.insert(new_first.value(), 1);
           delta_.insert(new_first.value(), 1);
         }
       }
@@ -90,20 +88,56 @@ public:
         partitions_.erase(partition_key);
       }
     }
+    // result_ is LAZY (same contract as NativeWindowView's): the one
+    // production construction is embedded behind EmbeddedViewNode, which
+    // propagates get_delta() only. Content is by definition each
+    // partition's first row; get_result() rebuilds that on demand.
+    result_.clear();
+    result_valid_ = false;
     ++version_;
   }
 
-  const DuckDBZSet &get_result() const override { return result_; }
-  void set_result(const DuckDBZSet &result) override { result_ = result; version_++; }
+  const DuckDBZSet &get_result() const override {
+    if (!result_valid_) {
+      result_.clear();
+      for (const auto &[key, partition] : partitions_.data) {
+        (void)key;
+        if (!partition.rows.empty()) {
+          result_.insert(*partition.rows.begin(), 1);
+        }
+      }
+      result_valid_ = true;
+    }
+    return result_;
+  }
+  void set_result(const DuckDBZSet &result) override {
+    result_ = result;
+    result_valid_ = true;
+    version_++;
+  }
   const DuckDBZSet &get_delta() const override { return delta_; }
   const TableSchema &result_schema() const override { return schema_; }
   std::vector<std::string> source_tables() const override {
     return {source_table_};
   }
 
+  // Direct-member accounting: the base impl calls get_result(), which
+  // would materialize the lazy result_ during a RAM-accounting pass.
+  void account_state(StateBytes &out, StateAccounting &acct) const override {
+    out.result += acct.zset_bytes(result_);
+    out.other += acct.zset_bytes(delta_);
+    for (const auto &[key, partition] : partitions_.data) {
+      out.other += acct.row_bytes(key) + 32;
+      for (const auto &row : partition.rows) {
+        out.other += acct.row_bytes(row) + 32;
+      }
+    }
+  }
+
   void reset() override {
     partitions_.clear();
     result_.clear();
+    result_valid_ = true; // empty view: empty result is correct
     delta_.clear();
     version_ = 0;
   }
@@ -192,7 +226,8 @@ private:
   };
 
   PartitionMap partitions_{RowComparator(sort_columns_)};
-  DuckDBZSet result_;
+  mutable DuckDBZSet result_; // lazy — see apply_changes/get_result
+  mutable bool result_valid_ = true;
   DuckDBZSet delta_;
 };
 

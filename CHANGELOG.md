@@ -1,5 +1,26 @@
 # Changelog
 
+## Lazy result_ on NativeSortView / NativeDistinctOnView - Aug 2026
+
+- Same write-only finding (and same fix) as the window view: both are
+  constructed only embedded behind EmbeddedViewNode, which propagates
+  get_delta() only, and the presentation-root ordered read path
+  (PlannedCircuitView::scan -> ordered_view_->scan) iterates sorted_rows_,
+  never result_. Their result_ Z-sets are now lazy caches rebuilt on
+  get_result(); apply_changes invalidates and clears. For a sort view with
+  a projection this removes a full UNSHARED second copy of every row; for
+  distinct-on it removes one zset entry per partition plus the per-edit
+  first-row maintenance ops.
+- Both gained direct-member account_state overrides: the base impl calls
+  get_result() (would materialize the lazy zset during RAM accounting),
+  and neither view previously accounted its real backing structure at all
+  (sorted_rows_ / partition multisets were invisible whenever their
+  payloads weren't shared with result_) — they are now counted under
+  StateBytes::other.
+- NativeLimitView deliberately unchanged: its result_ is the diff base for
+  delta computation (delta_ = new_result + (-result_)) — load-bearing, and
+  bounded at offset+limit rows anyway.
+
 ## Lazy result_ on NativeWindowView - Aug 2026
 
 - The embedded window view's result_ Z-set was write-only in production:
