@@ -1,5 +1,33 @@
 # Changelog
 
+## Hot-path micro-costs + mapped-index serialize fix - Aug 2026
+
+- FlatWeightMap::clear() releases its slot vector + open-addressing index
+  when capacity exceeds 64k entries (was: capacity retained forever, so
+  every node's transient output buffer pinned its PEAK delta footprint —
+  one initial-population fan left ~40B/slot resident per node for the
+  view's lifetime). Small maps keep capacity; steady 1-cell edits still
+  never realloc. Note the old trim_outputs comment's "11.4GB reclaimed"
+  was the row PAYLOADS (Slot destructors); the backing arrays were not
+  reclaimed until this change.
+- Fix (latent data-loss class): PlanJoinNode::probe_packed and its
+  serialize_state write_pindex read the flat index through the
+  mapped-aware accessors (dir_size/dir_at/bucket_at/arena_data) instead
+  of the owned vectors, which are EMPTY for an mmap-adopted sidecar —
+  a mapped join index would have probed nothing and checkpointed as an
+  empty index. Not reachable today (join flats are only built from owned
+  reads) but one adopt-path change away from silent data loss.
+- classify() short-circuits unambiguous SELECT/EXPLAIN heads before
+  constructing a Parser: with auto-sync on, every statement paid a full
+  ParseQuery — read-heavy workloads parsed each SELECT twice. "WITH"
+  deliberately still parses (data-modifying CTEs); PRAGMA still parses.
+- integrate_packed's per-row std::getenv("DBSP_PACKED_DEBUG") is a
+  static; SharedArrangement::apply hoists its two encode scratch strings
+  out of the per-row loop (2 malloc/free per delta row); DbspScopeTimer
+  skips the clock read and drops the detail string in its ctor when
+  timing is off (call sites build "name rows=N" strings per view per
+  commit purely for the timer).
+
 ## First-edit page-in + bulk-ingest: measured, bounded, documented - Aug 2026
 
 - 144M first-edit-after-reopen (176s one-time, cold page cache):

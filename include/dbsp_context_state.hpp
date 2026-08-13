@@ -610,6 +610,23 @@ private:
           out.kind = StmtClass::READ;
           return out;
         }
+        // Plain reads skip the full parse: with auto-sync on, classify runs
+        // on EVERY statement, and constructing a Parser + ParseQuery for
+        // each SELECT taxed read-heavy workloads. Only unambiguous read
+        // heads short-circuit — "with" is excluded (data-modifying CTEs),
+        // "pragma" can write settings; everything else still parses.
+        const auto head_kw = [&head](const char *kw, size_t n) {
+          if (head.rfind(kw, 0) != 0) {
+            return false;
+          }
+          return head.size() == n ||
+                 !(std::isalnum(static_cast<unsigned char>(head[n])) ||
+                   head[n] == '_');
+        };
+        if (head_kw("select", 6) || head_kw("explain", 7)) {
+          out.kind = StmtClass::READ;
+          return out;
+        }
       }
     }
     duckdb::Parser parser;

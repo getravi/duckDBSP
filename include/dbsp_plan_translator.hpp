@@ -2072,6 +2072,9 @@ struct SharedArrangement {
     // merge per touched key (updates run pre-views, single-threaded)
     std::unordered_map<RowDigest, SpilledBucketIndex::Bucket, RowDigestHash>
         spill_batch;
+    std::string kb, rb; // hoisted: encode_row clears; a fresh pair per row
+                        // was two malloc/free per delta row (same fix as
+                        // integrate_packed's hoist)
     for (size_t i = 0; i < rows.size(); i++) {
       const DuckDBRow &row = *rows[i];
       const int64_t w = ws[i];
@@ -2101,7 +2104,6 @@ struct SharedArrangement {
         continue;
       }
       if (packed_ok) {
-        std::string kb, rb;
         if (!packed::encode_row(kb, keys[i]) ||
             !packed::encode_row(rb, row)) {
           throw std::runtime_error("packed arrangement: unencodable row");
@@ -3186,32 +3188,36 @@ public:
             overlay_only.push_back(&kv);
           }
         }
-        // First pass counts live keys.
+        // First pass counts live keys. All reads go through the
+        // mapped-aware accessors (dir_size/dir_at/bucket_at/arena_data):
+        // the owned `dir` vector is EMPTY for an mmap-adopted sidecar, and
+        // reading it directly would silently serialize an empty index.
         uint64_t live = 0;
-        std::vector<PackedBucket> flat_merged(flat.dir.size());
-        for (size_t i = 0; i < flat.dir.size(); i++) {
-          const auto &de = flat.dir[i];
+        const uint8_t *arena_base = flat.arena_data();
+        std::vector<PackedBucket> flat_merged(flat.dir_size());
+        for (size_t i = 0; i < flat.dir_size(); i++) {
+          const auto &de = flat.dir_at(i);
           const std::string kb(
-              reinterpret_cast<const char *>(flat.arena.data() + de.key_off),
+              reinterpret_cast<const char *>(arena_base + de.key_off),
               de.key_len);
           PackedBucket &bucket = flat_merged[i];
           auto ov = idx.find(kb);
           if (ov == idx.end()) {
             bucket.reserve(de.bucket_n);
             for (uint32_t b = 0; b < de.bucket_n; b++) {
-              const auto &be = flat.buckets[de.bucket_off + b];
+              const auto &be = flat.bucket_at(de.bucket_off + b);
               bucket.emplace_back(
-                  std::string(reinterpret_cast<const char *>(
-                                  flat.arena.data() + be.row_off),
-                              be.row_len),
+                  std::string(
+                      reinterpret_cast<const char *>(arena_base + be.row_off),
+                      be.row_len),
                   be.weight);
             }
           } else {
             std::unordered_map<std::string, int64_t> m;
             for (uint32_t b = 0; b < de.bucket_n; b++) {
-              const auto &be = flat.buckets[de.bucket_off + b];
+              const auto &be = flat.bucket_at(de.bucket_off + b);
               m.emplace(std::string(reinterpret_cast<const char *>(
-                                        flat.arena.data() + be.row_off),
+                                        arena_base + be.row_off),
                                     be.row_len),
                         be.weight);
             }
@@ -3234,12 +3240,12 @@ public:
           }
         }
         w.u64(live);
-        for (size_t i = 0; i < flat.dir.size(); i++) {
+        for (size_t i = 0; i < flat.dir_size(); i++) {
           if (flat_merged[i].empty()) {
             continue;
           }
-          const auto &de = flat.dir[i];
-          w.bytes(flat.arena.data() + de.key_off, de.key_len);
+          const auto &de = flat.dir_at(i);
+          w.bytes(arena_base + de.key_off, de.key_len);
           w.u64(flat_merged[i].size());
           for (const auto &[rb, weight] : flat_merged[i]) {
             w.bytes(reinterpret_cast<const uint8_t *>(rb.data()), rb.size());
@@ -3519,7 +3525,10 @@ private:
       if (!packed::encode_row(kb, dk.keys[i])) {
         throw std::runtime_error("packed join index: unencodable key");
       }
-      if (std::getenv("DBSP_PACKED_DEBUG") != nullptr) {
+      // static: getenv scans environ (with a lock in some libcs) — this sat
+      // inside the per-row integrate loop.
+      static const bool packed_debug = std::getenv("DBSP_PACKED_DEBUG") != nullptr;
+      if (packed_debug) {
         fprintf(stderr, "[packed] integrate side=%s klen=%zu k0=%02x%02x%02x w=%lld\n",
                 left ? "L" : "R", kb.size(), (unsigned char)kb[0],
                 (unsigned char)kb[4], kb.size() > 5 ? (unsigned char)kb[5] : 0,
@@ -3564,11 +3573,12 @@ private:
     // cases are flat-only (post-restore reads) and overlay-only (models
     // built this session), both of which skip the merge map.
     if (fe != nullptr && it == idx.end()) {
+      // Mapped-aware accessors, not the owned vectors — see write_pindex.
       for (uint32_t b = 0; b < fe->bucket_n; b++) {
-        const auto &be = flat.buckets[fe->bucket_off + b];
+        const auto &be = flat.bucket_at(fe->bucket_off + b);
         DuckDBRow row;
         std::string bytes(
-            reinterpret_cast<const char *>(flat.arena.data() + be.row_off),
+            reinterpret_cast<const char *>(flat.arena_data() + be.row_off),
             be.row_len);
         packed::decode_row(bytes, row);
         out.emplace(std::move(row), be.weight);
@@ -3588,10 +3598,10 @@ private:
     }
     std::unordered_map<std::string, int64_t> merged;
     for (uint32_t b = 0; b < fe->bucket_n; b++) {
-      const auto &be = flat.buckets[fe->bucket_off + b];
+      const auto &be = flat.bucket_at(fe->bucket_off + b);
       merged.emplace(
           std::string(
-              reinterpret_cast<const char *>(flat.arena.data() + be.row_off),
+              reinterpret_cast<const char *>(flat.arena_data() + be.row_off),
               be.row_len),
           be.weight);
     }

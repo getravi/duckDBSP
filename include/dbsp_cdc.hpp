@@ -72,9 +72,15 @@ struct DbspScopeTimer {
   const char *phase;
   std::string detail;
   std::chrono::steady_clock::time_point t0;
-  DbspScopeTimer(const char *phase_p, std::string detail_p)
-      : phase(phase_p), detail(std::move(detail_p)),
-        t0(std::chrono::steady_clock::now()) {}
+  // Timing off (the default): skip the clock read and drop the detail
+  // string immediately — several call sites build "name rows=N" strings
+  // per view per commit purely for this ctor.
+  DbspScopeTimer(const char *phase_p, std::string detail_p) : phase(phase_p) {
+    if (dbsp_timing_enabled()) {
+      detail = std::move(detail_p);
+      t0 = std::chrono::steady_clock::now();
+    }
+  }
   ~DbspScopeTimer() {
     if (!dbsp_timing_enabled()) {
       return;

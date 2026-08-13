@@ -53,6 +53,20 @@ public:
     bool empty() const { return entries_.empty(); }
 
     void clear() {
+        // Row payloads are freed either way (Slot destructors run). Above
+        // the threshold, release the slot vector + index too: transient
+        // delta buffers (node outputs, sink copies) otherwise retain their
+        // PEAK capacity (~40B/slot) for the node's lifetime — one big
+        // initial-population fan pinned that high-water forever. Small maps
+        // keep their capacity so steady 1-cell edits never realloc.
+        if (entries_.capacity() > kShrinkCapacity) {
+            std::vector<Slot>().swap(entries_);
+            std::vector<IndexSlot>().swap(index_);
+            capacity_ = 0;
+            mask_ = 0;
+            generation_ = 1;
+            return;
+        }
         entries_.clear(); // keeps capacity
         generation_++;    // O(1): every index slot becomes stale
     }
@@ -118,6 +132,10 @@ public:
     }
 
 private:
+    // 64k slots ~= 2.5MB of Slot+IndexSlot backing per map — the point where
+    // retained-peak capacity starts to matter across hundreds of nodes.
+    static constexpr size_t kShrinkCapacity = 65536;
+
     struct IndexSlot {
         size_t pos = 0;
         uint64_t gen = 0; // matches generation_ when live
