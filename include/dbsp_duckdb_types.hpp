@@ -558,8 +558,20 @@ public:
     spill_.reset();
   }
 
+  // ---- checkpoint-watermark cache (see fields below) -------------------
+  bool wm_begin_scan() { return wm_dirty_.exchange(false); }
+  void wm_store(int64_t count, std::string hash) {
+    wm_count_ = count;
+    wm_hash_ = std::move(hash);
+  }
+  bool wm_clean() const { return !wm_dirty_.load(); }
+  int64_t wm_count() const { return wm_count_; }
+  const std::string &wm_hash() const { return wm_hash_; }
+  void wm_mark_dirty() { wm_dirty_.store(true); }
+
   // Apply changes
   void insert(const DuckDBRow &row) {
+    wm_mark_dirty();
     maybe_auto_spill();
     if (spill_) {
       spill_->apply_row(row_values(row), 1);
@@ -570,6 +582,7 @@ public:
   }
 
   void remove(const DuckDBRow &row) {
+    wm_mark_dirty();
     if (spill_) {
       spill_->apply_row(row_values(row), -1);
     } else {
@@ -579,6 +592,7 @@ public:
   }
 
   void update(const DuckDBRow &old_row, const DuckDBRow &new_row) {
+    wm_mark_dirty();
     if (spill_) {
       spill_->apply_row(row_values(old_row), -1);
       spill_->apply_row(row_values(new_row), 1);
@@ -594,6 +608,7 @@ public:
   // sync: the delta is propagated by the caller, so pending_changes_ is
   // not involved)
   void apply_delta(const DuckDBZSet &delta) {
+    wm_mark_dirty();
     maybe_auto_spill();
     for (const auto &[row, w] : delta) {
       if (spill_) {
@@ -611,6 +626,7 @@ public:
   // swaps the new baseline in.
 
   void begin_rebuild() {
+    wm_mark_dirty();
     if (spill_) {
       spill_->begin_rebuild();
     } else {
@@ -833,6 +849,14 @@ private:
   std::string spill_path_hint_; // set by CDCManager; empty = no auto-spill
   bool spill_durable_ = false;  // files survive process exit (per-DB dir)
   uint64_t sequence_;
+  // Checkpoint-watermark cache (save_checkpoint): starts dirty; every
+  // content mutation re-dirties. wm_begin_scan() uses exchange so a write
+  // racing the save's scan re-dirties AFTER the exchange and the next
+  // save rescans — a stale cached watermark can only ever cause a
+  // load-side mismatch (safe rebuild), never a wrong adopt.
+  std::atomic<bool> wm_dirty_{true};
+  int64_t wm_count_ = 0;
+  std::string wm_hash_;
   // Deferred baseline (D3c): true until the first operation that needs
   // table state materializes it from a storage scan.
   bool deferred_ = false;

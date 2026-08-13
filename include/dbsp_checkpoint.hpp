@@ -99,17 +99,15 @@ public:
   void i64(int64_t v) { raw(&v, sizeof(v)); }
   void f64(double v) { raw(&v, sizeof(v)); }
 
-  // Accepts std::vector<Value> or DuckDBRow's ColumnVec (index/size API)
+  // Accepts std::vector<Value> or DuckDBRow's ColumnVec (index/size API).
+  // Serializes straight from the container (no vector<Value> copy) into a
+  // member scratch buffer: a checkpoint serializes every row of every
+  // view, and the per-row copy + two heap allocations dominated
+  // ckpt_serialize.
   template <typename Container> void row(const Container &values) {
-    std::vector<duckdb::Value> vals;
-    vals.reserve(values.size());
-    for (size_t i = 0; i < values.size(); i++) {
-      vals.push_back(values[i]);
-    }
-    std::vector<uint8_t> tmp;
-    serialize_row(vals, tmp);
-    u64(tmp.size());
-    raw(tmp.data(), tmp.size());
+    serialize_row(values, row_tmp_);
+    u64(row_tmp_.size());
+    raw(row_tmp_.data(), row_tmp_.size());
   }
 
   // Length-prefixed opaque bytes (packed join-index blobs, Phase 2d).
@@ -120,12 +118,17 @@ public:
 
   std::vector<uint8_t> take() { return std::move(bytes_); }
 
+  // Callers with a known result size can pre-reserve to avoid the
+  // insert-driven doubling reallocs (each one copies the whole blob).
+  void reserve(size_t n) { bytes_.reserve(n); }
+
 private:
   void raw(const void *p, size_t n) {
     const auto *b = static_cast<const uint8_t *>(p);
     bytes_.insert(bytes_.end(), b, b + n);
   }
   std::vector<uint8_t> bytes_;
+  std::vector<uint8_t> row_tmp_;
 };
 
 // Row hash matching ColumnVec::hash()/fold_vector_hashes bit-for-bit, computed

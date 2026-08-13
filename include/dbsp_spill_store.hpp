@@ -110,13 +110,18 @@ template <typename T> inline T get_raw(const uint8_t *&p) {
 }
 } // namespace rowcodec
 
-inline void serialize_row(const std::vector<duckdb::Value> &row,
-                          std::vector<uint8_t> &out) {
+// Template over any indexable Value container (std::vector<Value>,
+// DuckDBRow's ColumnVec — index/size API, no iterators required). The
+// checkpoint writer serializes every row of every view; copying each row
+// into a vector<Value> first was pure refcount churn.
+template <typename RowT>
+inline void serialize_row(const RowT &row, std::vector<uint8_t> &out) {
   using namespace rowcodec;
   out.clear();
   const uint32_t n = static_cast<uint32_t>(row.size());
   put_raw(out, n);
-  for (const auto &v : row) {
+  for (uint32_t ri = 0; ri < n; ri++) {
+    const duckdb::Value &v = row[ri];
     const auto id = v.type().id();
     if (v.IsNull()) {
       switch (id) {

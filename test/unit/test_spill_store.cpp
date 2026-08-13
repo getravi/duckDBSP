@@ -49,9 +49,11 @@ TEST_CASE("spill: row codec round-trips typed values", "[unit][spill]") {
 
 TEST_CASE("spill: digest distinguishes rows, is stable", "[unit][spill]") {
   std::vector<uint8_t> a, b, a2;
-  serialize_row({Value::INTEGER(1), Value("x")}, a);
-  serialize_row({Value::INTEGER(2), Value("x")}, b);
-  serialize_row({Value::INTEGER(1), Value("x")}, a2);
+  // Explicit vectors: serialize_row is a template now (indexable-container
+  // API), and a braced init-list cannot deduce its row parameter.
+  serialize_row(std::vector<Value>{Value::INTEGER(1), Value("x")}, a);
+  serialize_row(std::vector<Value>{Value::INTEGER(2), Value("x")}, b);
+  serialize_row(std::vector<Value>{Value::INTEGER(1), Value("x")}, a2);
   REQUIRE(digest_bytes(a.data(), a.size()) ==
           digest_bytes(a2.data(), a2.size()));
   REQUIRE_FALSE(digest_bytes(a.data(), a.size()) ==
@@ -191,7 +193,7 @@ TEST_CASE("spill: property test vs in-memory oracle", "[unit][spill]") {
 namespace {
 RowDigest key_digest_of(int k) {
   std::vector<uint8_t> bytes;
-  serialize_row({Value::INTEGER(k)}, bytes);
+  serialize_row(std::vector<Value>{Value::INTEGER(k)}, bytes);
   return digest_bytes(bytes.data(), bytes.size());
 }
 } // namespace

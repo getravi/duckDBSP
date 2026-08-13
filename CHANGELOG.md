@@ -1,5 +1,22 @@
 # Changelog
 
+## Checkpoint-watermark cache + serialize scratch reuse - Aug 2026
+
+- save_checkpoint skips the O(rows) COUNT+bit_xor(hash) scan for tracked
+  tables whose content is unchanged since their last scan. TrackedTable
+  re-dirties on every mutation (insert/remove/update/apply_delta/
+  begin_rebuild); wm_begin_scan()'s exchange means a write racing the scan
+  re-dirties for the NEXT save, so a stale cache can only produce a
+  load-side watermark mismatch (safe rebuild), never a wrong adopt.
+  Benefits long-session periodic autopersists (typical: 1-3 of 25 tables
+  dirty per interval); a session's FIRST save still scans everything, so
+  single-save closes are unchanged.
+- serialize_row is a template over any indexable Value container;
+  BlobWriter::row serializes straight from ColumnVec into member scratch
+  buffers (was: a vector<Value> copy + two heap allocations per row).
+  Measured neutral on ckpt_serialize at wfp scale — the remaining 5-6s is
+  not per-row allocation; profiling it is an open item.
+
 ## Hot-path micro-costs + mapped-index serialize fix - Aug 2026
 
 - FlatWeightMap::clear() releases its slot vector + open-addressing index

@@ -726,28 +726,59 @@ public:
       std::unordered_map<std::string, std::pair<int64_t, std::string>>
           saved_wms;
       DbspScopeTimer t_wm("ckpt_watermarks", std::to_string(table_names.size()) + " tables");
+      // Shared: only reads the tracked_tables_ map shape + per-table atomic
+      // flags; scoped so it releases before the post-COMMIT block takes the
+      // same mutex (same-thread recursive shared locking is UB).
+      {
+      std::shared_lock<std::shared_mutex> wm_struct_lock(struct_mutex_);
       for (const auto &t : table_names) {
-        // Alias must not be shadowable by a same-named column: `hash(x)`
-        // resolves to the COLUMN x when one exists, silently hashing a
-        // single column instead of the row and blinding the watermark to
-        // every other column's updates.
-        auto wm = con.Query("SELECT COUNT(*), CAST(bit_xor(hash("
-                            "__dbsp_wm_row)) AS VARCHAR) FROM " +
-                            quote_table_key(t) + " __dbsp_wm_row");
-        if (wm->HasError() || wm->RowCount() != 1) {
-          con.Query("ROLLBACK");
-          last_error_ = "checkpoint watermark failed for " + t;
-          return false;
+        // Skip the O(rows) scan for tables whose content has not changed
+        // since their last scan: TrackedTable re-dirties on every content
+        // mutation, and wm_begin_scan()'s exchange means a write racing
+        // this scan re-dirties for the NEXT save. A stale cache can only
+        // produce a load-side mismatch (safe rebuild), never a wrong adopt.
+        TrackedTable *tt = nullptr;
+        {
+          auto tt_it = tracked_tables_.find(t);
+          if (tt_it != tracked_tables_.end()) {
+            tt = tt_it->second.get();
+          }
         }
-        auto r = insm->Execute(t, wm->GetValue(0, 0),
-                               wm->GetValue(1, 0).ToString());
+        int64_t wm_count = 0;
+        std::string wm_hash;
+        if (tt != nullptr && tt->wm_clean() && !tt->wm_hash().empty()) {
+          wm_count = tt->wm_count();
+          wm_hash = tt->wm_hash();
+        } else {
+          if (tt != nullptr) {
+            tt->wm_begin_scan();
+          }
+          // Alias must not be shadowable by a same-named column: `hash(x)`
+          // resolves to the COLUMN x when one exists, silently hashing a
+          // single column instead of the row and blinding the watermark to
+          // every other column's updates.
+          auto wm = con.Query("SELECT COUNT(*), CAST(bit_xor(hash("
+                              "__dbsp_wm_row)) AS VARCHAR) FROM " +
+                              quote_table_key(t) + " __dbsp_wm_row");
+          if (wm->HasError() || wm->RowCount() != 1) {
+            con.Query("ROLLBACK");
+            last_error_ = "checkpoint watermark failed for " + t;
+            return false;
+          }
+          wm_count = wm->GetValue(0, 0).GetValue<int64_t>();
+          wm_hash = wm->GetValue(1, 0).ToString();
+          if (tt != nullptr) {
+            tt->wm_store(wm_count, wm_hash);
+          }
+        }
+        auto r = insm->Execute(t, duckdb::Value::BIGINT(wm_count), wm_hash);
         if (r->HasError()) {
           con.Query("ROLLBACK");
           last_error_ = r->GetError();
           return false;
         }
-        saved_wms[t] = {wm->GetValue(0, 0).GetValue<int64_t>(),
-                        wm->GetValue(1, 0).ToString()};
+        saved_wms[t] = {wm_count, wm_hash};
+      }
       }
       con.Query("COMMIT");
       last_ckpt_saved_count_ = view_blobs.size();
