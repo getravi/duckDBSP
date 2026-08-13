@@ -75,3 +75,73 @@ TEST_CASE("bench: window single-row update is O(affected), not O(partition)",
   // O(partition) would be ~100x; O(affected) stays near-flat. Allow 10x slack.
   REQUIRE(big < small * 10.0);
 }
+
+// Partition-state footprint and teardown cost — the two axes the packed-row
+// storage targets. Reports accounted window bytes, checkpoint serialize time,
+// and destruction time for a view holding many mid-size partitions (the wfp
+// shape: one partition per entity, ordered periods within).
+TEST_CASE("bench: window state footprint / serialize / teardown",
+          "[window_bench]") {
+  constexpr int kParts = 500, kRows = 400; // 200k rows total
+  auto v = std::make_unique<NativeWindowView>(
+      "b", "", "t", TableSchema{}, TableSchema{}, [] {
+        NativeWindowView::WindowDef w;
+        w.function = "LAG";
+        w.partition_indices = {0};
+        w.sort_columns = {{1, true, true}};
+        w.arg_column_idx = 2;
+        w.offset = 1;
+        return std::vector<NativeWindowView::WindowDef>{w};
+      }());
+  {
+    // Scoped so the input delta dies before teardown is timed — in
+    // production the commit's delta Z-set is long gone by close, so the
+    // partition stores are the last owners of their rows.
+    DuckDBZSet init;
+    for (int p = 0; p < kParts; p++)
+      for (int o = 0; o < kRows; o++)
+        init.insert(row3(p, o, o), 1);
+    v->apply_changes("t", init);
+    v->drop_delta();
+  }
+
+  StateBytes sb;
+  StateAccounting acct;
+  v->account_state(sb, acct);
+
+  auto t0 = high_resolution_clock::now();
+  std::vector<uint8_t> blob;
+  v->serialize_circuit_node_state(blob);
+  double ser_ms =
+      duration_cast<microseconds>(high_resolution_clock::now() - t0).count() /
+      1000.0;
+
+  NativeWindowView restored("b", "", "t", TableSchema{}, TableSchema{}, [] {
+    NativeWindowView::WindowDef w;
+    w.function = "LAG";
+    w.partition_indices = {0};
+    w.sort_columns = {{1, true, true}};
+    w.arg_column_idx = 2;
+    w.offset = 1;
+    return std::vector<NativeWindowView::WindowDef>{w};
+  }());
+  t0 = high_resolution_clock::now();
+  REQUIRE(restored.restore_circuit_node_state(blob.data(), blob.size()));
+  double restore_ms =
+      duration_cast<microseconds>(high_resolution_clock::now() - t0).count() /
+      1000.0;
+  REQUIRE(restored.get_result().size() == v->get_result().size());
+
+  t0 = high_resolution_clock::now();
+  v.reset(); // destroy the view: partition state + caches + result
+  double destroy_ms =
+      duration_cast<microseconds>(high_resolution_clock::now() - t0).count() /
+      1000.0;
+
+  std::cout << "[bench] window state 200k rows: window_bytes=" << sb.window
+            << " blob_bytes=" << blob.size() << " serialize_ms=" << ser_ms
+            << " restore_ms=" << restore_ms << " destroy_ms=" << destroy_ms
+            << "\n";
+  REQUIRE(sb.window > 0);
+  REQUIRE(!blob.empty());
+}

@@ -494,6 +494,15 @@ State after:
   partition's ordered source rows plus its rendered-output cache
   (`partitions_`/`partition_outputs_`), sized however that partition
   currently is — watermarked by source COUNT + bit_xor(hash(row)).
+  Window partition rows live PACKED at rest (`dbsp_window_rows.hpp`):
+  each store is one byte arena + positional slot directory using the
+  join-index codec (`dbsp_packed_row.hpp`), with binary searches
+  comparing sort columns straight from the packed bytes and render
+  passes memoizing full-row decodes; codec-unsupported types flip that
+  store to boxed rows transparently. Packed window checkpoint blobs are
+  bulk byte copies (in-blob `kWindowPackedMagic` marker); legacy
+  row-by-row blobs remain readable and re-encode on restore, while a
+  boxed-fallback store still writes the legacy layout.
   `EmbeddedViewNode` reports whatever its wrapped view reports
   (`NativeMaterializedView::circuit_state_kind()`), so a `NativeSortView`/
   `NativeLimitView`/`NativeDistinctOnView` behind the same wrapper (the

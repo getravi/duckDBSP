@@ -1,5 +1,28 @@
 # Changelog
 
+## Packed window partition rows - Aug 2026
+
+- NativeWindowView partition state (ordered source rows + rendered-output
+  cache) moved off boxed vector<DuckDBRow> onto WindowRowStore
+  (dbsp_window_rows.hpp): one packed byte arena + positional slot directory
+  per store, reusing the join-index row codec. Binary searches compare sort
+  columns straight from packed bytes (typed fast lanes, NaN follows DuckDB
+  total order); render paths memoize decodes via WindowRowsView (sparse for
+  O(affected) fast paths, dense for full re-renders); overwrites append with
+  ratio-gated arena compaction. Rows the codec can't represent flip that
+  store to boxed transparently — correctness never depends on coverage.
+- Measured at 200k rows (500 partitions x 400, LAG): accounted window state
+  62.4MB -> 20.5MB, checkpoint serialize 17.0ms -> 6.4ms, restore 51ms ->
+  42ms, teardown 18.6ms -> 11.8ms (residual teardown/restore = the boxed
+  result_ Z-set, shared with every view type). Single-update fast path
+  stays flat and within noise of boxed (6.2us @1k, 4.5us @100k vs 8.5/4.1).
+- Window checkpoint blobs now write a packed layout (in-blob
+  kWindowPackedMagic; slot lens + concatenated row bytes, bulk copy both
+  directions). Legacy row-by-row blobs restore unchanged (re-encoded on
+  push); a store on the boxed fallback still writes the legacy layout. An
+  old reader hitting a packed blob fails restore -> rebuild-by-replay, the
+  standard degradation.
+
 ## Checkpoint-watermark cache + serialize scratch reuse - Aug 2026
 
 - save_checkpoint skips the O(rows) COUNT+bit_xor(hash) scan for tracked
