@@ -130,7 +130,10 @@ TEST_CASE("bench: window state footprint / serialize / teardown",
   double restore_ms =
       duration_cast<microseconds>(high_resolution_clock::now() - t0).count() /
       1000.0;
-  REQUIRE(restored.get_result().size() == v->get_result().size());
+  // Compare against the known row count, NOT v->get_result(): reading v's
+  // result would materialize its lazy result_ right before the teardown
+  // timing below, which production close never does.
+  REQUIRE(restored.get_result().size() == (size_t)kParts * kRows);
 
   t0 = high_resolution_clock::now();
   v.reset(); // destroy the view: partition state + caches + result

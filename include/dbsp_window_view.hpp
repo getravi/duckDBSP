@@ -50,10 +50,23 @@ private:
   // partition, so individual rows can be retracted/re-emitted (fast paths).
   std::map<PartitionKey, RowStore> partition_outputs_;
 
-  // Output state
-  DuckDBZSet result_;
+  // Output state. result_ is LAZY: on the one production construction
+  // (embedded behind EmbeddedViewNode, the WINDOW plan shape) nothing ever
+  // reads get_result() — the node propagates get_delta() only — so
+  // apply_changes doesn't maintain it. Invariant: result_valid_ implies
+  // result_ == the multiset union of every partition's output cache;
+  // get_result() rebuilds from partition_outputs_ on demand (tests,
+  // scan()). Invalidation clears the zset so an unread result_ never
+  // holds RAM.
+  mutable DuckDBZSet result_;
+  mutable bool result_valid_ = true; // empty view: empty result is correct
   DuckDBZSet delta_;
   TableSchema result_schema_;
+
+  void invalidate_result() {
+    result_.clear();
+    result_valid_ = false;
+  }
 
   // Render the full output row (source columns + every window column) for one
   // ordered index. Ranking scalars (row_number/rank/dense_rank) are passed in
@@ -414,11 +427,9 @@ private:
         continue;
       const DuckDBRow old = cache.row_at(idx); // hash-seeded decode
       delta_.insert(old, -1);
-      result_.insert(old, -1);
       DuckDBRow nr = render_row(rows, idx, kNoPeers, kNoPeers,
                                (int64_t)idx + 1, 0, 0);
       delta_.insert(nr, 1);
-      result_.insert(nr, 1);
       cache.overwrite_at(idx, nr);
     }
   }
@@ -437,15 +448,35 @@ public:
   }
 
   // Implement required abstract methods
-  const DuckDBZSet &get_result() const override { return result_; }
-  void set_result(const DuckDBZSet &result) override { result_ = result; version_++; }
+  const DuckDBZSet &get_result() const override {
+    if (!result_valid_) {
+      result_.clear();
+      for (const auto &[key, cache] : partition_outputs_) {
+        (void)key;
+        for (size_t j = 0; j < cache.size(); j++) {
+          result_.insert(cache.row_at(j), 1);
+        }
+      }
+      result_valid_ = true;
+    }
+    return result_;
+  }
+  void set_result(const DuckDBZSet &result) override {
+    result_ = result;
+    result_valid_ = true;
+    version_++;
+  }
   const DuckDBZSet &get_delta() const override { return delta_; }
   const TableSchema &result_schema() const override { return result_schema_; }
 
   void drop_delta() override { delta_.clear(); }
 
   void account_state(StateBytes &out, StateAccounting &acct) const override {
-    NativeMaterializedView::account_state(out, acct); // result + delta
+    // NOT the base impl: that calls get_result(), which would MATERIALIZE
+    // the lazy result_ during a RAM-accounting pass and pin it. Account
+    // only what is actually resident (result_ is empty whenever invalid).
+    out.result += acct.zset_bytes(result_);
+    out.other += acct.zset_bytes(delta_);
     for (const auto &[key, store] : partitions_) {
       (void)key;
       out.window += store.account(acct);
@@ -463,6 +494,7 @@ public:
     partitions_.clear();
     partition_outputs_.clear();
     result_.clear();
+    result_valid_ = true; // empty view: empty result is correct
     delta_.clear();
     version_ = 0;
   }
@@ -500,26 +532,19 @@ public:
   //     full path's opening loop retracts every `cache` entry before
   //     re-rendering. Without this restored, the very first post-restore
   //     edit would retract nothing that was never there, producing
-  //     duplicate (stale + new) rows in both delta_ and result_ -- exactly
-  //     what the twin round-trip tests below would catch.
+  //     duplicate (stale + new) rows in delta_ (and any later
+  //     get_result()) -- exactly what the round-trip tests catch.
   // Excluded, and why:
-  //   - result_ (get_result()): NOT independently serialized. Nothing
-  //     reads it back on this class -- apply_changes only ever WRITES to
-  //     it (in lockstep with partition_outputs_: every render/retraction
-  //     applies the identical row+sign to both simultaneously), and
-  //     nothing external calls get_result()/set_result() on this instance
-  //     (it is privately owned by EmbeddedViewNode; unlike a top-level
-  //     view's own sink, whose integrated total IS restored at the outer
-  //     NativeMaterializedView::get_result()/set_result() level -- see
-  //     dbsp::SinkNode::state_kind()'s doc comment for that precedent --
-  //     nothing plays that role for an EMBEDDED view's own result_).
-  //     Rather than leave it silently empty forever (an unread-but-still-
-  //     wrong internal invariant) or pay bytes for fully redundant data,
-  //     restore reconstructs it for free from the just-restored
-  //     partition_outputs_: result_ is, by construction, always exactly
-  //     the multiset union of every partition's current cache (proven by
-  //     induction over apply_changes -- every mutation site touches both
-  //     together with the same row/sign, from the empty initial state).
+  //   - result_ (get_result()): NOT serialized and NOT reconstructed --
+  //     it is a LAZY cache (see the member comment): the one production
+  //     construction is embedded behind EmbeddedViewNode, which reads
+  //     get_delta() only (verified: no get_result()/set_result()/scan()
+  //     call reaches an embedded instance; CircuitWrappedView, the only
+  //     other wrapper that would forward get_result(), is never
+  //     constructed). restore marks it invalid; a reader (tests, scan())
+  //     rebuilds it from the restored partition_outputs_, which is by
+  //     definition exactly its content -- the multiset union of every
+  //     partition's current cache.
   //   - delta_/has_output_-equivalent: checkpoints are taken quiescent (no
   //     pending push), same convention every other checkpointed node
   //     already follows (SourceNode's pending_delta_, PlanRecursiveNode's
@@ -601,7 +626,7 @@ public:
       BlobReader r(data, len);
       partitions_.clear();
       partition_outputs_.clear();
-      result_.clear();
+      invalidate_result(); // lazy: get_result() rebuilds from the caches
 
       const uint64_t first = r.u64();
       if (first == windowrows::kWindowPackedMagic) {
@@ -622,10 +647,6 @@ public:
           const uint64_t n_rows = r.u64();
           if (!cache.restore_packed(r, n_rows)) {
             return false;
-          }
-          for (uint64_t j = 0; j < n_rows; j++) {
-            // reconstruct result_ -- see exclusion note above
-            result_.insert(cache.row_at(j), 1);
           }
         }
         delta_.clear();
@@ -650,9 +671,7 @@ public:
         auto &cache = partition_outputs_[std::move(key)];
         const uint64_t n_rows = r.u64();
         for (uint64_t j = 0; j < n_rows; j++) {
-          DuckDBRow row = r.hashed_row();
-          result_.insert(row, 1); // reconstruct result_ -- see exclusion note above
-          cache.push_back(row);
+          cache.push_back(r.hashed_row());
         }
       }
 
@@ -668,6 +687,7 @@ public:
     delta_.clear();
     if (table_name != source_table_)
       return;
+    invalidate_result(); // lazy result_ -- see member comment
 
     // 1. Group the delta by partition into inserts / deletes.
     struct PartDelta {
@@ -783,9 +803,7 @@ public:
       // Partition emptied: retract all cached output and drop it.
       if (it == partitions_.end() || it->second.empty()) {
         for (size_t j = 0; j < cache.size(); j++) {
-          const DuckDBRow row = cache.row_at(j);
-          delta_.insert(row, -1);
-          result_.insert(row, -1);
+          delta_.insert(cache.row_at(j), -1);
         }
         cache.clear();
         if (it != partitions_.end())
@@ -816,9 +834,7 @@ public:
 
       // FULL PATH: retract all cached output, then re-render every row.
       for (size_t j = 0; j < cache.size(); j++) {
-        const DuckDBRow row = cache.row_at(j);
-        delta_.insert(row, -1);
-        result_.insert(row, -1);
+        delta_.insert(cache.row_at(j), -1);
       }
       cache.clear();
 
@@ -1097,7 +1113,6 @@ public:
 
         // Emit
         delta_.insert(out_row, 1);
-        result_.insert(out_row, 1);
         cache.push_back(out_row);
       }
     }

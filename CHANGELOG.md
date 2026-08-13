@@ -1,5 +1,22 @@
 # Changelog
 
+## Lazy result_ on NativeWindowView - Aug 2026
+
+- The embedded window view's result_ Z-set was write-only in production:
+  EmbeddedViewNode (the only prod wrapper — verified, CircuitWrappedView is
+  never constructed) propagates get_delta() only, yet every edit paid two
+  hash-map ops per affected row to maintain result_, restore decoded every
+  cached output row to reconstruct it, and teardown destroyed a full boxed
+  copy of the view's output. result_ is now a lazy cache: apply_changes
+  invalidates (and clears, so an unread result_ holds no RAM); get_result()
+  rebuilds from partition_outputs_ on demand (tests, scan()). account_state
+  no longer routes through get_result() — the base impl would materialize
+  the lazy zset during a RAM-accounting pass.
+- Measured at 200k rows (with packed rows below, vs the boxed pre-packed
+  baseline): teardown 18.6ms -> 1.2ms, checkpoint restore 51ms -> 3.3ms
+  (both now bulk byte copies + empty result), serialize 17.0ms -> 7.7ms.
+  Fast path unchanged (~5-7us, flat across partition sizes).
+
 ## Packed window partition rows - Aug 2026
 
 - NativeWindowView partition state (ordered source rows + rendered-output

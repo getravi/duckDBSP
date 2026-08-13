@@ -502,7 +502,11 @@ State after:
   store to boxed rows transparently. Packed window checkpoint blobs are
   bulk byte copies (in-blob `kWindowPackedMagic` marker); legacy
   row-by-row blobs remain readable and re-encode on restore, while a
-  boxed-fallback store still writes the legacy layout.
+  boxed-fallback store still writes the legacy layout. The embedded
+  window view's own result_ Z-set is a LAZY cache (nothing in
+  production reads it — EmbeddedViewNode propagates the delta only):
+  edits invalidate it, readers rebuild it from the output caches, and
+  neither checkpoints nor restores touch it.
   `EmbeddedViewNode` reports whatever its wrapped view reports
   (`NativeMaterializedView::circuit_state_kind()`), so a `NativeSortView`/
   `NativeLimitView`/`NativeDistinctOnView` behind the same wrapper (the
