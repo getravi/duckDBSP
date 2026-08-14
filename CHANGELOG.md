@@ -1,5 +1,26 @@
 # Changelog
 
+## AggState POD/collecting split + weighted value counts (F8) - Aug 2026
+
+- AggState now keeps only the scalar accumulators inline (~48B: count,
+  isum, dsum, hsum); the collecting containers (value counts, DISTINCT
+  weights, ordered entries, MODE counts, spill handle) moved behind one
+  pointer allocated on first use. A SUM/COUNT-only aggregate previously
+  carried ~144B of empty container headers per group.
+- The MIN/MAX/MEDIAN/QUANTILE/MAD/FIRST multiset became a value->count map:
+  a weight-w row is one map node instead of w duplicate tree nodes.
+  Quantiles walk ranks weighted (total_of/ranks_of); MAD expands counts
+  only into its transient double vector. The N4 spill threshold now gates
+  on DISTINCT values (map nodes ARE the RAM footprint in this layout).
+- Checkpoint wire format unchanged: counts expand to unit values on
+  serialize and fold back on restore — old and new checkpoints stay
+  mutually readable.
+- account_state reports real per-group state (key + POD + every container
+  node) instead of a flat 96B/group estimate that undercounted
+  MIN/MAX-heavy groups 4-8x and fed the spill-mode decisions.
+- Aggregate bench throughput unchanged (~11.4ms/100k rows); the wins are
+  resident bytes per group and weighted-row/duplicate-heavy shapes.
+
 ## Join probe decode micro-costs (F4/F5) - Aug 2026
 
 - decode_row rewritten: decode_values() reads straight from a byte pointer

@@ -899,34 +899,88 @@ public:
   }
 
   void account_state(StateBytes &out, StateAccounting &acct) const override {
+    // Real per-group state, not a flat estimate — the old 96B/group figure
+    // ignored every collecting container and underestimated MIN/MAX-heavy
+    // groups 4-8x, which fed the spill-mode decisions.
+    auto value_bytes = [](const duckdb::Value &v) -> size_t {
+      size_t b = 72; // sizeof(duckdb::Value) + slop (kValueBytes)
+      if (!v.IsNull() && v.type().id() == duckdb::LogicalTypeId::VARCHAR) {
+        b += duckdb::StringValue::Get(v).size();
+      }
+      return b;
+    };
     for (const auto &[key, gs] : states_) {
-      (void)gs;
-      out.other += acct.row_bytes(key) + 96; // GroupState flat estimate
+      out.other += acct.row_bytes(key) + 48; // hash node + GroupState header
+      for (const auto &a : gs.aggs) {
+        out.other += sizeof(AggState);
+        if (!a.coll) {
+          continue;
+        }
+        const auto &c = *a.coll;
+        for (const auto &[v, cnt] : c.vcounts) {
+          (void)cnt;
+          out.other += value_bytes(v) + 48; // map node + count
+        }
+        for (const auto &[v, cnt] : c.dvals) {
+          (void)cnt;
+          out.other += value_bytes(v) + 48;
+        }
+        for (const auto &[v, cnt] : c.mode_counts) {
+          (void)cnt;
+          out.other += value_bytes(v) + 48;
+        }
+        for (const auto &[keys, v] : c.ordered) {
+          out.other += value_bytes(v) + 48;
+          for (const auto &k : keys) {
+            out.other += value_bytes(k);
+          }
+        }
+      }
     }
     out.other += acct.zset_bytes(output_);
   }
 
 private:
+  // F8 split: the POD scalars every aggregate uses stay inline (~48B);
+  // the collecting containers — which only MIN/MAX/quantile-family,
+  // DISTINCT, ordered (STRING_AGG/ARRAY_AGG) and MODE aggregates touch —
+  // live behind one pointer allocated on first use. A SUM/COUNT-only
+  // group previously paid ~144B of empty container headers per aggregate.
   struct AggState {
     int64_t count = 0; // non-NULL argument count (rows for COUNT(*))
     int64_t isum = 0;
     double dsum = 0;
     duckdb::hugeint_t hsum = 0; // DECIMAL SUM, unscaled
-    std::multiset<duckdb::Value> values; // MIN/MAX
-    // DISTINCT: per-value weights; contributions fire on presence
-    // transitions (0→>0 adds the value once, >0→0 retracts it)
-    std::map<duckdb::Value, int64_t> dvals;
-    // Order-sensitive aggregates: (order keys, value) kept sorted; the
-    // whole aggregate re-renders from this on every group change
-    std::vector<std::pair<std::vector<duckdb::Value>, duckdb::Value>>
-        ordered;
-    // MODE: per-value multiplicities (values multiset serves
-    // MEDIAN/QUANTILE the same way it serves MIN/MAX)
-    std::map<duckdb::Value, int64_t> mode_counts;
-    // N4: a group whose values multiset grows past the threshold (spill
-    // mode) moves its values to a disk record log; renders reload the
-    // group when it is touched. mode_counts/ordered entries stay in RAM.
-    std::unique_ptr<SpilledBaseline> spilled_values;
+
+    struct Collecting {
+      // MIN/MAX/MEDIAN/QUANTILE/MAD/FIRST: value -> multiplicity. A
+      // weight-w row is ONE map node with count w (was: w duplicate
+      // multiset nodes).
+      std::map<duckdb::Value, int64_t> vcounts;
+      // DISTINCT: per-value weights; contributions fire on presence
+      // transitions (0→>0 adds the value once, >0→0 retracts it)
+      std::map<duckdb::Value, int64_t> dvals;
+      // Order-sensitive aggregates: (order keys, value) kept sorted; the
+      // whole aggregate re-renders from this on every group change
+      std::vector<std::pair<std::vector<duckdb::Value>, duckdb::Value>>
+          ordered;
+      // MODE: per-value multiplicities
+      std::map<duckdb::Value, int64_t> mode_counts;
+      // N4: a group whose DISTINCT value count grows past the threshold
+      // (spill mode) moves its values to a disk record log; renders
+      // reload the group when it is touched. mode_counts/ordered entries
+      // stay in RAM. (Threshold is on vcounts.size() — distinct values —
+      // which IS the RAM footprint in the count-map layout.)
+      std::unique_ptr<SpilledBaseline> spilled_values;
+    };
+    std::unique_ptr<Collecting> coll;
+
+    Collecting &collecting() {
+      if (!coll) {
+        coll = std::make_unique<Collecting>();
+      }
+      return *coll;
+    }
   };
 
   struct GroupState {
@@ -972,22 +1026,23 @@ private:
                                  const decltype(entry) &b) {
           return ordered_less(spec, a, b);
         };
+        auto &ordered = s.collecting().ordered;
         if (weight > 0) {
           for (int64_t w = 0; w < weight; w++) {
-            auto it = std::upper_bound(s.ordered.begin(), s.ordered.end(),
-                                       entry, cmp);
-            s.ordered.insert(it, entry);
+            auto it =
+                std::upper_bound(ordered.begin(), ordered.end(), entry, cmp);
+            ordered.insert(it, entry);
           }
         } else {
           for (int64_t w = 0; w < -weight; w++) {
-            auto range = std::equal_range(s.ordered.begin(),
-                                          s.ordered.end(), entry, cmp);
+            auto range =
+                std::equal_range(ordered.begin(), ordered.end(), entry, cmp);
             // Erase one exact match (order keys AND value equal)
             for (auto it = range.first; it != range.second; ++it) {
               if (it->second.IsNull() == entry.second.IsNull() &&
                   (it->second.IsNull() || !(it->second < entry.second) &&
                                               !(entry.second < it->second))) {
-                s.ordered.erase(it);
+                ordered.erase(it);
                 break;
               }
             }
@@ -1001,12 +1056,13 @@ private:
       if (spec.distinct) {
         // Presence transition drives COUNT/SUM/AVG; MIN/MAX fall through
         // (duplicates never change an extreme)
-        int64_t &dw = s.dvals[v];
+        auto &dvals = s.collecting().dvals;
+        int64_t &dw = dvals[v];
         const bool was = dw > 0;
         dw += weight;
         const bool is = dw > 0;
         if (dw == 0) {
-          s.dvals.erase(v);
+          dvals.erase(v);
         }
         if (spec.fn != PlanAggSpec::Fn::MIN &&
             spec.fn != PlanAggSpec::Fn::MAX) {
@@ -1055,44 +1111,37 @@ private:
       case PlanAggSpec::Fn::MEDIAN:
       case PlanAggSpec::Fn::QUANTILE_CONT:
       case PlanAggSpec::Fn::QUANTILE_DISC:
-      case PlanAggSpec::Fn::MAD:
-        if (s.spilled_values) {
-          s.spilled_values->apply_row({v}, weight);
+      case PlanAggSpec::Fn::MAD: {
+        auto &coll = s.collecting();
+        if (coll.spilled_values) {
+          coll.spilled_values->apply_row({v}, weight);
           break;
         }
-        if (weight > 0) {
-          for (int64_t w = 0; w < weight; w++) {
-            s.values.insert(v);
-          }
-        } else {
-          for (int64_t w = 0; w < -weight; w++) {
-            auto it = s.values.find(v);
-            if (it != s.values.end()) {
-              s.values.erase(it);
-            }
-          }
-        }
-        // N4: oversized group → move values to disk (spill mode). Renders
-        // reload the group only when it is touched again.
-        if (g_spill_mode.load() && s.values.size() > 65536) {
-          s.spilled_values = std::make_unique<SpilledBaseline>(
-              g_spill_dir + "/agg_" +
-              std::to_string(g_spill_file_seq.fetch_add(1)) + ".dbspill");
-          auto it = s.values.begin();
-          while (it != s.values.end()) {
-            auto next = s.values.upper_bound(*it);
-            s.spilled_values->apply_row(
-                {*it}, static_cast<int64_t>(std::distance(it, next)));
-            it = next;
-          }
-          s.values.clear();
-        }
-        break;
-      case PlanAggSpec::Fn::MODE: {
-        int64_t &c = s.mode_counts[v];
+        int64_t &c = coll.vcounts[v];
         c += weight;
         if (c <= 0) {
-          s.mode_counts.erase(v);
+          coll.vcounts.erase(v);
+        }
+        // N4: oversized group → move values to disk (spill mode). Renders
+        // reload the group only when it is touched again. Threshold is on
+        // DISTINCT values — the map node count IS the RAM footprint.
+        if (g_spill_mode.load() && coll.vcounts.size() > 65536) {
+          coll.spilled_values = std::make_unique<SpilledBaseline>(
+              g_spill_dir + "/agg_" +
+              std::to_string(g_spill_file_seq.fetch_add(1)) + ".dbspill");
+          for (const auto &[val, cnt] : coll.vcounts) {
+            coll.spilled_values->apply_row({val}, cnt);
+          }
+          coll.vcounts.clear();
+        }
+        break;
+      }
+      case PlanAggSpec::Fn::MODE: {
+        auto &mode_counts = s.collecting().mode_counts;
+        int64_t &c = mode_counts[v];
+        c += weight;
+        if (c <= 0) {
+          mode_counts.erase(v);
         }
         break;
       }
@@ -1135,25 +1184,60 @@ private:
     return value_less(a.second, b.second, true, false);
   }
 
-  // N4: multiset renders read through this — a spilled group reloads
+  // N4: value-count renders read through this — a spilled group reloads
   // into `tmp` (touched groups only; untouched groups never re-render)
-  static const std::multiset<duckdb::Value> &
-  values_of(const AggState &s, std::multiset<duckdb::Value> &tmp) {
-    if (!s.spilled_values) {
-      return s.values;
+  using ValueCounts = std::map<duckdb::Value, int64_t>;
+  static const ValueCounts &values_of(const AggState &s, ValueCounts &tmp) {
+    static const ValueCounts kEmpty;
+    if (!s.coll) {
+      return kEmpty;
     }
-    s.spilled_values->scan(
+    if (!s.coll->spilled_values) {
+      return s.coll->vcounts;
+    }
+    s.coll->spilled_values->scan(
         [&](const std::vector<duckdb::Value> &vals, int64_t w) {
-          for (int64_t c = 0; c < w; c++) {
-            tmp.insert(vals[0]);
-          }
+          tmp[vals[0]] += w;
         });
     return tmp;
   }
 
+  // Total multiplicity of a value-count map (quantile denominators).
+  static size_t total_of(const ValueCounts &values) {
+    size_t n = 0;
+    for (const auto &[v, c] : values) {
+      (void)v;
+      n += static_cast<size_t>(c);
+    }
+    return n;
+  }
+
+  // Values at 0-based ranks `lo_idx` and `lo_idx+1` of the weighted sorted
+  // sequence (hi unused when lo is the last element).
+  static void ranks_of(const ValueCounts &values, size_t lo_idx,
+                       duckdb::Value &lo, duckdb::Value &hi) {
+    size_t cum = 0;
+    bool have_lo = false;
+    for (const auto &[v, c] : values) {
+      const size_t end = cum + static_cast<size_t>(c);
+      if (!have_lo && lo_idx < end) {
+        lo = v;
+        have_lo = true;
+      }
+      if (lo_idx + 1 < end) {
+        hi = v;
+        return;
+      }
+      cum = end;
+    }
+    if (have_lo) {
+      hi = lo; // lo was the final rank
+    }
+  }
+
   duckdb::Value agg_value(const AggInstance &spec, const AggState &s) const {
-    std::multiset<duckdb::Value> spill_tmp;
-    const std::multiset<duckdb::Value> &values = values_of(s, spill_tmp);
+    ValueCounts spill_tmp;
+    const ValueCounts &values = values_of(s, spill_tmp);
     switch (spec.fn) {
     case PlanAggSpec::Fn::COUNT_STAR:
     case PlanAggSpec::Fn::COUNT:
@@ -1181,17 +1265,17 @@ private:
     case PlanAggSpec::Fn::MIN:
     case PlanAggSpec::Fn::FIRST:
       return values.empty() ? duckdb::Value(spec.return_type)
-                              : *values.begin();
+                              : values.begin()->first;
     case PlanAggSpec::Fn::MAX:
       return values.empty() ? duckdb::Value(spec.return_type)
-                              : *values.rbegin();
+                              : values.rbegin()->first;
     case PlanAggSpec::Fn::STRING_AGG: {
-      if (s.ordered.empty()) {
+      if (!s.coll || s.coll->ordered.empty()) {
         return duckdb::Value(spec.return_type);
       }
       std::string out;
       bool first = true;
-      for (const auto &[keys, v] : s.ordered) {
+      for (const auto &[keys, v] : s.coll->ordered) {
         if (!first) {
           out += spec.separator;
         }
@@ -1206,21 +1290,19 @@ private:
       if (values.empty()) {
         return duckdb::Value(spec.return_type);
       }
-      // Interpolated quantile over the sorted multiset: position
-      // q*(n-1) between neighbors lo and hi
+      // Interpolated quantile over the weighted sorted values: position
+      // q*(n-1) between rank neighbors lo and hi
       const double q =
           spec.fn == PlanAggSpec::Fn::MEDIAN ? 0.5 : spec.quantile;
-      const size_t n = values.size();
+      const size_t n = total_of(values);
       const double pos = q * static_cast<double>(n - 1);
       const size_t lo_idx = static_cast<size_t>(pos);
       const double frac = pos - static_cast<double>(lo_idx);
-      auto it = values.begin();
-      std::advance(it, lo_idx);
-      const duckdb::Value lo = *it;
+      duckdb::Value lo, hi;
+      ranks_of(values, lo_idx, lo, hi);
       if (frac == 0.0 || lo_idx + 1 >= n) {
         return lo.DefaultCastAs(spec.return_type);
       }
-      const duckdb::Value hi = *std::next(it);
       const double lod = lo.DefaultCastAs(duckdb::LogicalType::DOUBLE)
                              .GetValue<double>();
       const double hid = hi.DefaultCastAs(duckdb::LogicalType::DOUBLE)
@@ -1233,16 +1315,16 @@ private:
         return duckdb::Value(spec.return_type);
       }
       // Discrete quantile: element at ceil(q*n)-1 (DuckDB semantics)
-      const size_t n = values.size();
+      const size_t n = total_of(values);
       size_t idx = static_cast<size_t>(
           std::ceil(spec.quantile * static_cast<double>(n)));
       idx = idx > 0 ? idx - 1 : 0;
       if (idx >= n) {
         idx = n - 1;
       }
-      auto it = values.begin();
-      std::advance(it, idx);
-      return it->DefaultCastAs(spec.return_type);
+      duckdb::Value lo, hi;
+      ranks_of(values, idx, lo, hi);
+      return lo.DefaultCastAs(spec.return_type);
     }
     case PlanAggSpec::Fn::MAD: {
       if (values.empty()) {
@@ -1252,10 +1334,13 @@ private:
       // interpolated (DuckDB semantics). Deviations come out sorted by
       // merging the two halves around the median.
       std::vector<double> vals;
-      vals.reserve(values.size());
-      for (const auto &v : values) {
-        vals.push_back(v.DefaultCastAs(duckdb::LogicalType::DOUBLE)
-                           .GetValue<double>());
+      vals.reserve(total_of(values));
+      for (const auto &[v, c] : values) {
+        const double d = v.DefaultCastAs(duckdb::LogicalType::DOUBLE)
+                             .GetValue<double>();
+        for (int64_t k = 0; k < c; k++) {
+          vals.push_back(d);
+        }
       }
       auto interp = [](const std::vector<double> &sorted) {
         const double pos = 0.5 * static_cast<double>(sorted.size() - 1);
@@ -1291,7 +1376,7 @@ private:
       return duckdb::Value(interp(devs)).DefaultCastAs(spec.return_type);
     }
     case PlanAggSpec::Fn::MODE: {
-      if (s.mode_counts.empty()) {
+      if (!s.coll || s.coll->mode_counts.empty()) {
         return duckdb::Value(spec.return_type);
       }
       // Highest multiplicity; ties break by smallest value (std::map is
@@ -1299,7 +1384,7 @@ private:
       // scan-order-dependent and unreproducible incrementally
       const duckdb::Value *best = nullptr;
       int64_t best_count = 0;
-      for (const auto &[v, c] : s.mode_counts) {
+      for (const auto &[v, c] : s.coll->mode_counts) {
         if (c > best_count) {
           best = &v;
           best_count = c;
@@ -1308,12 +1393,12 @@ private:
       return best->DefaultCastAs(spec.return_type);
     }
     case PlanAggSpec::Fn::ARRAY_AGG: {
-      if (s.ordered.empty()) {
+      if (!s.coll || s.coll->ordered.empty()) {
         return duckdb::Value(spec.return_type);
       }
       duckdb::vector<duckdb::Value> vals;
-      vals.reserve(s.ordered.size());
-      for (const auto &[keys, v] : s.ordered) {
+      vals.reserve(s.coll->ordered.size());
+      for (const auto &[keys, v] : s.coll->ordered) {
         vals.push_back(v);
       }
       return duckdb::Value::LIST(
@@ -1374,7 +1459,7 @@ public:
     }
     for (const auto &[key, group] : states_) {
       for (const auto &a : group.aggs) {
-        if (a.spilled_values) {
+        if (a.coll && a.coll->spilled_values) {
           return StateKind::UNSUPPORTED;
         }
       }
@@ -1397,10 +1482,20 @@ public:
         w.f64(a.dsum);
         w.i64(a.hsum.upper);
         w.u64(a.hsum.lower);
-        // MIN/MAX retraction state: the full values multiset, duplicates
+        // MIN/MAX retraction state: the full value sequence, duplicates
         // preserved, as one row so a deleted extreme retreats correctly
         // post-restore (empty for scalar-only aggs — cheap no-op row).
-        std::vector<duckdb::Value> vals(a.values.begin(), a.values.end());
+        // Counts are EXPANDED to unit values so the wire format matches
+        // the pre-count-map layout — old and new checkpoints stay
+        // mutually readable.
+        std::vector<duckdb::Value> vals;
+        if (a.coll) {
+          for (const auto &[v, c] : a.coll->vcounts) {
+            for (int64_t k = 0; k < c; k++) {
+              vals.push_back(v);
+            }
+          }
+        }
         w.row(vals);
       }
     }
@@ -1430,7 +1525,12 @@ public:
           a.hsum.upper = r.i64();
           a.hsum.lower = r.u64();
           auto vals = r.row();
-          a.values.insert(vals.begin(), vals.end());
+          if (!vals.empty()) {
+            auto &vcounts = a.collecting().vcounts;
+            for (auto &v : vals) {
+              vcounts[v] += 1;
+            }
+          }
         }
         states_.emplace(std::move(key), std::move(group));
       }
