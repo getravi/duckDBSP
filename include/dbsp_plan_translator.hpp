@@ -5059,7 +5059,16 @@ public:
   bool restore_circuit_state(
       const std::unordered_map<uint64_t, std::vector<uint8_t>> &blobs)
       override {
+    // The three failure modes are logged distinctly: the flaky
+    // "lazy-restore stash failed to decode" report has never said WHICH
+    // of them fired (a checkpointable() flip, a node-id/plan-shape
+    // mismatch vs the save-time circuit, or a genuine blob decode
+    // failure) — each implicates a completely different cause.
     if (!checkpointable()) {
+      fprintf(stderr,
+              "[dbsp] restore_circuit_state(%s): checkpointable() false at "
+              "realize (was true at save)\n",
+              name().c_str());
       return false;
     }
     bool ok = true;
@@ -5068,8 +5077,21 @@ public:
         return;
       }
       auto it = blobs.find(n.id());
-      if (it == blobs.end() ||
-          !n.restore_state(it->second.data(), it->second.size())) {
+      if (it == blobs.end()) {
+        fprintf(stderr,
+                "[dbsp] restore_circuit_state(%s): no blob for node id=%llu "
+                "'%s' (%zu blobs stashed — plan shape drifted since save?)\n",
+                name().c_str(), static_cast<unsigned long long>(n.id()),
+                n.name().c_str(), blobs.size());
+        ok = false;
+        return;
+      }
+      if (!n.restore_state(it->second.data(), it->second.size())) {
+        fprintf(stderr,
+                "[dbsp] restore_circuit_state(%s): node id=%llu '%s' rejected "
+                "its blob (%zu bytes)\n",
+                name().c_str(), static_cast<unsigned long long>(n.id()),
+                n.name().c_str(), it->second.size());
         ok = false;
       }
     });

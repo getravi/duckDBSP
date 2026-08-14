@@ -1,5 +1,33 @@
 # Changelog
 
+## Mirror-apply statement overhead + realize diagnostics (F9) - Aug 2026
+
+- mv_after_propagate keeps one persistent mirror connection with per-view
+  TEMP stage tables and cached statement STRINGS: a commit now runs
+  truncate + DELETE + INSERT (+ appender) per touched view and ONE batched
+  meta upsert per pass, instead of CREATE TEMP/DROP + built-fresh
+  statements + CREATE-IF-NOT-EXISTS + meta INSERT per view. Measured
+  (DBSP_TIMING, wfp 120): mv_apply_delta was 1.49ms mean x ~40 views =
+  ~42% of a steady edit; cached path measured 1.01ms mean (-32%).
+- Two traps found while shipping this, both reproduced then fixed:
+  - duckdb::PreparedStatement bakes data-dependent optimizations into the
+    plan: a DELETE ... USING stage prepared while the stage was EMPTY has
+    the join pruned at prepare time and silently deletes nothing forever
+    (mirror corruption: retractions stop landing). The cache therefore
+    holds statement strings, never PreparedStatements, so every execute
+    re-plans against current data.
+  - A Connection member on the manager is an instance-lifetime CYCLE
+    (Connection holds a strong DatabaseInstance ref; the instance owns the
+    manager) — DB shutdown never starts and a same-file reopen blocks
+    forever (reproduced as a suite hang). save_checkpoint releases the
+    mirror connection (every close path saves; autopersists rebuild the
+    cache lazily on the next commit).
+- restore_circuit_state / realize_pending_view now log WHICH failure mode
+  fired (checkpointable() flip, missing node blob / plan-shape drift, node
+  blob rejection, sink blob decode) for the still-unreproduced flaky
+  "lazy-restore stash failed to decode" report; mv_apply_delta gained a
+  DBSP_TIMING scope.
+
 ## AggState POD/collecting split + weighted value counts (F8) - Aug 2026
 
 - AggState now keeps only the scalar accumulators inline (~48B: count,

@@ -580,6 +580,14 @@ public:
       last_error_ = "Invalid catalog name: " + catalog;
       return false;
     }
+    {
+      // Release the persistent mirror connection (see the mv_con_ member
+      // comment: holding it across idle periods is an instance-lifetime
+      // cycle). Exclusive view lock: mutual exclusion with propagate's
+      // mv_after_propagate, the only user.
+      std::unique_lock<std::shared_mutex> view_lock(view_mutex_);
+      mv_reset_mirror_conn();
+    }
     struct ViewCkpt {
       std::string name;
       std::string sql; // fingerprint (Finding 1): definition at save time
@@ -1207,7 +1215,13 @@ public:
     bool ok;
     try {
       ok = view_it->second->restore_circuit_state(pend_it->second.nodes);
-      if (ok) {
+    } catch (...) {
+      fprintf(stderr, "[dbsp] realize(%s): node restore threw\n",
+              view_name.c_str());
+      ok = false;
+    }
+    if (ok) {
+      try {
         BlobReader r(pend_it->second.sink.data(), pend_it->second.sink.size());
         DuckDBZSet result;
         const uint64_t n = r.u64();
@@ -1217,10 +1231,18 @@ public:
           result.insert(row, w);
         }
         view_it->second->set_result(result);
-        ok = ok && r.done();
+        ok = r.done();
+        if (!ok) {
+          fprintf(stderr,
+                  "[dbsp] realize(%s): sink blob has trailing bytes "
+                  "(%zu total)\n",
+                  view_name.c_str(), pend_it->second.sink.size());
+        }
+      } catch (...) {
+        fprintf(stderr, "[dbsp] realize(%s): sink blob decode threw (%zu bytes)\n",
+                view_name.c_str(), pend_it->second.sink.size());
+        ok = false;
       }
-    } catch (...) {
-      ok = false;
     }
     // Phase 3 (reattach): set_result turned sink integration back on; an
     // adopted table-backed view must stay table-backed — its checkpoint
@@ -3800,9 +3822,28 @@ private:
     return mv_meta_upsert(con, name);
   }
 
+  // F9 per-view mirror cache on the persistent mirror connection (see the
+  // mv_con_ member comment): the TEMP stage table (created once per
+  // connection) and the three statement STRINGS. Deliberately NOT
+  // duckdb::PreparedStatement: DuckDB bakes data-dependent optimizations
+  // into the prepared plan — a DELETE ... USING stage prepared while the
+  // stage was empty stays a no-op forever (reproduced: the join is pruned
+  // at prepare time), which silently stops retractions and corrupts the
+  // mirror. Statement strings re-plan per execute against current data.
+  struct MvViewStmts {
+    bool stage_ready = false;
+    std::string stage_raw; // appender target
+    std::string truncate_sql;
+    std::string del_sql;
+    std::string ins_sql;
+  };
+
   bool mv_apply_delta(duckdb::Connection &con, const std::string &name,
                       const NativeMaterializedView &view,
-                      const DuckDBZSet &delta) {
+                      const DuckDBZSet &delta, MvViewStmts *stmts = nullptr,
+                      bool defer_meta = false) {
+    DbspScopeTimer t_mv("mv_apply_delta",
+                        name + " rows=" + std::to_string(delta.size()));
     // Fast path needs every delta weight at ±1 (retract exactly one copy
     // per row). Anything else — multiplicities — rebuilds the table from
     // its own current rows + the delta (the table IS the result for
@@ -3818,13 +3859,6 @@ private:
       return true;
     }
     const std::string qt = mv_quote(mv_table_for(name));
-    auto res = con.Query("CREATE OR REPLACE TEMP TABLE __mv_stage (" +
-                         mv_columns_ddl(schema) + ", __w BIGINT)");
-    if (res->HasError()) {
-      last_error_ = "mv stage create failed: " + res->GetError();
-      return false;
-    }
-    mv_append_rows(con, "__mv_stage", delta, /*with_weight=*/true);
     std::string match;
     for (size_t i = 0; i < schema.columns.size(); i++) {
       if (i > 0) {
@@ -3833,18 +3867,69 @@ private:
       const std::string c = mv_quote(schema.columns[i].name);
       match += "t." + c + " IS NOT DISTINCT FROM s." + c;
     }
-    res = con.Query("DELETE FROM " + qt + " t USING __mv_stage s WHERE " +
-                    "s.__w < 0 AND " + match);
-    if (res->HasError()) {
-      last_error_ = "mv delete failed: " + res->GetError();
-      return false;
-    }
     std::string cols;
     for (size_t i = 0; i < schema.columns.size(); i++) {
       if (i > 0) {
         cols += ", ";
       }
       cols += mv_quote(schema.columns[i].name);
+    }
+
+    // F9 cached path (persistent mirror connection): per-view TEMP stage
+    // created once per connection and truncated per commit — a commit
+    // runs three cached-string statements plus the appender instead of
+    // CREATE OR REPLACE + DROP + two built-fresh statements. Any error
+    // (rolled-back stage create, schema drift after a view recreate, ...)
+    // drops the cache and falls through to the self-contained path below
+    // for this call.
+    if (stmts != nullptr) {
+      bool ok = true;
+      if (!stmts->stage_ready) {
+        stmts->stage_raw = "__mv_stage_" + mv_table_for(name);
+        const std::string st = mv_quote(stmts->stage_raw);
+        auto res = con.Query("CREATE TEMP TABLE IF NOT EXISTS " + st + " (" +
+                             mv_columns_ddl(schema) + ", __w BIGINT)");
+        ok = !res->HasError();
+        if (ok) {
+          stmts->truncate_sql = "DELETE FROM " + st;
+          stmts->del_sql = "DELETE FROM " + qt + " t USING " + st +
+                           " s WHERE s.__w < 0 AND " + match;
+          stmts->ins_sql = "INSERT INTO " + qt + " SELECT " + cols +
+                           " FROM " + st + " WHERE __w > 0";
+          stmts->stage_ready = true;
+        }
+      }
+      if (ok) {
+        auto tr = con.Query(stmts->truncate_sql);
+        ok = !tr->HasError();
+      }
+      if (ok) {
+        mv_append_rows(con, stmts->stage_raw, delta, /*with_weight=*/true);
+        auto dr = con.Query(stmts->del_sql);
+        ok = !dr->HasError();
+        if (ok) {
+          auto ir = con.Query(stmts->ins_sql);
+          ok = !ir->HasError();
+        }
+      }
+      if (ok) {
+        return defer_meta ? true : mv_meta_upsert(con, name);
+      }
+      *stmts = MvViewStmts{}; // stale — rebuild lazily next commit
+    }
+
+    auto res = con.Query("CREATE OR REPLACE TEMP TABLE __mv_stage (" +
+                         mv_columns_ddl(schema) + ", __w BIGINT)");
+    if (res->HasError()) {
+      last_error_ = "mv stage create failed: " + res->GetError();
+      return false;
+    }
+    mv_append_rows(con, "__mv_stage", delta, /*with_weight=*/true);
+    res = con.Query("DELETE FROM " + qt + " t USING __mv_stage s WHERE " +
+                    "s.__w < 0 AND " + match);
+    if (res->HasError()) {
+      last_error_ = "mv delete failed: " + res->GetError();
+      return false;
     }
     res = con.Query("INSERT INTO " + qt + " SELECT " + cols +
                     " FROM __mv_stage WHERE __w > 0");
@@ -3853,7 +3938,7 @@ private:
       return false;
     }
     con.Query("DROP TABLE __mv_stage");
-    return mv_meta_upsert(con, name);
+    return defer_meta ? true : mv_meta_upsert(con, name);
   }
 
   // General fallback: reconstruct the multiset from the CURRENT backing
@@ -3917,18 +4002,33 @@ private:
     return true;
   }
 
+  void mv_reset_mirror_conn() {
+    mv_stmts_.clear();
+    mv_meta_ready_ = false;
+    mv_con_.reset();
+    mv_con_db_ = nullptr;
+  }
+
   // Mirror the deltas of this pass's touched views. Runs at the end of
   // propagate_changes, locks held; InternalQueryGuard keeps the hooks out.
   // ONE internal transaction per pass: either every touched view's table
-  // advances together with the meta rows, or none do.
+  // advances together with the meta rows, or none do. Meta rows are
+  // upserted in ONE batched statement per pass (was: CREATE IF NOT EXISTS
+  // + INSERT per view per commit).
   void mv_after_propagate(const std::vector<std::string> &touched) {
     if (!mv_tables_enabled_.load() || mv_db_ == nullptr || touched.empty()) {
       return;
     }
     InternalQueryGuard guard;
     try {
-      duckdb::Connection con(*mv_db_);
+      if (!mv_con_ || mv_con_db_ != mv_db_) {
+        mv_reset_mirror_conn();
+        mv_con_ = std::make_unique<duckdb::Connection>(*mv_db_);
+        mv_con_db_ = mv_db_;
+      }
+      duckdb::Connection &con = *mv_con_;
       con.Query("BEGIN");
+      std::vector<std::string> applied;
       for (const auto &name : touched) {
         auto it = views_.find(name);
         if (it == views_.end()) {
@@ -3938,16 +4038,48 @@ private:
         if (delta.empty()) {
           continue;
         }
-        if (!mv_apply_delta(con, name, *it->second, delta)) {
+        applied.push_back(name);
+        if (!mv_apply_delta(con, name, *it->second, delta,
+                            &mv_stmts_[name], /*defer_meta=*/true)) {
           con.Query("ROLLBACK");
           mv_tables_enabled_ = false;
+          mv_reset_mirror_conn();
           return;
+        }
+      }
+      if (!applied.empty()) {
+        if (!mv_meta_ready_) {
+          auto res =
+              con.Query("CREATE TABLE IF NOT EXISTS __dbsp_mv_meta ("
+                        "view_name VARCHAR PRIMARY KEY, commit_seq BIGINT)");
+          if (res->HasError()) {
+            throw std::runtime_error("mv meta create failed: " +
+                                     res->GetError());
+          }
+          mv_meta_ready_ = true;
+        }
+        std::string sql = "INSERT OR REPLACE INTO __dbsp_mv_meta VALUES ";
+        const std::string seq = std::to_string(commit_seq_.load());
+        for (size_t i = 0; i < applied.size(); i++) {
+          if (i > 0) {
+            sql += ", ";
+          }
+          sql += "('" + escape_string(applied[i]) + "', " + seq + ")";
+        }
+        auto res = con.Query(sql);
+        if (res->HasError()) {
+          throw std::runtime_error("mv meta upsert failed: " +
+                                   res->GetError());
         }
       }
       con.Query("COMMIT");
     } catch (const std::exception &e) {
+      if (mv_con_) {
+        mv_con_->Query("ROLLBACK");
+      }
       last_error_ = std::string("mv mirror failed: ") + e.what();
       mv_tables_enabled_ = false;
+      mv_reset_mirror_conn();
     }
   }
 
@@ -5608,6 +5740,23 @@ private:
   // propagation). Reads still come from circuit state until Phase 1c.
   std::atomic<bool> mv_tables_enabled_{false};
   duckdb::DatabaseInstance *mv_db_ = nullptr; // captured at create_view
+  // F9: persistent mirror connection + per-view stage/SQL cache. A fresh
+  // Connection per commit made every mirror pass recreate its stage and
+  // rebuild ~7 statements per touched view (~40 views/commit on wfp —
+  // measured 1.49ms mean per view, ~42% of a steady edit). The connection
+  // and the per-view TEMP stages live until the next save_checkpoint:
+  // a live Connection holds a strong DatabaseInstance reference, and the
+  // manager hangs off the instance, so holding it forever is an ownership
+  // CYCLE that blocks instance shutdown (reproduced as a suite hang) —
+  // save_checkpoint releases it (every close path saves; autopersists
+  // rebuild the cache lazily on the next commit). Any mirror failure or
+  // mv_db_ change also resets (mv_reset_mirror_conn). Used ONLY by
+  // mv_after_propagate — other mirror writers keep their own short-lived
+  // connections. (MvViewStmts is defined above mv_apply_delta.)
+  std::unique_ptr<duckdb::Connection> mv_con_;
+  duckdb::DatabaseInstance *mv_con_db_ = nullptr;
+  std::unordered_map<std::string, MvViewStmts> mv_stmts_;
+  bool mv_meta_ready_ = false;
   // Phase 1c: views whose sink stopped integrating — the __mv_ table IS
   // the result; reads, replays and backfills stream from it. Guarded by
   // view_mutex_.
