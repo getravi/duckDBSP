@@ -58,6 +58,12 @@ namespace dbsp_native {
 // g_recompute_invocations in dbsp_plan_translator.hpp) for asserting "only
 // this view's chain decoded" without parsing DBSP_TIMING stderr output.
 inline std::atomic<size_t> g_lazy_view_decodes{0};
+// Lazy realizes that FAILED to decode their stash (each one schedules the
+// rebuild_pending_ full-rebuild escape hatch). Observable so tests can pin
+// the failure site: record_error_best_effort cannot set last_error_ from
+// realize_pending_view_locked (its callers hold struct_mutex_ shared, so
+// the try-lock always fails and the message goes to stderr only).
+inline std::atomic<size_t> g_lazy_realize_failures{0};
 
 // DBSP_TIMING=1: emit per-phase wall-clock lines to stderr
 // ("[dbsp-timing] <phase> <detail> ms=..."), for profiling restore cost
@@ -595,6 +601,11 @@ public:
       std::vector<uint8_t> sink;
     };
     std::vector<ViewCkpt> view_blobs;
+    // Still-pending lazy-from-table views (Phase 3): their _dbsp_ckpt rows
+    // are the ONLY copy of their checkpoint bytes (the stash holds empty
+    // placeholders). The write phase keeps these views' existing rows in
+    // place instead of rewriting them.
+    std::vector<std::string> preserve_pending;
     std::vector<std::string> table_names;
     {
       DbspScopeTimer t_ser("ckpt_serialize", "all views");
@@ -621,6 +632,59 @@ public:
         // realized view would otherwise silently (and wrongly) produce
         // below.
         auto pend_it = pending_restore_.find(name);
+        if (pend_it != pending_restore_.end() &&
+            pend_it->second.lazy_from_table) {
+          // Phase 3 (lazy-from-table): the stash holds EMPTY placeholders
+          // -- the real bytes live only in _dbsp_ckpt (blob_catalog) and
+          // are fetched at realize time. Re-saving the stash "verbatim"
+          // here would clobber that only copy with 0-byte rows; the next
+          // realize (this session, or any later one -- watermarks still
+          // match) would fail to decode and take the full-rebuild escape
+          // hatch. That was the intermittent "lazy-restore stash for view
+          // '...' failed to decode" report. Same-catalog saves keep the
+          // view's existing rows in place (see the write phase below); a
+          // cross-catalog save must copy the bytes over, so fetch them
+          // now, the same way realize_pending_view_locked does.
+          if (pend_it->second.blob_catalog == catalog) {
+            preserve_pending.push_back(name);
+            continue;
+          }
+          bool fetched = false;
+          if (mv_db_ != nullptr) {
+            try {
+              InternalQueryGuard fetch_guard;
+              duckdb::Connection fcon(*mv_db_);
+              auto rows = fcon.Query(
+                  "SELECT kind, node_id, data FROM " +
+                  qualify(pend_it->second.blob_catalog, "_dbsp_ckpt") +
+                  " WHERE name = '" + escape_string(name) +
+                  "' AND kind IN ('node', 'sink')");
+              if (rows->HasError()) {
+                throw std::runtime_error(rows->GetError());
+              }
+              for (duckdb::idx_t i = 0; i < rows->RowCount(); i++) {
+                const auto blob_str =
+                    duckdb::StringValue::Get(rows->GetValue(2, i));
+                std::vector<uint8_t> blob(blob_str.begin(), blob_str.end());
+                if (rows->GetValue(0, i).ToString() == "node") {
+                  ck.nodes.emplace_back(
+                      static_cast<uint64_t>(
+                          rows->GetValue(1, i).GetValue<int64_t>()),
+                      std::move(blob));
+                } else {
+                  ck.sink = std::move(blob);
+                }
+              }
+              fetched = true;
+            } catch (...) {
+            }
+          }
+          if (!fetched) {
+            continue; // not checkpointed this save: replays at next load
+          }
+          view_blobs.push_back(std::move(ck));
+          continue;
+        }
         if (pend_it != pending_restore_.end()) {
           if (std::getenv("DBSP_DEBUG_SYNC") && !view->get_result().empty()) {
             // Invariant check: pending == no deltas seen == empty live
@@ -671,8 +735,28 @@ public:
       InternalQueryGuard guard;
       duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
       con.Query("BEGIN");
-      con.Query("CREATE OR REPLACE TABLE " + ckpt_tbl + " (kind VARCHAR, name "
-                "VARCHAR, node_id BIGINT, data BLOB)");
+      if (preserve_pending.empty()) {
+        con.Query("CREATE OR REPLACE TABLE " + ckpt_tbl + " (kind VARCHAR, "
+                  "name VARCHAR, node_id BIGINT, data BLOB)");
+      } else {
+        // Keep still-pending lazy views' rows (node/sink/sql) -- the only
+        // copy of their bytes -- and replace everything else. The table
+        // necessarily exists with this schema: the placeholders were
+        // stashed by a load that read it from this same catalog.
+        con.Query("CREATE TABLE IF NOT EXISTS " + ckpt_tbl + " (kind "
+                  "VARCHAR, name VARCHAR, node_id BIGINT, data BLOB)");
+        std::string keep;
+        for (const auto &n : preserve_pending) {
+          keep += (keep.empty() ? "'" : ", '") + escape_string(n) + "'";
+        }
+        auto del = con.Query("DELETE FROM " + ckpt_tbl +
+                             " WHERE name NOT IN (" + keep + ")");
+        if (del->HasError()) {
+          con.Query("ROLLBACK");
+          last_error_ = del->GetError();
+          return false;
+        }
+      }
       con.Query("CREATE OR REPLACE TABLE " + ckpt_meta_tbl + " (table_name "
                 "VARCHAR, row_count BIGINT, row_hash VARCHAR)");
       // Format version (see dbsp_checkpoint.hpp kDbspCkptFormatVersion): a
@@ -789,7 +873,7 @@ public:
       }
       }
       con.Query("COMMIT");
-      last_ckpt_saved_count_ = view_blobs.size();
+      last_ckpt_saved_count_ = view_blobs.size() + preserve_pending.size();
       mark_saved();
       // Recovery inc B: persist each durable spilled baseline's digest
       // index under the watermark just written — a reopen whose live
@@ -1255,6 +1339,7 @@ public:
     pending_restore_.erase(pend_it);
     view_it->second->clear_pending_restore();
     if (!ok) {
+      g_lazy_realize_failures++;
       rebuild_pending_ = true;
       record_error_best_effort(
           "DBSP: lazy-restore stash for view '" + view_name +

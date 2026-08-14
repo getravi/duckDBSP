@@ -5170,7 +5170,11 @@ public:
     // of them fired (a checkpointable() flip, a node-id/plan-shape
     // mismatch vs the save-time circuit, or a genuine blob decode
     // failure) — each implicates a completely different cause.
-    if (!checkpointable()) {
+    // DBSP_TEST_CKPT_FLIP: fault injection (tests only) — forces this
+    // guard as if checkpointable() flipped between save and realize; no
+    // organic SQL sequence can, since the fingerprint gate re-plans the
+    // same definition. Checked here only, never at save.
+    if (!checkpointable() || std::getenv("DBSP_TEST_CKPT_FLIP") != nullptr) {
       fprintf(stderr,
               "[dbsp] restore_circuit_state(%s): checkpointable() false at "
               "realize (was true at save)\n",

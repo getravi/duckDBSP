@@ -1,5 +1,35 @@
 # Changelog
 
+## Lazy-restore "failed to decode" flake: root-caused + fixed - Aug 2026
+
+- The intermittent "lazy-restore stash for view '...' failed to decode;
+  scheduling full rebuild" report is root-caused and now deterministic:
+  under Phase 3 (disk-backed/mv) lazy blobs a reopened view's stash holds
+  EMPTY placeholder blobs (the real bytes stay in `_dbsp_ckpt`, fetched at
+  realize time), and `save_checkpoint`'s verbatim re-save of a
+  still-pending view wrote those placeholders back — 0-byte node/sink rows
+  replaced the only copy of the real bytes. The next realize (same session
+  or any later one; watermarks still match) failed to decode and took the
+  full-rebuild escape hatch. Flaky in the app because it needed a view
+  still pending at a `dbsp_save()` and touched afterwards; correct results
+  either way (the rebuild replays committed storage), but a silent
+  full-rebuild cost.
+- Fix: a same-catalog save preserves a still-pending lazy view's existing
+  `_dbsp_ckpt` rows in place (`DELETE ... WHERE name NOT IN (pending)`
+  instead of `CREATE OR REPLACE TABLE`); a cross-catalog save fetches the
+  real bytes first, the way realize does. Non-lazy (in-RAM) stashes keep
+  the true verbatim re-save.
+- Every realize failure mode the F9 diagnostics distinguish is now pinned
+  by a deterministic test: the organic placeholder-clobber repro, a
+  `checkpointable()` flip (forced via the test-only `DBSP_TEST_CKPT_FLIP`
+  env var), a missing node blob, a rejected (corrupt) node blob, and a
+  sink-blob decode throw — each fails cleanly, schedules the rebuild
+  escape hatch, and the rebuilt view matches a continuously-live twin.
+- New `g_lazy_realize_failures` counter makes the failure site observable:
+  `record_error_best_effort` can never set `last_error_` from the realize
+  path (its callers hold `struct_mutex_` shared, so the try-lock always
+  fails and the message reaches stderr only).
+
 ## Cold-attach replay: chunk-grouped join-index integration - Aug 2026
 
 - Attach profiling (create_translate / create_replay / create_replay_split

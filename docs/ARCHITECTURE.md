@@ -586,7 +586,13 @@ State after:
   view's stash). `save_checkpoint` re-saves a still-pending view's stash
   **verbatim** — valid because "pending" is definitionally "no deltas
   applied since the stash," so the undecoded bytes are still exactly
-  current. `dbsp_lazy_restore(false)` reproduces the pre-D-lazy eager
+  current. Under disk-backed (Phase 3) lazy blobs the stash holds empty
+  placeholders — the bytes live only in `_dbsp_ckpt` — so a same-catalog
+  save preserves the view's existing rows in place instead (writing the
+  placeholders back would clobber the only copy: the root cause of the
+  historical "lazy-restore stash failed to decode" flake), and a
+  cross-catalog save fetches the bytes first, the way realize does.
+  `dbsp_lazy_restore(false)` reproduces the pre-D-lazy eager
   behavior (every checkpointed view fully restored during the load call
   itself).
 - A checkpoint blob format version travels alongside the data (a

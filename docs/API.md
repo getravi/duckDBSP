@@ -799,7 +799,9 @@ still-pending view's live state decodes it transparently — the query or
 delta still returns/applies the exact same result, just with the decode
 cost deferred to when it's actually needed. A checkpointed view never
 touched between reopen and the next `dbsp_save()` is re-saved verbatim
-(no decode at all).
+(no decode at all); on a disk-backed database, where the stash holds
+placeholders and the bytes live in `_dbsp_ckpt`, the save keeps that
+view's existing rows in place instead of rewriting them.
 
 One deliberate exception to "decodes transparently on first read": `dbsp_views()`
 reports a pending view's row count from the checkpoint's stashed metadata

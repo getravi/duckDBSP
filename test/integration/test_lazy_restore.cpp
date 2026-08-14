@@ -27,6 +27,7 @@
 #include "../test_helpers.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -437,4 +438,185 @@ TEST_CASE("lazy restore: first post-reopen delta on a join's local side "
     REQUIRE(db.manager().pending_restore_count() == 0);
     REQUIRE(snapshotView(db, "v1") == snapshotView(db, "v1_live"));
     REQUIRE(snapshotView(db, "v3") == snapshotView(db, "v3_live"));
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 (disk-backed / lazy-from-table) failure modes. These tests pin
+// down the previously "unreproduced flaky" report
+//   "lazy-restore stash for view '...' failed to decode; scheduling full
+//    rebuild"
+// (realize_pending_view_locked, dbsp_cdc.hpp) by building the exact app
+// shape deterministically: mv tables ON, a checkpointed view reloaded
+// PENDING with placeholder blobs (bytes left in _dbsp_ckpt, fetched at
+// realize time -- CkptData::lazy_blobs).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Build the Phase 3 lazy shape: v_sum checkpointed while mv tables are ON,
+// dropped in-memory (its __mv_ table + meta row survive), reloaded via the
+// checkpoint fast path -> pending with EMPTY placeholder blobs. v_live is
+// the continuously-live correctness oracle (identical SQL, never dropped).
+void setupMvPendingPair(DuckDBTestHarness &db) {
+    setupItemsTable(db);
+    const std::string sql =
+        "SELECT cat, SUM(value) AS s FROM items GROUP BY cat";
+    db.exec("SELECT * FROM dbsp_create_view('v_sum', '" + sql + "')");
+    db.exec("SELECT * FROM dbsp_create_view('v_live', '" + sql + "')");
+    db.exec("SELECT * FROM dbsp_mv_tables(true)");
+    REQUIRE_FALSE(db.query("SELECT * FROM dbsp_save()")->HasError());
+    REQUIRE_FALSE(db.query("SELECT dbsp_drop('v_sum')")->HasError());
+    REQUIRE_FALSE(db.query("SELECT * FROM dbsp_load()")->HasError());
+    REQUIRE(db.manager().pending_restore_count() == 1);
+}
+
+// Smallest persisted blob length for v_sum rows of `kind` in _dbsp_ckpt.
+// A Phase 3 placeholder clobber leaves 0-byte rows; real node blobs are
+// always non-empty, and even a table-backed view's deliberately-empty sink
+// result blob is 8 bytes (u64 row count = 0), never 0.
+int64_t minCkptBlobLen(DuckDBTestHarness &db, const std::string &kind) {
+    auto r = db.query("SELECT COALESCE(MIN(octet_length(data)), -1) FROM "
+                      "_dbsp_ckpt WHERE name = 'v_sum' AND kind = '" +
+                      kind + "'");
+    REQUIRE_FALSE(r->HasError());
+    return r->GetValue(0, 0).GetValue<int64_t>();
+}
+
+// Drive the rebuild_pending_ escape hatch to completion (it runs at the
+// next statement boundary -- QueryBegin) and prove it self-heals: the
+// rebuilt view matches the continuously-live twin exactly.
+void requireEscapeHatchHeals(DuckDBTestHarness &db,
+                             size_t failures_before) {
+    // The failure site fired (realize decode failure -> escape hatch).
+    // Asserted via the g_lazy_realize_failures counter: last_error_ is
+    // unreachable from realize_pending_view_locked (its callers hold
+    // struct_mutex_ shared, so record_error_best_effort's try-lock always
+    // fails and the message goes to stderr only).
+    REQUIRE(dbsp_native::g_lazy_realize_failures.load() ==
+            failures_before + 1);
+    REQUIRE(db.manager().rebuild_pending());
+    db.exec("SELECT 1"); // statement boundary: rebuild_all_views runs here
+    REQUIRE_FALSE(db.manager().rebuild_pending());
+    REQUIRE(snapshotView(db, "v_sum") == snapshotView(db, "v_live"));
+}
+
+} // namespace
+
+// THE ROOT CAUSE of the flaky report (repro without any fault injection):
+// a Phase 3 lazy stash holds EMPTY placeholder blobs -- the real bytes
+// stay in _dbsp_ckpt and are fetched per view at realize time. But
+// save_checkpoint's "verbatim re-save" of a still-pending view wrote the
+// STASH back, i.e. the placeholders: 0-byte node/sink rows replaced the
+// only copy of the real bytes. The next realize (same session, or any
+// later one -- watermarks still match) fetched the 0-byte rows, failed to
+// decode, and fell back to the full rebuild. In the app: attach -> some
+// views never touched -> periodic dbsp_save -> first touch of such a view
+// logs "lazy-restore stash ... failed to decode". Flaky only because it
+// needs a view that is still pending at save time and touched afterwards.
+TEST_CASE("lazy restore: dbsp_save while a lazy-from-table view is still "
+          "pending preserves its checkpoint bytes",
+          "[integration][checkpoint][lazy_restore]") {
+    DuckDBTestHarness db;
+    setupMvPendingPair(db);
+
+    // The trigger: save while v_sum is still pending (stash = placeholders).
+    REQUIRE_FALSE(db.query("SELECT * FROM dbsp_save()")->HasError());
+
+    // The persisted bytes must survive the save. Pre-fix this read 0
+    // (placeholder rows clobbered the real blobs).
+    REQUIRE(minCkptBlobLen(db, "node") > 0);
+    REQUIRE(minCkptBlobLen(db, "sink") > 0);
+
+    // First touch after the save: a delta on v_sum's source realizes it
+    // (propagate_changes pre-pass). Must decode cleanly -- no escape hatch.
+    db.exec("INSERT INTO items VALUES (5, 'a', 5)");
+    db.exec("SELECT * FROM dbsp_sync('items')");
+    REQUIRE_FALSE(db.manager().rebuild_pending());
+    REQUIRE(db.manager().pending_restore_count() == 0);
+    REQUIRE(snapshotView(db, "v_sum") == snapshotView(db, "v_live"));
+
+    // Next-session durability: the re-saved checkpoint round-trips too.
+    REQUIRE_FALSE(db.query("SELECT * FROM dbsp_save()")->HasError());
+    REQUIRE_FALSE(db.query("SELECT dbsp_drop('v_sum')")->HasError());
+    REQUIRE_FALSE(db.query("SELECT * FROM dbsp_load()")->HasError());
+    REQUIRE(db.manager().pending_restore_count() == 1);
+    db.exec("INSERT INTO items VALUES (6, 'b', 6)");
+    db.exec("SELECT * FROM dbsp_sync('items')");
+    REQUIRE_FALSE(db.manager().rebuild_pending());
+    REQUIRE(snapshotView(db, "v_sum") == snapshotView(db, "v_live"));
+}
+
+// F9 failure mode 1: checkpointable() flips false between save and realize
+// (restore_circuit_state's first guard). Cannot occur organically from SQL
+// alone -- the fingerprint gate re-plans the same SQL -- so it is forced
+// via the DBSP_TEST_CKPT_FLIP fault-injection env var (test-only, checked
+// at realize, never at save). Proves the diagnostic path fails cleanly and
+// the rebuild escape hatch restores exact parity.
+TEST_CASE("lazy restore: injected checkpointable() flip at realize fails "
+          "cleanly and the rebuild escape hatch heals",
+          "[integration][checkpoint][lazy_restore]") {
+    DuckDBTestHarness db;
+    setupMvPendingPair(db);
+
+    const size_t fails_before = dbsp_native::g_lazy_realize_failures.load();
+    setenv("DBSP_TEST_CKPT_FLIP", "1", 1);
+    auto q = db.query("SELECT * FROM dbsp_query('v_sum')"); // touch: realize
+    unsetenv("DBSP_TEST_CKPT_FLIP");
+    REQUIRE_FALSE(q->HasError());
+
+    requireEscapeHatchHeals(db, fails_before);
+}
+
+// F9 failure mode 2: a node blob missing at realize (the "plan shape
+// drifted since save?" diagnostic). Injected by deleting v_sum's node rows
+// from _dbsp_ckpt after the lazy load stashed placeholders but before
+// anything fetched the bytes -- the realize-time fetch then comes back
+// sink-only, and the aggregate node finds no blob for its id.
+TEST_CASE("lazy restore: missing node blob at realize fails cleanly and "
+          "the rebuild escape hatch heals",
+          "[integration][checkpoint][lazy_restore]") {
+    DuckDBTestHarness db;
+    setupMvPendingPair(db);
+
+    const size_t fails_before = dbsp_native::g_lazy_realize_failures.load();
+    db.exec("DELETE FROM _dbsp_ckpt WHERE name = 'v_sum' AND kind = 'node'");
+    auto q = db.query("SELECT * FROM dbsp_query('v_sum')");
+    REQUIRE_FALSE(q->HasError());
+
+    requireEscapeHatchHeals(db, fails_before);
+}
+
+// F9 failure mode 3: a node blob present but rejected by restore_state
+// (truncated/corrupt bytes). Injected by overwriting v_sum's node rows
+// with garbage; BlobReader's bounds checks make the node reject the blob.
+TEST_CASE("lazy restore: corrupt node blob at realize fails cleanly and "
+          "the rebuild escape hatch heals",
+          "[integration][checkpoint][lazy_restore]") {
+    DuckDBTestHarness db;
+    setupMvPendingPair(db);
+
+    const size_t fails_before = dbsp_native::g_lazy_realize_failures.load();
+    db.exec("UPDATE _dbsp_ckpt SET data = 'xx'::BLOB "
+            "WHERE name = 'v_sum' AND kind = 'node'");
+    auto q = db.query("SELECT * FROM dbsp_query('v_sum')");
+    REQUIRE_FALSE(q->HasError());
+
+    requireEscapeHatchHeals(db, fails_before);
+}
+
+// Sink-blob decode failure (the catch right after restore_circuit_state in
+// realize_pending_view_locked): nodes restore fine, the sink blob throws.
+TEST_CASE("lazy restore: corrupt sink blob at realize fails cleanly and "
+          "the rebuild escape hatch heals",
+          "[integration][checkpoint][lazy_restore]") {
+    DuckDBTestHarness db;
+    setupMvPendingPair(db);
+
+    const size_t fails_before = dbsp_native::g_lazy_realize_failures.load();
+    db.exec("UPDATE _dbsp_ckpt SET data = 'x'::BLOB "
+            "WHERE name = 'v_sum' AND kind = 'sink'");
+    auto q = db.query("SELECT * FROM dbsp_query('v_sum')");
+    REQUIRE_FALSE(q->HasError());
+
+    requireEscapeHatchHeals(db, fails_before);
 }
