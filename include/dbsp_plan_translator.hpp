@@ -3630,11 +3630,57 @@ private:
     auto &wmap = packed_weights(left);
     auto &idx = packed_index(left);
     std::string kb, rb;
-    // Group this delta's rows per encoded key so each bucket is merged
-    // once per CALL, not scanned once per row: the old per-row linear
-    // bucket probe made initial replay O(rows x bucket) on fat buckets
-    // (low-cardinality keys, degenerate cross-join single bucket) —
-    // profiled at ~25% of a wfp cold attach.
+    // Small deltas (the steady edit path: 1-few rows per commit) keep the
+    // original per-row merge — the grouped path below costs a map build +
+    // an extra string copy per row, measured at ~+19ms on a wfp steady
+    // edit when applied unconditionally.
+    if (dk.rows.size() <= 16) {
+      for (size_t i = 0; i < dk.rows.size(); i++) {
+        const DuckDBRow &row = *dk.rows[i];
+        const int64_t w = dk.weights[i];
+        if (!packed::encode_row(rb, row)) {
+          throw std::runtime_error("packed join index: unencodable row");
+        }
+        if (track_weights) {
+          int64_t &total = wmap[rb];
+          total += w;
+          if (total == 0) {
+            wmap.erase(rb);
+          }
+        }
+        if (!dk.valid[i]) {
+          continue;
+        }
+        if (!packed::encode_row(kb, dk.keys[i])) {
+          throw std::runtime_error("packed join index: unencodable key");
+        }
+        auto &bucket = idx[kb];
+        bool merged = false;
+        for (size_t b = 0; b < bucket.size(); b++) {
+          if (bucket[b].first == rb) {
+            bucket[b].second += w;
+            if (bucket[b].second == 0) {
+              bucket[b] = std::move(bucket.back());
+              bucket.pop_back();
+            }
+            merged = true;
+            break;
+          }
+        }
+        if (!merged) {
+          bucket.emplace_back(rb, w);
+        }
+        if (bucket.empty()) {
+          idx.erase(kb);
+        }
+      }
+      return;
+    }
+    // Bulk deltas (initial replay chunks): group per encoded key so each
+    // bucket is merged once per CALL, not scanned once per row — the
+    // per-row linear bucket probe made initial replay O(rows x bucket) on
+    // fat buckets (low-cardinality keys, degenerate cross-join single
+    // bucket), profiled at ~25% of a wfp cold attach.
     std::unordered_map<std::string,
                        std::vector<std::pair<std::string, int64_t>>>
         grouped;
