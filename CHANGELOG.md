@@ -1,5 +1,25 @@
 # Changelog
 
+## Join probe decode micro-costs (F4/F5) - Aug 2026
+
+- decode_row rewritten: decode_values() reads straight from a byte pointer
+  into an exactly-reserved vector<Value> and the row adopts it via one
+  assign() — replacing a COW-checked ColumnVec::push_back per value, and
+  (mapped flat paths) an arena->std::string copy per bucket row.
+- All hot probe paths (SharedArrangement::probe_packed / probe_spilled /
+  probe_projected, PlanJoinNode::probe_packed / probe_local_spill) now
+  hash-seed decoded rows via hash_row_fast before they become scratch-map
+  keys — the lazy per-Value ColumnVec::hash path they previously hit on
+  first map contact is the expensive one its own docs warn about. Scratch
+  maps are reserved to the bucket size.
+- Measured (bench_planner_eval join delta, 100k probes vs 100k-row packed
+  index): 103.2ms -> 89.9ms median (~13%; 0.97 -> 1.11M rows/s).
+- NOT taken: F4's full vector-of-pairs probe scratch. The map is required
+  for projection collapse, and the non-projected paths share their return
+  type with the zero-copy live-index branch of probe_side — five consumer
+  loops would fork over a residual node-alloc-per-row cost. Revisit only
+  if a profile shows the scratch-map allocs dominating.
+
 ## Lazy result_ on NativeSortView / NativeDistinctOnView - Aug 2026
 
 - Same write-only finding (and same fix) as the window view: both are

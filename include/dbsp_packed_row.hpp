@@ -177,14 +177,27 @@ inline duckdb::Value decode_value(const char *&p) {
   return Value(); // unreachable for well-formed input
 }
 
-// Decode into an existing row object (RowT must expose columns.push_back).
+// Decode all values of a packed row starting at `p` (advances p past the
+// row). `vals` is cleared and reserved to the exact column count — one
+// allocation, no per-push growth.
+inline void decode_values(const char *&p, std::vector<duckdb::Value> &vals) {
+  const uint32_t n = get_raw<uint32_t>(p);
+  vals.clear();
+  vals.reserve(n);
+  for (uint32_t i = 0; i < n; i++) {
+    vals.push_back(decode_value(p));
+  }
+}
+
+// Decode into a row object (RowT must expose columns.assign). The row's
+// columns are REPLACED — every caller passes a fresh row. One payload
+// allocation via assign instead of a COW-checked push_back per value.
 template <typename RowT>
 inline void decode_row(const std::string &bytes, RowT &row) {
   const char *p = bytes.data();
-  const uint32_t n = get_raw<uint32_t>(p);
-  for (uint32_t i = 0; i < n; i++) {
-    row.columns.push_back(decode_value(p));
-  }
+  std::vector<duckdb::Value> vals;
+  decode_values(p, vals);
+  row.columns.assign(std::move(vals));
 }
 
 // True when every column type round-trips through this codec — the gate

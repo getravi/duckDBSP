@@ -1455,6 +1455,22 @@ public:
 // state for this side; their bilinear formula drops the Δl⋈Δr term
 // accordingly (v1 shares at most one side per join, which keeps view
 // initialization = plain replay of the local side).
+// Decode a packed bucket row straight from arena/overlay bytes into a
+// hash-seeded DuckDBRow. Probe rows become scratch-map keys immediately, so
+// the hash is always paid — hash_row_fast on the decoded values is the same
+// bits as the lazy ColumnVec::hash at a fraction of the cost (see its doc
+// in dbsp_checkpoint.hpp), and assign() replaces a COW-checked push_back
+// per value with one payload allocation.
+inline DuckDBRow decode_probe_row(const char *p) {
+  std::vector<duckdb::Value> vals;
+  packed::decode_values(p, vals);
+  DuckDBRow row;
+  const size_t h = hash_row_fast(vals);
+  row.columns.assign(std::move(vals));
+  row.columns.set_hash(h);
+  return row;
+}
+
 struct SharedArrangement {
   using RowWeights = std::unordered_map<DuckDBRow, int64_t, DuckDBRowHash>;
   using Index = std::unordered_map<DuckDBRow, RowWeights, DuckDBRowHash>;
@@ -1500,34 +1516,35 @@ struct SharedArrangement {
     if (!have_overlay && fe == nullptr) {
       return false;
     }
-    auto emit = [&](const std::string &bytes, int64_t w) {
-      DuckDBRow row;
-      packed::decode_row(bytes, row);
+    auto emit = [&](const char *p, int64_t w) {
       if (proj) {
-        DuckDBRow projected;
         std::vector<duckdb::Value> vals;
-        vals.reserve(proj->size());
+        packed::decode_values(p, vals);
+        std::vector<duckdb::Value> pv;
+        pv.reserve(proj->size());
         for (auto idx : *proj) {
-          vals.push_back(idx < row.columns.size() ? row.columns[idx]
-                                                  : duckdb::Value());
+          pv.push_back(idx < vals.size() ? vals[idx] : duckdb::Value());
         }
-        projected.columns.assign(std::move(vals));
+        DuckDBRow projected;
+        const size_t h = hash_row_fast(pv);
+        projected.columns.assign(std::move(pv));
+        projected.columns.set_hash(h);
         out[std::move(projected)] += w; // collapse under projection
       } else {
-        out[std::move(row)] += w;
+        out[decode_probe_row(p)] += w;
       }
     };
     if (fe != nullptr && !have_overlay) {
+      out.reserve(fe->bucket_n);
       for (uint32_t b = 0; b < fe->bucket_n; b++) {
         const auto &be = flat.bucket_at(fe->bucket_off + b);
-        emit(std::string(reinterpret_cast<const char *>(flat.arena_data() +
-                                                        be.row_off),
-                         be.row_len),
+        emit(reinterpret_cast<const char *>(flat.arena_data() + be.row_off),
              be.weight);
       }
     } else if (fe == nullptr) {
+      out.reserve(it->second.size());
       for (const auto &[bytes, w] : it->second) {
-        emit(bytes, w);
+        emit(bytes.data(), w);
       }
     } else {
       // merge by row bytes: flat weight + overlay delta
@@ -1545,7 +1562,7 @@ struct SharedArrangement {
       }
       for (const auto &[bytes, w] : merged) {
         if (w != 0) {
-          emit(bytes, w);
+          emit(bytes.data(), w);
         }
       }
     }
@@ -1864,7 +1881,9 @@ struct SharedArrangement {
       } else {
         copy = vals;
       }
+      const size_t h = hash_row_fast(copy);
       row.columns.assign(std::move(copy));
+      row.columns.set_hash(h);
       out[std::move(row)] += w; // projection can collapse distinct rows
     }
     return true;
@@ -1886,7 +1905,9 @@ struct SharedArrangement {
         vals.push_back(idx < row.columns.size() ? row.columns[idx]
                                                 : duckdb::Value());
       }
+      const size_t h = hash_row_fast(vals);
       projected.columns.assign(std::move(vals));
+      projected.columns.set_hash(h);
       out[std::move(projected)] += w; // collapse under projection
     }
     return true;
@@ -2587,10 +2608,13 @@ private:
     if (!bucket) {
       return false;
     }
+    out.reserve(bucket->size());
     for (const auto &[vals, w] : *bucket) {
       DuckDBRow row;
       std::vector<duckdb::Value> copy = vals;
+      const size_t h = hash_row_fast(copy);
       row.columns.assign(std::move(copy));
+      row.columns.set_hash(h);
       out.emplace(std::move(row), w);
     }
     return true;
@@ -3574,14 +3598,12 @@ private:
     // built this session), both of which skip the merge map.
     if (fe != nullptr && it == idx.end()) {
       // Mapped-aware accessors, not the owned vectors — see write_pindex.
+      out.reserve(fe->bucket_n);
       for (uint32_t b = 0; b < fe->bucket_n; b++) {
         const auto &be = flat.bucket_at(fe->bucket_off + b);
-        DuckDBRow row;
-        std::string bytes(
-            reinterpret_cast<const char *>(flat.arena_data() + be.row_off),
-            be.row_len);
-        packed::decode_row(bytes, row);
-        out.emplace(std::move(row), be.weight);
+        out.emplace(decode_probe_row(reinterpret_cast<const char *>(
+                        flat.arena_data() + be.row_off)),
+                    be.weight);
       }
       return !out.empty();
     }
@@ -3589,10 +3611,9 @@ private:
       if (it->second.empty()) {
         return false;
       }
+      out.reserve(it->second.size());
       for (const auto &[bytes, w] : it->second) {
-        DuckDBRow row;
-        packed::decode_row(bytes, row);
-        out.emplace(std::move(row), w);
+        out.emplace(decode_probe_row(bytes.data()), w);
       }
       return true;
     }
@@ -3612,9 +3633,7 @@ private:
       if (w == 0) {
         continue;
       }
-      DuckDBRow row;
-      packed::decode_row(bytes, row);
-      out.emplace(std::move(row), w);
+      out.emplace(decode_probe_row(bytes.data()), w);
     }
     return !out.empty();
   }
