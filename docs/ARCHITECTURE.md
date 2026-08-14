@@ -552,7 +552,17 @@ State after:
   fingerprint sidecar written at save and ADOPTED at register over a
   watermark-verified deferred table (`sharr_*.flat`) — first edit after
   reopen stops paying a whole-baseline backfill. Serialization folds
-  flat + overlay back into one stream
+  flat + overlay back into one stream. VIEW-sourced arrangements adopt
+  the same way, but their trust anchor is the checkpoint itself, not a
+  data watermark: every save writes a random per-save id (`_dbsp_ckpt`
+  kind='saveid', same transaction as the view blobs) and stamps each
+  saved view's arrangement sidecar with it — clean files are re-stamped
+  in place (~24-byte header patch), changed ones re-fold or
+  delta-append. Register-time adoption requires the source view to be
+  PENDING (its checkpoint stash was accepted) and the file stamp to
+  equal the loaded checkpoint's save-id; anything else declines and the
+  arrangement backfills from the view's `__mv_` table/result as before
+  (full design note at `save_checkpoint`'s sidecar loop)
 - **Delta-append sidecars**: with an adopted base and a small overlay, a
   dirty save writes only the changes — the digest-index overlay as
   `.idx.d` and per-arrangement replacement buckets for touched keys as

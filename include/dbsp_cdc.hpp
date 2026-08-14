@@ -36,6 +36,7 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <random>
 #include <shared_mutex>
 #include <thread>
 #include <cerrno>
@@ -64,6 +65,19 @@ inline std::atomic<size_t> g_lazy_view_decodes{0};
 // realize_pending_view_locked (its callers hold struct_mutex_ shared, so
 // the try-lock always fails and the message goes to stderr only).
 inline std::atomic<size_t> g_lazy_realize_failures{0};
+
+// View-arrangement sidecars (design note at save_checkpoint's sidecar
+// loop): test-observable counters, same g_* convention as above.
+// Arrangements adopted from a view-sourced sidecar at register time
+// (reattach skipped that arrangement's __mv_/result backfill scan):
+inline std::atomic<size_t> g_view_arr_sidecar_adopts{0};
+// Clean view-sourced sidecar files re-stamped in place at save (content
+// unchanged, identity moved to the new checkpoint's save-id):
+inline std::atomic<size_t> g_view_arr_sidecar_restamps{0};
+// Shared-arrangement backfill scans actually performed, across every fill
+// site (register-time, deferred-table materialize, pending-view realize).
+// "Reattach adopts without scanning" == this counter not moving.
+inline std::atomic<size_t> g_arr_backfills{0};
 
 // DBSP_TIMING=1: emit per-phase wall-clock lines to stderr
 // ("[dbsp-timing] <phase> <detail> ms=..."), for profiling restore cost
@@ -782,6 +796,33 @@ public:
           return false;
         }
       }
+      // View-arrangement sidecar identity for THIS save (design note at
+      // the sidecar loop below): a fresh random 16-hex id every save, so
+      // a sidecar file stamped with it is provably the one this exact
+      // checkpoint's sidecar pass wrote or re-stamped. seq is a monotone
+      // informative counter carried in the file's wm_count field.
+      int64_t save_seq = 0;
+      std::string save_id;
+      {
+        {
+          std::lock_guard<std::mutex> g(seeds_mutex_);
+          save_seq = view_arr_seq_ + 1;
+        }
+        std::random_device rd;
+        const uint64_t r =
+            (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
+        char hex[17];
+        std::snprintf(hex, sizeof(hex), "%016llx",
+                      static_cast<unsigned long long>(r));
+        save_id = hex;
+        auto rs = ins->Execute("saveid", "", save_seq,
+                               duckdb::Value::BLOB(save_id));
+        if (rs->HasError()) {
+          con.Query("ROLLBACK");
+          last_error_ = rs->GetError();
+          return false;
+        }
+      }
       for (const auto &ck : view_blobs) {
         for (const auto &[node_id, blob] : ck.nodes) {
           auto r = ins->Execute(
@@ -875,6 +916,14 @@ public:
       con.Query("COMMIT");
       last_ckpt_saved_count_ = view_blobs.size() + preserve_pending.size();
       mark_saved();
+      {
+        // The committed checkpoint's identity is now this save's: later
+        // register-time adoption (same session) and the next save's
+        // seq increment both key off it.
+        std::lock_guard<std::mutex> g(seeds_mutex_);
+        view_arr_seq_ = save_seq;
+        view_arr_id_ = save_id;
+      }
       // Recovery inc B: persist each durable spilled baseline's digest
       // index under the watermark just written — a reopen whose live
       // table still matches it adopts the pair instead of rescanning.
@@ -902,16 +951,77 @@ public:
         // arrangements, under the same just-saved watermarks. Skipped for
         // free when an adopted flat layer is still clean. Best-effort —
         // a missing sidecar only costs the baseline backfill on reopen.
+        //
+        // ---- View-sourced arrangement sidecars: correctness design ----
+        // A TABLE-sourced sidecar's trust anchor is the source table's
+        // content watermark: the load verified it against live storage,
+        // so a file stamped with it is exactly the live content. A
+        // VIEW-sourced arrangement has no independently-verifiable
+        // source: its truth is the view's restored circuit state, whose
+        // own trust anchor is "this view's stash was accepted" (SQL
+        // fingerprint matched AND no table in its source closure is
+        // stale). So the sidecar's identity must be *the checkpoint that
+        // wrote those view blobs*, not any data watermark:
+        //   stamp := (save_seq, save_id), the random per-save id written
+        //   as the _dbsp_ckpt 'saveid' row IN THE SAME TRANSACTION as
+        //   every view blob and watermark.
+        // Adoption (register_arrangements' cold defer branch) requires
+        //   (1) the source view is PENDING — its stash was accepted, so
+        //       its restored state is exactly the save-time state — and
+        //   (2) the file's stamp equals the loaded checkpoint's save-id.
+        // (1)+(2) ⇒ file content == arrangement content at that save ==
+        // content the realized view will present. Deltas can only reach
+        // the arrangement after the pending source realizes (D-lazy
+        // Global Constraint), exactly as with a scan backfill. Hazards:
+        //   (a) lazy realize replays nothing beyond the stash (watermarks
+        //       pin the sources), so adopt-then-realize is delta-clean;
+        //   (b) dirty/partial saves: the save-id changes EVERY save, so a
+        //       clean file (content still exact) is re-stamped in place
+        //       (restamp_flat_index_file, ~24 bytes) instead of skipped
+        //       the way table files are — a skipped old stamp would be
+        //       indistinguishable from stale. Changed arrangements write
+        //       a delta chained to the (unrestamped) base identity or a
+        //       full fold, exactly like the table path;
+        //   (c) a still-pending view's arrangement is either adopted
+        //       (content unchanged by definition of pending — restamp is
+        //       correct) or needs_backfill (skipped: nothing to write,
+        //       and its file, if any, keeps its old stamp and simply
+        //       declines later — never clobbered), mirroring how the
+        //       pending view's ckpt bytes are preserved verbatim.
+        // Crash windows: sidecar writes/restamps run post-COMMIT, so a
+        // crash leaves files stamped with an id no checkpoint carries —
+        // adoption declines, the arrangement backfills (today's cost).
+        // Only views actually carried by THIS checkpoint (blobs written
+        // or preserved) get stamped: anything else could not be pending
+        // at the next load, so its file would be unusable anyway.
         if (spill_durable_dir_) {
           std::shared_lock<std::shared_mutex> vl(view_mutex_);
+          std::unordered_set<std::string> saved_views;
+          saved_views.reserve(view_blobs.size() + preserve_pending.size());
+          for (const auto &ck : view_blobs) {
+            saved_views.insert(ck.name);
+          }
+          for (const auto &n : preserve_pending) {
+            saved_views.insert(n);
+          }
           for (const auto &[fp, weak] : arrangements_) {
             auto arr = weak.lock();
             if (!arr || !arr->packed_ok || arr->track_weights ||
                 arr->track_counters || arr->needs_backfill) {
               continue;
             }
+            int64_t swc = 0;
+            std::string swh;
+            bool view_src = false;
             auto wm_it = saved_wms.find(arr->table);
-            if (wm_it == saved_wms.end()) {
+            if (wm_it != saved_wms.end()) {
+              swc = wm_it->second.first;
+              swh = wm_it->second.second;
+            } else if (saved_views.count(arr->table) > 0) {
+              view_src = true;
+              swc = save_seq;
+              swh = save_id;
+            } else {
               continue;
             }
             if (arr->packed.empty() && !arr->flat.empty() &&
@@ -920,48 +1030,63 @@ public:
               // on disk is already exactly this content. A LOCALLY folded
               // flat (compact_to_flat, flat_file_wm_count == -1) has no
               // file yet and must fall through to the full write.
-              continue;
+              if (!view_src) {
+                continue; // table identity unchanged: file stays valid
+              }
+              // View identity moves every save: re-stamp the clean file
+              // to this save's id (content bytes untouched — see (b)).
+              DbspScopeTimer t_rs("ckpt_arr_restamp", arr->table);
+              if (flatpacked::restamp_flat_index_file(sharr_path(fp), fp,
+                                                      swc, swh)) {
+                g_view_arr_sidecar_restamps++;
+                arr->flat_file_wm_count = swc;
+                arr->flat_file_wm_hash = swh;
+                arr->sidecar_saved_wm_count = swc;
+                arr->sidecar_saved_wm_hash = swh;
+                continue;
+              }
+              // missing/odd file: fall through to the full fold
             }
-            if (arr->sidecar_saved_wm_count == wm_it->second.first &&
-                arr->sidecar_saved_wm_hash == wm_it->second.second) {
+            if (!view_src && arr->sidecar_saved_wm_count == swc &&
+                arr->sidecar_saved_wm_hash == swh) {
               continue; // this exact content is already on disk
             }
             DbspScopeTimer t_fp("ckpt_arr_sidecar", arr->table);
             // Delta-append: with an adopted base and a small overlay,
             // write only the touched keys' replacement buckets chained to
             // the base — O(touched) instead of a whole-arrangement fold.
+            // (View arrs chain to the base's OLD stamp: the base file is
+            // deliberately NOT re-stamped when a delta references it.)
             if (arr->flat_file_wm_count >= 0 &&
                 arr->packed.size() * 10 < arr->flat.dir_size()) {
               flatpacked::ReplacementBuckets touched;
               arr->fold_packed_touched(touched);
               if (flatpacked::write_flat_delta_file(
-                      sharr_path(fp) + ".d", fp, wm_it->second.first,
-                      wm_it->second.second, arr->flat_file_wm_count,
-                      arr->flat_file_wm_hash, touched)) {
-                arr->sidecar_saved_wm_count = wm_it->second.first;
-                arr->sidecar_saved_wm_hash = wm_it->second.second;
+                      sharr_path(fp) + ".d", fp, swc, swh,
+                      arr->flat_file_wm_count, arr->flat_file_wm_hash,
+                      touched)) {
+                arr->sidecar_saved_wm_count = swc;
+                arr->sidecar_saved_wm_hash = swh;
                 continue;
               }
               // fall through to the full fold on a delta-write failure
             }
             flatpacked::FlatPackedIndex folded;
             arr->fold_packed(folded);
-            if (flatpacked::write_flat_index_file(sharr_path(fp), fp,
-                                                  wm_it->second.first,
-                                                  wm_it->second.second,
-                                                  folded)) {
+            if (flatpacked::write_flat_index_file(sharr_path(fp), fp, swc,
+                                                  swh, folded)) {
               // A full fold supersedes any delta chained to the old base.
               std::error_code fec;
               std::filesystem::remove(sharr_path(fp) + ".d", fec);
-              arr->sidecar_saved_wm_count = wm_it->second.first;
-              arr->sidecar_saved_wm_hash = wm_it->second.second;
+              arr->sidecar_saved_wm_count = swc;
+              arr->sidecar_saved_wm_hash = swh;
               // The just-written file IS a valid delta-chain base: future
               // replacement buckets are absolute per key (merge of the
               // live layers), so chaining them to this file's watermark is
               // correct whether `flat` was adopted, locally folded, or
               // still layered under `packed`.
-              arr->flat_file_wm_count = wm_it->second.first;
-              arr->flat_file_wm_hash = wm_it->second.second;
+              arr->flat_file_wm_count = swc;
+              arr->flat_file_wm_hash = swh;
             }
           }
         }
@@ -985,6 +1110,13 @@ public:
     // the view's definition changed since this checkpoint was written, so
     // the fast path is declined for that view alone.
     std::unordered_map<std::string, std::string> sql_fingerprints;
+    // View-arrangement sidecar identity of this checkpoint (the
+    // kind='saveid' row; design note at save_checkpoint's sidecar loop):
+    // sidecar files stamped with exactly this (seq, id) pair were written
+    // or re-stamped by the save that wrote these view blobs. An empty id
+    // (pre-feature checkpoint) just declines view-sidecar adoption.
+    int64_t view_arr_seq = -1;
+    std::string view_arr_id;
     // Verified per-source watermarks (COUNT, bit_xor(hash) as VARCHAR) —
     // seeds for lazy (deferred) baselines on the load fast path (D3c).
     // Only tables whose live content MATCHED the save-time watermark
@@ -1072,6 +1204,15 @@ public:
         }
         out.watermarks[t] = {meta->GetValue(1, i).GetValue<int64_t>(),
                              meta->GetValue(2, i).ToString()};
+      }
+      // View-arrangement sidecar identity (kind='saveid'; design note at
+      // save_checkpoint's sidecar loop). A missing row — pre-feature
+      // checkpoint — leaves the id empty and adoption simply declines.
+      auto sid = con.Query("SELECT node_id, data FROM " + ckpt_tbl +
+                           " WHERE kind = 'saveid'");
+      if (!sid->HasError() && sid->RowCount() == 1) {
+        out.view_arr_seq = sid->GetValue(0, 0).GetValue<int64_t>();
+        out.view_arr_id = duckdb::StringValue::Get(sid->GetValue(1, 0));
       }
       // Phase 3 (reattach): on a disk-backed database (mv tables present,
       // marked earlier in load_from_duck_table) operator blobs run to GBs
@@ -1490,6 +1631,7 @@ public:
       // Mirrors backfill_deferred_arrangements_locked's view-source arm
       // (the batched worklist only ever names views).
       DbspScopeTimer t_bf("arr_backfill", it.name);
+      g_arr_backfills += it.needy.size();
       for (auto &arr : it.needy) {
         arr->begin_initial_fill();
       }
@@ -1815,6 +1957,11 @@ public:
     if (have_ckpt) {
       std::lock_guard<std::mutex> g(seeds_mutex_);
       deferred_seeds_ = ckpt.watermarks;
+      // View-arrangement sidecars: this checkpoint's save-id is the ONLY
+      // identity register_arrangements may adopt view-sourced sidecars
+      // under (empty for a pre-feature checkpoint: adoption declines).
+      view_arr_seq_ = ckpt.view_arr_seq;
+      view_arr_id_ = ckpt.view_arr_id;
     }
 
     size_t loaded = 0;
@@ -2653,74 +2800,48 @@ public:
           // Recovery inc 3: adopt the fingerprint sidecar written by the
           // last save instead of backfilling from a 36M-row baseline scan
           // at first edit. Only over a DEFERRED table (its watermark was
-          // verified against live storage at load) and only for plain
-          // packed arrangements — pads/marks keep the backfill path.
+          // verified against live storage at load) or a PENDING view
+          // (its checkpoint stash was accepted — the sidecar's identity
+          // is then the checkpoint's save-id; see the design note at
+          // save_checkpoint's sidecar loop) and only for plain packed
+          // arrangements — pads/marks keep the backfill path.
           bool adopted = false;
-          if (source_is_table && spill_durable_dir_ && arr->packed_ok &&
-              !arr->track_weights && !arr->track_counters) {
-            const auto &tt = tracked_tables_.at(req.table);
-            // Delta chain first: a delta sidecar whose watermark matches
-            // the live table names the base it overlays; adopt that base
-            // and convert each replacement bucket into overlay deltas.
-            int64_t base_wc = -1;
-            std::string base_wh;
-            flatpacked::ReplacementBuckets repl;
-            if (flatpacked::load_flat_delta_file(
-                    sharr_path(req.fingerprint) + ".d", req.fingerprint,
-                    tt->deferred_weight(), tt->deferred_hash(), base_wc,
-                    base_wh, repl) &&
-                flatpacked::load_flat_index_file(
-                    sharr_path(req.fingerprint), req.fingerprint, base_wc,
-                    base_wh, arr->flat)) {
-              for (auto &[kb, rows] : repl) {
-                // overlay delta = replacement − base bucket
-                std::unordered_map<std::string, int64_t> m;
-                for (const auto &[rb, w] : rows) {
-                  m[rb] += w;
-                }
-                const auto *fe = arr->flat.find(kb);
-                if (fe != nullptr) {
-                  for (uint32_t b = 0; b < fe->bucket_n; b++) {
-                    const auto &be = arr->flat.bucket_at(fe->bucket_off + b);
-                    m[std::string(reinterpret_cast<const char *>(
-                                      arr->flat.arena_data() + be.row_off),
-                                  be.row_len)] -= be.weight;
-                  }
-                }
-                std::vector<std::pair<std::string, int64_t>> deltas;
-                for (auto &[rb, w] : m) {
-                  if (w != 0) {
-                    deltas.emplace_back(rb, w);
-                  }
-                }
-                if (!deltas.empty()) {
-                  arr->packed[kb] = std::move(deltas);
-                }
-              }
-              arr->flat_file_wm_count = base_wc;
-              arr->flat_file_wm_hash = base_wh;
-              // The delta's content is already on disk for this watermark.
-              arr->sidecar_saved_wm_count = tt->deferred_weight();
-              arr->sidecar_saved_wm_hash = tt->deferred_hash();
-              adopted = true;
+          if (spill_durable_dir_ && arr->packed_ok && !arr->track_weights &&
+              !arr->track_counters) {
+            if (source_is_table) {
+              const auto &tt = tracked_tables_.at(req.table);
+              adopted = adopt_arrangement_sidecar(*arr, req.fingerprint,
+                                                  tt->deferred_weight(),
+                                                  tt->deferred_hash());
             } else {
-              adopted = flatpacked::load_flat_index_file(
-                  sharr_path(req.fingerprint), req.fingerprint,
-                  tt->deferred_weight(), tt->deferred_hash(), arr->flat);
-              if (adopted) {
-                arr->flat_file_wm_count = tt->deferred_weight();
-                arr->flat_file_wm_hash = tt->deferred_hash();
+              // defer_fill && !source_is_table ⇒ the source view is
+              // pending, i.e. its stash was accepted (fingerprint match,
+              // stale-closure clean) — condition (1) of the design note.
+              int64_t seq = -1;
+              std::string id;
+              {
+                std::lock_guard<std::mutex> g(seeds_mutex_);
+                seq = view_arr_seq_;
+                id = view_arr_id_;
+              }
+              if (!id.empty()) {
+                adopted = adopt_arrangement_sidecar(*arr, req.fingerprint,
+                                                    seq, id);
+                if (adopted) {
+                  g_view_arr_sidecar_adopts++;
+                }
               }
             }
             if (std::getenv("DBSP_DEBUG_SYNC") && adopted) {
               std::cerr << "[dbsp] shared arrangement adopted from sidecar"
-                           " for table '" << req.table << "'"
+                           " for source '" << req.table << "'"
                         << (arr->packed.empty() ? "" : " (+delta)") << "\n";
             }
           }
           arr->needs_backfill = !adopted;
         } else {
           DbspScopeTimer timer("arr_backfill", req.table);
+          g_arr_backfills++;
           arr->begin_initial_fill(); // streaming build (flat PODs)
           if (source_is_table) {
             DuckDBZSet chunk;
@@ -5184,6 +5305,7 @@ private:
         continue;
       }
       DbspScopeTimer timer("arr_backfill", source_name);
+      g_arr_backfills++;
       arr->begin_initial_fill(); // streaming build (flat PODs)
       if (tt_it != tracked_tables_.end()) {
         DuckDBZSet chunk;
@@ -6092,6 +6214,13 @@ private:
   std::mutex seeds_mutex_;
   std::unordered_map<std::string, std::pair<int64_t, std::string>>
       deferred_seeds_;
+  // View-arrangement sidecar identity (seeds_mutex_): (seq, 16-hex id) of
+  // the checkpoint currently on disk for this database. Loads seed it
+  // from the checkpoint's 'saveid' row; every save mints a fresh id (see
+  // the design note at save_checkpoint's sidecar loop). Empty id = no
+  // adoptable checkpoint identity known.
+  int64_t view_arr_seq_ = -1;
+  std::string view_arr_id_;
   size_t last_deferred_count_ = 0;
   // D-lazy: default ON (see enable_lazy_restore/disable_lazy_restore), and
   // views left pending by the last load_from_duck_table call (mirrors
@@ -6117,6 +6246,68 @@ private:
                   static_cast<unsigned long long>(
                       std::hash<std::string>{}(fingerprint)));
     return spill_dir_ + "/sharr_" + hex + ".flat";
+  }
+
+  // Recovery inc 3 + view-arrangement sidecars: adopt a shared
+  // arrangement's durable sidecar when its stamp matches (wc, wh) — the
+  // source's verified identity (a deferred table's load-checked watermark,
+  // or the loaded checkpoint's save-id for a pending view's arrangement).
+  // Delta chain first: a delta sidecar whose stamp matches names the base
+  // it overlays; adopt that base and convert each replacement bucket into
+  // overlay deltas. On success `flat` (plus any overlay) holds exactly the
+  // stamped content and the sidecar bookkeeping fields are set.
+  bool adopt_arrangement_sidecar(SharedArrangement &arr,
+                                 const std::string &fingerprint, int64_t wc,
+                                 const std::string &wh) {
+    int64_t base_wc = -1;
+    std::string base_wh;
+    flatpacked::ReplacementBuckets repl;
+    if (flatpacked::load_flat_delta_file(sharr_path(fingerprint) + ".d",
+                                         fingerprint, wc, wh, base_wc,
+                                         base_wh, repl) &&
+        flatpacked::load_flat_index_file(sharr_path(fingerprint), fingerprint,
+                                         base_wc, base_wh, arr.flat)) {
+      for (auto &[kb, rows] : repl) {
+        // overlay delta = replacement − base bucket
+        std::unordered_map<std::string, int64_t> m;
+        for (const auto &[rb, w] : rows) {
+          m[rb] += w;
+        }
+        const auto *fe = arr.flat.find(kb);
+        if (fe != nullptr) {
+          for (uint32_t b = 0; b < fe->bucket_n; b++) {
+            const auto &be = arr.flat.bucket_at(fe->bucket_off + b);
+            m[std::string(reinterpret_cast<const char *>(
+                              arr.flat.arena_data() + be.row_off),
+                          be.row_len)] -= be.weight;
+          }
+        }
+        std::vector<std::pair<std::string, int64_t>> deltas;
+        for (auto &[rb, w] : m) {
+          if (w != 0) {
+            deltas.emplace_back(rb, w);
+          }
+        }
+        if (!deltas.empty()) {
+          arr.packed[kb] = std::move(deltas);
+        }
+      }
+      arr.flat_file_wm_count = base_wc;
+      arr.flat_file_wm_hash = base_wh;
+      // The delta's content is already on disk for this stamp.
+      arr.sidecar_saved_wm_count = wc;
+      arr.sidecar_saved_wm_hash = wh;
+      return true;
+    }
+    if (flatpacked::load_flat_index_file(sharr_path(fingerprint), fingerprint,
+                                         wc, wh, arr.flat)) {
+      arr.flat_file_wm_count = wc;
+      arr.flat_file_wm_hash = wh;
+      arr.sidecar_saved_wm_count = wc;
+      arr.sidecar_saved_wm_hash = wh;
+      return true;
+    }
+    return false;
   }
 
   // Best-effort capture of the default catalog's file path (durable spill

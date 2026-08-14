@@ -1,5 +1,31 @@
 # Changelog
 
+## View-sourced arrangement sidecars: reattach skips the __mv_ backfill scan - Aug 2026
+
+- Shared arrangements sourced on a VIEW (the probe-target side of a join)
+  used to rebuild by scanning the view's `__mv_` backing table (or its
+  decoded result) on every reattach — ~3.4s of `arr_backfill` at 60emp.
+  They now get durable `sharr_*.flat` sidecars like table-sourced ones.
+- Correctness design (extended comment at `save_checkpoint`'s sidecar
+  loop): a view has no independently verifiable content watermark, so the
+  sidecar's identity is the CHECKPOINT that wrote the view's blobs — a
+  random per-save id persisted as the `_dbsp_ckpt` kind='saveid' row in
+  the same transaction. Adoption (register-time, cold defer branch)
+  requires the source view to be pending (stash accepted: SQL fingerprint
+  match + stale-closure clean) AND the file stamp to equal the loaded
+  checkpoint's save-id. Since the id changes every save, clean files are
+  re-stamped in place (`restamp_flat_index_file`, ~24-byte header patch)
+  instead of skipped; changed arrangements delta-append (chained to the
+  un-restamped base identity) or re-fold, exactly like the table path.
+  Pending views' arrangements restamp (content unchanged by definition)
+  or are skipped when never filled — never clobbered, mirroring the
+  pending-preserve semantics for their checkpoint bytes.
+- Observability: `g_view_arr_sidecar_adopts` / `g_view_arr_sidecar_restamps`
+  / `g_arr_backfills` counters (g_* test convention).
+- Tests: `test/integration/test_view_arr_sidecars.cpp` — adopt without a
+  backfill scan + probe/write-path parity, pending-save restamp cycle,
+  stale-closure decline, stale-stamp (older save's file) rejection.
+
 ## CASE + later column refs silently wrong (BatchEvaluator stale reference) - Aug 2026
 
 - Reported by NumPad's MV compiler as "a CASE expression across a table

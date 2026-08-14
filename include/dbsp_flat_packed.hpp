@@ -489,6 +489,48 @@ inline bool load_flat_delta_file(const std::string &path,
   return true;
 }
 
+// View-arrangement sidecars (design note at save_checkpoint's sidecar
+// loop in dbsp_cdc.hpp): a VIEW-sourced sidecar's identity is the
+// checkpoint save-id, which changes on EVERY save — but a clean file's
+// CONTENT is still exact, so instead of re-folding, patch the
+// (wm_count, wm_hash) header fields in place. Only legal when the new
+// hash has the SAME length as the stored one (view stamps are a fixed
+// 16-hex string) — a length change would shift the section offsets. A
+// torn patch can only produce a stamp that matches no checkpoint (adopt
+// declines, arrangement backfills); content bytes are never touched.
+inline bool restamp_flat_index_file(const std::string &path,
+                                    const std::string &fingerprint,
+                                    int64_t wm_count,
+                                    const std::string &wm_hash) {
+  std::FILE *f = std::fopen(path.c_str(), "r+b");
+  if (f == nullptr) {
+    return false;
+  }
+  auto get = [&](void *p, size_t n) { return std::fread(p, 1, n, f) == n; };
+  uint64_t magic = 0;
+  uint32_t ver = 0, fplen = 0, hlen = 0;
+  int64_t old_count = 0;
+  bool ok = get(&magic, 8) && magic == kFlatFileMagic && get(&ver, 4) &&
+            ver == kFlatFileVersion && get(&fplen, 4);
+  std::string fp_in(fplen, '\0');
+  ok = ok && (fplen == 0 || get(fp_in.data(), fplen)) && get(&old_count, 8) &&
+       get(&hlen, 4);
+  if (!ok || fp_in != fingerprint || hlen != wm_hash.size()) {
+    std::fclose(f);
+    return false;
+  }
+  // wm_count sits right after magic(8) + ver(4) + fplen(4) + fp bytes;
+  // the hash follows its 4-byte length field.
+  ok = std::fseek(f, 16 + static_cast<long>(fplen), SEEK_SET) == 0 &&
+       std::fwrite(&wm_count, 1, 8, f) == 8 &&
+       std::fseek(f, 4, SEEK_CUR) == 0 &&
+       std::fwrite(wm_hash.data(), 1, hlen, f) == hlen;
+  std::fflush(f);
+  ::fsync(fileno(f));
+  std::fclose(f);
+  return ok;
+}
+
 inline bool load_flat_index_file(const std::string &path,
                                  const std::string &fingerprint,
                                  int64_t wm_count, const std::string &wm_hash,
