@@ -578,9 +578,13 @@ State after:
   into every surface that reads a view's live state — `dbsp_query`'s
   read path (`scan_view`/`query_view`), an incoming delta reaching the
   view or a pending ancestor of it (`propagate_changes`'s pre-pass, which
-  runs sequentially before any per-level parallel `step_view` work so
-  `pending_restore_`'s single shared map is never touched from more than
-  one thread at a time), a warm `create_view` replay or shared-arrangement
+  completes before any per-level parallel `step_view` work; it walks the
+  dependency closure first, then realizes the whole worklist as one batch
+  — `realize_pending_views_locked` fans the per-view blob fetch, decode,
+  and own-arrangement backfill across worker threads that touch only
+  per-view-disjoint state, while all `pending_restore_` map mutation stays
+  on the locking thread in a sequential resolve step), a warm
+  `create_view` replay or shared-arrangement
   backfill reading another view's result as a source, and
   `dbsp_replace_view`/drop (which discard rather than decode a dropped
   view's stash). `save_checkpoint` re-saves a still-pending view's stash

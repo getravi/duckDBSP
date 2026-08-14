@@ -1,5 +1,34 @@
 # Changelog
 
+## Reattach realize: batched parallel fetch/decode/backfill - Aug 2026
+
+- Profiled the wfp 60emp reattach (bench_mv_authority, DBSP_TIMING):
+  the first edit's `propagate_changes` pre-pass realizes every pending
+  view in the dependent closure (141 views), and its `blob_decode` total
+  (7.9s of an 18.4s reattach) split as 1.3s per-view `_dbsp_ckpt` fetch
+  queries + 3.2s node-state decode + ~0s sink decode + 3.4s of
+  view-sourced shared-arrangement backfill scans NESTED inside the
+  realize timer (`arr_backfill` under `blob_decode` — the two headline
+  timers partially double-counted).
+- The pre-pass now walks the dependency closure first and realizes the
+  worklist as one batch (`realize_pending_views_locked`): per-view blob
+  fetch, decode (`decode_pending_stash`, extracted pure per-view helper),
+  and own-arrangement backfill run on up to 8 worker threads inside the
+  pre-pass's exclusive `view_mutex_` hold — workers touch only
+  per-view-disjoint state (each shared arrangement has exactly one source
+  view, so no two workers share one); all `pending_restore_` map mutation
+  and error escalation stays on the locking thread in a sequential
+  resolve, mirroring the level-step loop's publish discipline.
+- An IN-list batch fetch was tried and REJECTED by measurement: a
+  110-name `IN` scan of `_dbsp_ckpt` cost 2.0s where 141 per-view
+  `name =` probes cost 1.3s total (equality pushdown prunes row groups
+  before the blob column is touched; `IN` does not) — the per-view probe
+  stays, parallelized across workers.
+- Measured (60emp wfp, same machine/day): reattach 19.3s → 13.6s; cold
+  attach and steady edits unchanged. Failure behavior preserved per view
+  (fetch failure and decode failure each schedule the same full-rebuild
+  escape hatch as the sequential path).
+
 ## Lazy-restore "failed to decode" flake: root-caused + fixed - Aug 2026
 
 - The intermittent "lazy-restore stash for view '...' failed to decode;

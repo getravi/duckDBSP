@@ -1249,6 +1249,65 @@ public:
   // drop_view()s and create_view()s every view fresh from committed
   // storage -- same "rare correctness escape hatch" the codebase already
   // accepts for a deferred-baseline watermark mismatch.
+  // Decode one stashed view's node + sink blobs and inject them into the
+  // view. Pure per-view mutation: touches ONLY `view` and reads ONLY `pv`
+  // (blobs must already be fetched) — no manager maps, no locks, no
+  // pending_restore_ mutation — so the batched pre-pass realize
+  // (realize_pending_views_locked) may run several of these on worker
+  // threads under the ONE exclusive view_mutex_ hold, the same
+  // disjoint-per-view-state reliance propagate_changes_multi's level-step
+  // threads already make. Returns decode success; the caller does all
+  // bookkeeping (counters, pending_restore_ erase, rebuild escalation,
+  // arrangement backfill).
+  bool decode_pending_stash(const std::string &view_name,
+                            NativeMaterializedView &view,
+                            const PendingViewCkpt &pv, bool table_backed) {
+    bool ok;
+    try {
+      DbspScopeTimer t_nodes("ckpt_node_restore", view_name);
+      ok = view.restore_circuit_state(pv.nodes);
+    } catch (...) {
+      fprintf(stderr, "[dbsp] realize(%s): node restore threw\n",
+              view_name.c_str());
+      ok = false;
+    }
+    if (ok) {
+      try {
+        DbspScopeTimer t_sink("ckpt_sink_decode", view_name);
+        BlobReader r(pv.sink.data(), pv.sink.size());
+        DuckDBZSet result;
+        const uint64_t n = r.u64();
+        for (uint64_t i = 0; i < n; i++) {
+          DuckDBRow row = r.hashed_row();
+          const int64_t w = r.i64();
+          result.insert(row, w);
+        }
+        view.set_result(result);
+        ok = r.done();
+        if (!ok) {
+          fprintf(stderr,
+                  "[dbsp] realize(%s): sink blob has trailing bytes "
+                  "(%zu total)\n",
+                  view_name.c_str(), pv.sink.size());
+        }
+      } catch (...) {
+        fprintf(stderr,
+                "[dbsp] realize(%s): sink blob decode threw (%zu bytes)\n",
+                view_name.c_str(), pv.sink.size());
+        ok = false;
+      }
+    }
+    // Phase 3 (reattach): set_result turned sink integration back on; an
+    // adopted table-backed view must stay table-backed — its checkpoint
+    // result blob is deliberately empty (rows live in __mv_), and letting
+    // the sink integrate again would grow a partial RAM result no reader
+    // uses.
+    if (table_backed) {
+      view.set_table_backed();
+    }
+    return ok;
+  }
+
   bool realize_pending_view_locked(const std::string &view_name) {
     auto pend_it = pending_restore_.find(view_name);
     if (pend_it == pending_restore_.end()) {
@@ -1264,78 +1323,18 @@ public:
     // Phase 3 (reattach): the stash holds placeholders — fetch this view's
     // bytes from _dbsp_ckpt now (mv_db_ is set whenever lazy_from_table
     // was, both keyed on the mv-table marker at load).
-    if (pend_it->second.lazy_from_table && mv_db_ != nullptr) {
-      try {
-        InternalQueryGuard fetch_guard;
-        duckdb::Connection fcon(*mv_db_);
-        auto rows = fcon.Query(
-            "SELECT kind, node_id, data FROM " +
-            qualify(pend_it->second.blob_catalog, "_dbsp_ckpt") +
-            " WHERE name = '" + escape_string(view_name) +
-            "' AND kind IN ('node', 'sink')");
-        if (rows->HasError()) {
-          throw std::runtime_error(rows->GetError());
-        }
-        for (duckdb::idx_t i = 0; i < rows->RowCount(); i++) {
-          const auto blob_str = duckdb::StringValue::Get(rows->GetValue(2, i));
-          std::vector<uint8_t> blob(blob_str.begin(), blob_str.end());
-          if (rows->GetValue(0, i).ToString() == "node") {
-            pend_it->second.nodes[static_cast<uint64_t>(
-                rows->GetValue(1, i).GetValue<int64_t>())] = std::move(blob);
-          } else {
-            pend_it->second.sink = std::move(blob);
-          }
-        }
-      } catch (...) {
-        pending_restore_.erase(pend_it);
-        view_it->second->clear_pending_restore();
-        rebuild_pending_ = true;
-        record_error_best_effort(
-            "DBSP: lazy checkpoint fetch for view '" + view_name +
-            "' failed; scheduling full rebuild");
-        return false;
-      }
+    if (!fetch_pending_blobs(view_name, pend_it->second)) {
+      pending_restore_.erase(pend_it);
+      view_it->second->clear_pending_restore();
+      rebuild_pending_ = true;
+      record_error_best_effort(
+          "DBSP: lazy checkpoint fetch for view '" + view_name +
+          "' failed; scheduling full rebuild");
+      return false;
     }
-    bool ok;
-    try {
-      ok = view_it->second->restore_circuit_state(pend_it->second.nodes);
-    } catch (...) {
-      fprintf(stderr, "[dbsp] realize(%s): node restore threw\n",
-              view_name.c_str());
-      ok = false;
-    }
-    if (ok) {
-      try {
-        BlobReader r(pend_it->second.sink.data(), pend_it->second.sink.size());
-        DuckDBZSet result;
-        const uint64_t n = r.u64();
-        for (uint64_t i = 0; i < n; i++) {
-          DuckDBRow row = r.hashed_row();
-          const int64_t w = r.i64();
-          result.insert(row, w);
-        }
-        view_it->second->set_result(result);
-        ok = r.done();
-        if (!ok) {
-          fprintf(stderr,
-                  "[dbsp] realize(%s): sink blob has trailing bytes "
-                  "(%zu total)\n",
-                  view_name.c_str(), pend_it->second.sink.size());
-        }
-      } catch (...) {
-        fprintf(stderr, "[dbsp] realize(%s): sink blob decode threw (%zu bytes)\n",
-                view_name.c_str(), pend_it->second.sink.size());
-        ok = false;
-      }
-    }
-    // Phase 3 (reattach): set_result turned sink integration back on; an
-    // adopted table-backed view must stay table-backed — its checkpoint
-    // result blob is deliberately empty (rows live in __mv_), and letting
-    // the sink integrate again would grow a partial RAM result no reader
-    // uses.
-    if (mv_table_backed_.count(view_name) > 0) {
-      view_it->second->set_table_backed();
-    }
+    const bool ok =
+        decode_pending_stash(view_name, *view_it->second, pend_it->second,
+                             mv_table_backed_.count(view_name) > 0);
     pending_restore_.erase(pend_it);
     view_it->second->clear_pending_restore();
     if (!ok) {
@@ -1362,6 +1361,202 @@ public:
       backfill_deferred_arrangements_locked(view_name, /*view_lock_held=*/true);
     }
     return ok;
+  }
+
+  // Fetch a still-placeholder stash's node/sink blobs from _dbsp_ckpt.
+  // No-op (true) when the stash already holds bytes or there is no mv db.
+  // Per-view `name =` probes beat one big IN-list query here: measured at
+  // the 60emp reattach, 141 filtered probes cost 1.3s total while a
+  // 110-name IN scan cost 2.0s alone (the equality filter prunes row
+  // groups before the blob column is touched; the IN filter does not).
+  // Thread-safe by construction — touches only `pv` (per-view state) on a
+  // fresh internal connection — so the batched pre-pass realize calls it
+  // from worker threads, which also overlaps the fetch I/O per view.
+  bool fetch_pending_blobs(const std::string &view_name, PendingViewCkpt &pv) {
+    if (!pv.lazy_from_table || mv_db_ == nullptr) {
+      return true;
+    }
+    try {
+      DbspScopeTimer t_fetch("ckpt_fetch", view_name);
+      InternalQueryGuard fetch_guard;
+      duckdb::Connection fcon(*mv_db_);
+      auto rows = fcon.Query("SELECT kind, node_id, data FROM " +
+                             qualify(pv.blob_catalog, "_dbsp_ckpt") +
+                             " WHERE name = '" + escape_string(view_name) +
+                             "' AND kind IN ('node', 'sink')");
+      if (rows->HasError()) {
+        throw std::runtime_error(rows->GetError());
+      }
+      for (duckdb::idx_t i = 0; i < rows->RowCount(); i++) {
+        const auto blob_str = duckdb::StringValue::Get(rows->GetValue(2, i));
+        std::vector<uint8_t> blob(blob_str.begin(), blob_str.end());
+        if (rows->GetValue(0, i).ToString() == "node") {
+          pv.nodes[static_cast<uint64_t>(
+              rows->GetValue(1, i).GetValue<int64_t>())] = std::move(blob);
+        } else {
+          pv.sink = std::move(blob);
+        }
+      }
+      pv.lazy_from_table = false;
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+
+  // Batched realize for propagate_changes_multi's pre-pass: the per-view
+  // blob fetch + CPU decode + own-arrangement backfill fanned across
+  // worker threads, instead of a fetch-query + decode + backfill-scan per
+  // view in sequence (the dominant reattach cost at 60emp: 7.9s of 18.4s).
+  //
+  // Locking contract identical to realize_pending_view_locked: caller
+  // holds struct_mutex_ (shared) and view_mutex_ EXCLUSIVELY. Worker
+  // threads run strictly inside that exclusive hold and touch only
+  // per-view-disjoint state:
+  //   - decode_pending_stash mutates only the worker's own view;
+  //   - the backfill fills only arrangements SOURCED on that view (every
+  //     arrangement has exactly one source, so no two workers share one),
+  //     reading rows from the view's own __mv_ table on a fresh internal
+  //     connection (concurrent read-only queries are safe; the
+  //     thread-local InternalQueryGuard keeps hooks out per thread) or
+  //     from the view's just-decoded result;
+  //   - shared maps (pending_restore_, views_, arrangements_by_table_,
+  //     mv_table_backed_) are only READ during the parallel phase — all
+  //     mutation happens in the sequential resolve below, exactly like
+  //     the level-step loop publishes its results sequentially.
+  // A worklist entry that is a table name or not pending is skipped; a
+  // per-view fetch failure escalates that view alone in the sequential
+  // resolve, same as the per-view path.
+  void realize_pending_views_locked(const std::vector<std::string> &names) {
+    struct Item {
+      std::string name;
+      NativeMaterializedView *view = nullptr;
+      PendingViewCkpt *pv = nullptr;
+      bool table_backed = false;
+      std::vector<std::shared_ptr<SharedArrangement>> needy;
+      bool ok = false;
+      bool fetch_failed = false;
+    };
+    std::vector<Item> items;
+    items.reserve(names.size());
+    for (const auto &name : names) {
+      auto pend_it = pending_restore_.find(name);
+      if (pend_it == pending_restore_.end()) {
+        continue; // not pending: already live, or was never checkpointed
+      }
+      auto view_it = views_.find(name);
+      if (view_it == views_.end()) {
+        pending_restore_.erase(pend_it);
+        continue;
+      }
+      Item it;
+      it.name = name;
+      it.view = view_it->second.get();
+      it.pv = &pend_it->second;
+      it.table_backed = mv_table_backed_.count(name) > 0;
+      auto arr_it = arrangements_by_table_.find(name);
+      if (arr_it != arrangements_by_table_.end()) {
+        for (auto &weak : arr_it->second) {
+          auto arr = weak.lock();
+          if (arr && arr->needs_backfill) {
+            it.needy.push_back(std::move(arr));
+          }
+        }
+      }
+      items.push_back(std::move(it));
+    }
+    if (items.empty()) {
+      return;
+    }
+    if (items.size() == 1) {
+      realize_pending_view_locked(items[0].name);
+      return;
+    }
+    // Parallel fetch + decode + per-view backfill. Same worker-count clamp
+    // as set_parallel_sync's shard knob; work-stealing over an atomic
+    // cursor.
+    std::exception_ptr first_error;
+    std::mutex error_mutex;
+    auto run_item = [&](Item &it) {
+      DbspScopeTimer timer("blob_decode", it.name);
+      if (!fetch_pending_blobs(it.name, *it.pv)) {
+        it.fetch_failed = true;
+        return;
+      }
+      it.ok = decode_pending_stash(it.name, *it.view, *it.pv, it.table_backed);
+      if (!it.ok || it.needy.empty()) {
+        return;
+      }
+      // Mirrors backfill_deferred_arrangements_locked's view-source arm
+      // (the batched worklist only ever names views).
+      DbspScopeTimer t_bf("arr_backfill", it.name);
+      for (auto &arr : it.needy) {
+        arr->begin_initial_fill();
+      }
+      if (it.table_backed && mv_db_ != nullptr) {
+        DuckDBZSet chunk; // Phase 1c: backfill from the backing table
+        mv_scan_table(it.name, [&](const DuckDBRow &row, Weight w) {
+          chunk.insert(row, w);
+        });
+        for (auto &arr : it.needy) {
+          arr->apply(chunk);
+        }
+      } else {
+        for (auto &arr : it.needy) {
+          arr->apply(it.view->get_result());
+        }
+      }
+      for (auto &arr : it.needy) {
+        arr->finish_initial_fill();
+        arr->needs_backfill = false;
+      }
+    };
+    const size_t nthreads = std::min<size_t>(
+        {8, items.size(),
+         std::max<size_t>(2, std::thread::hardware_concurrency())});
+    std::atomic<size_t> next{0};
+    std::vector<std::thread> threads;
+    threads.reserve(nthreads);
+    for (size_t t = 0; t < nthreads; t++) {
+      threads.emplace_back([&]() {
+        for (size_t i = next.fetch_add(1); i < items.size();
+             i = next.fetch_add(1)) {
+          try {
+            run_item(items[i]);
+          } catch (...) {
+            std::lock_guard<std::mutex> g(error_mutex);
+            if (!first_error) {
+              first_error = std::current_exception();
+            }
+          }
+        }
+      });
+    }
+    for (auto &t : threads) {
+      t.join();
+    }
+    // Sequential resolve: all shared-map mutation and error escalation
+    // happens here, on the locking thread, in worklist order.
+    for (auto &it : items) {
+      g_lazy_view_decodes++;
+      pending_restore_.erase(it.name);
+      it.view->clear_pending_restore();
+      if (it.fetch_failed) {
+        rebuild_pending_ = true;
+        record_error_best_effort(
+            "DBSP: lazy checkpoint fetch for view '" + it.name +
+            "' failed; scheduling full rebuild");
+      } else if (!it.ok) {
+        g_lazy_realize_failures++;
+        rebuild_pending_ = true;
+        record_error_best_effort(
+            "DBSP: lazy-restore stash for view '" + it.name +
+            "' failed to decode; scheduling full rebuild");
+      }
+    }
+    if (first_error) {
+      std::rethrow_exception(first_error);
+    }
   }
 
   // Self-locking entry point for callers that hold neither struct_mutex_
@@ -5541,13 +5736,18 @@ private:
       if (!views_.count(name)) {
         continue; // a table dependency: nothing to realize, walk stops
       }
-      realize_pending_view_locked(name);
       for (const auto &dep : dep_graph_.get_dependencies(name)) {
         if (realize_seen.insert(dep).second) {
           realize_worklist.push_back(dep);
         }
       }
     }
+    // Walk first, realize after: the closure walk needs no realized state
+    // (dep_graph_ edges only), which lets the whole worklist realize as
+    // ONE batch — per-view blob fetch, decode, and own-arrangement
+    // backfill fanned across worker threads — instead of a sequential
+    // fetch/decode/backfill per view in walk order.
+    realize_pending_views_locked(realize_worklist);
 
     struct StepResult {
       std::string view_name;
