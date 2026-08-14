@@ -5313,10 +5313,11 @@ public:
   // (a plain per-branch sum, see PlanSetOpNode::multiplicity's UNION_ALL
   // case): UNION/INTERSECT[_ALL]/EXCEPT[_ALL] compute min/clamped-
   // indicator/max(a-b,0) of the per-branch counts, which is nonlinear.
-  // The planner currently accepts these shapes inside a recursive step and
-  // they are already wrong on every existing path (pre-existing, out of
-  // scope here) — this scan only prevents the new signed-delta path from
-  // ALSO claiming linearity for them.
+  // The planner frontend REJECTS these shapes inside a recursive step at
+  // translate time (Walker::visit_recursive_cte, "row-collapsing
+  // operator" unsupported) — they used to be accepted-and-silently-wrong.
+  // This scan is that reject's detector, and also stops the signed-delta
+  // path from claiming linearity for any such shape that reaches it.
   static void scan_step_linearity(const PlanOpSpec &spec,
                                   const std::string &sentinel,
                                   StepLinearity &info) {
