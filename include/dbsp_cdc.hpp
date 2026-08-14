@@ -1937,6 +1937,7 @@ public:
         }
         mv_schemas.emplace_back(existing_name, existing_view->result_schema());
       }
+      DbspScopeTimer t_tr("create_translate", view_name);
       auto translated =
           PlanTranslator::translate(context, view_name, sql, mv_schemas);
       view = std::move(translated.view);
@@ -2101,21 +2102,39 @@ public:
       // mv_rebuild_from_table inside mv_apply_delta (correct, but O(result)
       // transient — acceptable: duplicate-row results are rare and small).
       bool stream_failed = false;
+      // DBSP_TIMING split of create_replay: circuit apply vs mirror flush
+      // (the remainder of create_replay is the source scan/boxing).
+      double apply_ms = 0.0, mirror_ms = 0.0;
       auto apply_step = [&](const std::string &src, const DuckDBZSet &delta) {
         if (stream_failed) {
           return;
         }
+        const bool timing = dbsp_timing_enabled();
+        auto t0 = timing ? std::chrono::steady_clock::now()
+                         : std::chrono::steady_clock::time_point{};
         view->apply_changes(src, delta);
+        if (timing) {
+          apply_ms += std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+        }
         if (!streaming_mirror) {
           return;
         }
         const DuckDBZSet &out = view->get_batch_delta();
         if (!out.empty()) {
+          auto m0 = timing ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
           InternalQueryGuard mv_guard;
           duckdb::Connection mv_con(*mv_db_);
           if (!mv_apply_delta(mv_con, view_name, *view, out)) {
             stream_failed = true;
             return;
+          }
+          if (timing) {
+            mirror_ms += std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - m0)
+                             .count();
           }
         }
         view->drop_delta();
@@ -2126,6 +2145,8 @@ public:
       // tables or other views can occur; reads are safe without table_locks_
       // Checkpoint restore (D3b) skips this replay: node state and the sink
       // result are injected from the checkpoint instead.
+      {
+      DbspScopeTimer t_rp("create_replay", view_name);
       for (const auto &source :
            skip_init_replay ? std::vector<std::string>{} : resolved_sources) {
         if (pview && pview->shared_init_skip().count(source)) {
@@ -2176,6 +2197,13 @@ public:
             apply_step(source, views_[source]->get_result());
           }
         }
+      }
+      if (dbsp_timing_enabled()) {
+        fprintf(stderr,
+                "[dbsp-timing] create_replay_split %s apply_ms=%.1f "
+                "mirror_ms=%.1f\n",
+                view_name.c_str(), apply_ms, mirror_ms);
+      }
       }
 
       if (stream_failed) {

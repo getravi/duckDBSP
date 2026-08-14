@@ -1,5 +1,24 @@
 # Changelog
 
+## Cold-attach replay: chunk-grouped join-index integration - Aug 2026
+
+- Attach profiling (create_translate / create_replay / create_replay_split
+  timers, new): a wfp cold attach is ~95% materialize, and within that
+  translate totals 0.1s while initial replay is 100% circuit apply —
+  scan/boxing and the streaming mirror are both negligible. The single
+  concentrated hotspot (~25% of the sampled window) was
+  PlanJoinNode::integrate_packed's per-row linear bucket scan: fat buckets
+  (low-cardinality keys, degenerate cross-join single bucket) made replay
+  O(rows x bucket).
+- integrate_packed now groups each delta by encoded key and merges per
+  bucket once per call: a position map over the existing bucket (weight
+  updates in place, appends deferred, zero-weight compaction at the end),
+  with the old linear merge kept for small buckets (<=16 entries).
+  Measured: materialize 49.75s -> 42.22s, attach 52.5s -> 45.1s at wfp
+  120. The remaining replay cost is spread circuit compute (window
+  apply, expression eval, join residue) with no concentrated hotspot at
+  10s-sample granularity.
+
 ## Mirror-apply statement overhead + realize diagnostics (F9) - Aug 2026
 
 - mv_after_propagate keeps one persistent mirror connection with per-view

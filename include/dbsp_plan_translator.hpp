@@ -3630,6 +3630,14 @@ private:
     auto &wmap = packed_weights(left);
     auto &idx = packed_index(left);
     std::string kb, rb;
+    // Group this delta's rows per encoded key so each bucket is merged
+    // once per CALL, not scanned once per row: the old per-row linear
+    // bucket probe made initial replay O(rows x bucket) on fat buckets
+    // (low-cardinality keys, degenerate cross-join single bucket) —
+    // profiled at ~25% of a wfp cold attach.
+    std::unordered_map<std::string,
+                       std::vector<std::pair<std::string, int64_t>>>
+        grouped;
     for (size_t i = 0; i < dk.rows.size(); i++) {
       const DuckDBRow &row = *dk.rows[i];
       const int64_t w = dk.weights[i];
@@ -3658,24 +3666,76 @@ private:
                 (unsigned char)kb[4], kb.size() > 5 ? (unsigned char)kb[5] : 0,
                 (long long)w);
       }
-      auto &bucket = idx[kb];
-      bool merged = false;
-      for (size_t b = 0; b < bucket.size(); b++) {
-        if (bucket[b].first == rb) {
-          bucket[b].second += w;
-          if (bucket[b].second == 0) {
-            bucket[b] = std::move(bucket.back());
-            bucket.pop_back();
+      grouped[kb].emplace_back(rb, w);
+    }
+
+    for (auto &[key, adds] : grouped) {
+      auto &bucket = idx[key];
+      if (bucket.size() + adds.size() <= 16) {
+        // Small: the linear merge is cheaper than building a map.
+        for (auto &[arb, aw] : adds) {
+          bool merged = false;
+          for (size_t b = 0; b < bucket.size(); b++) {
+            if (bucket[b].first == arb) {
+              bucket[b].second += aw;
+              if (bucket[b].second == 0) {
+                bucket[b] = std::move(bucket.back());
+                bucket.pop_back();
+              }
+              merged = true;
+              break;
+            }
           }
-          merged = true;
-          break;
+          if (!merged) {
+            bucket.emplace_back(std::move(arb), aw);
+          }
+        }
+      } else {
+        // One position map over the existing bucket; weight updates land
+        // in place (indices stay valid — appends are deferred), fresh
+        // rows collect separately, zero-weight entries compact at the end.
+        std::unordered_map<std::string_view, size_t> pos;
+        pos.reserve(bucket.size());
+        for (size_t b = 0; b < bucket.size(); b++) {
+          pos.emplace(bucket[b].first, b);
+        }
+        std::vector<std::pair<std::string, int64_t>> fresh;
+        // Reserve BEFORE taking string_views into fresh entries: SSO
+        // string bytes move on vector reallocation.
+        fresh.reserve(adds.size());
+        std::unordered_map<std::string_view, size_t> fresh_pos;
+        for (auto &[arb, aw] : adds) {
+          auto it = pos.find(arb);
+          if (it != pos.end()) {
+            bucket[it->second].second += aw;
+            continue;
+          }
+          auto fit = fresh_pos.find(arb);
+          if (fit != fresh_pos.end()) {
+            fresh[fit->second].second += aw;
+            continue;
+          }
+          fresh.emplace_back(std::move(arb), aw);
+          fresh_pos.emplace(fresh.back().first, fresh.size() - 1);
+        }
+        size_t out_i = 0;
+        for (size_t b = 0; b < bucket.size(); b++) {
+          if (bucket[b].second != 0) {
+            if (out_i != b) {
+              bucket[out_i] = std::move(bucket[b]);
+            }
+            out_i++;
+          }
+        }
+        bucket.resize(out_i);
+        for (auto &[frb, fw] : fresh) {
+          if (fw != 0) {
+            bucket.emplace_back(std::move(frb), fw);
+          }
         }
       }
-      if (!merged) {
-        bucket.emplace_back(rb, w);
-      }
       if (bucket.empty()) {
-        idx.erase(kb);
+        idx.erase(key);
       }
     }
   }
