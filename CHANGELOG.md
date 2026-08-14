@@ -1,5 +1,33 @@
 # Changelog
 
+## CASE + later column refs silently wrong (BatchEvaluator stale reference) - Aug 2026
+
+- Reported by NumPad's MV compiler as "a CASE expression across a table
+  LEFT-JOINed twice into the same view is silently wrong/NULL in the
+  circuit". Root cause is not self-join-specific: DuckDB's CASE executor
+  has all-one-branch fast paths that return by making the result vector a
+  REFERENCE to an input chunk column, and `BatchEvaluator` reused each
+  expression's result vector across `execute()` calls. A later batch that
+  took the mixed-branch path (`FillSwitch`) wrote the CASE results through
+  the stale pointer straight into the shared input chunk, corrupting the
+  branch's source column for every expression evaluated AFTER the CASE in
+  that batch — any plain reference to that column then returned the CASE's
+  value. Triggering sequence: one batch where every row takes the same
+  branch (e.g. LEFT-JOIN NULL pads, or a commit of same-sign rows), then a
+  mixed-branch batch. The self-join shape merely produced that sequence
+  during CREATE.
+- Fix: each `BatchEvaluator` slot now owns a `VectorCache`, and
+  `execute()` resets the slot's result vector from its cache before every
+  evaluation — a result can never retain a reference into the shared
+  chunk across calls, so no executor fast path can write through one.
+  Covers every `BatchEvaluator` consumer (MAP_EXPR/FILTER_MAP projections
+  and filters, join keys, aggregates); `RowExprEval` already built a
+  fresh result vector per call.
+- Regression tests: `test/integration/test_case_batch_eval.cpp` (ctest
+  `case_batch_eval`: the original self-join shape + the staged-commit
+  no-join shape) and `test/python/test_self_join_case.py` (differential
+  against stock DuckDB, incl. incremental follow-up commits).
+
 ## Reattach realize: batched parallel fetch/decode/backfill - Aug 2026
 
 - Profiled the wfp 60emp reattach (bench_mv_authority, DBSP_TIMING):

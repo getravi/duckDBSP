@@ -66,6 +66,7 @@
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/enum_util.hpp"
+#include "duckdb/common/types/vector_cache.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
@@ -188,10 +189,12 @@ public:
     if (!input_types_.empty()) {
       chunk_.Initialize(duckdb::Allocator::Get(context_), input_types_);
     }
+    auto &allocator = duckdb::Allocator::Get(context_);
     for (const auto *expr : exprs_) {
       executors_.push_back(
           std::make_unique<duckdb::ExpressionExecutor>(context_, *expr));
-      results_.emplace_back(expr->return_type);
+      result_caches_.emplace_back(allocator, expr->return_type);
+      results_.emplace_back(result_caches_.back());
     }
   }
 
@@ -229,8 +232,22 @@ public:
   }
 
   // Evaluate expression e over the current chunk; result is flattened and
-  // valid until the next execute(e) call
+  // valid until the next execute(e) call.
+  //
+  // The reset-from-cache below is load-bearing correctness, not hygiene:
+  // several DuckDB expression executors (CASE's all-one-branch shortcut,
+  // and anything else that ends in ExpressionExecutor::Execute of a
+  // BOUND_REF root) return by REFERENCING an input chunk column — after
+  // such a call results_[e] shares that column's buffer. A later
+  // execute(e) on a batch that takes the slow path (e.g. CASE FillSwitch)
+  // writes through the vector's existing data pointer, i.e. straight into
+  // the shared input chunk, corrupting that column for every expression
+  // evaluated after this one in the same batch (found as the
+  // self-join+CASE silent-wrong defect; see test_self_join_case.py).
+  // Resetting to the slot's own cached buffer first makes stale
+  // references impossible while keeping the allocation amortized.
   duckdb::Vector &execute(size_t e) {
+    results_[e].ResetFromCache(result_caches_[e]);
     executors_[e]->ExecuteExpression(chunk_, results_[e]);
     results_[e].Flatten(count_);
     return results_[e];
@@ -359,6 +376,9 @@ private:
   std::vector<const duckdb::Expression *> exprs_;
   duckdb::vector<duckdb::LogicalType> input_types_;
   std::vector<std::unique_ptr<duckdb::ExpressionExecutor>> executors_;
+  // Per-slot owned buffers; execute() resets each result vector from its
+  // cache so a result can never retain a stale reference into chunk_
+  std::vector<duckdb::VectorCache> result_caches_;
   std::vector<duckdb::Vector> results_;
   duckdb::DataChunk chunk_;
   duckdb::idx_t count_ = 0;
