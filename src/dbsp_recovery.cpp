@@ -22,6 +22,7 @@ DBSPRecoveryManager& get_recovery_manager() {
 
 DBSPRecoveryManager::DBSPRecoveryManager(const std::string &recovery_path)
   : recovery_path_(recovery_path.empty() ? ".dbsp_recovery" : recovery_path),
+    configured_path_(recovery_path),
     recovery_enabled_(true),
     session_started_(false) {
 }
@@ -33,8 +34,11 @@ DBSPRecoveryManager::~DBSPRecoveryManager() {
 }
 
 std::string DBSPRecoveryManager::determine_recovery_path(const std::string &db_path) const {
-  if (!recovery_path_.empty() && recovery_path_ != ".dbsp_recovery") {
-    return recovery_path_;
+  // The CONFIGURED override, never the member: recovery_path_ holds the
+  // path of whichever database recovered last, so reading it here handed
+  // the second database in a process the first one's directory.
+  if (!configured_path_.empty()) {
+    return configured_path_;
   }
 
   // In-memory instances have no durable state: views die with the process,
@@ -219,6 +223,11 @@ bool DBSPRecoveryManager::recover_from_crash(duckdb::ClientContext &context,
   if (!recovery_enabled_) {
     return true;  // Recovery disabled, nothing to do
   }
+
+  // recovery_path_ is one member on a process-wide singleton and this call
+  // now runs once per DATABASE, so hold it for the whole call: every step
+  // below (marker check, directory creation, session start) reads it.
+  std::lock_guard<std::mutex> recovery_guard(recovery_mutex_);
 
   // Determine final recovery path
   recovery_path_ = determine_recovery_path(db_path);

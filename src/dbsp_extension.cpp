@@ -2204,6 +2204,12 @@ public:
     if (total > internals + 1) {
       return; // other user connections remain
     }
+    // Past this point this IS the last connection, so the DatabaseInstance
+    // is going away. DuckDB reuses freed addresses, and a stale "already
+    // recovered" entry would make a BRAND-NEW database at the same address
+    // skip recovery entirely. Dropped here rather than after the take()
+    // below so a racing close cannot leave the entry behind.
+    dbsp_native::dbsp_forget_recovery(static_cast<const void *>(db));
     // take() is atomic single-flight: a racing close gets nullptr.
     auto manager = dbsp_native::get_cdc_registry().take(db);
     if (!manager) {

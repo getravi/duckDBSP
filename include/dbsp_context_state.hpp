@@ -52,6 +52,8 @@
 #include "duckdb/storage/storage_manager.hpp"
 
 #include <atomic>
+#include <mutex>
+#include <set>
 #include <thread>
 #include <iostream>
 #include <unordered_map>
@@ -70,6 +72,37 @@ inline std::atomic<bool> &engine_hook_flag() {
 }
 inline bool engine_hook_active() {
   return engine_hook_flag().load(std::memory_order_relaxed);
+}
+
+/// Tracks which DatabaseInstances have already run recovery, so it runs
+/// once per DATABASE rather than once per process.
+///
+/// Entries MUST be dropped when a database closes (dbsp_forget_recovery,
+/// called from the teardown hook): DuckDB reuses freed DatabaseInstance
+/// addresses, so a stale entry makes a BRAND-NEW database at the same
+/// address skip recovery entirely — no crash marker, no session registered.
+/// Measured: opening three databases, closing them, then opening a fourth
+/// left the fourth completely unprotected.
+inline std::set<const void *> &dbsp_recovered_dbs() {
+  static std::set<const void *> recovered;
+  return recovered;
+}
+
+inline std::mutex &dbsp_recovered_mutex() {
+  static std::mutex m;
+  return m;
+}
+
+/// True if THIS call is the one that should run recovery for `db`.
+inline bool dbsp_claim_recovery(const void *db) {
+  std::lock_guard<std::mutex> guard(dbsp_recovered_mutex());
+  return dbsp_recovered_dbs().insert(db).second;
+}
+
+/// Let a future database at this address recover. Idempotent.
+inline void dbsp_forget_recovery(const void *db) {
+  std::lock_guard<std::mutex> guard(dbsp_recovered_mutex());
+  dbsp_recovered_dbs().erase(db);
 }
 
 class DBSPContextState : public duckdb::ClientContextState {
@@ -480,9 +513,11 @@ public:
   // recovery's own internal connections (internal_query_depth > 0) and
   // re-entrant queries never recurse.
   static void maybe_run_recovery(duckdb::ClientContext &context) {
-    static std::atomic<bool> recovery_started{false};
-    bool expected = false;
-    if (!recovery_started.compare_exchange_strong(expected, true)) {
+    // Once per DATABASE, not once per process. A process-wide latch meant
+    // only the first database opened ever ran recovery, so every later one
+    // got no crash marker and registered no session — leaving them
+    // unprotected and making the first close drop the shared lock.
+    if (!dbsp_claim_recovery(context.db.get())) {
       return;
     }
     auto &recovery_manager = get_recovery_manager();
