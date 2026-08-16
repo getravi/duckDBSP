@@ -134,6 +134,18 @@ struct PlanKeepAlive {
 // Row-at-a-time adapter over ExpressionExecutor: builds a 1-row DataChunk
 // from a DuckDBRow, evaluates one bound expression, returns the result Value.
 // Correct but slow; vectorized evaluation is a later milestone (B6).
+/// DBSP_ROWEVAL_FASTPATH=0 forces every RowExprEval through the generic
+/// executor. The fast path must be value-for-value identical to it, so this
+/// exists to A/B a suspected divergence (and is what the differential test
+/// compares against) -- not as a tuning knob.
+inline bool row_eval_fastpath_enabled() {
+  static const bool on = [] {
+    const char *e = std::getenv("DBSP_ROWEVAL_FASTPATH");
+    return e == nullptr || std::string(e) != "0";
+  }();
+  return on;
+}
+
 class RowExprEval {
 public:
   RowExprEval(std::shared_ptr<PlanKeepAlive> keep_alive,
@@ -145,9 +157,41 @@ public:
     if (!input_types_.empty()) {
       chunk_.Initialize(duckdb::Allocator::Get(context_), input_types_);
     }
+    // A bare column reference needs no executor at all. The generic path
+    // below pays a DataChunk::Reset (a VectorCacheBuffer::ResetFromCache per
+    // column), refills EVERY input column, and allocates a fresh result
+    // Vector -- all to hand back one column of the row it was given. Join
+    // pad reconciliation calls this once per affected row per step, where it
+    // profiled as the hottest frame of a cold build.
+    if (row_eval_fastpath_enabled() &&
+        expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+      const auto idx = expr.Cast<duckdb::BoundReferenceExpression>().index;
+      // An index past the input types stays on the generic path rather than
+      // being clamped: that case reads a virtual column, and quietly
+      // returning a different column is worse than being slow.
+      if (idx < input_types_.size()) {
+        ref_index_ = idx;
+      }
+    }
   }
 
   duckdb::Value eval(const DuckDBRow &row) {
+    if (ref_index_ != duckdb::DConstants::INVALID_INDEX) {
+      // Must yield exactly what the generic path yields: the missing-column
+      // default, the input-type cast the chunk fill applies, and then the
+      // expression's own return type (a BOUND_REF's return_type may legally
+      // differ from the input type it points at).
+      const auto i = ref_index_;
+      duckdb::Value v =
+          i < row.columns.size() ? row.columns[i] : duckdb::Value(input_types_[i]);
+      if (v.type() != input_types_[i]) {
+        v = v.DefaultCastAs(input_types_[i]);
+      }
+      if (v.type() != expr_.return_type) {
+        v = v.DefaultCastAs(expr_.return_type);
+      }
+      return v;
+    }
     chunk_.Reset();
     for (duckdb::idx_t i = 0; i < input_types_.size(); i++) {
       duckdb::Value v = i < row.columns.size()
@@ -172,6 +216,9 @@ private:
   duckdb::vector<duckdb::LogicalType> input_types_;
   duckdb::ExpressionExecutor executor_;
   duckdb::DataChunk chunk_;
+  /// Column this expression is a bare reference to, or INVALID_INDEX when
+  /// the generic executor path is required.
+  duckdb::idx_t ref_index_ = duckdb::DConstants::INVALID_INDEX;
 };
 
 // Batched adapter over ExpressionExecutor: fills a DataChunk with up to
