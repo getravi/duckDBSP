@@ -1834,6 +1834,41 @@ public:
                      [](const ViewDefinition &a, const ViewDefinition &b) {
                        return a.created_at < b.created_at;
                      });
+    // Skip the rewrite when the definitions are byte-for-byte what this
+    // catalog already holds. This table is DELETE-all + one INSERT per view
+    // into a PRIMARY KEY'd table, so it re-indexed all 140 rows on EVERY
+    // save (~1.2s at wfp/60) even though definitions only move when a view
+    // is created, replaced or dropped.
+    //
+    // The guard compares the CONTENT rather than a "definitions changed"
+    // counter: view_definitions_ is mutated at seven sites, and a counter
+    // that missed one would leave stale SQL on disk — which a later load
+    // reads as the view's definition. Exact string, not a hash: a collision
+    // here would do the same damage, and a few hundred KB is nothing.
+    std::string defs_image;
+    if (only_view.empty()) {
+      for (const auto &d : defs) {
+        defs_image += d.name;
+        defs_image += '\x01';
+        defs_image += d.sql;
+        defs_image += '\x01';
+        for (const auto &src : d.source_tables) {
+          defs_image += src;
+          defs_image += ',';
+        }
+        defs_image += '\x01';
+        defs_image += std::to_string(d.created_at);
+        defs_image += '\x02';
+      }
+      if (view_defs_saved_catalog_ == catalog &&
+          view_defs_saved_image_ == defs_image && !defs_image.empty()) {
+        if (std::getenv("DBSP_TIMING")) {
+          std::fprintf(stderr, "[dbsp-timing] save_view_defs skipped "
+                               "(unchanged)\n");
+        }
+        return true;
+      }
+    }
     try {
       // Fresh connection: `context` is mid-query inside a table function.
       InternalQueryGuard guard;
@@ -1885,6 +1920,14 @@ public:
         }
       }
       con.Query("COMMIT");
+      // Committed: this catalog now holds exactly these definitions, so an
+      // identical next save may skip. Recorded only after COMMIT, and only
+      // for a full save — a single-view save leaves the rest untouched, so
+      // it cannot stand in for the whole image.
+      if (only_view.empty()) {
+        view_defs_saved_image_ = std::move(defs_image);
+        view_defs_saved_catalog_ = catalog;
+      }
       return true;
     } catch (const std::exception &e) {
       last_error_ = std::string("Save failed: ") + e.what();
@@ -6207,6 +6250,12 @@ private:
   // Tier 3 (view_mutex_) -- see stash_pending_view/realize_pending_view.
   std::unordered_map<std::string, PendingViewCkpt> pending_restore_;
   std::unordered_map<std::string, ViewDefinition> view_definitions_;
+  // Exact image of the view definitions as of the last COMMITted full save
+  // to view_defs_saved_catalog_ — lets an unchanged save skip rewriting the
+  // whole _dbsp_views table. See save_to_duck_table for why this is the
+  // content and not a change counter.
+  std::string view_defs_saved_image_;
+  std::string view_defs_saved_catalog_;
   DependencyGraph dep_graph_;
   std::string last_error_;
   // ON by default: a materialized view keeps itself current. Turn off
