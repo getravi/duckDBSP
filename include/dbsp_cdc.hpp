@@ -621,6 +621,10 @@ public:
     // place instead of rewriting them.
     std::vector<std::string> preserve_pending;
     std::vector<std::string> table_names;
+    // Generation observed per view during this save; promoted into
+    // view_saved_generation_ only after the write COMMITs.
+    std::unordered_map<std::string, uint64_t> view_gen_now;
+    int dbsp_ck_preserved = 0, dbsp_ck_serialized = 0;
     {
       DbspScopeTimer t_ser("ckpt_serialize", "all views");
       std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
@@ -717,9 +721,42 @@ public:
           view_blobs.push_back(std::move(ck));
           continue;
         }
+        // INCREMENTAL SAVE: a view whose operator state has not changed
+        // since the last successful save to THIS catalog still has valid
+        // rows in _dbsp_ckpt — preserve them instead of re-serializing and
+        // rewriting identical bytes. Every save used to serialize all 126
+        // views regardless (3.3s of a 7.6s save at wfp/60, paid even when
+        // literally nothing had changed), which is what made "checkpoint
+        // continuously" unaffordable.
+        //
+        // view_delta_generation_ is the signal because it is stamped in
+        // exactly the places a view's state can move — creation's initial
+        // replay, and a propagate step that applied — and it is already
+        // trusted for correctness by delta consumers. A NEW flag could miss
+        // a mutation path and preserve stale bytes, which restores as
+        // silently wrong values.
+        {
+          auto gen_it = view_delta_generation_.find(name);
+          const uint64_t cur_gen =
+              gen_it == view_delta_generation_.end() ? 0 : gen_it->second;
+          view_gen_now[name] = cur_gen;
+          static const bool incremental_ckpt = [] {
+            const char *e = std::getenv("DBSP_INCREMENTAL_CKPT");
+            return e == nullptr || std::string(e) != "0";
+          }();
+          auto saved_it = view_saved_generation_.find(name);
+          if (incremental_ckpt && view_saved_catalog_ == catalog &&
+              saved_it != view_saved_generation_.end() &&
+              saved_it->second == cur_gen) {
+            preserve_pending.push_back(name);
+            dbsp_ck_preserved++;
+            continue;
+          }
+        }
         if (!view->serialize_circuit_state(ck.nodes)) {
           continue;
         }
+        dbsp_ck_serialized++;
         BlobWriter w;
         // Phase 1c: a table-backed view's rows are durable in its __mv_
         // table — checkpoint operator state only (empty result blob).
@@ -933,6 +970,17 @@ public:
       con.Query("COMMIT");
       last_ckpt_saved_count_ = view_blobs.size() + preserve_pending.size();
       mark_saved();
+      // Committed: these generations are now what _dbsp_ckpt holds, so the
+      // NEXT save may preserve any view still sitting at the same one.
+      // Promoted only after COMMIT — a rolled-back save must not leave a
+      // record claiming bytes were written.
+      view_saved_generation_ = std::move(view_gen_now);
+      view_saved_catalog_ = catalog;
+      if (std::getenv("DBSP_TIMING")) {
+        std::fprintf(stderr,
+                     "[dbsp-timing] ckpt_views serialized=%d preserved=%d\n",
+                     dbsp_ck_serialized, dbsp_ck_preserved);
+      }
       {
         // The committed checkpoint's identity is now this save's: later
         // register-time adoption (same session) and the next save's
@@ -6145,6 +6193,15 @@ private:
   // consumers building change feeds need this to skip stale buffers.
   // Guarded by view_mutex_ alongside views_.
   std::unordered_map<std::string, uint64_t> view_delta_generation_;
+  // INCREMENTAL SAVE: per-view delta generation as of the last COMMITted
+  // checkpoint, and the catalog it was written to. A view still at its
+  // saved generation has unchanged operator state, so its existing
+  // _dbsp_ckpt rows are still valid and the next save preserves them
+  // instead of re-serializing. Cleared wholesale whenever the catalog
+  // differs, so a cross-catalog save never preserves rows that are not
+  // there. Guarded by view_mutex_ alongside views_.
+  std::unordered_map<std::string, uint64_t> view_saved_generation_;
+  std::string view_saved_catalog_;
   // D-lazy: checkpoint blobs for views the load fast path cold-created but
   // has not yet decoded (NativeMaterializedView::is_pending_restore()).
   // Tier 3 (view_mutex_) -- see stash_pending_view/realize_pending_view.
