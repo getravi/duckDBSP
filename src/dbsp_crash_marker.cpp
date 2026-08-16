@@ -3,6 +3,7 @@
 #include <iomanip>
 #include <ctime>
 #include <random>
+#include <system_error>
 #include <unistd.h>  // for getpid()
 
 namespace dbsp_native {
@@ -70,6 +71,27 @@ void DBSPCrashMarker::mark_session_end(const std::string &path) {
   if (std::filesystem::exists(lock_path)) {
     std::filesystem::remove(lock_path);
   }
+
+  // ...and take the directory with it when nothing is left in it, so a
+  // cleanly-closed model leaves no trace beside its database file.
+  //
+  // Deliberately std::filesystem::remove and NOT remove_all: remove()
+  // succeeds only on an EMPTY directory, so it cannot delete a .dbsp.crash
+  // log left by a previous crash — which is the whole reason this directory
+  // exists. Verified: a directory holding a crash log survives the close.
+  //
+  // NOTE this does not make the marker multi-session safe, and does not try
+  // to. mark_session_end above already drops the shared lock whichever
+  // session closes first, so with two sessions open on one database the
+  // second was ALREADY running unprotected; this just also removes the
+  // directory the lock lived in. Refcounting the lock across sessions would
+  // be a real fix, but it is a separate concern — and NumPad opens one
+  // backend connection per model, so it never hits this.
+  //
+  // Best-effort: this runs on the shutdown path, where throwing would be
+  // worse than leaving a directory behind.
+  std::error_code ec;
+  std::filesystem::remove(std::filesystem::path(path), ec);
 }
 
 bool DBSPCrashMarker::detect_crash(const std::string &path) {
