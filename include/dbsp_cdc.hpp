@@ -858,6 +858,8 @@ public:
       }
       std::unordered_map<std::string, std::pair<int64_t, std::string>>
           saved_wms;
+      int dbsp_wm_cached = 0, dbsp_wm_dirty = 0, dbsp_wm_untracked = 0,
+          dbsp_wm_nohash = 0;
       DbspScopeTimer t_wm("ckpt_watermarks", std::to_string(table_names.size()) + " tables");
       // Shared: only reads the tracked_tables_ map shape + per-table atomic
       // flags; scoped so it releases before the post-COMMIT block takes the
@@ -882,7 +884,15 @@ public:
         if (tt != nullptr && tt->wm_clean() && !tt->wm_hash().empty()) {
           wm_count = tt->wm_count();
           wm_hash = tt->wm_hash();
+          dbsp_wm_cached++;
         } else {
+          if (tt == nullptr) {
+            dbsp_wm_untracked++;
+          } else if (!tt->wm_clean()) {
+            dbsp_wm_dirty++;
+          } else {
+            dbsp_wm_nohash++;
+          }
           if (tt != nullptr) {
             tt->wm_begin_scan();
           }
@@ -911,6 +921,13 @@ public:
           return false;
         }
         saved_wms[t] = {wm_count, wm_hash};
+      }
+      if (std::getenv("DBSP_TIMING")) {
+        std::fprintf(stderr,
+                     "[dbsp-timing] ckpt_wm_breakdown cached=%d dirty=%d "
+                     "untracked=%d nohash=%d\n",
+                     dbsp_wm_cached, dbsp_wm_dirty, dbsp_wm_untracked,
+                     dbsp_wm_nohash);
       }
       }
       con.Query("COMMIT");
