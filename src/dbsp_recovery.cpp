@@ -1,4 +1,5 @@
 #include "dbsp_recovery.hpp"
+#include <vector>
 #include "dbsp_crash_marker.hpp"
 #include "dbsp_cdc.hpp"
 #include <filesystem>
@@ -52,18 +53,65 @@ std::string DBSPRecoveryManager::determine_recovery_path(const std::string &db_p
   return ".dbsp_recovery";
 }
 
-void DBSPRecoveryManager::mark_session_start() {
+void DBSPRecoveryManager::mark_session_start(const void *db) {
   if (!recovery_enabled_ || recovery_path_.empty()) return;
 
-  DBSPCrashMarker::mark_session_start(recovery_path_);
+  const std::string path = recovery_path_;
+  bool write_lock = false;
+  {
+    std::lock_guard<std::mutex> guard(sessions_mutex_);
+    // First session on this database writes the lock; later ones only
+    // raise the count. The manager is a process-wide singleton but the
+    // lock is per DATABASE, so two different databases open at once each
+    // keep their own marker.
+    write_lock = (++session_counts_[path] == 1);
+    if (db != nullptr) {
+      db_paths_[db] = path;
+    }
+  }
+  if (write_lock) {
+    DBSPCrashMarker::mark_session_start(path);
+  }
   session_started_ = true;
 }
 
-void DBSPRecoveryManager::mark_session_end() {
-  if (!recovery_enabled_ || recovery_path_.empty()) return;
+void DBSPRecoveryManager::mark_session_end(const void *db) {
+  if (!recovery_enabled_) return;
 
-  DBSPCrashMarker::mark_session_end(recovery_path_);
-  session_started_ = false;
+  std::vector<std::string> release;
+  {
+    std::lock_guard<std::mutex> guard(sessions_mutex_);
+    if (db == nullptr) {
+      // Process teardown: end every tracked session.
+      for (const auto &entry : session_counts_) {
+        release.push_back(entry.first);
+      }
+      session_counts_.clear();
+      db_paths_.clear();
+    } else {
+      auto it = db_paths_.find(db);
+      // An untracked database has no marker of its own. Falling back to
+      // recovery_path_ here is what let one database's close drop ANOTHER
+      // database's lock, so it deliberately does nothing instead.
+      if (it == db_paths_.end()) {
+        return;
+      }
+      const std::string path = it->second;
+      db_paths_.erase(it);
+      auto count = session_counts_.find(path);
+      if (count != session_counts_.end() && --count->second <= 0) {
+        // Last session on this database: the lock may go.
+        session_counts_.erase(count);
+        release.push_back(path);
+      }
+    }
+  }
+  for (const auto &path : release) {
+    DBSPCrashMarker::mark_session_end(path);
+  }
+  if (!release.empty()) {
+    session_started_ = false;
+  }
 }
 
 bool DBSPRecoveryManager::check_crash_markers() const {
@@ -220,9 +268,12 @@ bool DBSPRecoveryManager::recover_from_crash(duckdb::ClientContext &context,
     return false;
   }
 
-  // Step 6: Clear crash markers and mark new session start
+  // Step 6: Clear crash markers and mark new session start. Keyed by
+  // DatabaseInstance so the close path finds THIS database's recovery
+  // directory without re-deriving it from a tearing-down context, and so
+  // the lock survives until the last session on this database closes.
   clear_crash_markers();
-  mark_session_start();
+  mark_session_start(static_cast<const void *>(context.db.get()));
 
   if (crashed) {
       } else {

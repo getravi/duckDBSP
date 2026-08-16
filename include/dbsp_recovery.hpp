@@ -2,6 +2,8 @@
 
 #include "duckdb.hpp"
 #include <string>
+#include <mutex>
+#include <map>
 #include <vector>
 #include <memory>
 
@@ -51,13 +53,26 @@ public:
 
   /**
    * @brief Mark that session started (called on connection open)
+   *
+   * REFCOUNTED PER DATABASE. Several sessions can be open on one database
+   * file, and the crash marker must survive until the LAST of them closes —
+   * otherwise the first close drops the shared lock and every session still
+   * running is unprotected: a crash after that point looks like a clean
+   * exit, so the next open skips recovery.
+   *
+   * @param db  the DatabaseInstance this session belongs to, so the close
+   *            path can find its recovery directory without re-deriving it
+   *            from a half-torn-down context.
    */
-  void mark_session_start();
+  void mark_session_start(const void *db = nullptr);
 
   /**
-   * @brief Mark that session ended cleanly (called on connection close)
+   * @brief Mark that one session ended cleanly (called on connection close)
+   *
+   * Drops the lock only when this was the last session on that database.
+   * With no argument, ends EVERY tracked session (process teardown).
    */
-  void mark_session_end();
+  void mark_session_end(const void *db = nullptr);
 
   /**
    * @brief Get recovery directory path
@@ -117,6 +132,15 @@ private:
   std::string determine_recovery_path(const std::string &db_path) const;
 
   std::string recovery_path_;  ///< Path to recovery directory
+  /// Live sessions per recovery directory. The lock file is written when a
+  /// path's count reaches 1 and removed when it falls back to 0, so a
+  /// database with two sessions open stays crash-protected until both go.
+  std::map<std::string, int> session_counts_;
+  /// DatabaseInstance -> its recovery directory, recorded at session start.
+  /// The close path runs during teardown, where re-deriving the path from
+  /// the context is unreliable.
+  std::map<const void *, std::string> db_paths_;
+  mutable std::mutex sessions_mutex_;
   bool recovery_enabled_;      ///< Whether recovery is enabled
   bool session_started_;       ///< Whether session has been marked as started
 };
