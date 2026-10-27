@@ -626,8 +626,13 @@ SELECT * FROM dbsp_delta_generations();
 
 Save all view definitions to the `_dbsp_views` table in the default
 catalog — inside the database file, so copies and backups carry the
-views. `dbsp_save('view_name', 'table_name')` saves one view to a named
-table (identifier-validated).
+views — plus a circuit-state checkpoint: each supported view's operator
+state and result go into the `_dbsp_ckpt` tables, with a watermark of
+every source table. The report string says how many views made it into
+the checkpoint (`(+ circuit checkpoint: N views)`), or why none did.
+`dbsp_save(catalog := 'm')` does the same in an `ATTACH`ed database.
+`dbsp_save('view_name', 'table_name')` saves one view's definition to a
+named table (identifier-validated) and writes no checkpoint.
 
 ```sql
 SELECT * FROM dbsp_save();
@@ -672,8 +677,21 @@ SELECT * FROM dbsp_save('views.json');
 Load view definitions from the `_dbsp_views` table (see `dbsp_save()`).
 Missing `_dbsp_views` is not an error — there is simply nothing to load.
 `dbsp_load('table_name')` loads from a named table (identifier-validated;
-a missing named table IS an error). Loading rebuilds view state from
-current table data.
+a missing named table IS an error); `dbsp_load(catalog := 'm')` loads
+from an `ATTACH`ed database.
+
+A view restores from the checkpoint written by the last `dbsp_save()`,
+without replaying its sources, when the checkpoint is still valid for it.
+Any other view is rebuilt from the current table data:
+- its source closure changed since the save (a stale watermark on any
+  table it reads, directly or through the views it is stacked on);
+- its definition differs from the one the checkpoint recorded;
+- it has no checkpoint support, or no checkpoint exists (including one
+  written under an older checkpoint format).
+
+The report string counts both, e.g. `Loaded views from _dbsp_views
+(3 views, 2 from checkpoint, ...)`. With `dbsp_lazy_restore` on (the
+default) a restored view is decoded on first use.
 
 ```sql
 SELECT * FROM dbsp_load();
