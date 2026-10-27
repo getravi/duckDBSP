@@ -5,6 +5,11 @@ Real-time incrementally maintained materialized views for DuckDB, based on [Data
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![DuckDB](https://img.shields.io/badge/DuckDB-v2.0.0_LTS-blue.svg)](https://duckdb.org/)
 
+Built for **DuckDB 2.0**. It is pinned to the
+[v2.0.0 LTS release](https://duckdb.org/2026/10/21/announcing-duckdb-200),
+runs on a stock, unpatched engine, and loads into the matching
+`duckdb==2.0.0` Python wheel.
+
 ## Overview
 
 Traditional materialized views recompute entirely when underlying data changes. DBSP-powered views update **incrementally** in O(delta) time - only processing the changes, not the entire dataset.
@@ -19,15 +24,20 @@ DBSP:         INSERT 1 row → Update affected aggregates → O(delta)
 - **Incremental Updates**: Views update in O(delta) time, not O(n)
 - **SQL Syntax**: Define views using familiar SQL
 - **Cascading Views**: Views can reference other views
-- **Automatic CDC**: Change Data Capture with sync detection
+- **Exact change capture**: generated statement triggers hand each
+  commit's row changes to the views, so a commit is applied as a delta with
+  no table scan. Scan-and-diff is the safety net.
 - **Delta read-back**: `dbsp_changes('view')` returns the last sync's
   output delta with signed weights
 - **Attached catalogs**: views can source tables in `ATTACH`ed databases
   (`... FROM m.orders`); tables are keyed by canonical
   `catalog.schema.table`
-- **Persistence**: Save/restore views across sessions
+- **Persistence**: view definitions plus circuit-state checkpoints.
+  Reopening a database restores views without replaying their sources.
 - **Auto-persist**: views survive a clean connection reopen with no
   explicit save/load calls (`dbsp_autopersist`, on by default)
+- **Native DDL**: `CREATE [OR REPLACE]`, `REFRESH` and
+  `DROP MATERIALIZED VIEW`, with the SQL stored exactly as typed
 - **Zero Dependencies**: Pure C++ header-only core library
 - **Bounded Memory**: optional disk-backed state (`dbsp_spill`)
 - **Parallel Updates**: optional multi-core sync, propagation, and join
@@ -38,8 +48,8 @@ DBSP:         INSERT 1 row → Update affected aggregates → O(delta)
 ### Basic Example
 
 ```sql
--- Load the extension
-LOAD 'dbsp';
+-- Load the extension (unsigned: see "Loading the Extension")
+LOAD '/path/to/dbsp.duckdb_extension';
 
 -- Create a table
 CREATE TABLE orders (id INT, customer VARCHAR, amount DECIMAL);
@@ -246,22 +256,38 @@ See `docs/TESTING.md`.
 
 ### Loading the Extension
 
-```sql
-LOAD '/path/to/dbsp.duckdb_extension';
+The extension is not signed, so DuckDB has to be told to accept unsigned
+extensions.
+
+DuckDB CLI:
+
+```bash
+duckdb -unsigned my.duckdb -cmd "LOAD '/path/to/dbsp.duckdb_extension'"
 ```
+
+Python (`duckdb==2.0.0`):
+
+```python
+import duckdb
+con = duckdb.connect("my.duckdb", config={"allow_unsigned_extensions": "true"})
+con.execute("LOAD '/path/to/dbsp.duckdb_extension'")
+```
+
+Close the connection before the process exits, so the auto-save and teardown
+run cleanly.
 
 ## Testing
 
 ### Running Tests
 
 ```bash
-# Build and run the full suite (unit + integration)
+# Build and run the full suite (unit + integration, 48 targets)
 cd test/build_test
-cmake .. && make -j8
+cmake .. && cmake --build . -j 8
 ctest
 
 # Same suite under DuckDB's vector verification — catches chunks handed to
-# the engine with stale child-vector sizes. CI runs all three.
+# the engine with stale child-vector sizes.
 DBSP_TEST_VERIFY_VECTORS=1 ctest
 
 # Same suite under the internal-connection law: a helper that opens its own
@@ -277,8 +303,14 @@ SOAK_ROUNDS=60 ./soak_differential "[soak]"
 
 ### Test Coverage
 
-- **Unit tests**: Core DBSP library, native views, CDC manager
-- **Integration tests**: All extension functions, CDC, cascading views, persistence
+- **Unit tests**: Core DBSP library, native views, CDC manager, the
+  trigger delta source
+- **Integration tests**: All extension functions, CDC, cascading views,
+  persistence and checkpoints. Most check every view against the same query
+  run as plain SQL (differential testing).
+- **Engine canaries**: DuckDB behaviours the extension relies on, pinned by
+  name so an engine upgrade fails them first
+- **Python probes**: the loadable extension on the real `duckdb==2.0.0` wheel
 - **Benchmarks**: O(delta) performance validation
 
 See [docs/TESTING.md](docs/TESTING.md) for details.
@@ -305,27 +337,41 @@ See [docs/TESTING.md](docs/TESTING.md) for details.
 
 | Function | Description |
 |----------|-------------|
+| `CREATE [OR REPLACE] MATERIALIZED VIEW` | DDL form of create/replace |
+| `DROP MATERIALIZED VIEW [IF EXISTS] v [CASCADE]` | DDL form of drop |
 | `dbsp_create_view(name, sql)` | Create view with SQL syntax |
 | `dbsp_replace_view(name, sql)` | Redefine a view, rebuilding only it and its dependents |
 | `dbsp_query(view)` | Query a materialized view |
+| `dbsp_changes(view)` | The view's last delta: its columns plus a signed `weight` |
+| `dbsp_delta_generations()` | Commit generation of each view's last delta (for change feeds) |
 | `dbsp_views()` | List all views with stats |
-| `dbsp_drop(view)` | Drop a view |
-| `dbsp_drop_cascade(view)` | Drop view and dependents |
+| `dbsp_drop(view)` | Drop a view (alias `dbsp_drop_view`) |
+| `dbsp_drop_cascade(view)` | Drop view and dependents (alias `dbsp_drop_view_cascade`) |
 | `dbsp_deps(view)` | Show view dependencies |
+| `dbsp_set_view_key(view, 'c1,c2')` | Declare a unique, non-null row key so deltas apply by key |
 
 ### Persistence
 
 | Function | Description |
 |----------|-------------|
-| `dbsp_save()` | Save view definitions to the `_dbsp_views` table (in the database file) |
-| `dbsp_load()` | Load view definitions from `_dbsp_views` |
-| `dbsp_save('views.json')` | Save view definitions to a JSON file |
+| `dbsp_save()` | Save view definitions to `_dbsp_views` plus a circuit-state checkpoint (in the database file) |
+| `dbsp_load()` | Load views, restoring their state from the checkpoint where it is still valid |
+| `dbsp_save(catalog := 'm')` / `dbsp_load(catalog := 'm')` | The same, in an `ATTACH`ed database |
+| `dbsp_save('views.json')` | Save view definitions only to a JSON file |
 | `dbsp_load('views.json', 'json')` | Load view definitions from a JSON file |
 
-Persistence covers definitions, not materialized state — loading rebuilds
-views from current table data. Table-form persistence lives in the database
-file, so file copies/backups carry the views. JSON file paths must be
-relative to the working directory — absolute paths are rejected.
+Table-form persistence lives in the database file, so file copies and
+backups carry the views. Beside the definitions, `dbsp_save()` writes each
+supported view's operator state and result into the `_dbsp_ckpt` tables,
+together with a watermark of every source table:
+- A view whose sources are unchanged since the save restores from the
+  checkpoint without replay. By default it is decoded lazily, on first use.
+- A view whose source closure changed is rebuilt from the current table
+  data.
+- So is a view whose definition changed, or one with no checkpoint support.
+
+The JSON form carries definitions only. JSON file paths must be relative to
+the working directory; absolute paths are rejected.
 
 `dbsp_save()`/`dbsp_load()` are no longer something a caller has to
 remember: with auto-persist on (the default), a clean connection close
@@ -349,6 +395,11 @@ automatically. See `dbsp_autopersist` below.
 | `dbsp_lazy_restore(bool)` | Toggle lazy per-view checkpoint restore: each view decodes on first need instead of eagerly at load (default ON) |
 | `dbsp_parallel(bool)` | Toggle parallel multi-table sync + same-level view propagation |
 | `dbsp_spill(bool)` | Toggle disk-backed state: baselines, join indexes, top-K windows, big aggregate groups |
+| `dbsp_mv_tables(bool)` | Mirror each view's result into an ordinary `__mv_<view>` table (disk-backed results) |
+| `dbsp_realize(view)` | Decode a lazily restored view now instead of on first use |
+| `dbsp_stats()` | Sync-path counters: trigger ingests, exact deltas, scan reconciles |
+| `dbsp_view_state()` / `dbsp_table_state()` | Resident state per view / per tracked table |
+| `dbsp_wait_teardown()` | Wait for close-time teardown threads before process exit |
 | `dbsp_use_planner([bool])` | No-op since Phase C (planner is the only frontend); kept for script compatibility |
 
 ## Error Handling
@@ -371,13 +422,12 @@ See [Error Handling Guide](docs/ERROR_HANDLING.md) for details.
 - `CREATE OR REPLACE MATERIALIZED VIEW name AS SELECT ...` - redefine a
   view, rebuilding only it and its transitive dependents
 - `REFRESH MATERIALIZED VIEW name` (no-op with auto-refresh)
-- Dropping a view is a FUNCTION, not DDL: `SELECT dbsp_drop_view('name')`
-  (aliases `dbsp_drop`) and `SELECT dbsp_drop_view_cascade('name')`
-  (`dbsp_drop_cascade`) to take the dependents with it. `DROP MATERIALIZED
-  VIEW` is claimed by DuckDB's own parser, which throws
-  `NotImplementedException` before any parser extension is consulted — on
-  1.5.4 and on 2.0 alike. The functions return a status string
-  (`'Dropped'`, or the reason) rather than raising, so callers must read it.
+- `DROP MATERIALIZED VIEW [IF EXISTS] name [CASCADE]`. DuckDB 2.0's own
+  grammar claims this statement and refuses it, so the extension recognises
+  it first, in `parser_override` (see "SQL DDL" above). The function forms
+  `dbsp_drop_view('name')` and `dbsp_drop_view_cascade('name')` still work.
+  They return a status string (`'Dropped'`, or the reason) rather than
+  raising, so callers must read it.
 
 **Query Operations:**
 - `SELECT * FROM table` / `SELECT columns FROM table`
@@ -431,11 +481,19 @@ parser was deleted):**
 
 ### 📋 Not yet supported
 
+These fail at view creation with a DBSP-E110 error:
 - WITH RECURSIVE ... USING KEY
-- Non-constant (expression) LIMIT — percentage LIMIT works
-- Window ORDER BY / PARTITION BY over expressions (project first)
+- Non-constant (expression) LIMIT — constant and percentage LIMIT work
 - string_agg / array_agg without ORDER BY inside the aggregate (ordered
   forms are supported)
+- `approx_quantile` / `reservoir_quantile` / `approx_top_k`
+- DISTINCT on holistic aggregates (median / quantile / mode)
+- `NTH_VALUE` (its N must index within the window frame first)
+
+On a tracked table, the engine itself refuses `MERGE INTO`,
+`ON CONFLICT DO UPDATE` / `INSERT OR REPLACE`, and every `ALTER TABLE` except
+`ADD COLUMN`. See "What tracking a table costs it". The full list of
+limitations is in [TODO.md](TODO.md).
 
 
 ## How It Works
@@ -478,23 +536,30 @@ other commit pays the scan-and-diff above.*
 
 ## Project Structure
 
+```
 duckDBSP/
-├── include/                     # Header-only implementation
-│   ├── dbsp_zset.hpp            # Z-set data structure
-│   ├── dbsp_stream.hpp          # Stream operators
-│   ├── dbsp_circuit.hpp         # Dataflow graph
-│   ├── dbsp_plan_translator.hpp # Planner frontend (circuit translation)
-│   ├── dbsp_cdc.hpp             # CDC manager + shared arrangements
-│   ├── dbsp_internal_connection.hpp # Scoped/retained internal connections
-│   ├── dbsp_duckdb_types.hpp    # Native DuckDB type integration
-│   └── dbsp_context_state.hpp   # Transaction hooks (auto-CDC)
-├── src/                         # Extension source
-│   ├── dbsp_extension.cpp       # Extension entry point
-│   └── dbsp_recovery.cpp        # Replay-based crash recovery
-├── build.sh                     # Build script
-├── test/                        # Unit/integration tests, benchmarks
-├── docs/                        # Documentation
-└── examples/                    # Usage examples
+├── include/                           # Header-only implementation
+│   ├── dbsp_zset.hpp                  # Z-set data structure
+│   ├── dbsp_stream.hpp                # Stream operators
+│   ├── dbsp_circuit.hpp               # Dataflow graph
+│   ├── dbsp_plan_translator.hpp       # Planner frontend (circuit translation)
+│   ├── dbsp_cdc.hpp                   # CDC manager + shared arrangements
+│   ├── dbsp_trigger_source.hpp        # Trigger-fed exact delta source
+│   ├── dbsp_checkpoint.hpp            # Checkpoint blob codecs
+│   ├── dbsp_checkpoint_store.hpp      # Checkpoint table I/O (_dbsp_ckpt*)
+│   ├── dbsp_spill_store.hpp           # Disk-backed state (dbsp_spill)
+│   ├── dbsp_internal_connection.hpp   # Scoped/retained internal connections
+│   ├── dbsp_duckdb_types.hpp          # Native DuckDB type integration
+│   └── dbsp_context_state.hpp         # Transaction hooks (auto-sync)
+├── src/                               # Extension source
+│   ├── dbsp_extension.cpp             # Extension entry point
+│   └── dbsp_recovery.cpp              # Replay-based crash recovery
+├── duckdb/                            # DuckDB v2.0.0 source (pinned by build.sh)
+├── build.sh                           # Build script
+├── test/                              # Unit/integration tests, benchmarks
+├── docs/                              # Documentation
+└── examples/                          # Usage examples
+```
 
 
 ## Contributing
@@ -505,17 +570,20 @@ Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for gui
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/duckDBSP.git
+git clone https://github.com/getravi/duckDBSP.git
 cd duckDBSP
 
-# Build the core library tests
-mkdir build && cd build
-cmake ..
-make
+# Build the extension (fetches DuckDB v2.0.0 on first run)
+./build.sh
 
-# Run tests
-./dbsp_tests
+# Build and run the test suite
+mkdir -p test/build_test && cd test/build_test
+cmake .. && cmake --build . -j 8
+ctest
 ```
+
+Run `ctest` only from `test/build_test`. Every change to code needs a green
+full suite before it is committed.
 
 ## References
 
@@ -531,14 +599,3 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 - The DBSP theory was developed by Mihai Budiu, Tej Chajed, Frank McSherry, Leonid Ryzhyk, and Val Tannen
 - DuckDB team for the excellent embeddable database
-
-### Internal connection ownership
-
-`dbsp_internal_connection.hpp` owns the scoped and retained internal connection
-APIs. `InternalConnection` keeps hook suppression active through connection and
-context teardown. `RetainedInternalConnection` keeps planner context
-registration for the plan lifetime without carrying a thread-local guard; the
-caller guards planner queries, and reset guards teardown. Persistence loading,
-planner binding, sidecar watermarking, and the transaction-manager-only probe
-use the owners with explicit policies. Run `[internal_connection]` canaries
-normally and with `DBSP_STRICT_INTERNAL_QUERY=1` in separate processes.
